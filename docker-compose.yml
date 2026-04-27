@@ -1,0 +1,34 @@
+services:
+  postgres:
+    build:
+      context: ./db
+      dockerfile: Dockerfile
+    image: acct-postgres:18
+    container_name: acct-postgres
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      POSTGRES_DB: acct
+      POSTGRES_USER: acct
+      POSTGRES_PASSWORD: acct_dev
+    ports:
+      - "5111:5432"
+    volumes:
+      - acct-pgdata:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements,pg_cron
+      - -c
+      - io_method=io_uring
+      - -c
+      - cron.database_name=acct
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acct -d acct"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  acct-pgdata:
