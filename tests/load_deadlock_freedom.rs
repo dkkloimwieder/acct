@@ -75,6 +75,18 @@ async fn deadlock_freedom_under_concurrent_post_transfers() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
+    let events_min: usize = env::var("T4_EVENTS_MIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let events_max: usize = env::var("T4_EVENTS_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    assert!(
+        events_min <= events_max && events_min >= 1,
+        "T4_EVENTS_MIN must be >=1 and <= T4_EVENTS_MAX (got min={events_min}, max={events_max})"
+    );
     let duration = Duration::from_secs(duration_secs);
 
     let pool = connect_test_db_with(n_writers + 2).await;
@@ -170,9 +182,11 @@ async fn deadlock_freedom_under_concurrent_post_transfers() {
 
     let accounts: Arc<Vec<DebitAccount>> = Arc::new(accounts);
     eprintln!(
-        "T4: writers={} duration={}s debit_pool_size={} creation_void_id={}",
+        "T4: writers={} duration={}s events_per_batch={}-{} debit_pool_size={} creation_void_id={}",
         n_writers,
         duration_secs,
+        events_min,
+        events_max,
         accounts.len(),
         void_qty_id
     );
@@ -240,8 +254,9 @@ async fn deadlock_freedom_under_concurrent_post_transfers() {
             // Per-writer latency log in microseconds.
             let mut latencies_us: Vec<u32> = Vec::new();
 
+            let span = (events_max - events_min + 1) as u64;
             while start.elapsed() < duration {
-                let n_events = 5 + (xorshift(&mut rng) % 16) as usize;
+                let n_events = events_min + (xorshift(&mut rng) % span) as usize;
                 let mut events = Vec::with_capacity(n_events);
                 for _ in 0..n_events {
                     let a = accounts_w[(xorshift(&mut rng) as usize) % accounts_w.len()];
