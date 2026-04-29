@@ -133,6 +133,24 @@ In Phase 0 the caller pre-computes `amount`. W2 (acct-93b.15) adds a **gating** 
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 
+## Schema integrity check (`scripts/ci-check.sh`)
+
+Pre-push guard for schema changes. There is no remote CI; this script is the check. Runs entirely against an ephemeral `acct_ci` DB inside the existing dev Postgres instance — the dev `acct` DB is untouched.
+
+```bash
+./scripts/ci-check.sh
+```
+
+Five steps:
+
+1. `sqlx migrate run` on a freshly-created `acct_ci` — every migration applies cleanly.
+2. `sqlx migrate info` — assert every migration shows installed (no `pending` lines).
+3. `sqlx migrate revert` in a loop until empty — every migration reverts cleanly.
+4. `sqlx migrate run` again — redeploys cleanly on the empty DB.
+5. `pg_dump -s | sha256sum` — print the schema digest. Useful for reviewing what changed across branches; identical schemas produce identical digests.
+
+The throwaway DB is dropped on exit via `trap`, even on failure.
+
 ## Tests
 
 Cargo integration tests run against an **ephemeral `acct_test` database** inside the existing dev Postgres instance. The dev `acct` DB is untouched.
