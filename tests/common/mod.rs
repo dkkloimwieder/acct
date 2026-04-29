@@ -91,3 +91,76 @@ pub async fn call_post_transfers(
         .fetch_one(pool)
         .await
 }
+
+/// Generate a UUID server-side (avoids needing the `uuid` crate as a
+/// dev-dependency). Returned as the canonical hex string form.
+pub async fn fresh_uuid(pool: &PgPool) -> String {
+    sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(pool)
+        .await
+        .expect("gen_random_uuid")
+}
+
+/// Look up a non-sku-scoped account by `(kind, currency)`. Pass
+/// `currency = None` for qty accounts (e.g. `creation_void` on the qty
+/// ledger). Panics if the account does not exist or is ambiguous.
+pub async fn account_id_by_kind_currency(
+    pool: &PgPool,
+    kind: &str,
+    currency: Option<&str>,
+) -> i64 {
+    sqlx::query_scalar(
+        "SELECT id FROM accounts
+          WHERE kind::text = $1
+            AND sku_id IS NULL
+            AND ((currency = $2) OR ($2 IS NULL AND currency IS NULL))",
+    )
+    .bind(kind)
+    .bind(currency)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("lookup account kind={kind} currency={currency:?}: {e}"))
+}
+
+/// Look up the stock_available account for a given SKU + location pair.
+pub async fn account_id_stock_available(pool: &PgPool, sku_code: &str, loc_code: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT a.id
+           FROM accounts a
+           JOIN skus      s ON s.id = a.sku_id
+           JOIN locations l ON l.id = a.location_id
+          WHERE a.kind = 'stock_available'
+            AND s.code = $1
+            AND l.code = $2",
+    )
+    .bind(sku_code)
+    .bind(loc_code)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("stock_available lookup {sku_code}/{loc_code}: {e}"))
+}
+
+/// Build a minimal `post_transfers` event JSON. Fixed `document_kind`,
+/// `document_id`, and `posted_by` — those don't affect any invariant the
+/// T2 suite exercises. Optional fields (document_line_id, routing_op,
+/// counterparty_id) are omitted; `post_transfers` casts them as NULL.
+pub fn make_event(
+    reason: &str,
+    debit_account_id: i64,
+    credit_account_id: i64,
+    amount: i64,
+    business_date: &str,
+    idempotency_key: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "reason":            reason,
+        "document_kind":     "test_doc",
+        "document_id":       "00000000-0000-0000-0000-0000000000aa",
+        "debit_account_id":  debit_account_id,
+        "credit_account_id": credit_account_id,
+        "amount":            amount,
+        "business_date":     business_date,
+        "idempotency_key":   idempotency_key,
+        "posted_by":         "00000000-0000-0000-0000-0000000000bb",
+    })
+}
