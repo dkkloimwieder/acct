@@ -80,15 +80,21 @@ These are decisions the consolidated doc commits to. If a task touches one of th
 - **Tiered read model.** Tier 1 (base tables) → Tier 2 (trigger-maintained mat views, only when measured) → Tier 3 (logical replication for OLAP/search, only when justified). Do not propose an async projector service for MVP.
 - **No outbox in Phase 0** (Part VII Q3 resolved, bd `acct-93b.3`). `post_transfers` is called synchronously inside the same Postgres transaction as document writes. Outbox-vs-sync is a perf question revisited as `acct-tyq` once §14.1 baseline data exists.
 - **`standard` cost only in Phase 0** (Part VII Q4 resolved, bd `acct-93b.4`). Schema includes a `cost_method` enum and `skus.cost_method` column (default `'standard'`) so `post_transfers` dispatches on it; non-`standard` branches raise `P0006`. WAC / FIFO / lot tracked as `acct-8gg`.
+- **TigerBeetle is a reference model, not a parity target** (Part VII Q1 resolved, 2026-04-29). TB informs behavioral correctness (atomicity, lock semantics, idempotency, append-only) but the implementation does not have to shape itself to TB's primitives. Postgres-native ergonomics win where they conflict.
+- **No fixed TPS target; correctness > performance; baseline before complexity** (Part VII Q2 resolved, 2026-04-29). The project is an exploration of what's possible Postgres-native vs the v0.1 hybrid Postgres/TB design. The §14.1 perf baseline is established on the *simplest* schema first (`acct-1ia` produces `perf_baseline_v0.md`), then every Phase 1 complexity addition is diff'd against it. Phase 1 schema expansion (customers, work_orders, routings, BOMs, alternate cost methods) is gated behind the baseline so regressions are detectable.
 
 ## Open questions that gate work
 
-Part VII of the consolidated doc lists 10 gating questions. Q3 (outbox) and Q4 (cost method) are resolved as Phase 0 decisions (see "Load-bearing design decisions" above). The remainder are still open. The two that frame everything else:
+Part VII of the consolidated doc lists 10 gating questions. **Q1 (TB optionality), Q2 (TPS projection), Q3 (outbox), Q4 (cost method) are resolved** (see "Load-bearing design decisions" above). The remaining open ones are scope-shaping rather than framing:
 
-1. Is TigerBeetle optionality a hard requirement or a "nice to have"?
-2. Realistic 24-month TPS projection?
+5. Reservation lifetime — sub-second timeouts ever needed? (Drives `pg_cron` vs `LISTEN/NOTIFY`.)
+6. Append-only enforcement model — trigger + RBAC + both?
+7. CDC sinks at MVP — none / search / OLAP?
+8. Commodity materiality threshold — 5% is a placeholder.
+9. Tier-2 mat view scope at MVP — default none.
+10. Per-WO per-op account opt-in — default none.
 
-If a task depends on the answer to (1) or (2) and the answer isn't recorded in the doc, surface the question rather than picking an implicit answer.
+These don't gate further engineering work the way Q1/Q2 did. Surface them when a task forces a choice; default behaviors above otherwise.
 
 ## Testing methodology (when implementation starts)
 

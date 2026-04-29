@@ -177,10 +177,51 @@ async fn deadlock_freedom_under_concurrent_post_transfers() {
         void_qty_id
     );
 
+    // ---- pg_stat reset + pre-snapshots. ----
+    // Reset pg_stat_statements so the post-run top-queries snapshot is
+    // attributable to this run. pg_stat_database / pg_stat_io don't
+    // reset on demand here (resetting cluster-wide IO stats requires
+    // pg_stat_reset_shared which we leave alone), so we diff them.
+    let _ = sqlx::query("SELECT pg_stat_statements_reset()")
+        .execute(&pool)
+        .await; // ignore result; extension may not be present in all env
+    let stat_db_before = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        "SELECT xact_commit, xact_rollback, blks_read, blks_hit, deadlocks
+           FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or((0, 0, 0, 0, 0));
+
+    // pg_stat_io: sum across contexts/objects for client backend.
+    let stat_io_before = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
+        "SELECT
+           COALESCE(SUM(reads),     0)::BIGINT,
+           COALESCE(SUM(read_bytes),0)::BIGINT,
+           COALESCE(SUM(writes),    0)::BIGINT,
+           COALESCE(SUM(write_bytes),0)::BIGINT,
+           COALESCE(SUM(extends),   0)::BIGINT,
+           COALESCE(SUM(hits),      0)::BIGINT,
+           COALESCE(SUM(fsyncs),    0)::BIGINT
+         FROM pg_stat_io
+         WHERE backend_type = 'client backend'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+
+    // WAL position before run.
+    let wal_lsn_before: String =
+        sqlx::query_scalar("SELECT pg_current_wal_lsn()::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_default();
+
     // ---- Run the load. ----
-    let deadlocks_before = pg_deadlock_count(&pool).await;
+    let deadlocks_before = stat_db_before.4;
     let ok_count = Arc::new(AtomicU64::new(0));
     let err_count = Arc::new(AtomicU64::new(0));
+    let event_count = Arc::new(AtomicU64::new(0));
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(n_writers as usize);
@@ -189,12 +230,15 @@ async fn deadlock_freedom_under_concurrent_post_transfers() {
         let accounts_w = accounts.clone();
         let ok_w = ok_count.clone();
         let err_w = err_count.clone();
+        let ev_w = event_count.clone();
         handles.push(tokio::spawn(async move {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as u64;
             let mut rng = nanos ^ ((w as u64) << 32) ^ 0xa5a5_a5a5_5a5a_5a5a;
+            // Per-writer latency log in microseconds.
+            let mut latencies_us: Vec<u32> = Vec::new();
 
             while start.elapsed() < duration {
                 let n_events = 5 + (xorshift(&mut rng) % 16) as usize;
@@ -219,9 +263,14 @@ async fn deadlock_freedom_under_concurrent_post_transfers() {
                     events.push(ev);
                 }
                 let batch = json!(events);
-                match call_post_transfers(&pool_w, batch, false).await {
+                let t0 = Instant::now();
+                let res = call_post_transfers(&pool_w, batch, false).await;
+                let dur_us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                latencies_us.push(dur_us);
+                match res {
                     Ok(_) => {
                         ok_w.fetch_add(1, Ordering::Relaxed);
+                        ev_w.fetch_add(n_events as u64, Ordering::Relaxed);
                     }
                     Err(e) => {
                         let code = e
@@ -236,31 +285,201 @@ async fn deadlock_freedom_under_concurrent_post_transfers() {
                     }
                 }
             }
+            latencies_us
         }));
     }
 
+    let mut all_latencies: Vec<u32> = Vec::new();
     for h in handles {
-        h.await.expect("writer panic");
+        let writer_lats = h.await.expect("writer panic");
+        all_latencies.extend(writer_lats);
     }
     let elapsed = start.elapsed();
 
-    let deadlocks_after = pg_deadlock_count(&pool).await;
+    // ---- Post-snapshots + percentiles. ----
+    let stat_db_after = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        "SELECT xact_commit, xact_rollback, blks_read, blks_hit, deadlocks
+           FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or((0, 0, 0, 0, 0));
+    let deadlocks_after = stat_db_after.4;
+
+    let stat_io_after = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
+        "SELECT
+           COALESCE(SUM(reads),     0)::BIGINT,
+           COALESCE(SUM(read_bytes),0)::BIGINT,
+           COALESCE(SUM(writes),    0)::BIGINT,
+           COALESCE(SUM(write_bytes),0)::BIGINT,
+           COALESCE(SUM(extends),   0)::BIGINT,
+           COALESCE(SUM(hits),      0)::BIGINT,
+           COALESCE(SUM(fsyncs),    0)::BIGINT
+         FROM pg_stat_io
+         WHERE backend_type = 'client backend'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+
+    let wal_lsn_after: String = sqlx::query_scalar("SELECT pg_current_wal_lsn()::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_default();
+    // Compute WAL byte delta server-side to avoid LSN math in Rust.
+    let wal_bytes_delta: i64 = if !wal_lsn_before.is_empty() && !wal_lsn_after.is_empty() {
+        sqlx::query_scalar(
+            "SELECT pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::BIGINT",
+        )
+        .bind(&wal_lsn_after)
+        .bind(&wal_lsn_before)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let top_queries: Vec<(String, i64, f64, f64)> = sqlx::query_as(
+        "SELECT left(query, 80) AS q,
+                calls::BIGINT,
+                total_exec_time,
+                mean_exec_time
+           FROM pg_stat_statements
+          WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+            AND query NOT ILIKE 'SELECT pg_stat_%'
+            AND query NOT ILIKE 'SELECT xact_commit%'
+          ORDER BY total_exec_time DESC
+          LIMIT 10",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+
     let ok = ok_count.load(Ordering::Relaxed);
     let err = err_count.load(Ordering::Relaxed);
+    let events = event_count.load(Ordering::Relaxed);
     let total = ok + err;
+
+    // Percentile computation (sort, pick at quantiles).
+    all_latencies.sort_unstable();
+    let pct = |q: f64| -> u32 {
+        if all_latencies.is_empty() {
+            return 0;
+        }
+        let idx =
+            ((q * (all_latencies.len() as f64)).floor() as usize).min(all_latencies.len() - 1);
+        all_latencies[idx]
+    };
+    let p50 = pct(0.50);
+    let p95 = pct(0.95);
+    let p99 = pct(0.99);
+    let p99_9 = pct(0.999);
+    let max_lat = *all_latencies.last().unwrap_or(&0);
+
+    eprintln!("====================== T4 PERF SUMMARY ======================");
     eprintln!(
-        "T4: elapsed={:.1}s batches={} ok={} err={} throughput={:.1}/s",
+        "duration_s={:.2} writers={} debit_pool_size={}",
         elapsed.as_secs_f64(),
+        n_writers,
+        accounts.len()
+    );
+    eprintln!(
+        "batches: total={} ok={} err={} throughput={:.1}/s",
         total,
         ok,
         err,
         total as f64 / elapsed.as_secs_f64()
     );
     eprintln!(
-        "T4: deadlocks delta = {} ({} -> {})",
+        "events:  total={} throughput={:.1}/s",
+        events,
+        events as f64 / elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "latency_us: p50={} p95={} p99={} p99.9={} max={} (n={})",
+        p50,
+        p95,
+        p99,
+        p99_9,
+        max_lat,
+        all_latencies.len()
+    );
+    eprintln!(
+        "deadlocks: delta={} ({} -> {})",
         deadlocks_after - deadlocks_before,
         deadlocks_before,
         deadlocks_after
+    );
+    let xact_commit_d  = stat_db_after.0 - stat_db_before.0;
+    let xact_rollbk_d  = stat_db_after.1 - stat_db_before.1;
+    let blks_read_d    = stat_db_after.2 - stat_db_before.2;
+    let blks_hit_d     = stat_db_after.3 - stat_db_before.3;
+    eprintln!(
+        "pg_stat_database: xact_commit_delta={} xact_rollback_delta={} blks_read_delta={} blks_hit_delta={}",
+        xact_commit_d, xact_rollbk_d, blks_read_d, blks_hit_d
+    );
+
+    let io_reads_d   = stat_io_after.0 - stat_io_before.0;
+    let io_rbytes_d  = stat_io_after.1 - stat_io_before.1;
+    let io_writes_d  = stat_io_after.2 - stat_io_before.2;
+    let io_wbytes_d  = stat_io_after.3 - stat_io_before.3;
+    let io_extends_d = stat_io_after.4 - stat_io_before.4;
+    let io_hits_d    = stat_io_after.5 - stat_io_before.5;
+    let io_fsyncs_d  = stat_io_after.6 - stat_io_before.6;
+    eprintln!(
+        "pg_stat_io (client backend, summed across contexts): reads_delta={} read_bytes_delta={} writes_delta={} write_bytes_delta={} extends_delta={} hits_delta={} fsyncs_delta={}",
+        io_reads_d, io_rbytes_d, io_writes_d, io_wbytes_d, io_extends_d, io_hits_d, io_fsyncs_d
+    );
+
+    eprintln!(
+        "wal_bytes_delta={} (lsn {} -> {})",
+        wal_bytes_delta, wal_lsn_before, wal_lsn_after
+    );
+
+    eprintln!("pg_stat_statements (top 10 by total_exec_time on this DB):");
+    for (q, calls, total_ms, mean_ms) in &top_queries {
+        eprintln!(
+            "  calls={:>10} total_ms={:>10.1} mean_ms={:>8.3}  query={}",
+            calls, total_ms, mean_ms, q
+        );
+    }
+    eprintln!("=============================================================");
+
+    // Machine-parseable single-line CSV for the multi-run aggregator
+    // (scripts/run-perf-baseline.sh). Fields below — keep in sync if
+    // you add or remove metrics.
+    eprintln!(
+        "T4_CSV_HEADER: duration_s,writers,batches_total,batches_ok,batches_err,events_total,throughput_bps,throughput_evps,p50_us,p95_us,p99_us,p999_us,max_us,deadlocks_delta,xact_commit_delta,xact_rollback_delta,blks_read_delta,blks_hit_delta,io_reads_delta,io_read_bytes_delta,io_writes_delta,io_write_bytes_delta,io_extends_delta,io_hits_delta,io_fsyncs_delta,wal_bytes_delta"
+    );
+    eprintln!(
+        "T4_CSV_VALUES: {:.3},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        elapsed.as_secs_f64(),
+        n_writers,
+        total,
+        ok,
+        err,
+        events,
+        total as f64 / elapsed.as_secs_f64(),
+        events as f64 / elapsed.as_secs_f64(),
+        p50,
+        p95,
+        p99,
+        p99_9,
+        max_lat,
+        deadlocks_after - deadlocks_before,
+        xact_commit_d,
+        xact_rollbk_d,
+        blks_read_d,
+        blks_hit_d,
+        io_reads_d,
+        io_rbytes_d,
+        io_writes_d,
+        io_wbytes_d,
+        io_extends_d,
+        io_hits_d,
+        io_fsyncs_d,
+        wal_bytes_delta
     );
 
     assert_eq!(

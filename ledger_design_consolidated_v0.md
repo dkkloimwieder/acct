@@ -1696,9 +1696,9 @@ The CDC seam is the thing to preserve. Logical replication slots, named in the s
 
 Decisions that need answers before v0.2 implementation can proceed:
 
-1. **Is TB optionality a hard requirement** (regulatory, organizational, strategic), or a "nice to have" that has been rationalized into the architecture? If hard-required, v0.2 is moot — but B1, B2, B3 still need fixing in v0.1. If nice-to-have, the cost-benefit analysis above applies.
+1. ~~**Is TB optionality a hard requirement** (regulatory, organizational, strategic), or a "nice to have" that has been rationalized into the architecture?~~ **Resolved (2026-04-29):** TB optionality is **not a hard requirement**. TigerBeetle remains a *reference model* for behavioral correctness (atomicity, lock semantics, idempotency, append-only invariants) but **not** a parity target the implementation has to shape itself against. Postgres-native ergonomics win where they conflict with TB-shape decisions. The "TB-parity tax" framing in Part III stays as historical context, not as a future-cutover obligation.
 
-2. **What is the realistic 24-month TPS projection** for this workload? Numbers above 30K sustained reframe the conversation. Numbers below 5K make TB optionality nearly free to drop.
+2. ~~**What is the realistic 24-month TPS projection** for this workload?~~ **Resolved (2026-04-29):** No fixed TPS target. The project is an **exploration of what's possible with Postgres-native** in place of the v0.1 hybrid Postgres/TigerBeetle design. Goal ordering is **correctness first, performance second**. The implication for the perf baseline (§14.1): we measure to establish a *yardstick*, not to chase a number. Specifically — establish a baseline on the simplest schema before any Phase 1 complexity (customers, work orders, routings, BOMs, alternate cost methods, etc.) is added; subsequent additions get diff'd against the baseline so that "did adding feature X regress throughput?" is answerable. `acct-1ia` is the immediate baseline-producing work item; `acct-tyq`, `acct-e8g`, and the latency note in `acct-93b.21` (O1) are downstream of it.
 
 3. ~~**Is the outbox load-bearing** in a single-database world?~~ **Resolved (Phase 0, 2026-04-27, bd `acct-93b.3`):** No outbox in Phase 0. `post_transfers` is called synchronously inside the same Postgres transaction as document writes. The choice is fundamentally a perf question hard to answer pre-baseline; revisited as a benchmark issue (`acct-tyq`) once §14.1 exploratory data exists.
 
@@ -1716,7 +1716,7 @@ Decisions that need answers before v0.2 implementation can proceed:
 
 10. **Per-WO per-op account opt-in:** which SKU families or WO types warrant job-cost grain? (Default: none; opt in when Finance or operations requests.)
 
-Answers to (1) and (2) determine whether this entire document is the right framing or a footnote. Answers to (3)–(10) determine the v0.2 spec's final shape.
+~~Answers to (1) and (2) determine whether this entire document is the right framing or a footnote.~~ With (1) and (2) resolved, this document is the framing. Answers to (5)–(10) determine the v0.2 spec's final shape.
 
 ---
 
