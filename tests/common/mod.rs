@@ -164,3 +164,69 @@ pub fn make_event(
         "posted_by":         "00000000-0000-0000-0000-0000000000bb",
     })
 }
+
+/// Insert a fresh sales_orders row, return its id as canonical UUID text.
+pub async fn fresh_sales_order(pool: &PgPool) -> String {
+    sqlx::query_scalar("INSERT INTO sales_orders (status) VALUES ('open') RETURNING id::text")
+        .fetch_one(pool)
+        .await
+        .expect("insert sales_order")
+}
+
+/// Stock a (sku, location) by `qty` units via post_transfers — the
+/// fixture seeds zero on-hand. Posts a `cycle_count_adj` event with
+/// stock_available on the debit side and `creation_void` (qty) on the
+/// credit side, which is the canonical "balance from nothing" pattern
+/// for qty ledgers and keeps every CHECK happy.
+pub async fn seed_stock(pool: &PgPool, sku_code: &str, loc_code: &str, qty: i64) {
+    let stock = account_id_stock_available(pool, sku_code, loc_code).await;
+    let void_qty = account_id_by_kind_currency(pool, "creation_void", None).await;
+    let key = fresh_uuid(pool).await;
+    let event = make_event("cycle_count_adj", stock, void_qty, qty, "2026-04-15", &key);
+    let result = call_post_transfers(pool, serde_json::json!([event]), false)
+        .await
+        .expect("seed_stock post_transfers");
+    assert_eq!(result[0]["result"], "ok", "seed_stock: {result}");
+}
+
+/// Invoke the `reserve_inventory()` PL/pgSQL function (migration 0014).
+/// Returns `Some(id)` on success, `None` if the function returned
+/// NULL (qty_promisable < qty). Both `so_id` and `so_line_id` are UUID
+/// strings; expiry is set 1 hour out. The single-statement CTE+INSERT
+/// pattern shown in doc §3.3 is unsafe under concurrent reservers
+/// (snapshot taken before FOR UPDATE wait stays in effect for the
+/// SUM subquery) — see the migration's header comment.
+pub async fn try_reserve(
+    pool: &PgPool,
+    sku_code: &str,
+    loc_code: &str,
+    qty: i64,
+    so_id: &str,
+    so_line_id: &str,
+) -> Option<String> {
+    let sku_id: String = sqlx::query_scalar("SELECT id::text FROM skus WHERE code = $1")
+        .bind(sku_code)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("sku {sku_code}: {e}"));
+    let loc_id: String = sqlx::query_scalar("SELECT id::text FROM locations WHERE code = $1")
+        .bind(loc_code)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("location {loc_code}: {e}"));
+    let result: Option<String> = sqlx::query_scalar(
+        "SELECT reserve_inventory(
+            $1::UUID, $2::UUID, $3::BIGINT, $4::UUID, $5::UUID,
+            clock_timestamp() + INTERVAL '1 hour'
+         )::text",
+    )
+    .bind(&sku_id)
+    .bind(&loc_id)
+    .bind(qty)
+    .bind(so_id)
+    .bind(so_line_id)
+    .fetch_one(pool)
+    .await
+    .expect("reserve_inventory call");
+    result
+}
