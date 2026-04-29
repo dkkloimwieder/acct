@@ -12,15 +12,33 @@ const FIXTURE_SQL: &str = include_str!("../../db/fixtures/small/seed.sql");
 /// Connect to the test DB. Requires `TEST_DATABASE_URL` (set by
 /// scripts/run-tests.sh). Panics if unset or unreachable.
 pub async fn connect_test_db() -> PgPool {
+    connect_test_db_with(8).await
+}
+
+/// Like `connect_test_db` but with a caller-specified max_connections.
+/// Used by the T4 load test so it can spawn many concurrent writers
+/// without each one starving the pool.
+pub async fn connect_test_db_with(max_connections: u32) -> PgPool {
     let url = env::var("TEST_DATABASE_URL").expect(
         "TEST_DATABASE_URL not set — run via ./scripts/run-tests.sh \
          (it provisions an ephemeral 'acct_test' DB and exports the URL)",
     );
     PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(max_connections)
         .connect(&url)
         .await
         .expect("connect to test DB")
+}
+
+/// Read `pg_stat_database.deadlocks` for the current database. Used by
+/// the T4 load test to assert deadlock-freedom across a run.
+pub async fn pg_deadlock_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT deadlocks::BIGINT FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("pg_stat_database read")
 }
 
 /// TRUNCATE all base tables, then re-seed from db/fixtures/small/seed.sql.

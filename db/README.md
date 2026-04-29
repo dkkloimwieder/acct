@@ -167,6 +167,27 @@ The script `DROP`s `acct_test` if present, `CREATE`s it fresh, runs all migratio
 
 Test helpers live in `tests/common/mod.rs` (loaded via `mod common;` in each integration test file): `connect_test_db`, `reset_to_fixture`, `expect_sqlstate`, `call_post_transfers`. Set `TEST_DATABASE_URL` if you want to run `cargo test` outside of `scripts/run-tests.sh`.
 
+### Load tests (opt-in)
+
+Long-running load tests are gated behind `#[ignore]` so they don't run with the default `cargo test`. Triggered explicitly:
+
+```bash
+./scripts/run-tests.sh --test load_deadlock_freedom -- --ignored --nocapture
+```
+
+Available env knobs (defaults shown):
+
+- `T4_DURATION_SECS=30` — wall-clock duration of the load phase.
+- `T4_WRITERS=32` — number of concurrent tokio writers.
+
+The current single test, `deadlock_freedom_under_concurrent_post_transfers`, posts random valid batches against `post_transfers` and asserts (a) `pg_stat_database.deadlocks` delta is 0, (b) every batch succeeded (no non-deadlock errors), (c) per-ledger double-entry holds at the end. The original Part IV §13 target is 100 writers × 30 minutes; defaults are smaller for tractable sanity runs. Spec-target run:
+
+```bash
+T4_DURATION_SECS=1800 T4_WRITERS=100 ./scripts/run-tests.sh --test load_deadlock_freedom -- --ignored --nocapture
+```
+
+(Bumping `T4_WRITERS` above the dev container's `max_connections` will fail; scaling work is tracked separately.)
+
 ## Reference data — Phase 0 scope
 
 Phase 0 ships **stub** reference tables only (`skus`, `locations`, `sales_orders`, `purchase_orders`) — just enough columns to serve as FK targets for the ledger schema and to drive cost dispatch.
