@@ -8,12 +8,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 What exists now:
 - Postgres 18 dev environment in Docker (`docker-compose.yml`, `db/Dockerfile`, `db/init/`).
-- Helper scripts (`scripts/dev-up.sh`, `scripts/dev-down.sh`).
+- Helper scripts (`scripts/dev-up.sh`, `scripts/dev-down.sh`, `scripts/run-migrations.sh`).
+- Rust crate root (`Cargo.toml`, `src/lib.rs`) — minimal; sqlx + tokio deps only.
+- Migration scaffold via `sqlx-cli` under `db/migrations/`. First migration: `0001_enable_extensions` (reversible, sequential).
 - The design spec (`ledger_design_consolidated_v0.md`) and `ARCHIVE/` of predecessor docs.
 
 What does NOT yet exist:
-- Rust source tree (`src/`, `Cargo.toml`).
-- Migrations (`db/migrations/`) — see `acct-93b.6` (S2).
+- Schema tables (enums, periods, fx_rates, accounts, transfers, …) — see `acct-93b.9` onward.
+- `post_transfers` function — see `acct-93b.14`/`.15`.
 - Tests, fixtures, CI.
 
 When adding new categories of code, update this file with real commands. Until each category exists, do not invent commands for it.

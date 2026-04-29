@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS purchase_orders;
+DROP TABLE IF EXISTS sales_orders;
+DROP TABLE IF EXISTS locations;
+DROP TABLE IF EXISTS skus;

@@ -1,0 +1,1 @@
+DROP FUNCTION IF EXISTS post_transfers(JSONB, BOOLEAN);

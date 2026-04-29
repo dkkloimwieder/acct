@@ -3,3 +3,9 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Rust
+/target/
+
+# Local env (use .env.example as template)
+.env
