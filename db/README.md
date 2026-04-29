@@ -208,6 +208,25 @@ Smoke-check the end-to-end flow (inserts a test row, waits 35s, asserts expiry, 
 ./scripts/verify-o1-expiry.sh
 ```
 
+`daily_reconciliation` runs every day at 00:00 UTC in `acct` and calls the PL/pgSQL function `run_daily_reconciliation()`. Two checks today (Part IV §7):
+
+- **Per-ledger double-entry**: `SUM(debits_total) ≠ SUM(credits_total)` per `(ledger_kind, currency)` writes a `'double_entry_imbalance'` row to `reconciliation_alerts` with `payload = {ledger_kind, currency, debits, credits, imbalance}`.
+- **Reservation over-promise**: any `(sku, location)` where on-hand `<` SUM(active reservations.qty) writes a `'reservation_over_promise'` alert with `payload = {sku_id, location_id, on_hand, reserved, deficit}`.
+
+Phase 0 is log-only; Phase 1 will tee `reconciliation_alerts` into PagerDuty / Slack / email. The function is correctness-tested in `tests/reconciliation.rs`; against the live `acct` DB you can smoke-check via:
+
+```bash
+./scripts/verify-o2-recon.sh
+```
+
+Inspect alerts directly:
+
+```sql
+SELECT alert_type, payload, created_at
+  FROM reconciliation_alerts
+ ORDER BY id DESC LIMIT 20;
+```
+
 ## Reference data — Phase 0 scope
 
 Phase 0 ships **stub** reference tables only (`skus`, `locations`, `sales_orders`, `purchase_orders`) — just enough columns to serve as FK targets for the ledger schema and to drive cost dispatch.

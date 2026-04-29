@@ -50,6 +50,7 @@ pub async fn reset_to_fixture(pool: &PgPool) {
         "TRUNCATE TABLE
             transfers,
             inventory_reservations,
+            reconciliation_alerts,
             period_snapshots,
             commodity_receipts,
             accounts,
