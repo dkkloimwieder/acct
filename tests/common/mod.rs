@@ -158,6 +158,66 @@ pub async fn account_id_stock_available(pool: &PgPool, sku_code: &str, loc_code:
     .unwrap_or_else(|e| panic!("stock_available lookup {sku_code}/{loc_code}: {e}"))
 }
 
+/// Resolve an account by a flexible (kind, sku_code, location_code,
+/// currency, routing_op) selector — used by the T5 conformance harness
+/// to map JSON selectors to BIGSERIAL ids. Panics if zero or >1 rows
+/// match (selector ambiguity is a case-authoring bug).
+#[allow(clippy::too_many_arguments)]
+pub async fn account_id_for_selector(
+    pool: &PgPool,
+    kind: &str,
+    sku_code: Option<&str>,
+    location_code: Option<&str>,
+    currency: Option<&str>,
+    routing_op: Option<i32>,
+) -> i64 {
+    let rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT a.id
+           FROM accounts a
+           LEFT JOIN skus      s ON s.id = a.sku_id
+           LEFT JOIN locations l ON l.id = a.location_id
+          WHERE a.kind::text = $1
+            AND ($2::text IS NULL OR s.code = $2)
+            AND ($3::text IS NULL OR l.code = $3)
+            AND ($4::text IS NULL OR a.currency = $4)
+            AND ($5::int  IS NULL OR a.routing_op = $5)
+            AND ($2::text IS NOT NULL OR a.sku_id      IS NULL)
+            AND ($3::text IS NOT NULL OR a.location_id IS NULL)
+            AND ($4::text IS NOT NULL OR a.currency    IS NULL)
+            AND ($5::int  IS NOT NULL OR a.routing_op  IS NULL)",
+    )
+    .bind(kind)
+    .bind(sku_code)
+    .bind(location_code)
+    .bind(currency)
+    .bind(routing_op)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| panic!("selector query failed: {e}"));
+    match rows.len() {
+        0 => panic!(
+            "selector matched no account: kind={kind} sku={sku_code:?} loc={location_code:?} currency={currency:?} routing_op={routing_op:?}"
+        ),
+        1 => rows[0],
+        n => panic!(
+            "selector matched {n} accounts (ambiguous): kind={kind} sku={sku_code:?} loc={location_code:?} currency={currency:?} routing_op={routing_op:?}; ids={rows:?}"
+        ),
+    }
+}
+
+/// Snapshot every account's `(debits_total, credits_total)` keyed by
+/// id. The conformance harness uses this for "no unexpected change"
+/// assertions — every account whose balance changed must appear in
+/// the case's `deltas` list.
+pub async fn snapshot_balances(pool: &PgPool) -> std::collections::HashMap<i64, (i64, i64)> {
+    let rows: Vec<(i64, i64, i64)> =
+        sqlx::query_as("SELECT id, debits_total, credits_total FROM accounts ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .expect("snapshot_balances");
+    rows.into_iter().map(|(id, d, c)| (id, (d, c))).collect()
+}
+
 /// Build a minimal `post_transfers` event JSON. Fixed `document_kind`,
 /// `document_id`, and `posted_by` — those don't affect any invariant the
 /// T2 suite exercises. Optional fields (document_line_id, routing_op,

@@ -34,4 +34,8 @@ DATABASE_URL="$TEST_URL" sqlx migrate run --source db/migrations >/dev/null
 docker compose exec -T postgres psql -U "$PG_USER" -d "$TEST_DB" -v ON_ERROR_STOP=1 \
   < db/fixtures/small/seed.sql >/dev/null
 
-TEST_DATABASE_URL="$TEST_URL" cargo test "$@"
+# Default to 1 thread per test binary: every binary has at most one
+# test function except the conformance binary, where two #[tokio::test]
+# functions both reset the shared DB and would race in parallel.
+# Callers can override by exporting RUST_TEST_THREADS in the environment.
+TEST_DATABASE_URL="$TEST_URL" RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}" cargo test "$@"
