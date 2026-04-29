@@ -133,6 +133,22 @@ In Phase 0 the caller pre-computes `amount`. W2 (acct-93b.15) adds a **gating** 
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 
+## Tests
+
+Cargo integration tests run against an **ephemeral `acct_test` database** inside the existing dev Postgres instance. The dev `acct` DB is untouched.
+
+```bash
+./scripts/run-tests.sh                    # full run
+./scripts/run-tests.sh smoke              # filter to a single test binary
+./scripts/run-tests.sh -- --test-threads=1  # serialize
+```
+
+The script `DROP`s `acct_test` if present, `CREATE`s it fresh, runs all migrations against it, seeds `db/fixtures/small/seed.sql`, runs `cargo test`, and drops `acct_test` again on exit (success or failure).
+
+`pg_cron` does not get installed in `acct_test` — its install script enforces a hard `current_database() = cron.database_name` check that `cron.use_background_workers` does not relax. Migration 0001 tolerates this with a `DO/EXCEPTION` block; the test DB simply doesn't get pg_cron. O1 / O2 (which schedule cron jobs) run only against `acct`.
+
+Test helpers live in `tests/common/mod.rs` (loaded via `mod common;` in each integration test file): `connect_test_db`, `reset_to_fixture`, `expect_sqlstate`, `call_post_transfers`. Set `TEST_DATABASE_URL` if you want to run `cargo test` outside of `scripts/run-tests.sh`.
+
 ## Reference data — Phase 0 scope
 
 Phase 0 ships **stub** reference tables only (`skus`, `locations`, `sales_orders`, `purchase_orders`) — just enough columns to serve as FK targets for the ledger schema and to drive cost dispatch.
