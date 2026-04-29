@@ -188,6 +188,26 @@ T4_DURATION_SECS=1800 T4_WRITERS=100 ./scripts/run-tests.sh --test load_deadlock
 
 (Bumping `T4_WRITERS` above the dev container's `max_connections` will fail; scaling work is tracked separately.)
 
+## Scheduled jobs (pg_cron)
+
+`reservation_expiry` runs every 30 seconds in the `acct` database (set via `cron.database_name` GUC) and flips `inventory_reservations` rows from `'active'` to `'expired'` when `expires_at` has passed. Migration `0015_cron_reservation_expiry` registers the job; the migration tolerates non-`acct` databases (acct_test, acct_ci) where pg_cron isn't installed.
+
+Inspect the job:
+
+```sql
+SELECT jobid, schedule, command FROM cron.job WHERE jobname = 'reservation_expiry';
+SELECT runid, status, return_message, start_time, end_time
+  FROM cron.job_run_details
+ WHERE jobid = (SELECT jobid FROM cron.job WHERE jobname = 'reservation_expiry')
+ ORDER BY runid DESC LIMIT 5;
+```
+
+Smoke-check the end-to-end flow (inserts a test row, waits 35s, asserts expiry, cleans up):
+
+```bash
+./scripts/verify-o1-expiry.sh
+```
+
 ## Reference data — Phase 0 scope
 
 Phase 0 ships **stub** reference tables only (`skus`, `locations`, `sales_orders`, `purchase_orders`) — just enough columns to serve as FK targets for the ledger schema and to drive cost dispatch.
