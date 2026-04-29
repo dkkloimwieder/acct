@@ -33,6 +33,10 @@ CONFIGS="${T4_CONFIGS:-$DEFAULT_CONFIGS}"
 N_RUNS="${T4_BASELINE_RUNS:-3}"
 DURATION="${T4_DURATION_SECS:-300}"
 VMSTAT_INTERVAL="${T4_VMSTAT_INTERVAL:-5}"
+# Which cargo test binary to drive. Default is the deadlock-freedom
+# probe (worst-case lock contention). Set to load_realistic_workload
+# (acct-2ey) for the cross-account-spread shape.
+T4_BINARY_NAME="${T4_BINARY:-load_deadlock_freedom}"
 
 LOG_DIR="/tmp/t4_baseline_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
@@ -44,6 +48,7 @@ if ! command -v vmstat >/dev/null 2>&1; then
 fi
 
 echo "==> Multi-shape T4 perf baseline"
+echo "    binary:      $T4_BINARY_NAME"
 echo "    runs/config: $N_RUNS"
 echo "    duration:    ${DURATION}s per run"
 echo "    vmstat:      ${VMSTAT_INTERVAL}s interval (enabled=$VMSTAT_OK)"
@@ -65,9 +70,11 @@ run_one() {
     vmstat "$VMSTAT_INTERVAL" > "$vmstat_log" 2>&1 &
     vmstat_pid=$!
   fi
+  # Forward all caller-set T4_* env vars (T4_BENCH_SKUS for the
+  # realistic workload, etc.) plus the per-config writers/events.
   T4_DURATION_SECS="$DURATION" T4_WRITERS="$w" \
     T4_EVENTS_MIN="$emin" T4_EVENTS_MAX="$emax" \
-    ./scripts/run-tests.sh --test load_deadlock_freedom -- --ignored --nocapture \
+    ./scripts/run-tests.sh --test "$T4_BINARY_NAME" -- --ignored --nocapture \
     > "$cfg_dir/run_${run_idx}.log" 2>&1
   if [ -n "$vmstat_pid" ]; then
     kill "$vmstat_pid" 2>/dev/null || true

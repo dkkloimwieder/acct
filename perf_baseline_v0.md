@@ -9,13 +9,14 @@ every Phase 1 complexity addition is diff'd against these numbers.
 
 ## TL;DR
 
-The system has a clean three-regime structure:
+The system has a clean four-regime structure:
 
-1. **Single-writer regime** — peaks at **~2.5 K events/s**. Big batches give a modest ~15 % bump over small batches by amortizing per-batch overhead. CPU is half-idle and iowait is 15–22 %; the bound is per-event work + commit fsync, not contention.
-2. **Concurrent-writers regime** — every additional concurrent writer that converges on the same lock target costs throughput. 1→32→100 writers takes events/s from 2 164 → 1 421 → 559. Latencies grow from single-digit-ms (1 writer) to 11.9 s p99 (100 writers).
-3. **Concurrent + big batches regime** — catastrophic. 100 writers × 100-event batches finishes only **373 events/s** with **p99 ≈ 62 s** because each batch holds the shared lock for ~20 s and the queue compounds.
+1. **Single-writer regime (A, B)** — peaks at **~2.5 K events/s**. Big batches give a modest ~15 % bump over small batches by amortizing per-batch overhead. CPU is half-idle and iowait is 15–22 %; the bound is per-event work + commit fsync, not contention.
+2. **Concurrent + converged-on-one-row (C, D)** — every additional concurrent writer that hits the same lock target costs throughput. 1→32→100 writers takes events/s from 2 164 → 1 421 → 559. Latencies grow from single-digit-ms (1 writer) to **11.9 s p99** (100 writers).
+3. **Concurrent + big batches under contention (E)** — catastrophic. 100 writers × 100-event batches finishes only **373 events/s** with **p99 ≈ 62 s** because each batch holds the shared lock for ~20 s and the queue compounds.
+4. **Concurrent + spread across accounts (F)** — the realistic shape. 100 writers, same small batches as D, but spread across 50 SKUs × 2 locations = 100 distinct accounts. Throughput **2.3× D** (1 274 evps), **p50 26× lower** (51 ms vs 1 369 ms), **p99 1.4× lower** (8.3 s). CPU usage climbs from 25 % → 40 % — the system is doing actual work instead of queuing. **This is much closer to what real workloads look like.**
 
-The route to higher throughput on the actual hardware is **not "tune Postgres"** — it's spreading contention (account sharding, doc Part IV §8) or collapsing concurrency to a single writer via an outbox (`acct-tyq`).
+The route to higher throughput on this hardware is **not "tune Postgres"** — it's spreading contention (the natural state of realistic workloads, plus account sharding for unavoidable hot rows per Part IV §8) or collapsing concurrency to a single writer via an outbox (`acct-tyq`).
 
 ## Methodology
 
@@ -41,17 +42,21 @@ The driver is `scripts/run-perf-baseline.sh`. Per run it captures:
 
 ## Configurations
 
-| Tag | Writers | Events / batch | What it isolates |
-|---|---|---|---|
-| **A** `w1_e5-20`     | 1 | 5–20 | Single-writer with the test's default small-batch shape |
-| **B** `w1_e1000-1000`| 1 | 1000 | TigerBeetle-style: single writer, big batches |
-| **C** `w32_e5-20`    | 32 | 5–20 | Moderate concurrency on small batches |
-| **D** `w100_e5-20`   | 100 | 5–20 | High-contention spec target — **the canonical regression-detection point** |
-| **E** `w100_e100-100`| 100 | 100 | Mid-batch under high concurrency — proves big batches *don't* help when contention is the bottleneck |
+| Tag | Writers | Events / batch | Workload | What it isolates |
+|---|---|---|---|---|
+| **A** `w1_e5-20`     | 1 | 5–20 | shared credit | Single-writer with the test's default small-batch shape |
+| **B** `w1_e1000-1000`| 1 | 1000 | shared credit | TigerBeetle-style: single writer, big batches |
+| **C** `w32_e5-20`    | 32 | 5–20 | shared credit | Moderate concurrency on small batches |
+| **D** `w100_e5-20`   | 100 | 5–20 | shared credit | High-contention spec target — pessimum, **canonical regression-detection point for the worst case** |
+| **E** `w100_e100-100`| 100 | 100 | shared credit | Mid-batch under high concurrency — proves big batches *don't* help when contention is the bottleneck |
+| **F** `w100_e5-20`   | 100 | 5–20 | **cross-account spread (50 SKUs × 2 locations = 100 accounts)** | Realistic-shape concurrency — same envelope as D but contention spreads. **The realistic-traffic regression-detection point.** |
 
 Skipped on purpose: **100 writers × 1000 events/batch**. We tested this in a separate exploratory pass; it produces a 30-min completion tail at 90 s nominal duration and is operationally useless. Big batches at high concurrency are an anti-pattern in this schema.
 
-In every config, every event posts `debit = <random pick from a 7-account pool>`, `credit = creation_void(qty)`. The credit side is shared across all writers — all contention converges on one row. Realistic application traffic does **not** look like this; `acct-2ey` will phase in cross-ledger / multi-currency / reservation-interleaved workloads.
+**Workload shapes:**
+
+- **A–E (`tests/load_deadlock_freedom.rs`)** — every event posts `debit = <random pick from a 7-account pool>`, `credit = creation_void(qty)`. The credit side is shared across all writers — all contention converges on one row.
+- **F (`tests/load_realistic_workload.rs`, `acct-2ey`)** — `bin_move` events across 50 SKUs × 2 locations. Each event picks a random SKU and direction (MAIN→OUT or OUT→MAIN). Both `debit` and `credit` rotate across the 100-account pool. Contention spreads. **Closer to realistic application traffic.**
 
 ## Run metadata
 
@@ -92,17 +97,19 @@ The single most important table. *Median across the 3 runs of each shape.*
 
 | Shape | bps | events/s | p50 (ms) | p95 (ms) | p99 (ms) | p99.9 (ms) | max (ms) | WAL (MB / 5 min) | Deadlocks |
 |---|---|---|---|---|---|---|---|---|---|
-| **A** 1 × 5–20      | **173.45** | **2 164** | **5.4** | **8.3** | **10.6** | 15.7 | 86.8 | 612 | 0 |
-| **B** 1 × 1000      | 2.49 | **2 486** | 373.9 | 524.0 | 610.9 | 834.2 | 834.2 | 717 | 0 |
-| **C** 32 × 5–20     | 113.85 | 1 421 | 163.6 | 919.0 | 1 441.8 | 2 155.9 | 3 370.7 | 406 | 0 |
-| **D** 100 × 5–20    | 44.84 | 558.5 | 1 369.2 | 7 213.8 | 11 905.8 | 18 590.6 | 28 555.6 | 162 | 0 |
-| **E** 100 × 100     | 3.73 | 372.8 | **28 176.7** | 45 521.7 | **61 726.1** | 70 880.8 | 73 453.7 | 120 | 0 |
+| **A** 1 × 5–20  · shared credit | **173.45** | **2 164** | **5.4** | **8.3** | **10.6** | 15.7 | 86.8 | 612 | 0 |
+| **B** 1 × 1000  · shared credit | 2.49 | **2 486** | 373.9 | 524.0 | 610.9 | 834.2 | 834.2 | 717 | 0 |
+| **C** 32 × 5–20 · shared credit | 113.85 | 1 421 | 163.6 | 919.0 | 1 441.8 | 2 155.9 | 3 370.7 | 406 | 0 |
+| **D** 100 × 5–20 · shared credit (worst case) | 44.84 | 558.5 | 1 369.2 | 7 213.8 | 11 905.8 | 18 590.6 | 28 555.6 | 162 | 0 |
+| **E** 100 × 100 · shared credit (anti-pattern) | 3.73 | 372.8 | **28 176.7** | 45 521.7 | **61 726.1** | 70 880.8 | 73 453.7 | 120 | 0 |
+| **F** 100 × 5–20 · **cross-account spread** | **102.16** | **1 274.2** | **51.4** | 5 410.5 | 8 250.7 | 14 469.2 | 16 767.8 | 431 | 0 |
 
 Key reads:
 
 - **Throughput peak is ~2 500 events/s** (config B), 14 % higher than config A's 2 164. That ~14 % is the entire amortization gain from big batches when there's no contention.
-- **Adding writers on this workload is purely destructive** because every batch fights for the same lock. 1 → 100 writers loses ~75 % of throughput.
-- **Big batches under contention compound the problem instead of helping it** (E vs D): going from small batches to 100-event batches at 100 writers cuts throughput further (559 → 373 evps) and explodes p99 (12 s → 62 s).
+- **Adding writers on the shared-credit workload is purely destructive** (A → C → D) because every batch fights for the same lock. 1 → 100 writers loses ~75 % of throughput.
+- **Big batches under shared-credit contention compound the problem instead of helping it** (E vs D): going from small batches to 100-event batches at 100 writers cuts throughput further (559 → 373 evps) and explodes p99 (12 s → 62 s).
+- **Spreading contention recovers most of the loss** (F vs D): same writer count, same batch size, just rotating across 100 accounts instead of 1. Throughput **2.3× higher** (1 274 vs 559 evps), **p50 26× lower** (51 vs 1 369 ms), **p99 1.4× lower** (8.3 vs 11.9 s). The FOR UPDATE lock-queue cost dominates D; F approaches what the schema can actually do.
 - **Zero deadlocks across every shape** — the ascending-id `FOR UPDATE` lock ordering in `post_transfers` is correct under every shape we threw at it.
 
 ## Per-config detail
@@ -207,25 +214,72 @@ vmstat: `us≈25%  sy≈2%  id≈52%  wa≈18%  cs≈16.3K/s`. Lock-queue cost d
 
 vmstat: `us≈22%  sy≈1%  id≈54%  wa≈18%  cs≈6.2K/s`. **Note duration_s = 326–331 s** (vs 300 s nominal) — once the test stops launching batches, in-flight ones still need to drain through the queue. Throughput here is **half** of D's — bigger batches at 100 writers buy worse contention. p50 batch wall clock = 28 s; p99 = 62 s. **Don't run real workloads in this regime.**
 
+### F — 100 writers × 5–20 events/batch, cross-account spread (50 SKUs × 2 locations)
+
+| Metric | min | median | mean | max |
+|---|---|---|---|---|
+| Batches / 5 min | 30 560 | 30 751 | 31 028 | 31 773 |
+| Events / 5 min | 381 480 | 383 536 | 387 178 | 396 519 |
+| batches/s | 101.55 | 102.16 | 103.09 | 105.55 |
+| events/s | 1 267.6 | 1 274.2 | 1 286.3 | 1 317.2 |
+| p50 (ms) | 50.04 | 51.43 | 51.12 | 51.90 |
+| p95 (ms) | 5 156.7 | 5 410.5 | 5 424.6 | 5 706.5 |
+| p99 (ms) | 7 724.7 | 8 250.7 | 8 121.6 | 8 389.4 |
+| p99.9 (ms) | 12 377.8 | 14 469.2 | 13 792.8 | 14 531.5 |
+| max (ms) | 14 956.7 | 16 767.8 | 17 007.2 | 19 297.0 |
+| io_writes | 30 653 | 30 831 | 31 123 | 31 884 |
+| io_write MB | 656.5 | 660.0 | 721.0 | 846.5 |
+| io_fsyncs | 30 568 | 30 746 | 31 038 | 31 801 |
+| WAL MB | 428.5 | 431.2 | 435.8 | 447.8 |
+
+vmstat: `us≈40%  sy≈2.5%  id≈38%  wa≈16%  cs≈14.9K/s`. **CPU usage 40 %** vs D's 25 % — the system is doing more actual work per second instead of waiting in line. Storage budget is roughly proportional to throughput; iowait is similar to D. Workload setup includes inserting 50 BENCH-NNN SKUs and 100 stock_available accounts pre-balanced to 10K units each at the start of every run (~1–2 s overhead, not in the measured window).
+
+### F vs D — the realistic-traffic headline
+
+The **same envelope** (100 writers × small batches × 5 min × 3 runs) — only the workload shape differs. F substitutes "credit always converges on `creation_void`" with "credit and debit both rotate across 100 distinct accounts." Outcomes:
+
+| Metric | D (shared credit) | F (cross-account) | F / D |
+|---|---|---|---|
+| events/s | 558.5 | 1 274.2 | **2.28×** |
+| p50 (ms) | 1 369.2 | 51.4 | 0.038 (≈ 26.6× lower) |
+| p95 (ms) | 7 213.8 | 5 410.5 | 0.75 |
+| p99 (ms) | 11 905.8 | 8 250.7 | 0.69 |
+| max (ms) | 28 555.6 | 16 767.8 | 0.59 |
+| WAL/5min (MB) | 162 | 431 | 2.66× |
+| CPU user % | 24.6 | 40.2 | +63 % |
+| CPU idle % | 52.5 | 38.2 | -27 pp |
+
+**What this says:**
+
+- **Throughput more than doubles, p50 collapses by 26×.** Most application latency disappears when contention spreads.
+- **The tail still drags.** p95/p99 improve 25–35 % but stay multi-second. With 50 SKUs and 100 writers each holding ~12 accounts in flight per batch, birthday-paradox-style overlaps on individual SKUs are still common; some batches still queue.
+- **CPU user % climbs 25 → 40 %** — half-idle drops. Spreading contention converts queue-wait into actual work.
+- **WAL throughput climbs proportionally** (162 → 431 MB / 5 min). Per-event WAL is roughly constant; we're just doing more events.
+- **Zero deadlocks** across the same ~85 K-batch sample size as D. Lock-order proof holds under spread.
+
+For Phase 1 regression detection going forward, **use F's median** as the realistic-traffic reference (1 274 evps; p50 51 ms; p99 8.25 s). Use D's median as the worst-case-contention regression-detection reference (when you specifically want to test that the lock-order proof still works under hot-row pressure).
+
 ## Observations
 
-1. **Lock contention is the dominant cost from C onward.** Every writer needs `creation_void`'s lock. The `FOR UPDATE` lock is held for the entire transaction (lock acquire → loop events → commit → fsync). Concurrent writers serialize behind that hold time. Single-row throughput limit ≈ 1 / mean-hold-time = ~2 K events/s for small batches; adding more concurrent writers redistributes that throughput across more queue depth, not into more total events/s.
+1. **Lock contention is the dominant cost from C onward in the shared-credit shapes.** Every writer needs `creation_void`'s lock. The `FOR UPDATE` lock is held for the entire transaction (lock acquire → loop events → commit → fsync). Concurrent writers serialize behind that hold time. Single-row throughput limit ≈ 1 / mean-hold-time = ~2 K events/s for small batches; adding more concurrent writers redistributes that throughput across more queue depth, not into more total events/s.
 
-2. **CPU is consistently half-idle (id ≈ 50 %)** across every shape. We are *never* CPU-bound. Adding cores wouldn't help — adding workload variety (so writers contend on different rows) would.
+2. **CPU is consistently 30–55 % idle across every shape.** Even F with 100 writers and contention spread gets only to ~38 % idle. We are *never* CPU-bound. Adding cores wouldn't help; the next leverage point is more workload spread or platform-level changes (storage layer for iowait, kernel for ctx-switch overhead).
 
 3. **Storage participates throughout (iowait 15–22 %).** ~50 K fsyncs / run at config A with ~600 MB write_bytes. Going to bigger batches (B) drops to ~750 fsyncs / run — that's the real benefit of batching: amortizing fsync.
 
-4. **WAL volume tracks throughput, not concurrency.** 612 MB (A, 2.2 K evps) > 717 MB (B, 2.5 K evps) > 406 MB (C, 1.4 K evps) > 162 MB (D, 559 evps) > 120 MB (E, 373 evps). Per-event WAL is roughly constant (~1 KB).
+4. **WAL volume tracks throughput, not concurrency.** 612 MB (A, 2.2 K evps) > 717 MB (B, 2.5 K evps) > **431 MB (F, 1.27 K evps)** > 406 MB (C, 1.4 K evps) > 162 MB (D, 559 evps) > 120 MB (E, 373 evps). Per-event WAL is roughly constant (~1 KB).
 
 5. **Big batches help only without contention.** A → B: events/s 2 164 → 2 486 (+15 %). D → E: 559 → 373 (–33 %). Same change in batch size; opposite effect, because the bottleneck moves from per-batch overhead to lock-hold time.
 
-6. **Variance is tight in contended configs (D, E)** and looser in uncontended ones (A, B). At 100 writers serializing, platform jitter is a small fraction of the 1.4 s median; at 1 writer the median is 5 ms and a single bad scheduler tick shows up.
+6. **Spreading contention is dramatically cheaper than batch-size optimization.** D → F (same writers, same batch size, just different credit-side accounts): +128 % throughput, –96 % p50 latency. D → E (same writers, larger batches, same shared credit): –33 % throughput, +1 957 % p50 latency. Account architecture beats batch tuning every time.
 
-7. **Zero deadlocks across all 5 shapes × 3 runs × 5 min** = ~115 K batches / ~2 M events. The lock-order proof in `post_transfers` is correct under every shape.
+7. **Variance is tight in contended configs (D, E, F)** and looser in uncontended ones (A, B). At 100 writers serializing, platform jitter is a small fraction of the 1.4 s median; at 1 writer the median is 5 ms and a single bad scheduler tick shows up.
 
-8. **The 2.5 K events/s ceiling is real for this hardware on this schema.** Routes to higher numbers:
-   - **Spread the contention** (`acct-2ey` workload variety; Part IV §8 account sharding).
-   - **Collapse concurrency to 1 writer** (outbox pattern, `acct-tyq`). Application requests append to a queue; a single drainer ships big batches through `post_transfers`.
+8. **Zero deadlocks across all 6 shapes × 3 runs × 5 min** = ~200 K batches / ~3 M events. The lock-order proof in `post_transfers` is correct under every shape.
+
+9. **The ~2.5 K events/s single-writer ceiling is real for this hardware on this schema.** Routes to higher numbers:
+   - **Spread the contention** (F demonstrates this — 2.3× lift just from cross-account workload). Real ERP traffic does this naturally; account sharding (Part IV §8) is the explicit Phase 1 mechanism for when natural spread isn't enough.
+   - **Collapse concurrency to 1 writer** (outbox pattern, `acct-tyq`). Application requests append to a queue; a single drainer ships big batches through `post_transfers` — combines B's per-batch amortization with no concurrent contention.
    - **Different hardware** is a multiplier on these ratios, not a fix for the regime structure.
 
 ## Top queries (representative — config D, run 3, `pg_stat_statements`)
@@ -246,16 +300,29 @@ vmstat: `us≈22%  sy≈1%  id≈54%  wa≈18%  cs≈6.2K/s`. **Note duration_s 
 ```bash
 ./scripts/dev-up.sh
 ./scripts/run-migrations.sh
-./scripts/run-perf-baseline.sh                 # full 5-shape × 3-runs × 5-min matrix
+
+# Shapes A-E (shared-credit, deadlock-freedom probe)
+./scripts/run-perf-baseline.sh
+
+# Shape F (cross-account spread, realistic shape)
+T4_BINARY=load_realistic_workload T4_CONFIGS="100:5:20" \
+  ./scripts/run-perf-baseline.sh
 ```
 
 Override defaults to characterize a single point ad-hoc:
 
 ```bash
+# One config × one run, fast
 T4_CONFIGS="100:5:20" T4_BASELINE_RUNS=1 T4_DURATION_SECS=60 \
   ./scripts/run-perf-baseline.sh
 
+# Bigger batch sweep on single writer
 T4_CONFIGS="1:5000:5000 1:10000:10000" \
+  ./scripts/run-perf-baseline.sh
+
+# Larger SKU pool for shape F (default is 50; bigger pool = less overlap)
+T4_BINARY=load_realistic_workload T4_BENCH_SKUS=200 T4_CONFIGS="100:5:20" \
+  T4_BASELINE_RUNS=1 T4_DURATION_SECS=60 \
   ./scripts/run-perf-baseline.sh
 ```
 
@@ -265,9 +332,12 @@ Logs land in `/tmp/t4_baseline_<timestamp>/<config>/run_<i>.log` plus matching `
 
 This file is regenerated whenever:
 
-1. A Phase 1 schema addition lands (compare to **config D** as canonical regression-detection point — flag throughput drops > 25 % or p99 inflation > 50 %).
+1. A Phase 1 schema addition lands. Compare two reference points:
+   - **Config F** for realistic-traffic regression detection (1 274 evps; p50 51 ms; p99 8.25 s). This is the number that approximates real workload behavior.
+   - **Config D** for worst-case-contention regression detection (559 evps; p50 1 369 ms; p99 11.9 s). This is what you check when you specifically want to confirm hot-row behavior hasn't regressed.
+   - Flag throughput drops > 25 % or p99 inflation > 50 % on either reference.
 2. Postgres major version changes.
 3. Significant container / OS / kernel change on the dev rig.
-4. Workload shape changes (`acct-2ey` will trigger this).
+4. Workload shape changes (e.g., `acct-jwg` multi-currency or `acct-9i6` reservation interleaving will trigger this).
 
 Append a new section dated below the current one rather than overwriting; the v0 → v1 → v2 history is the diff trail that detects creep.
