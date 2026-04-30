@@ -6,7 +6,7 @@ Postgres-native v0.2 design — see `ledger_design_consolidated_v0.md`.
 
 ## Status
 
-**Phase 0 — initial schema + dev environment — is the current scope.** Tracked under epic `acct-93b` in beads (`bd show acct-93b`). Phase 1 begins once the Part IV §14.1 perf baseline lands and the gating questions in Part VII items (1) and (2) are resolved.
+**Phase 0 is functionally complete.** The schema, write path (`post_transfers` with `'standard'` and `'wac'` cost dispatchers), reservations, period close, reconciliation, the conformance harness (T5), and the §14.1 perf baseline (`perf_baseline_v0.md`, 13 shapes) all shipped under epic `acct-93b`. The three remaining open issues (`bd ready`) are P3 and explicitly gated on Phase 1 framing or §14.1 follow-up evidence — claim them only if their gates have cleared.
 
 ## Quick start
 
@@ -42,7 +42,7 @@ Rust + `sqlx` + `sqlx-cli` + Postgres 18 (`io_method=io_uring`, `pg_stat_stateme
 | `db/README.md` | Dev DB details — image, GUC overrides, write path, scheduled jobs. |
 | `tests/` | Rust integration tests (`cargo test`). Each `tests/*.rs` is a binary. |
 | `tests/common/mod.rs` | Shared test helpers (connect, fixture reset, error assertions, etc.). |
-| `tests/data/conformance.json` | T5 conformance fixture — 100 (input, expected_response, expected_state) triples. |
+| `tests/data/conformance.json` | T5 conformance fixture — 107 (input, expected_response, expected_state) triples (11 also tagged `also_split` for batch-vs-split equivalence). |
 | `scripts/` | Dev helpers — `dev-up.sh`, `run-migrations.sh`, `run-tests.sh`, `ci-check.sh`, `verify-o1-expiry.sh`, `verify-o2-recon.sh`. |
 | `Cargo.toml` / `src/lib.rs` | Rust crate root; library only (no binary yet). |
 | `docker-compose.yml` | Dev DB service definition. |
@@ -135,7 +135,7 @@ The Phase 0 acceptance gate (Part IV §13) maps to these tests:
 | `tests/reservation_state_transitions.rs` | allocate / cancel / expire only from `'active'`; otherwise no-op | T3 |
 | `tests/reservation_expiry.rs` | Single UPDATE flips 1000 overdue active rows to `'expired'`; future-actives + non-actives untouched | T3 |
 | `tests/load_deadlock_freedom.rs` (opt-in, `#[ignore]`) | `pg_stat_database.deadlocks` delta = 0 across 32 writers × 30 s; per-ledger double-entry holds at end | T4 |
-| `tests/conformance.rs::conformance_cases` | 100 (input, expected_response, expected_state) triples | T5 |
+| `tests/conformance.rs::conformance_cases` | 107 (input, expected_response, expected_state) triples | T5 |
 | `tests/conformance.rs::batch_vs_split_equivalence` | 11 `also_split`-tagged cases prove linked-batch semantics (full rollback) vs independent-call semantics (partial commit) | T5 |
 | `tests/reconciliation.rs` | `run_daily_reconciliation()` detects double-entry imbalance + reservation over-promise; clean state produces zero alerts | O2 |
 

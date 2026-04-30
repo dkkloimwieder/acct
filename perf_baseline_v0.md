@@ -1,8 +1,8 @@
 # Perf baseline v0 — Phase 0 schema, workload-shape matrix
 
 This file records reference perf measurements across **thirteen workload
-shapes** on the simplest schema (Phase 0; migrations 0001–0018, no
-Phase 1 tables). Per the 2026-04-29 directive (Part VII Q2 resolved),
+shapes** on the simplest schema (Phase 0; migrations 0001–0021, no
+Phase 1 tables). Shapes A-K were collected on migrations 0001-0018 (2026-04-29 / 2026-04-30); shapes L and M (`acct-yjn`) were collected on the same schema 2026-04-30 evening; the `acct-ezm` follow-up re-measured shape L on migrations 0001-0021 (post-WAC) and confirmed no regression vs the pre-WAC numbers. Per the 2026-04-29 directive (Part VII Q2 resolved),
 every Phase 1 complexity addition is diff'd against these numbers.
 
 **These are not SLOs.** They are a yardstick.
@@ -16,7 +16,7 @@ The system has a clean five-regime structure:
 3. **Concurrent + big batches under contention (E)** — catastrophic. 100 writers × 100-event batches finishes only **373 events/s** with **p99 ≈ 62 s** because each batch holds the shared lock for ~20 s and the queue compounds.
 4. **Concurrent + spread across accounts (F)** — the realistic shape. 100 writers, same small batches as D, but spread across 50 SKUs × 2 locations = 100 distinct accounts. Throughput **2.3× D** (1 274 evps), **p50 26× lower** (51 ms vs 1 369 ms), **p99 1.4× lower** (8.3 s). CPU usage climbs from 25 % → 40 % — the system is doing actual work instead of queuing. **This is much closer to what real workloads look like.**
 5. **Naive outbox: writers → ledger_outbox → 1 drainer (G)** — caller-perceived tail latency collapses (**133 ms p99** vs F's 8.3 s — 62× lower) because writers no longer queue on `post_transfers` row locks; they just `INSERT` and return. But total committed-events throughput **falls to 140 evps** — 9× LESS than F. The single sequential drainer can't match what 100 contending writers manage in parallel, because shape B's amortization comes from packing 1 000 events into ONE `post_transfers` call, not from running 1 000 calls in series. End-to-end latency (caller-submit → ledger-commit) is dominated by queue residency: p50 **186 seconds** as the queue grows unbounded throughout the run.
-6. **Pseudo-sync outbox via LISTEN/NOTIFY (L) is the throughput peak.** Writers `INSERT` then BLOCK on a notification matching their row id. Drainer super-batches as in J, plus emits `pg_notify(channel, '{"id":N,"status":"ok"}')` per row outcome inside the drain tx. Result: **2 876 commit-evps** — 2.26× F, **16% above shape B's 2 486** (which was the prior peak). Caller p99 = 547 ms (15× better than F's 8.3 s) AND end-to-end (caller-submit → ledger-commit is the SAME thing in pseudo-sync). Queue depth bounded naturally by writer count (~100). The architectural insight: pseudo-sync **pipelines** the producer's INSERT stage with the drainer's commit stage on the same DB; writers never touch the account `FOR UPDATE` locks (only the drainer does, serially with itself), eliminating the 100-way contention that limits F. **This is the new architectural reference point for outbox-style work.**
+6. **Pseudo-sync outbox via LISTEN/NOTIFY (L) is the throughput peak.** Writers `INSERT` then BLOCK on a notification matching their row id. Drainer super-batches as in J, plus emits `pg_notify(channel, '{"id":N,"status":"ok"}')` per row outcome inside the drain tx. Result: **~2 876 commit-evps** at the high end of long-run sampling — 2.26× F, ~16 % above shape B's 2 486 (the prior peak). The `acct-ezm` re-measurement (5 × 60 s short-run sampling) found the *median* sits closer to ~2 300-2 400 evps with ~15-20 % run-to-run noise on this rig — see Caveats. Caller p99 = 547 ms (15× better than F's 8.3 s) AND end-to-end (caller-submit → ledger-commit is the SAME thing in pseudo-sync). Queue depth bounded naturally by writer count (~100). The architectural insight: pseudo-sync **pipelines** the producer's INSERT stage with the drainer's commit stage on the same DB; writers never touch the account `FOR UPDATE` locks (only the drainer does, serially with itself), eliminating the 100-way contention that limits F. **This is the new architectural reference point for outbox-style work.**
 
 The route to higher throughput on this hardware is **not "tune Postgres"** — it's either spreading contention (F) or pipelining the producer/consumer stages so concurrent writers never share `post_transfers`'s lock surface (L). The naive single-drainer outbox (G) collapses to 9× LESS throughput than F. The super-batched single-drainer (J) recovers half the gap (`acct-hbg`). The pseudo-sync caller pattern (L, `acct-yjn`) eliminates the gap and exceeds F. The hard-cap back-pressure variant (M, `acct-yjn`) is a sad middle ground at 971 evps — the busy-poll pre-INSERT gate burns 5× more CPU context-switches than L for half its throughput; not recommended.
 
@@ -26,11 +26,11 @@ The dev hardware is a consumer laptop on a multi-tenant desktop kernel. A single
 
 Configuration of this baseline pass:
 
-- 11 workload shapes (see "Configurations" below)
-- 3 runs per shape, 5 minutes per run (G adds 60 s grace drain, J/K add 90 s grace drains)
+- 13 workload shapes (see "Configurations" below)
+- 3 runs per shape, 5 minutes per run (G adds 60 s grace drain, J/K add 90 s grace drains; L/M use a notify rendezvous + drain-to-empty)
 - 100 writers connection ceiling on the dev container (`max_connections=200`)
 - `vmstat 5` sidecar during every run
-- ~165 minutes total wall clock (A–F: ~77 min on 2026-04-29; G: ~18 min on 2026-04-29; H: ~15 min on 2026-04-29; I: ~15 min on 2026-04-29; J: ~20 min on 2026-04-29; K: ~20 min on 2026-04-30)
+- ~205 minutes total wall clock (A–F: ~77 min on 2026-04-29; G: ~18 min on 2026-04-29; H: ~15 min on 2026-04-29; I: ~15 min on 2026-04-29; J: ~20 min on 2026-04-29; K: ~20 min on 2026-04-30; L+M: ~40 min on 2026-04-30)
 
 The driver is `scripts/run-perf-baseline.sh`. Per run it captures:
 

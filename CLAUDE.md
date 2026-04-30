@@ -4,21 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-**Phase 0 is in progress** (consolidated doc Part IV §13). The design phase is complete and committed to the consolidated doc; foundational schema/tooling work is being broken out into beads issues under epic `acct-93b`.
+**Phase 0 is functionally complete** (consolidated doc Part IV §13). All `acct-93b.*` foundational issues are closed. The three remaining open issues (`acct-0oy`, `acct-e8g`, `acct-8gg`) are all P3 and explicitly gated on Phase 1 framing or §14.1 follow-up evidence — they are *not* speculative work to claim.
 
 What exists now:
 - Postgres 18 dev environment in Docker (`docker-compose.yml`, `db/Dockerfile`, `db/init/`).
-- Helper scripts (`scripts/dev-up.sh`, `scripts/dev-down.sh`, `scripts/run-migrations.sh`).
-- Rust crate root (`Cargo.toml`, `src/lib.rs`) — minimal; sqlx + tokio deps only.
-- Migration scaffold via `sqlx-cli` under `db/migrations/`. First migration: `0001_enable_extensions` (reversible, sequential).
+- Helper scripts (`scripts/dev-up.sh`, `scripts/dev-down.sh`, `scripts/run-migrations.sh`, `scripts/run-tests.sh`, `scripts/ci-check.sh`, `scripts/run-perf-baseline.sh`).
+- Rust crate root (`Cargo.toml`, `src/lib.rs`) — library only, sqlx + tokio.
+- 21 sequential reversible migrations under `db/migrations/` (`0001_enable_extensions` through `0021_post_transfers_wac`). Schema, `post_transfers`, `reserve_inventory`, `run_daily_reconciliation`, the `_post_transfers_compute_amount` cost dispatcher (real `'standard'` and `'wac'` branches; `'fifo'`/`'lot'` raise `P0006`), `pg_cron` reservation expiry, the optional `ledger_outbox` table.
+- 26 integration test binaries under `tests/`: per-invariant probes (T2/T3), the conformance harness (T5, 107 cases + 11 batch-vs-split), the WAC integration suite, and the perf load matrix (shapes A-M).
+- `db/fixtures/small/seed.sql` — minimal-but-realistic seed for `cargo test`.
+- `perf_baseline_v0.md` — 13-shape baseline matrix (acct-1ia/yjn/ezm follow-ups).
 - The design spec (`ledger_design_consolidated_v0.md`) and `ARCHIVE/` of predecessor docs.
 
-What does NOT yet exist:
-- Schema tables (enums, periods, fx_rates, accounts, transfers, …) — see `acct-93b.9` onward.
-- `post_transfers` function — see `acct-93b.14`/`.15`.
-- Tests, fixtures, CI.
-
-When adding new categories of code, update this file with real commands. Until each category exists, do not invent commands for it.
+When adding new categories of code, update this file.
 
 ## Implementation stack
 

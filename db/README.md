@@ -114,7 +114,7 @@ Phase 0 calls it **synchronously inside the same Postgres transaction** as docum
 - **Value-ledger events**: caller MUST send `qty`, NOT `amount`. The function computes amount via the `_post_transfers_compute_amount` dispatcher keyed on `skus.cost_method`. Caller-supplied `amount` is ignored on these events.
 - **Qty-ledger events**: caller still sends `amount` (= qty by convention). Unchanged from earlier behavior.
 
-The dispatcher's `'standard'` branch is real: `amount = qty × skus.standard_cost`. The `'wac'`, `'lot'`, `'fifo'` branches RAISE `P0006` with a TODO referencing their downstream issues (`acct-uxu` for WAC, `acct-8gg` for lot/FIFO). When a non-`standard` SKU is referenced via a cost-relevant qty-side event, the function still raises `P0006` (qty-side gate), preserving migration 0013's behavior — that gate relaxes when WAC ships.
+The dispatcher has two real branches: `'standard'` (`amount = qty × skus.standard_cost`) and `'wac'` (acct-uxu, migration 0021 — `amount = qty × (value_pool_balance / qty_pool_balance)` with FOR UPDATE on both pool accounts; raises `P0006` only when the qty pool is zero). The `'lot'` and `'fifo'` branches RAISE `P0006` with a TODO referencing `acct-8gg`. The qty-side gate relaxes for `'wac'` (so SKU-WAC stock_available transfers post normally); it still fires for `'lot'`/`'fifo'`.
 
 For all other reasons (anything not in the cost-relevant set): caller sends `amount`. Unchanged.
 
@@ -136,7 +136,7 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 | `P0003` | `currency_mismatch` | both ledger_kind=`'value'`, currencies differ |
 | `P0004` | `period_missing` | no period contains `business_date` |
 | `P0005` | `period_closed` | period `closed_at IS NOT NULL` and `p_override_closed_period = FALSE` |
-| `P0006` | `cost_method_not_implemented` | `reason ∈ {op_move, scrap, wo_complete, so_ship}` AND any of: (a) sku not resolvable from either account, (b) sku's `cost_method ≠ 'standard'` on a qty-side event, (c) value-side event missing `qty`, (d) value-side event with sku's `cost_method ∈ {'wac','lot','fifo'}` (raised inside the dispatcher) |
+| `P0006` | `cost_method_not_implemented` / `wac_zero_qty_pool` | `reason ∈ {op_move, scrap, wo_complete, so_ship}` AND any of: (a) sku not resolvable from either account, (b) sku's `cost_method ∈ {'lot','fifo'}` on a qty-side event (the qty-side gate relaxes for `'standard'` and `'wac'`), (c) value-side event missing `qty`, (d) value-side event with sku's `cost_method ∈ {'lot','fifo'}` (raised inside the dispatcher), (e) value-side event with sku's `cost_method = 'wac'` and the qty pool is zero |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 
