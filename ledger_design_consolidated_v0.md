@@ -851,9 +851,22 @@ receipt:
 
 Reservations are NOT transfers in v0.2. They are rows in `inventory_reservations`.
 
-**Reserve** (single SQL operation, atomic):
+**Reserve** — call the `reserve_inventory()` PL/pgSQL function (migration `0014_reserve_inventory.up.sql`). Returns the new reservation's UUID on success, or NULL when `qty_promisable < qty`:
 
 ```sql
+SELECT reserve_inventory(
+  $sku_id, $location_id, $qty, $so_id, $so_line_id, $expires_at, $unit_price
+);
+```
+
+The function takes `FOR UPDATE` on the matching `stock_available` row, then computes `qty_promisable = (debits − credits) − SUM(active reservations)`, and either inserts the reservation row or returns NULL. Raises `P0010` if no open `stock_available` account exists for the (sku, location) pair (caller bug — accounts must be pre-created).
+
+#### Why a function and not a single-statement CTE+INSERT
+
+The naïve form looks like it should work:
+
+```sql
+-- DO NOT USE — unsafe under concurrent reservers in READ COMMITTED
 WITH avail AS (
   SELECT
     a.id,
@@ -865,13 +878,16 @@ WITH avail AS (
   WHERE a.kind = 'stock_available' AND a.sku_id = $sku AND a.location_id = $loc
   FOR UPDATE
 )
-INSERT INTO inventory_reservations (id, sku_id, location_id, qty, so_id, so_line_id, expires_at, unit_price)
-SELECT $rsv_id, $sku, $loc, $qty, $so_id, $so_line_id, $expires_at, $unit_price
-FROM avail WHERE qty_promisable >= $qty
+INSERT INTO inventory_reservations (...)
+SELECT ... FROM avail WHERE qty_promisable >= $qty
 RETURNING id;
 ```
 
-(If the SELECT returns no row — insufficient stock — INSERT inserts nothing. The caller checks the RETURNING count.)
+It isn't. **Postgres takes one snapshot per command in `READ COMMITTED`.** The `FOR UPDATE` on the `accounts` row correctly serializes contenders — only one waiter at a time runs to completion — but the inner `SUM(qty) FROM inventory_reservations` subquery still uses the snapshot that was taken at command start, *before* the `FOR UPDATE` wait. Each waiter therefore computes the same pre-contention `qty_promisable` and the constraint silently over-promises. Demonstrated in `tests/reserve_concurrency.rs` (T3): on-hand=10, five concurrent 3-unit requests, the CTE form admits four (sum=12) where the correct outcome is exactly three (sum=9).
+
+In a PL/pgSQL function each SQL statement takes its own snapshot. The post-`FOR UPDATE` `SELECT` on `inventory_reservations` sees the prior winner's `INSERT`, and the function returns NULL when the budget is exhausted. T3 now passes deterministically (`successes == 3`).
+
+This is a Postgres-specific snapshot-semantics gotcha; not a deadlock or a missing index. The fix is the function boundary, not a different operator.
 
 **Allocate** (pick confirm):
 
