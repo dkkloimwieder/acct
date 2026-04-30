@@ -35,17 +35,27 @@ pub struct DrainStats {
     pub duration_ms: u64,
 }
 
-/// Run the drain loop until `drain_to_empty` is set AND a 0-row iteration
-/// occurs. While `drain_to_empty` is false, the loop sleeps `idle_sleep_ms`
-/// on empty iterations and keeps polling.
+/// Run the drain loop. Two stop signals:
+///   * `hard_stop` — exits before the next iteration regardless of queue state.
+///     Used to bound a benchmark's drain phase when the queue would take
+///     too long to fully drain.
+///   * `drain_to_empty` — exits after the next 0-row iteration. Used in
+///     the seeded-queue smoke test where the queue is bounded.
+///
+/// While both flags are false, the loop sleeps `idle_sleep_ms` on empty
+/// iterations and keeps polling.
 pub async fn drain_loop(
     pool: PgPool,
     cfg: DrainConfig,
     drain_to_empty: Arc<AtomicBool>,
+    hard_stop: Arc<AtomicBool>,
 ) -> sqlx::Result<DrainStats> {
     let started = Instant::now();
     let mut stats = DrainStats::default();
     loop {
+        if hard_stop.load(Ordering::Relaxed) {
+            break;
+        }
         let processed = drain_one_batch(&pool, cfg.batch_size, &mut stats).await?;
         if processed == 0 {
             if drain_to_empty.load(Ordering::Relaxed) {

@@ -9,3 +9,6 @@
 
 # Local env (use .env.example as template)
 .env
+
+# Claude Code session-local state
+.claude/scheduled_tasks.lock

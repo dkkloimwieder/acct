@@ -53,7 +53,8 @@ async fn worker_drains_seeded_outbox_with_one_failure() {
     assert_eq!(pending_before, TOTAL_ROWS);
 
     let drain_to_empty = Arc::new(AtomicBool::new(true));
-    let stats = drain_loop(pool.clone(), DrainConfig::default(), drain_to_empty)
+    let hard_stop = Arc::new(AtomicBool::new(false));
+    let stats = drain_loop(pool.clone(), DrainConfig::default(), drain_to_empty, hard_stop)
         .await
         .expect("drain_loop");
 
