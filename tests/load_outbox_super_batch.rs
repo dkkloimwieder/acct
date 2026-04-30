@@ -229,14 +229,19 @@ async fn outbox_super_batch_shape_j() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    let n_drainers: u32 = env::var("T4_DRAINERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    assert!(n_drainers >= 1, "T4_DRAINERS must be >= 1");
     assert!(
         events_min <= events_max && events_min >= 1,
         "T4_EVENTS_MIN must be >=1 and <= T4_EVENTS_MAX"
     );
     let duration = Duration::from_secs(duration_secs);
 
-    // pool: writers + worker(2) + depth sampler(1) + setup/snapshot(2) headroom
-    let pool = connect_test_db_with(n_writers + 8).await;
+    // pool: writers + drainers + depth sampler(1) + setup/snapshot(2) headroom
+    let pool = connect_test_db_with(n_writers + n_drainers + 8).await;
     reset_to_fixture(&pool).await;
 
     eprintln!("T4: setting up load fixture (n_skus={n_skus})");
@@ -252,8 +257,9 @@ async fn outbox_super_batch_shape_j() {
     let pairs: Arc<Vec<LocPair>> = Arc::new(pairs);
 
     eprintln!(
-        "T4 shape J (super-batch): writers={} duration={}s events={}-{} pool_size={} drain_batch={} idle_sleep={}ms",
+        "T4 shape J (super-batch): writers={} drainers={} duration={}s events={}-{} pool_size={} drain_batch={} idle_sleep={}ms",
         n_writers,
+        n_drainers,
         duration_secs,
         events_min,
         events_max,
@@ -296,13 +302,18 @@ async fn outbox_super_batch_shape_j() {
     let err_count = Arc::new(AtomicU64::new(0));
     let event_count = Arc::new(AtomicU64::new(0));
 
-    // ---- Spawn the drain worker. Stays running for the entire load
-    //      phase, then drains-to-empty after writers stop (bounded by
+    // ---- Spawn N drain workers. All share the same drain_to_empty /
+    //      hard_stop signals; each independently runs the SKIP LOCKED
+    //      claim-and-process loop. Multiple workers are correct under
+    //      FOR UPDATE SKIP LOCKED — claims are non-overlapping by
+    //      construction. Stays running for the entire load phase, then
+    //      drains-to-empty after writers stop (bounded by
     //      T4_DRAIN_TIMEOUT_S — hard_stop forces an exit if the queue
     //      isn't empty by then).
     let drain_to_empty = Arc::new(AtomicBool::new(false));
     let hard_stop = Arc::new(AtomicBool::new(false));
-    let worker_handle = {
+    let mut worker_handles = Vec::with_capacity(n_drainers as usize);
+    for _ in 0..n_drainers {
         let pool = pool.clone();
         let cfg = DrainConfig {
             batch_size: outbox_batch_size,
@@ -310,8 +321,10 @@ async fn outbox_super_batch_shape_j() {
         };
         let stop = drain_to_empty.clone();
         let hs = hard_stop.clone();
-        tokio::spawn(async move { super_batched_drain_loop(pool, cfg, stop, hs).await })
-    };
+        worker_handles.push(tokio::spawn(async move {
+            super_batched_drain_loop(pool, cfg, stop, hs).await
+        }));
+    }
 
     // ---- Spawn the depth sampler.
     let depth_samples: Arc<std::sync::Mutex<Vec<i64>>> =
@@ -417,30 +430,45 @@ async fn outbox_super_batch_shape_j() {
         writer_elapsed.as_secs_f64()
     );
 
-    // ---- Bounded grace drain: tell the worker to exit on next-empty,
-    //      but cap the wait. If the queue is too deep to drain in time,
-    //      hard_stop forces an exit and we report partial state.
+    // ---- Bounded grace drain: tell all workers to exit on next-empty,
+    //      capped by T4_DRAIN_TIMEOUT_S. If the queue is too deep to
+    //      drain by then, hard_stop forces an exit and we report
+    //      partial state.
     drain_to_empty.store(true, Ordering::Relaxed);
     let drain_t0 = Instant::now();
     let drain_outcome = tokio::time::timeout(
         Duration::from_secs(drain_timeout_s),
-        worker_handle,
+        async move {
+            let mut results = Vec::with_capacity(worker_handles.len());
+            for h in worker_handles {
+                results.push(h.await);
+            }
+            results
+        },
     )
     .await;
-    let drain_stats = match drain_outcome {
-        Ok(join) => join.expect("drain worker panic").expect("super_batched_drain_loop"),
+    let mut drain_stats = DrainStats::default();
+    match drain_outcome {
+        Ok(joined) => {
+            for j in joined {
+                let s = j.expect("drain worker panic").expect("super_batched_drain_loop");
+                drain_stats.batches += s.batches;
+                drain_stats.rows_committed += s.rows_committed;
+                drain_stats.rows_failed += s.rows_failed;
+                drain_stats.duration_ms = drain_stats.duration_ms.max(s.duration_ms);
+                drain_stats.super_batch_attempts += s.super_batch_attempts;
+                drain_stats.super_batch_successes += s.super_batch_successes;
+                drain_stats.super_batch_fallbacks += s.super_batch_fallbacks;
+            }
+        }
         Err(_) => {
             eprintln!(
                 "T4: drain timeout after {}s — forcing hard_stop",
                 drain_timeout_s
             );
             hard_stop.store(true, Ordering::Relaxed);
-            // Worker handle is already moved into the timeout future; we
-            // need to wait for it now via a fresh loop. Re-issue: we
-            // actually consumed it. The hard_stop will let the next
-            // iteration check exit. We need a way to recover the handle.
-            // For now, the timeout already consumed worker_handle, so
-            // we can't await it again. Instead, sample the table.
+            // The timeout consumed the join_all future, so we can't
+            // await the handles again. Synthesize stats from the table.
             let committed: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM ledger_outbox WHERE status = 'committed'",
             )
@@ -453,7 +481,7 @@ async fn outbox_super_batch_shape_j() {
             .fetch_one(&pool)
             .await
             .unwrap_or(0);
-            DrainStats {
+            drain_stats = DrainStats {
                 batches: 0,
                 rows_committed: committed as u64,
                 rows_failed: failed as u64,
@@ -461,12 +489,12 @@ async fn outbox_super_batch_shape_j() {
                 super_batch_attempts: 0,
                 super_batch_successes: 0,
                 super_batch_fallbacks: 0,
-            }
+            };
         }
-    };
+    }
     let drain_secs = drain_t0.elapsed().as_secs_f64();
     eprintln!(
-        "T4: drain phase ended in {:.2}s — batches={} committed={} failed={} super_batch_attempts={} super_batch_successes={} super_batch_fallbacks={}",
+        "T4: drain phase ended in {:.2}s — batches={} committed={} failed={} super_batch_attempts={} super_batch_successes={} super_batch_fallbacks={} (aggregated across {} drainers)",
         drain_secs,
         drain_stats.batches,
         drain_stats.rows_committed,
@@ -474,6 +502,7 @@ async fn outbox_super_batch_shape_j() {
         drain_stats.super_batch_attempts,
         drain_stats.super_batch_successes,
         drain_stats.super_batch_fallbacks,
+        n_drainers,
     );
 
     // Stop depth sampler.
