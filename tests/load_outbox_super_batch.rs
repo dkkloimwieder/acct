@@ -1,11 +1,21 @@
-//! `acct-4fj` — Shape-G load test: writers → ledger_outbox → 1 drainer.
+//! `acct-hbg` — Shape-J: super-batched outbox drainer.
 //!
-//! Counterpart to `tests/load_realistic_workload.rs` (shape F). Same
-//! cross-account-spread workload (50 SKUs × 2 locations of bin_move
-//! traffic), same instrumentation. The ONLY difference: writers
-//! `INSERT INTO ledger_outbox` instead of calling `post_transfers`
-//! directly, and a single drain worker (acct-6hm) sequentially walks
-//! the queue and runs each row through `post_transfers`.
+//! Variant of shape G (`tests/load_outbox_workload.rs`). Same writers
+//! (100 → ledger_outbox), same fixture (50 SKUs × 2 locs of bin_move),
+//! same instrumentation. The ONE difference: the drain worker uses
+//! `super_batched_drain_loop` instead of `drain_loop`. Each iteration
+//! the worker concatenates events from up to T4_OUTBOX_BATCH_SIZE
+//! pending rows into ONE `post_transfers` call. On any error from
+//! the merged call, falls back to per-row savepoint drain so error
+//! attribution is preserved (cost: one bad event poisons the bundle's
+//! optimistic commit; recovery is a per-row pass).
+//!
+//! This is THE empirical test of "can outbox deliver shape-B-class
+//! throughput on Postgres?" Shape G showed naive single-row drain
+//! cannot recover the amortization. Super-batching merges many rows'
+//! events into one call so each commit-fsync amortizes across many
+//! events — the same shape that makes config B (1 writer × 1000-event
+//! batches) the system's throughput peak.
 //!
 //! Two distinct latency families are captured per run:
 //!
@@ -35,7 +45,7 @@
 //!
 //! Run via `./scripts/run-perf-baseline.sh`:
 //!
-//!   T4_BINARY=load_outbox_workload \
+//!   T4_BINARY=load_outbox_super_batch \
 //!     T4_CONFIGS="100:5:20" \
 //!     T4_BASELINE_RUNS=3 \
 //!     T4_DURATION_SECS=300 \
@@ -57,7 +67,7 @@
 
 mod common;
 
-use common::outbox_worker::{DrainConfig, DrainStats, drain_loop};
+use common::outbox_worker::{DrainConfig, DrainStats, super_batched_drain_loop};
 use common::*;
 use serde_json::json;
 use std::collections::HashMap;
@@ -182,7 +192,7 @@ fn pct(sorted: &[u32], q: f64) -> u32 {
 
 #[tokio::test]
 #[ignore = "load test — runs T4_DURATION_SECS (default 30); see file header"]
-async fn outbox_workload_shape_g() {
+async fn outbox_super_batch_shape_j() {
     let duration_secs: u64 = env::var("T4_DURATION_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -242,7 +252,7 @@ async fn outbox_workload_shape_g() {
     let pairs: Arc<Vec<LocPair>> = Arc::new(pairs);
 
     eprintln!(
-        "T4 shape G: writers={} duration={}s events={}-{} pool_size={} drain_batch={} idle_sleep={}ms",
+        "T4 shape J (super-batch): writers={} duration={}s events={}-{} pool_size={} drain_batch={} idle_sleep={}ms",
         n_writers,
         duration_secs,
         events_min,
@@ -300,7 +310,7 @@ async fn outbox_workload_shape_g() {
         };
         let stop = drain_to_empty.clone();
         let hs = hard_stop.clone();
-        tokio::spawn(async move { drain_loop(pool, cfg, stop, hs).await })
+        tokio::spawn(async move { super_batched_drain_loop(pool, cfg, stop, hs).await })
     };
 
     // ---- Spawn the depth sampler.
@@ -418,7 +428,7 @@ async fn outbox_workload_shape_g() {
     )
     .await;
     let drain_stats = match drain_outcome {
-        Ok(join) => join.expect("drain worker panic").expect("drain_loop"),
+        Ok(join) => join.expect("drain worker panic").expect("super_batched_drain_loop"),
         Err(_) => {
             eprintln!(
                 "T4: drain timeout after {}s — forcing hard_stop",
@@ -456,8 +466,14 @@ async fn outbox_workload_shape_g() {
     };
     let drain_secs = drain_t0.elapsed().as_secs_f64();
     eprintln!(
-        "T4: drain phase ended in {:.2}s — batches={} committed={} failed={}",
-        drain_secs, drain_stats.batches, drain_stats.rows_committed, drain_stats.rows_failed
+        "T4: drain phase ended in {:.2}s — batches={} committed={} failed={} super_batch_attempts={} super_batch_successes={} super_batch_fallbacks={}",
+        drain_secs,
+        drain_stats.batches,
+        drain_stats.rows_committed,
+        drain_stats.rows_failed,
+        drain_stats.super_batch_attempts,
+        drain_stats.super_batch_successes,
+        drain_stats.super_batch_fallbacks,
     );
 
     // Stop depth sampler.
@@ -605,7 +621,7 @@ async fn outbox_workload_shape_g() {
     let io_hits_d = stat_io_after.5 - stat_io_before.5;
     let io_fsyncs_d = stat_io_after.6 - stat_io_before.6;
 
-    eprintln!("====================== T4 PERF SUMMARY (shape G) ======================");
+    eprintln!("===================== T4 PERF SUMMARY (shape J: super-batch) =====================");
     eprintln!(
         "duration_s={:.2} (writers_phase={:.2}s drain_phase={:.2}s) writers={} events={}-{} pool={} (outbox)",
         total_elapsed.as_secs_f64(),
