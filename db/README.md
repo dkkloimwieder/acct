@@ -15,7 +15,7 @@ Postgres 18 dev environment for the acct ledger project.
 - **Database / user:** `acct` / `acct` (password `acct_dev`, dev only).
 - **Port:** host `5111` → container `5432` (host port chosen to avoid clashing with other local Postgres containers).
 - **Data volume:** named volume `acct-pgdata` mounted at `/var/lib/postgresql` (PG 18+ convention to enable `pg_upgrade --link`). Preserved across `dev-down.sh` unless `--wipe`.
-- **seccomp:** `seccomp:unconfined` is set on the container because Docker's default seccomp profile blocks the `io_uring_setup` / `io_uring_enter` / `io_uring_register` syscalls. Acceptable for local dev. Production deploys must use a tightened custom profile (whitelist only the three io_uring syscalls). Tracked separately.
+- **seccomp:** `seccomp:unconfined` is set on the dev container because Docker's default seccomp profile blocks the `io_uring_setup` / `io_uring_enter` / `io_uring_register` syscalls. Acceptable for local dev. Production deploys use **`db/seccomp/postgres-iouring.json`** — a copy of Docker's default profile (moby v28.0.0) with exactly those three syscalls added to the default-allow list (`acct-hbp`). Wire it in by replacing `seccomp:unconfined` with `seccomp:./db/seccomp/postgres-iouring.json` in the production compose file. The profile was verified by temporarily swapping the dev container to use it: postgres started cleanly with `io_method=io_uring`, both extensions loaded, smoke test passed, and the rest of Docker's syscall restrictions remain in place by construction (diff vs upstream is exactly +3 lines).
 
 ## Usage
 
