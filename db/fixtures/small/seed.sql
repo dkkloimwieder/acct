@@ -99,8 +99,35 @@ INSERT INTO accounts (kind, ledger_kind, sku_id, routing_op, normal_side)
 INSERT INTO accounts (kind, ledger_kind, sku_id, normal_side)
   SELECT 'stock_consumed', 'qty', s.id, 'debit' FROM skus s WHERE s.code='SKU-A';
 
--- SKU-WAC: stock_wip op10/op20 (used by T2 to verify W2 P0006 dispatch)
+-- SKU-WAC accounts (used by acct-uxu WAC tests + acct-93b.15 P0006 dispatch).
+-- Qty side: stock_available (MAIN), stock_wip (op10, op20).
+INSERT INTO accounts (kind, ledger_kind, sku_id, location_id, normal_side)
+  SELECT 'stock_available', 'qty', s.id, l.id, 'debit'
+    FROM skus s, locations l WHERE s.code='SKU-WAC' AND l.code='MAIN';
 INSERT INTO accounts (kind, ledger_kind, sku_id, routing_op, normal_side)
   SELECT 'stock_wip', 'qty', s.id, 10, 'debit' FROM skus s WHERE s.code='SKU-WAC';
 INSERT INTO accounts (kind, ledger_kind, sku_id, routing_op, normal_side)
   SELECT 'stock_wip', 'qty', s.id, 20, 'debit' FROM skus s WHERE s.code='SKU-WAC';
+-- Value side: inv_value_raw (MAIN), inv_value_wip (op10, op20), inv_value_fg (MAIN).
+-- Same partition shape as SKU-A so WAC tests can use either SKU.
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, location_id)
+  SELECT 'inv_value_raw', 'value', 'USD', 'debit', s.id, l.id
+    FROM skus s, locations l WHERE s.code='SKU-WAC' AND l.code='MAIN';
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, routing_op)
+  SELECT 'inv_value_wip', 'value', 'USD', 'debit', s.id, 10 FROM skus s WHERE s.code='SKU-WAC';
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, routing_op)
+  SELECT 'inv_value_wip', 'value', 'USD', 'debit', s.id, 20 FROM skus s WHERE s.code='SKU-WAC';
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, location_id)
+  SELECT 'inv_value_fg', 'value', 'USD', 'debit', s.id, l.id
+    FROM skus s, locations l WHERE s.code='SKU-WAC' AND l.code='MAIN';
+
+-- SKU-FIF accounts (used to verify the qty-side gate still raises P0006
+-- for non-implemented cost methods after acct-uxu relaxes WAC).
+-- Minimal: just stock_wip op10/op20 + stock_available MAIN.
+INSERT INTO accounts (kind, ledger_kind, sku_id, location_id, normal_side)
+  SELECT 'stock_available', 'qty', s.id, l.id, 'debit'
+    FROM skus s, locations l WHERE s.code='SKU-FIF' AND l.code='MAIN';
+INSERT INTO accounts (kind, ledger_kind, sku_id, routing_op, normal_side)
+  SELECT 'stock_wip', 'qty', s.id, 10, 'debit' FROM skus s WHERE s.code='SKU-FIF';
+INSERT INTO accounts (kind, ledger_kind, sku_id, routing_op, normal_side)
+  SELECT 'stock_wip', 'qty', s.id, 20, 'debit' FROM skus s WHERE s.code='SKU-FIF';
