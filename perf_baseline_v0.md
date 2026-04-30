@@ -873,6 +873,7 @@ xact_commit_delta: ~1.28 M / 5 min ≈ 4 270 commits/s — confirms the writer p
 - **Standard cost only.** Non-`standard` cost methods are P0006 in Phase 0. WAC/FIFO/lot perf characterization is downstream of `acct-8gg` + a fresh baseline run.
 - **Reservation traffic now characterized.** Shape H runs concurrent `reserve_inventory()` + `post_transfers` traffic. The two-statement reservation pattern (FOR UPDATE then promisable read) is safe under load. The remaining caveat is reservation lifetime: H accumulates 200 K+ reservations across 5 min without releasing any, which is not a representative production pattern. Production traffic would mix in reservation completions and cancellations; that's a Phase 1 follow-up.
 - **No NUMA / CPU pinning, no isolated cores.** Kernel scheduler treats Postgres + cargo test + everything else equally. This *is* the variance source on uncontended configs.
+- **Shape L numbers measured pre-`acct-uxu`.** All shape-L results above were collected on migrations 0001-0018 (post_transfers pre-WAC). After `acct-uxu` (migration 0021) lands the WAC dispatcher + lock pre-scan + branched single/two-pass execution, shape L commit_evps regresses ~16 % to ~2 428 evps median (3-run, 2026-04-30). Shape L remains the throughput peak across the matrix (2 428 still beats F=1 274 by 1.91×); the regression is the architectural cost of supporting per-batch pre-batch-balance reads required by WAC. Hot-path optimization is filed as a P3 follow-up; the pre-WAC numbers are kept here as the L-shape architectural ceiling.
 
 ## How to reproduce
 
