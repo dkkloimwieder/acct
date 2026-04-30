@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod outbox_worker;
+
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::env;
 use std::future::Future;
@@ -53,6 +55,7 @@ pub async fn reset_to_fixture(pool: &PgPool) {
             reconciliation_alerts,
             period_snapshots,
             commodity_receipts,
+            ledger_outbox,
             accounts,
             periods,
             fx_rates,
