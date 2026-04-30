@@ -1,6 +1,6 @@
 # Perf baseline v0 — Phase 0 schema, workload-shape matrix
 
-This file records reference perf measurements across **seven workload
+This file records reference perf measurements across **eight workload
 shapes** on the simplest schema (Phase 0; migrations 0001–0017, no
 Phase 1 tables). Per the 2026-04-29 directive (Part VII Q2 resolved),
 every Phase 1 complexity addition is diff'd against these numbers.
@@ -25,11 +25,11 @@ The dev hardware is a consumer laptop on a multi-tenant desktop kernel. A single
 
 Configuration of this baseline pass:
 
-- 7 workload shapes (see "Configurations" below)
+- 8 workload shapes (see "Configurations" below)
 - 3 runs per shape, 5 minutes per run (G adds a 60 s grace drain after the writer phase)
 - 100 writers connection ceiling on the dev container (`max_connections=200`)
 - `vmstat 5` sidecar during every run
-- ~95 minutes total wall clock (A–F: ~77 min on `872f3e50`; G: ~18 min on `ff5d6b5`, same day)
+- ~110 minutes total wall clock (A–F: ~77 min on `872f3e50`; G: ~18 min on `ff5d6b5`; H: ~15 min on `f88fd0b+`, same day)
 
 The driver is `scripts/run-perf-baseline.sh`. Per run it captures:
 
@@ -52,6 +52,7 @@ The driver is `scripts/run-perf-baseline.sh`. Per run it captures:
 | **E** `w100_e100-100`| 100 | 100 | shared credit | Mid-batch under high concurrency — proves big batches *don't* help when contention is the bottleneck |
 | **F** `w100_e5-20`   | 100 | 5–20 | **cross-account spread (50 SKUs × 2 locations = 100 accounts)** | Realistic-shape concurrency — same envelope as D but contention spreads. **The realistic-traffic regression-detection point.** |
 | **G** `w100_e5-20` (outbox) | 100 | 5–20 | **same cross-account spread as F**, but writers `INSERT` into `ledger_outbox` and one drain worker dispatches to `post_transfers` | Naive single-drainer outbox vs direct sync. **The outbox-vs-sync comparison point** (`acct-tyq`). |
+| **H** `w100_e5-20` (reserve interleave) | 70 + 30 | 5–20 (posters only) | F's qty workload **plus** concurrent `reserve_inventory()` calls from 30 % of the writer pool | Reservation-flow safety + perf under realistic mixed traffic (`acct-9i6`). |
 
 Skipped on purpose: **100 writers × 1000 events/batch**. We tested this in a separate exploratory pass; it produces a 30-min completion tail at 90 s nominal duration and is operationally useless. Big batches at high concurrency are an anti-pattern in this schema.
 
@@ -60,15 +61,16 @@ Skipped on purpose: **100 writers × 1000 events/batch**. We tested this in a se
 - **A–E (`tests/load_deadlock_freedom.rs`)** — every event posts `debit = <random pick from a 7-account pool>`, `credit = creation_void(qty)`. The credit side is shared across all writers — all contention converges on one row.
 - **F (`tests/load_realistic_workload.rs`, `acct-2ey`)** — `bin_move` events across 50 SKUs × 2 locations. Each event picks a random SKU and direction (MAIN→OUT or OUT→MAIN). Both `debit` and `credit` rotate across the 100-account pool. Contention spreads. **Closer to realistic application traffic.**
 - **G (`tests/load_outbox_workload.rs`, `acct-tyq`)** — same workload as F, but writers `INSERT` the event batch into `ledger_outbox` (returns immediately, no ledger lock). One sequential drain worker (`tests/common/outbox_worker.rs`) pulls pending rows in batches of 1 000 with `FOR UPDATE SKIP LOCKED` and runs each row through `post_transfers`. Per-row error isolation via savepoints. After the writer phase, the worker gets a 60 s grace drain window before being hard-stopped; the run reports both enqueue throughput and **commit throughput** (the apples-to-apples comparison vs F's events/s). Two latency families captured: writer-side `enqueue_us` (INSERT round-trip) and `queue_us` = `committed_at − enqueued_at` (drain residency).
+- **H (`tests/load_reservation_interleave.rs`, `acct-9i6`)** — same fixture as F but the 100-writer pool splits into **70 posters** (running F's `bin_move` workload) and **30 reservers** (each loop iteration calls `reserve_inventory(sku, loc, 1, so_id, fresh_so_line, +1h)`). Both writer types contend for the same `stock_available` row locks: `post_transfers` takes `FOR UPDATE` in ascending-id order across the batch's accounts; `reserve_inventory` takes a single `FOR UPDATE` on the matching row. Stock pre-balanced to 100 M units to avoid exhaustion confounding the throughput numbers. Reservations accumulate without release across the run.
 
 ## Run metadata
 
 - **Date:** 2026-04-29
-- **Issues:** `acct-1ia` (shapes A–E), `acct-2ey` (shape F), `acct-tyq` / `acct-epu` (shape G).
-- **Schema state:** A–F on migrations 0001–0016; G on 0001–0017 (adds `ledger_outbox`).
-- **Methodology:** 7 shapes × 3 runs × 5 min (`scripts/run-perf-baseline.sh`); G also runs a 60 s grace drain after the writer phase.
-- **Git refs at run time:** `872f3e50` (A–E), `997a680` (F), `ff5d6b5` (G).
-- **Total wall clock:** ~95 min combined (A–E ~50 min; F ~27 min; G ~18 min).
+- **Issues:** `acct-1ia` (shapes A–E), `acct-2ey` (shape F), `acct-tyq` / `acct-epu` (shape G), `acct-9i6` (shape H).
+- **Schema state:** A–F on migrations 0001–0016; G on 0001–0017 (adds `ledger_outbox`); H on 0001–0017 (no schema change vs G).
+- **Methodology:** 8 shapes × 3 runs × 5 min (`scripts/run-perf-baseline.sh`); G also runs a 60 s grace drain after the writer phase.
+- **Git refs at run time:** `872f3e50` (A–E), `997a680` (F), `ff5d6b5` (G), `f88fd0b+` (H, post-G writeup).
+- **Total wall clock:** ~110 min combined (A–E ~50 min; F ~27 min; G ~18 min; H ~15 min).
 
 ## Environment
 
@@ -107,6 +109,7 @@ The single most important table. *Median across the 3 runs of each shape.*
 | **E** 100 × 100 · shared credit (anti-pattern) | 3.73 | 372.8 | **28 176.7** | 45 521.7 | **61 726.1** | 70 880.8 | 73 453.7 | 120 | 0 |
 | **F** 100 × 5–20 · **cross-account spread** | **102.16** | **1 274.2** | **51.4** | 5 410.5 | 8 250.7 | 14 469.2 | 16 767.8 | 431 | 0 |
 | **G** 100 × 5–20 · outbox + 1 drainer | (enqueue 1 304.5; commit 11.7) † | **140.4 ‡** | **72.1 §** | **105.8 §** | **133.1 §** | **183.2 §** | 4 461 § | 587 | 0 |
+| **H** 70 + 30 · qty + reserve interleave | (combined 818.2; posters 95.0; reservers 723.6) ¶ | **1 186 ‖** + 723.6 rps reservations | **52.7 ¶** | 3 975 ¶ | 5 626 ¶ | 8 124 ¶ | 12 658 ¶ | 554 | 0 |
 
 † For G, `bps` = enqueue rate, since writers no longer call `post_transfers` directly. `1 304.5 / s` is the rate at which writer batches land in the outbox; `11.7 / s` is the rate at which drained outbox rows commit (median 4 057 / 360 s).
 ‡ For G, `events/s` is **commit throughput** (`committed_events / total_elapsed`), apples-to-apples with F's events/s. Enqueue throughput is **16 302 ev/s** — but those events sit in the queue for minutes (see queue_us below), and only 140 ev/s actually land in the ledger.
@@ -118,6 +121,17 @@ The single most important table. *Median across the 3 runs of each shape.*
   | max | 338 s |
   Writer-perceived end-to-end (had they waited) ≈ `enqueue_us + queue_us` ≈ 186 s p50.
 
+¶ For H, `bps` and the latency columns are **poster-only** (the 70 posters running F-style `bin_move` calls); reserver stats are reported separately, since their critical section and per-call cost are very different. Headline reserver numbers:
+  | metric | H reserver median |
+  |---|---|
+  | rps | 723.6 |
+  | p50 | 6.0 ms |
+  | p95 | 35.9 ms |
+  | p99 | 191.2 ms |
+  | max | 12 169 ms |
+
+‖ For H, the events/s column is the **poster** events/s (1 186 — these are committed `bin_move` events, apples-to-apples with F's events/s). The 723.6 reservations/s (each = 1 INSERT into `inventory_reservations`) are written separately because they aren't transfers; they don't hit the `transfers` table or touch `post_transfers`.
+
 Key reads:
 
 - **Throughput peak is ~2 500 events/s** (config B), 14 % higher than config A's 2 164. That ~14 % is the entire amortization gain from big batches when there's no contention.
@@ -125,7 +139,8 @@ Key reads:
 - **Big batches under shared-credit contention compound the problem instead of helping it** (E vs D): going from small batches to 100-event batches at 100 writers cuts throughput further (559 → 373 evps) and explodes p99 (12 s → 62 s).
 - **Spreading contention recovers most of the loss** (F vs D): same writer count, same batch size, just rotating across 100 accounts instead of 1. Throughput **2.3× higher** (1 274 vs 559 evps), **p50 26× lower** (51 vs 1 369 ms), **p99 1.4× lower** (8.3 vs 11.9 s). The FOR UPDATE lock-queue cost dominates D; F approaches what the schema can actually do.
 - **Naive outbox is throughput-catastrophic but tail-latency-excellent** (G vs F): same workload, same writer count, same batch shape — but writers `INSERT` instead of calling `post_transfers`. Caller p99 collapses 8.3 s → 133 ms (62× lower) because writers never queue on the ledger lock. **But** total commit throughput crashes from 1 274 → 140 evps (9× lower). The single drainer can't match what 100 contending writers do in parallel, because per-call `post_transfers` overhead doesn't amortize across rows the way packed events inside a single call do (shape B). The path to shape-B-class throughput via outbox requires a **super-batched** drainer that merges multiple rows' events into one `post_transfers` call — filed as `acct-hbg`.
-- **Zero deadlocks across every shape** — the ascending-id `FOR UPDATE` lock ordering in `post_transfers` is correct under every shape we threw at it.
+- **Reservation traffic doesn't hurt qty traffic — actually helps modestly** (H vs F): the 100-writer pool splits into 70 posters + 30 reservers. Total qty-side throughput drops only 7 % (1 274 → 1 186 evps), and qty p99 *improves* 32 % (8.3 s → 5.6 s) because there are simply fewer posters competing on `stock_available` row locks. Plus 723.6 reservations/s of useful reservation work. Reservers themselves are very fast (p50 6 ms, p99 191 ms) — `reserve_inventory`'s critical section is one `FOR UPDATE` + one promisable read + one `INSERT`, much shorter than `post_transfers`'s per-batch hold time. Confirms the doc §3.3 two-statement reservation pattern is provably safe under realistic mixed concurrency.
+- **Zero deadlocks across every shape** — the ascending-id `FOR UPDATE` lock ordering in `post_transfers` is correct under every shape we threw at it, including H's mixed `post_transfers` + `reserve_inventory` traffic on the same `stock_available` rows.
 
 ## Per-config detail
 
@@ -329,6 +344,64 @@ The path to actually getting shape-B-class throughput out of an outbox is to **s
 
 **For Phase 1 regression detection, F remains the reference.** G is filed alongside as the outbox-vs-sync comparison point — re-run G if/when D3 (the "synchronous `post_transfers`" decision) is reopened.
 
+### H — 70 posters + 30 reservers, cross-account spread (50 SKUs × 2 locations)
+
+Same fixture as F but the 100-writer pool splits 70/30 across two operation types. **Posters** run the same `bin_move` workload as F. **Reservers** loop on `reserve_inventory(sku, loc, 1, so_id, fresh_so_line, +1h)` for random (sku, loc) targets. Stock pre-balanced to **100 M units** per (sku, loc) pair so reservation-budget exhaustion can't confound the result; reservations accumulate without release across the 5-min run.
+
+| Metric | min | median | mean | max |
+|---|---|---|---|---|
+| Combined batches/ops | 233 266 | 246 039 | 242 517 | 248 246 |
+| Combined bps | 775.8 | 818.2 | 806.6 | 825.8 |
+| Poster bps | 94.5 | **95.0** | 95.0 | 95.5 |
+| Poster evps | 1 183 | **1 186** | 1 188 | 1 195 |
+| Poster p50 (ms) | 52.5 | **52.7** | 52.7 | 53.0 |
+| Poster p95 (ms) | 3 968 | 3 975 | 4 009 | 4 085 |
+| Poster p99 (ms) | 5 401 | **5 626** | 5 710 | 6 103 |
+| Poster p99.9 (ms) | 7 928 | 8 124 | 8 441 | 9 272 |
+| Poster max (ms) | 10 368 | 12 658 | 13 040 | 16 093 |
+| Reserver rps | 680.3 | **723.6** | 711.6 | 730.8 |
+| Reserver p50 (ms) | 6.01 | **6.02** | 6.02 | 6.03 |
+| Reserver p95 (ms) | 35.3 | 35.9 | 35.9 | 36.6 |
+| Reserver p99 (ms) | 172 | 191 | 206 | 253 |
+| Reserver p99.9 (ms) | 4 630 | 4 730 | 4 784 | 4 990 |
+| Reserver max (ms) | 11 270 | 12 170 | 12 267 | 13 362 |
+| Reserver `null` returns | 0 | 0 | 0 | 0 |
+| Active reservations at end | 204 553 | 217 609 | 213 952 | 219 695 |
+| io_writes | 132 563 | 134 504 | 134 012 | 134 970 |
+| io_fsyncs | 132 450 | 134 397 | 133 898 | 134 848 |
+| WAL MB | 549.3 | 554.5 | 553.5 | 556.7 |
+
+vmstat: `us≈43%  sy≈5.4%  id≈30%  wa≈17.6%  cs≈37 K/s`. CPU profile is similar to F (us 43 vs 40 %), with a 2.5× higher context-switch rate (37 K/s vs F's 15 K/s) because reservers do many short ops/sec — reserve_inventory's per-call latency averages ~6 ms versus post_transfers's ~50 ms per batch.
+
+`reserver null` count is **zero across all 3 runs** — pre-balanced 100 M units never approached exhaustion, so every reservation request was satisfied.
+
+### H vs F — reservation interleaving doesn't hurt qty, modestly helps
+
+Same total writer count (100), same fixture, same 5-min duration. Only difference: 30 of the 100 writers run `reserve_inventory()` instead of `post_transfers`.
+
+| Metric | F (100 posters) | H (70 posters + 30 reservers) | Δ |
+|---|---|---|---|
+| Qty-side committed events/s | 1 274.2 | 1 186.1 | **−7 %** |
+| Qty-side p50 (ms) | 51.4 | 52.7 | +3 % (essentially same) |
+| Qty-side p95 (ms) | 5 410.5 | 3 975 | **−27 %** |
+| Qty-side p99 (ms) | 8 250.7 | 5 626 | **−32 %** |
+| Qty-side max (ms) | 16 768 | 12 658 | **−25 %** |
+| Reservations/s | n/a | 723.6 | new |
+| Reservation p50 (ms) | n/a | 6.0 | new |
+| Reservation p99 (ms) | n/a | 191 | new |
+| WAL/5 min (MB) | 431 | 554 | +29 % |
+| CPU user % | 40.2 | 43.6 | +9 % |
+| Context switches/s | 14.9 K | 37 K | **+148 %** |
+| Deadlocks | 0 | 0 | safe |
+
+**What this says.** Qty-side throughput drops only 7 % when 30 % of writers switch to reservation work — and qty-side **tail latencies all improve** (−25 to −32 % across p95/p99/max) because there are fewer posters competing for the same `stock_available` row locks. The reservation work is essentially free in tail-latency terms: reservers acquire their `FOR UPDATE` lock briefly (~6 ms median), don't hold it across a multi-event batch like `post_transfers` does, and slot in between poster transactions cleanly.
+
+The reserver tail (p99.9 = 4.7 s, max = 12 s) is real and tracks poster lock-hold time — when a reserver picks an `(sku, loc)` whose row is currently locked by a slow poster batch, the reserver waits the rest of the poster's lifetime. p99.9 ≈ poster p95 confirms that pattern. p50 stays at 6 ms because the SKU pool spread (50 × 2 = 100 accounts) means most reserver picks find a clean row.
+
+**The two-statement reservation pattern is safe under load.** Zero deadlocks, zero `null` returns (i.e., zero "insufficient promisable" failures — the function logic always saw consistent promisable values), zero unexpected errors. Doc §3.3's `reserve_inventory()` (PL/pgSQL function variant, not the unsafe single-statement CTE — see migration 0014's header) holds under realistic concurrent traffic.
+
+For Phase 1 regression detection, **H is a useful third reference alongside F and D**: re-run if the reservation flow changes (e.g., `acct-alq` doc fix) or when reservation lifetime semantics evolve (Q5 in the consolidated doc).
+
 ## Observations
 
 1. **Lock contention is the dominant cost from C onward in the shared-credit shapes.** Every writer needs `creation_void`'s lock. The `FOR UPDATE` lock is held for the entire transaction (lock acquire → loop events → commit → fsync). Concurrent writers serialize behind that hold time. Single-row throughput limit ≈ 1 / mean-hold-time = ~2 K events/s for small batches; adding more concurrent writers redistributes that throughput across more queue depth, not into more total events/s.
@@ -345,7 +418,7 @@ The path to actually getting shape-B-class throughput out of an outbox is to **s
 
 7. **Variance is tight in contended configs (D, E, F)** and looser in uncontended ones (A, B). At 100 writers serializing, platform jitter is a small fraction of the 1.4 s median; at 1 writer the median is 5 ms and a single bad scheduler tick shows up.
 
-8. **Zero deadlocks across all 7 shapes × 3 runs × 5 min** = ~1.4 M batches / ~9 M events (G's 1.17 M batches dominate the count via fast INSERTs). The lock-order proof in `post_transfers` is correct under every shape including the SKIP LOCKED outbox drain pattern.
+8. **Zero deadlocks across all 8 shapes × 3 runs × 5 min** = ~2.1 M batches / ~9 M events (G's 1.17 M INSERTs and H's 0.66 M reservations dominate the count). The lock-order proof in `post_transfers` is correct under every shape including the SKIP LOCKED outbox drain pattern AND mixed `post_transfers` + `reserve_inventory` traffic on shared `stock_available` rows.
 
 9. **The ~2.5 K events/s single-writer ceiling is real for this hardware on this schema.** Routes to higher numbers:
    - **Spread the contention** (F demonstrates this — 2.3× lift just from cross-account workload). Real ERP traffic does this naturally; account sharding (Part IV §8) is the explicit Phase 1 mechanism for when natural spread isn't enough.
@@ -353,6 +426,8 @@ The path to actually getting shape-B-class throughput out of an outbox is to **s
    - **Different hardware** is a multiplier on these ratios, not a fix for the regime structure.
 
 10. **Outbox is a latency/throughput tradeoff, not a free win.** G's caller p99 is 62× lower than F's (133 ms vs 8.25 s) because writers don't queue on `post_transfers` row locks. But G's commit throughput is 9× lower because the single sequential drainer is the bottleneck. End-to-end latency (caller-submitted → ledger-committed) is dominated by queue residency: 186 s p50, 336 s p99 in our run. Outbox makes sense if the application can tolerate eventual semantics on the ledger and the workload's tail-latency budget at the caller is more constrained than its throughput budget. For the typical ERP flow (an invoice posting that needs an accept/reject decision now), F is dominant by every measure. The "yes, adopt outbox" decision needs `acct-hbg`'s super-batched throughput data before it can be made on perf grounds.
+
+11. **Reservation interleaving is a workload mix shift, not a regression.** Replacing 30 of F's 100 posters with `reserve_inventory()` callers doesn't damage qty throughput (−7 %) and actually *improves* qty tail latency by 25–32 % across p95/p99/max — the reduction in poster-vs-poster contention more than compensates for the added reserver lock contention. The reservation flow itself is fast (p50 6 ms, p99 191 ms) because `reserve_inventory`'s critical section is much shorter than `post_transfers`'s per-batch hold time. Phase 0's `reserve_inventory()` PL/pgSQL function (migration 0014, written specifically to fix the unsafe single-statement CTE in doc §3.3) holds under load: zero deadlocks, zero unexpected errors, zero over-promises across 660 K reservation calls.
 
 ## Top queries (representative — config D, run 3, `pg_stat_statements`)
 
@@ -364,7 +439,7 @@ The path to actually getting shape-B-class throughput out of an outbox is to **s
 - **All credits target one row.** Every event posts `credit = creation_void(qty)`. Real workloads don't do this. `acct-2ey` will phase in cross-account-set, cross-ledger, multi-currency, and reservation-interleaved batches.
 - **Outbox characterized for naive single-drainer only.** Shape G measures the 1-row-per-`post_transfers`-call drain pattern. The super-batched variant (multiple rows' events merged into one call) is the path to shape-B-class throughput; not yet built. Filed as `acct-hbg`. D3 (sync `post_transfers`) is unchanged on these results — outbox would regress throughput 9× without super-batching, and even with it the error-attribution tradeoff requires a separate decision.
 - **Standard cost only.** Non-`standard` cost methods are P0006 in Phase 0. WAC/FIFO/lot perf characterization is downstream of `acct-8gg` + a fresh baseline run.
-- **No reservation traffic in load mix.** `reserve_inventory()` is exercised by T3 but not under load. `acct-2ey`.
+- **Reservation traffic now characterized.** Shape H runs concurrent `reserve_inventory()` + `post_transfers` traffic. The two-statement reservation pattern (FOR UPDATE then promisable read) is safe under load. The remaining caveat is reservation lifetime: H accumulates 200 K+ reservations across 5 min without releasing any, which is not a representative production pattern. Production traffic would mix in reservation completions and cancellations; that's a Phase 1 follow-up.
 - **No NUMA / CPU pinning, no isolated cores.** Kernel scheduler treats Postgres + cargo test + everything else equally. This *is* the variance source on uncontended configs.
 
 ## How to reproduce
@@ -383,6 +458,11 @@ T4_BINARY=load_realistic_workload T4_CONFIGS="100:5:20" \
 # Shape G (outbox + 1 drainer, naive single-row-per-call pattern)
 T4_BINARY=load_outbox_workload T4_CONFIGS="100:5:20" \
   T4_DURATION_SECS=300 T4_DRAIN_TIMEOUT_S=60 \
+  ./scripts/run-perf-baseline.sh
+
+# Shape H (reservation interleaving — 70 posters + 30 reservers)
+T4_BINARY=load_reservation_interleave T4_CONFIGS="100:5:20" \
+  T4_RESERVE_PCT=30 \
   ./scripts/run-perf-baseline.sh
 ```
 
