@@ -1,7 +1,7 @@
 # Perf baseline v0 — Phase 0 schema, workload-shape matrix
 
-This file records reference perf measurements across **eleven workload
-shapes** on the simplest schema (Phase 0; migrations 0001–0017, no
+This file records reference perf measurements across **thirteen workload
+shapes** on the simplest schema (Phase 0; migrations 0001–0018, no
 Phase 1 tables). Per the 2026-04-29 directive (Part VII Q2 resolved),
 every Phase 1 complexity addition is diff'd against these numbers.
 
@@ -16,8 +16,9 @@ The system has a clean five-regime structure:
 3. **Concurrent + big batches under contention (E)** — catastrophic. 100 writers × 100-event batches finishes only **373 events/s** with **p99 ≈ 62 s** because each batch holds the shared lock for ~20 s and the queue compounds.
 4. **Concurrent + spread across accounts (F)** — the realistic shape. 100 writers, same small batches as D, but spread across 50 SKUs × 2 locations = 100 distinct accounts. Throughput **2.3× D** (1 274 evps), **p50 26× lower** (51 ms vs 1 369 ms), **p99 1.4× lower** (8.3 s). CPU usage climbs from 25 % → 40 % — the system is doing actual work instead of queuing. **This is much closer to what real workloads look like.**
 5. **Naive outbox: writers → ledger_outbox → 1 drainer (G)** — caller-perceived tail latency collapses (**133 ms p99** vs F's 8.3 s — 62× lower) because writers no longer queue on `post_transfers` row locks; they just `INSERT` and return. But total committed-events throughput **falls to 140 evps** — 9× LESS than F. The single sequential drainer can't match what 100 contending writers manage in parallel, because shape B's amortization comes from packing 1 000 events into ONE `post_transfers` call, not from running 1 000 calls in series. End-to-end latency (caller-submit → ledger-commit) is dominated by queue residency: p50 **186 seconds** as the queue grows unbounded throughout the run.
+6. **Pseudo-sync outbox via LISTEN/NOTIFY (L) is the throughput peak.** Writers `INSERT` then BLOCK on a notification matching their row id. Drainer super-batches as in J, plus emits `pg_notify(channel, '{"id":N,"status":"ok"}')` per row outcome inside the drain tx. Result: **2 876 commit-evps** — 2.26× F, **16% above shape B's 2 486** (which was the prior peak). Caller p99 = 547 ms (15× better than F's 8.3 s) AND end-to-end (caller-submit → ledger-commit is the SAME thing in pseudo-sync). Queue depth bounded naturally by writer count (~100). The architectural insight: pseudo-sync **pipelines** the producer's INSERT stage with the drainer's commit stage on the same DB; writers never touch the account `FOR UPDATE` locks (only the drainer does, serially with itself), eliminating the 100-way contention that limits F. **This is the new architectural reference point for outbox-style work.**
 
-The route to higher throughput on this hardware is **not "tune Postgres"** — it's spreading contention (the natural state of realistic workloads, plus account sharding for unavoidable hot rows per Part IV §8). The naive single-drainer outbox (G) does NOT collapse concurrency into shape-B-class throughput; doing that requires a **super-batched** drainer that merges events from many outbox rows into one `post_transfers` call (filed as `acct-hbg`).
+The route to higher throughput on this hardware is **not "tune Postgres"** — it's either spreading contention (F) or pipelining the producer/consumer stages so concurrent writers never share `post_transfers`'s lock surface (L). The naive single-drainer outbox (G) collapses to 9× LESS throughput than F. The super-batched single-drainer (J) recovers half the gap (`acct-hbg`). The pseudo-sync caller pattern (L, `acct-yjn`) eliminates the gap and exceeds F. The hard-cap back-pressure variant (M, `acct-yjn`) is a sad middle ground at 971 evps — the busy-poll pre-INSERT gate burns 5× more CPU context-switches than L for half its throughput; not recommended.
 
 ## Methodology
 
@@ -56,6 +57,8 @@ The driver is `scripts/run-perf-baseline.sh`. Per run it captures:
 | **I** `w100_e5-20` (qty + multi-cur value) | 50 + 50 | 5–20 | F's qty workload (50 writers) **plus** value-side `ar_invoice` traffic on shared per-currency cash/ar/ap/revenue accounts (50 writers, USD + EUR) | Multi-currency value-side hot-row contention concurrent with qty traffic (`acct-jwg`). |
 | **J** `w100_e5-20` (super-batch outbox, **1 drainer**) | 100 | 5–20 | Same as G but the drainer concatenates events from up to 1 000 outbox rows into ONE `post_transfers` call (per-row fallback on error) | Does super-batched outbox recover shape B's amortization? (`acct-hbg`) |
 | **K** `w100_e5-20` (super-batch outbox, **4 drainers**) | 100 | 5–20 | Same as J but **4** concurrent drainers. Each independently runs `super_batched_drain_loop` with `FOR UPDATE SKIP LOCKED` (claims are non-overlapping by construction) | Does multi-worker drain beat single-worker J, or does it regress toward shape F's account-lock contention? (`acct-dtv`) |
+| **L** `w100_e5-20` (pseudo-sync via LISTEN/NOTIFY) | 100 | 5–20 | Same writers/fixture as J. Each writer INSERTs, then **BLOCKS** awaiting a notification matching its row id. Drainer = J's super-batched single drainer plus `pg_notify(channel, '{"id":N,"status":"ok"}')` per row inside the drain tx. Single shared `PgListener` task fans notifications out to per-id oneshot channels in the test process | Pseudo-sync caller semantics: throughput vs F + caller-perceived end-to-end latency; **the LISTEN/NOTIFY exploration** (`acct-yjn`) |
+| **M** `w100_e5-20` (async outbox + hard-cap back-pressure) | 100 | 5–20 | Same as J (fire-and-forget caller, super-batched drainer) PLUS a writer-side gate: before each INSERT, the writer polls `count(pending) < cap` (default cap=200, poll cadence=2 ms). When at the cap, writers busy-wait until the drainer drops the queue depth | Producer-side back-pressure on a fast drainer; tests whether bounding the queue without LISTEN/NOTIFY rescues anything (`acct-yjn`) |
 
 Skipped on purpose: **100 writers × 1000 events/batch**. We tested this in a separate exploratory pass; it produces a 30-min completion tail at 90 s nominal duration and is operationally useless. Big batches at high concurrency are an anti-pattern in this schema.
 
@@ -68,15 +71,17 @@ Skipped on purpose: **100 writers × 1000 events/batch**. We tested this in a se
 - **I (`tests/load_value_workload.rs`, `acct-jwg`)** — F's qty fixture (50 BENCH SKUs × 2 locations) plus the existing per-currency value accounts (USD `cash/ar/ap/revenue`; EUR `cash/revenue` already in the fixture, EUR `ar/ap` filled in by setup). 100 writers split 50/50 across two operation types: **qty writers** run F's `bin_move` workload, **value writers** post 5–20-event `ar_invoice` batches with random currency (USD or EUR per event) and random debit-normal/credit-normal account pairs from that currency's pool. Value-side has only 4 accounts per currency, so per-currency contention is shape-D-shaped on the value ledger; qty-side contention is shape-F-shaped (spread). The two pools don't lock the same rows, so the workloads run essentially independently.
 - **J (`tests/load_outbox_super_batch.rs`, `acct-hbg`)** — same writers, fixture, and outbox infrastructure as G. The ONE difference: the drain worker uses `super_batched_drain_loop` (in `tests/common/outbox_worker.rs`). Each iteration the worker grabs up to 1 000 pending rows with `FOR UPDATE SKIP LOCKED`, concatenates their event arrays into ONE merged JSONB array, and calls `post_transfers(merged_events, override_flag)` exactly once. On any error from the merged call, the worker falls back to G's per-row savepoint drain so error attribution is preserved. Rows are split into two groups by `override_closed_period` (since `post_transfers`'s override is a single function arg); in our workload all rows have `override=false` so the split is a no-op.
 - **K (`tests/load_outbox_super_batch.rs` with `T4_DRAINERS=4`, `acct-dtv`)** — same test binary as J, but spawns 4 concurrent `super_batched_drain_loop` tasks instead of 1. All workers share `drain_to_empty` / `hard_stop` signals; SKIP LOCKED ensures non-overlapping row claims. Since the 4 workers' super-batches run in parallel, they compete for `FOR UPDATE` locks on the same `stock_available` rows during `post_transfers` — a contention pattern absent from single-worker J.
+- **L (`tests/load_outbox_pseudo_sync.rs`, `acct-yjn`)** — same writers, fixture, and outbox infrastructure as J. **Two changes:** (1) the drainer's `DrainConfig.notify_channel = Some("ledger_outbox_done")`, so each row's commit (or per-row failure in the savepoint fallback) emits `pg_notify(channel, '{"id":N,"status":"ok"|"failed"[,"sqlstate":"…"]}')` inside the drain tx (delivered to subscribers on commit, race-free); (2) writers INSERT then BLOCK on a per-id outcome via a single shared `PgListener` task that fans notifications to per-writer `oneshot` channels in the test process. Per-id rendezvous handles either ordering (writer-waits-first or notify-arrives-first) via a state-machine slot. Caller's wall-clock = `enqueue_us + wait_us`; both reported plus `total_us`. Writers fall back to row-poll if the notify times out (default 30 s); **0 timeouts observed in production runs**.
+- **M (`tests/load_outbox_back_pressure.rs`, `acct-yjn`)** — same drainer as J (single super-batched, NO notify channel — pure async outbox). Writer flow: before each INSERT, busy-poll `SELECT COUNT(*) FROM ledger_outbox WHERE status='pending'` and sleep `T4_BP_POLL_MS=2 ms` until depth < `T4_BP_CAP=200`. Then INSERT and continue (no waiting on commit). Captures `bp_wait_us` (pre-INSERT block time) and `enqueue_us` (INSERT round-trip) separately; `total_us = bp + enqueue` is the caller-perceived wall-clock. The poll-then-INSERT sequence is racy under 100 concurrent writers (multiple writers can observe sub-cap simultaneously and rush in), so steady-state queue depth oversoots the cap by ~25 %.
 
 ## Run metadata
 
-- **Date:** 2026-04-29
-- **Issues:** `acct-1ia` (A–E), `acct-2ey` (F), `acct-tyq` / `acct-epu` (G), `acct-9i6` (H), `acct-jwg` (I), `acct-hbg` (J), `acct-dtv` (K).
-- **Schema state:** A–F on migrations 0001–0016; G–K on 0001–0017 (adds `ledger_outbox` for G; H/I/J/K add no schema change).
-- **Methodology:** 11 shapes × 3 runs × 5 min (`scripts/run-perf-baseline.sh`); G runs a 60 s grace drain, J/K run 90 s grace drains.
-- **Git refs at run time:** `872f3e50` (A–E), `997a680` (F), `ff5d6b5` (G), `378b63f` (H), `30b323d` (I), `b6d96f2` (J), `b6d96f2+` (K, post-J writeup, same day 2026-04-30).
-- **Total wall clock:** ~165 min combined (A–E ~50 min; F ~27 min; G ~18 min; H ~15 min; I ~15 min; J ~20 min; K ~20 min).
+- **Date:** 2026-04-29 / 2026-04-30
+- **Issues:** `acct-1ia` (A–E), `acct-2ey` (F), `acct-tyq` / `acct-epu` (G), `acct-9i6` (H), `acct-jwg` (I), `acct-hbg` (J), `acct-dtv` (K), `acct-yjn` (L + M).
+- **Schema state:** A–F on migrations 0001–0016; G–M on 0001–0017 (adds `ledger_outbox` for G; H/I/J/K/L/M add no schema change). Migration 0018 (`acct-17x` periods_no_overlap) was added during this baseline window but doesn't affect any of these workloads.
+- **Methodology:** 13 shapes × 3 runs × 5 min (`scripts/run-perf-baseline.sh`); G runs a 60 s grace drain, J/K run 90 s grace drains, L/M run 30 s grace drains (queue stays bounded under both shapes, so the post-writer drain finishes in <1 s).
+- **Git refs at run time:** `872f3e50` (A–E), `997a680` (F), `ff5d6b5` (G), `378b63f` (H), `30b323d` (I), `b6d96f2` (J), `b6d96f2+` (K), `52dff5c+` (L + M, post-K, same day 2026-04-30).
+- **Total wall clock:** ~200 min combined (A–E ~50 min; F ~27 min; G ~18 min; H ~15 min; I ~15 min; J ~20 min; K ~20 min; L ~15 min; M ~15 min).
 
 ## Environment
 
@@ -119,6 +124,8 @@ The single most important table. *Median across the 3 runs of each shape.*
 | **I** 50 + 50 · qty + multi-cur value | (combined 226.7; qty 136.9; value 89.8) ★ | **1 715 qty** + **1 125 value** = **2 840 combined** | (qty 37.6; value 529) ★ | (qty 1 772; value 1 321) ★ | (qty 2 400; value 2 367) ★ | (qty 3 982; value 3 950) ★ | (qty 5 624; value 7 572) ★ | 892 | 0 |
 | **J** 100 × 5–20 · super-batch outbox + 1 drainer | (enqueue 1 446.2; commit ~30 † †) | **364.8 ‡ ‡** | **66.4 § §** | **84.3 § §** | **107.7 § §** | **367.1 § §** | 3 584 § § | 804 | 0 |
 | **K** 100 × 5–20 · super-batch outbox + 4 drainers | (enqueue 1 540.3; commit ~62 † † †) | **180.1 ‡ ‡ ‡** | **63.1 § § §** | **73.8 § § §** | **94.4 § § §** | **396.5 § § §** | 3 185 § § § | 674 | 0 |
+| **L** 100 × 5–20 · pseudo-sync via LISTEN/NOTIFY | 230.2 ★★ | **2 876.2 ★★ ★★** | **431.0 ★★ ★★ ★★** | **477.7 ★★ ★★ ★★** | **547.4 ★★ ★★ ★★** | 3 221.3 ★★ ★★ ★★ | 3 228.5 ★★ ★★ ★★ | **941** | 0 |
+| **M** 100 × 5–20 · async outbox + back-pressure cap=200 | 77.9 | **971.4 ◇** | **1 194.2 ◇ ◇** | **3 209.3 ◇ ◇** | **3 748.4 ◇ ◇** | **4 340.5 ◇ ◇** | **4 427.5 ◇ ◇** | 437 | 0 |
 
 † For G, `bps` = enqueue rate, since writers no longer call `post_transfers` directly. `1 304.5 / s` is the rate at which writer batches land in the outbox; `11.7 / s` is the rate at which drained outbox rows commit (median 4 057 / 360 s).
 ‡ For G, `events/s` is **commit throughput** (`committed_events / total_elapsed`), apples-to-apples with F's events/s. Enqueue throughput is **16 302 ev/s** — but those events sit in the queue for minutes (see queue_us below), and only 140 ev/s actually land in the ledger.
@@ -162,6 +169,37 @@ The single most important table. *Median across the 3 runs of each shape.*
   | p99 | 330 s |
   | max | 330 s |
   Slightly better p50 than J (queue grows less because… actually because the worker drains more rows per second initially, even though per-event throughput is worse). Tail bounded by drain timeout (90 s past writer end).
+
+★★ For L, `bps` is enqueue rate (230.2/s — much lower than J's 1 446 because writers BLOCK on notify per call, so they only enqueue at the rate the drainer commits).
+
+★★ ★★ For L, events/s is **commit throughput** — apples-to-apples with F, J, etc. **2 876 evps is the new throughput peak across the entire matrix.** 2.26× F, 16% above shape B, 7.9× J. The architectural reason: writers' INSERT phase pipelines with the drainer's super-batch commit phase on the same DB; writers never touch account `FOR UPDATE` locks, so the only contention surface is the drainer-with-itself (zero — single-threaded).
+
+★★ ★★ ★★ For L, latency columns measure **writer-perceived `total_us` = enqueue_us + wait_us**. **In pseudo-sync mode, end-to-end (caller-submit → ledger-commit) IS the caller's wall-clock — there's no separate "ledger lag" for the caller.** Component breakdowns:
+  | metric | L `enqueue_us` (ms) | L `wait_us` (ms) | L `queue_us` (ms) |
+  |---|---|---|---|
+  | p50 | 19.6 | 411.6 | 399.9 |
+  | p95 | 29.0 | 457.2 | 443.4 |
+  | p99 | 36.8 | 524.3 | 506.5 |
+  | p99.9 | 2 308 | 894.8 | 919.3 |
+  | max | 2 738 | 1 122.8 | 1 562 |
+  - `wait_us` = time between INSERT-commit and notify arrival; tightly correlated with `queue_us`.
+  - `queue_us` (committed_at − enqueued_at) tracks how long each row sits in the outbox before drain.
+  - The p999/max enqueue spike (2.3-2.7 s) is from rare INSERT round-trips contending with the drainer's `UPDATE ledger_outbox SET status='committed'` on the same page — a known pattern in single-table queues, not load-bearing.
+  - `final_failed=0`, `timeouts=0` across all runs; `max_outbox_depth=100` exactly (= writer count). Queue depth is **naturally bounded** by the pseudo-sync wait — if writers can't proceed past `wait_for(id)`, no new rows enter until the drainer commits some.
+
+◇ For M, events/s is **commit throughput** — 971 evps, between J (365) and F (1 274). The cap (200) keeps the drainer's super-batch size bounded, so per-batch amortization is worse than J's ~1 000-row batches.
+
+◇ ◇ For M, latency columns measure `total_us = bp_wait + enqueue`. The pre-INSERT busy-poll dominates (`bp p99 = 3 708 ms` of the `total p99 = 3 748 ms`). Component breakdown:
+  | metric | M `bp_wait_us` (ms) | M `enqueue_us` (ms) | M `queue_us` (ms) |
+  |---|---|---|---|
+  | p50 | 1 091 | 59.2 | 3 107 |
+  | p95 | 3 151 | 116.1 | 3 849 |
+  | p99 | 3 708 | 141.2 | 4 275 |
+  | p99.9 | 4 258 | 530 | 4 609 |
+  | max | 4 349 | 1 282 | 4 641 |
+  - Steady-state queue depth oversoots cap by ~25 % (max=275, p50=252) because 100 writers can race past the depth-poll gate concurrently.
+  - **Async semantics:** unlike L, queue residency (`queue_us`) is NOT visible to the caller — they fire-and-forget after the bp_wait + enqueue completes. End-to-end caller wait (had they waited for ledger commit) ≈ bp + enqueue + queue ≈ 4.3 s p50.
+  - Context-switch rate: 82 K/s (L: 14.6 K/s, F: 15 K/s) — the busy-poll back-pressure burns CPU. Not recommended.
 
 Key reads:
 
@@ -627,6 +665,163 @@ Same workload, fixture, super-batch logic. Only difference: 4 concurrent drainer
 
 5. **Closing acct-dtv as "documented & not pursued further":** the issue's hypothesis ("does multi-core commit help?") was sensible but the answer is no for this workload shape. The optimal tuning knob is N=1; document this explicitly so a future engineer doesn't re-derive it.
 
+### L — 100 writers → outbox → 1 super-batched drainer with LISTEN/NOTIFY pseudo-sync
+
+Same writers, fixture, and outbox infrastructure as J. **Two changes:**
+1. The drainer's `DrainConfig.notify_channel = Some("ledger_outbox_done")`, so each row's outcome (`ok` on commit, `failed` with `sqlstate` on per-row fallback) emits `pg_notify(channel, json_payload)` inside the drain tx. Postgres delivers the notification only when the tx commits, making the channel a faithful "row outcome" signal — no race window between commit and signal.
+2. Writers run a different control flow:
+   ```rust
+   let id = INSERT INTO ledger_outbox (events) VALUES (…) RETURNING id;
+   let outcome = dispatcher.wait_for(id, 30s).await;
+   ```
+   A single shared `PgListener` task subscribes to the channel and dispatches per-id notifications via `oneshot::Sender` to the waiting writer task. The dispatcher's per-id slot handles either ordering (writer-arrives-first installs a sender; notify-arrives-first buffers the outcome).
+
+The headline result is the new throughput peak.
+
+| Metric | min | median | mean | max |
+|---|---|---|---|---|
+| Batches enqueued / 5 min | 67 214 | **69 138** | 68 541 | 69 272 |
+| Events committed / 5 min | 840 889 | **864 269** | 856 734 | 865 044 |
+| Enqueue batches/s | 223.9 | **230.2** | 228.2 | 230.6 |
+| **Commit events/s** | 2 800.7 | **2 876.2** | 2 853.0 | 2 878.1 |
+| Final committed rows / run | 67 214 | 69 138 | 68 541 | 69 272 |
+| Final failed rows / run | 0 | **0** | 0 | 0 |
+| Timeouts (notify > 30 s) | 0 | **0** | 0 | 0 |
+| Max outbox depth | 100 | **100** | 100 | 100 |
+| `enqueue_us` p50 (ms) | 19.5 | **19.6** | 19.8 | 20.1 |
+| `enqueue_us` p95 (ms) | 29.0 | 29.0 | 29.6 | 30.8 |
+| `enqueue_us` p99 (ms) | 36.6 | **36.8** | 37.6 | 39.3 |
+| `enqueue_us` p99.9 (ms) | 1 770 | 2 308 | 2 163 | 2 411 |
+| `enqueue_us` max (ms) | 2 727 | 2 738 | 2 756 | 2 802 |
+| `wait_us` p50 (ms) | 408.9 | **411.6** | 412.3 | 416.4 |
+| `wait_us` p99 (ms) | 491.8 | **524.3** | 547.5 | 626.4 |
+| `wait_us` max (ms) | 1 082 | 1 122 | 1 117 | 1 145 |
+| `total_us` p50 (ms) | 429.0 | **431.0** | 432.1 | 436.5 |
+| `total_us` p95 (ms) | 477.1 | **477.7** | 492.4 | 522.3 |
+| `total_us` p99 (ms) | 511.1 | **547.4** | 569.4 | 649.6 |
+| `total_us` p99.9 (ms) | 2 839 | 3 221 | 3 108 | 3 265 |
+| `total_us` max (ms) | 3 185 | 3 229 | 3 228 | 3 272 |
+| `queue_us` p50 (ms) | 397.6 | **399.9** | 400.9 | 405.3 |
+| `queue_us` p99 (ms) | 473.9 | 506.5 | 531.9 | 615.3 |
+| `queue_us` max (ms) | 1 217 | 1 562 | 1 487 | 1 681 |
+| Drain-phase wall clock (s) | 0.001 | 0.001 | 0.001 | 0.001 |
+| io_writes | 5 682 | 5 736 | 5 768 | 5 886 |
+| io_fsyncs | 5 380 | 5 535 | 5 485 | 5 539 |
+| WAL MB | 925.4 | **940.9** | 936.8 | 943.8 |
+
+vmstat: `us≈22.5%  sy≈2.0%  id≈53.2%  wa≈19.4%  cs≈14.6 K/s`. **CPU profile is shape A's, not shape F's.** us=22% (vs F's 40%, J's 41%) because writers spend most of their time blocked on notify, not running CPU. iowait 19% — storage participates (similar to A and J). cs 14.6 K/s is the lowest of any 100-writer shape; the pseudo-sync wait halves coroutine context-switch frequency. WAL 941 MB / 5 min — the highest of any shape because more events were committed.
+
+Per-event time = (300 s / 864 269 events) ≈ **0.347 ms/event**. **This is BELOW shape B's 0.37 ms** — which was the prior theoretical floor (single writer × 1 000 events × no contention). Why does L beat B? Because B's drainer paid the round-trip-to-writer-and-back between batches, while L's drainer is *continuously* fed by 100 blocked writers, so its idle time approaches zero. The drainer runs at ~2.4 super-batches/sec, each averaging ~100 rows ≈ 1 200 events, with `post_transfers` per-call cost ≈ 417 ms. That matches the 400 ms `queue_us` median exactly.
+
+Drainer super-batch composition: 69 138 rows / ~720 super-batches over 300 s ≈ 96 rows per super-batch ≈ ~1 200 events per `post_transfers` call. Per-event 0.35 ms.
+
+`super_batch_attempts/successes/fallbacks` — the run reports 0 for all three because the timeout-fallback path (which fires when the drainer takes >30 s past writer-stop) synthesizes stats from DB queries and the actual drain finished in <1 s. `final_failed=0` confirms no row-level failures.
+
+### L vs J vs F vs B — pseudo-sync is the new throughput peak
+
+| Metric | F (sync) | B (1 writer × 1 000) | J (outbox, super-batch) | L (pseudo-sync via NOTIFY) |
+|---|---|---|---|---|
+| **Committed events/s** | 1 274 | 2 486 | 365 | **2 876** |
+| Caller p50 (ms) | 51.4 | 373.9 | 66.4 | 431.0 |
+| Caller p99 (ms) | 8 250 | 610.9 | 107.7 (caller-perceived only) | **547.4** |
+| End-to-end caller wait p50 | 51 ms | 374 ms | 217 SECONDS | **431 ms** |
+| End-to-end caller wait p99 | 8.25 s | 611 ms | 364 SECONDS | **547 ms** |
+| Per-event time (ms) | 4.25 | 0.37 | 2.8 | **0.347** |
+| Workload concurrency | 100 parallel | 1 sequential | 100 enqueue + 1 drain | 100 enqueue (blocked) + 1 drain |
+| WAL/5 min (MB) | 431 | 717 | 804 | **941** |
+| vmstat us% | 40 | 50 | 41 | **22.5** |
+| vmstat cs/s | 15 K | 8 K | 29 K | **14.6 K** |
+| Sync error semantics | yes | yes | no (caller fires-and-forgets) | **yes** (notify carries SQLSTATE on failure) |
+
+**What this says.**
+
+1. **L is the new architectural reference for outbox-style workloads.** It beats every other shape on commit throughput AND has end-to-end caller p99 only ~6× worse than F's p99 instead of 1 000× worse. And it preserves sync-style error semantics (the notify payload carries `sqlstate` on failure, so the caller can branch).
+
+2. **Pseudo-sync pipelines producer and consumer stages.** F's bottleneck is account `FOR UPDATE` contention across 100 parallel writers. L sidesteps this entirely: writers only INSERT into `ledger_outbox` (no account locks), drainer holds account locks alone (no peer contention). Producer (writer INSERT, ~20 ms) and consumer (drainer super-batch commit, ~400 ms) run concurrently on the same DB process.
+
+3. **L beats shape B by 16 %** despite running 100 concurrent writers vs B's 1. The mechanism: writers continuously feed the drainer via the bounded queue, so the drainer never has idle time; B's writer-side does serial round-trips between batches (idle gaps in the DB).
+
+4. **Caller p999/max enqueue tail is still present** (2.3–2.7 s) — this is the `INSERT INTO ledger_outbox` round-trip occasionally contending with the drainer's `UPDATE ledger_outbox SET status='committed'` on the same physical page. F's tail is much worse (8 s) because it's account-lock contention. L's tail is bounded by single-table page contention. Could be improved (HOT updates, partition the outbox, advisory-lock the depth check) but not load-bearing.
+
+5. **WAL throughput is the highest of any shape** (941 MB / 5 min). The system is doing more useful work per second; that translates linearly to WAL volume. iowait 19 % matches.
+
+6. **The remaining gap to "ideal":** the drainer is a single-tx-at-a-time bottleneck. Sharding the outbox by hash(account) and running N drainers (each owning a partition) would in principle scale further — but only if the workload spreads across enough partitions. K showed multi-drainer on shared accounts regresses; partitioned-drainer is a different design (filed conceptually as a Phase 1 idea, not P3).
+
+**For Phase 1 regression detection:** L is the upper bound on what the architecture can sustain on this hardware. If a Phase 1 change causes L to drop below ~2 500 evps, something fundamental degraded.
+
+### M — 100 writers → outbox + back-pressure cap → 1 super-batched drainer
+
+Same drainer as J (super-batched, single, no notify). Writers run a different control flow:
+```rust
+loop {
+  let depth = SELECT count(*) FROM ledger_outbox WHERE status='pending';
+  if depth < cap { break; }
+  sleep(2 ms);
+}
+INSERT INTO ledger_outbox (events) VALUES (…);
+// fire-and-forget — caller does NOT wait for commit
+```
+
+Cap=200, poll cadence=2 ms (env-tunable). The pre-INSERT depth poll is racy under 100 concurrent writers — multiple writers can observe `depth < cap` simultaneously and rush in, so the steady-state queue depth oversoots the cap by ~25 %.
+
+| Metric | min | median | mean | max |
+|---|---|---|---|---|
+| Batches enqueued / 5 min | 21 993 | **23 381** | 23 523 | 25 195 |
+| Events committed / 5 min | 273 662 | **292 285** | 293 211 | 313 685 |
+| Enqueue batches/s | 73.3 | **77.9** | 78.4 | 84.0 |
+| **Commit events/s** | 908.0 | **971.4** | 974.2 | 1 043.0 |
+| Final committed rows / run | 21 993 | 23 381 | 23 523 | 25 195 |
+| Final failed rows / run | 0 | **0** | 0 | 0 |
+| Max outbox depth | 275 | 275 | 275 | 276 |
+| Queue depth p50 (samples) | 251 | **252** | 252 | 253 |
+| `bp_wait_us` p50 (ms) | 964.0 | **1 091** | 1 063 | 1 134 |
+| `bp_wait_us` p95 (ms) | 3 065 | 3 151 | 3 185 | 3 338 |
+| `bp_wait_us` p99 (ms) | 3 601 | **3 708** | 3 757 | 3 964 |
+| `bp_wait_us` p99.9 (ms) | 4 028 | 4 258 | 4 326 | 4 692 |
+| `bp_wait_us` max (ms) | 4 070 | 4 349 | 4 413 | 4 820 |
+| `enqueue_us` p50 (ms) | 50.3 | **59.2** | 59.4 | 68.7 |
+| `enqueue_us` p99 (ms) | 114.4 | **141.2** | 146.9 | 185.2 |
+| `total_us` p50 (ms) | 1 035 | **1 194** | 1 148 | 1 214 |
+| `total_us` p99 (ms) | 3 657 | **3 748** | 3 814 | 4 037 |
+| `total_us` max (ms) | 4 119 | 4 428 | 4 488 | 4 916 |
+| `queue_us` p50 (s) | 2.94 | **3.11** | 3.13 | 3.34 |
+| `queue_us` p99 (s) | 4.03 | 4.28 | 4.34 | 4.71 |
+| `queue_us` max (s) | 4.12 | 4.64 | 4.54 | 4.86 |
+| Drain-phase wall clock (s) | 0.72 | 0.85 | 0.97 | 1.35 |
+| io_writes | 6 100 | 6 259 | 6 227 | 6 322 |
+| io_fsyncs | 6 072 | 6 233 | 6 197 | 6 287 |
+| WAL MB | 410.2 | **436.5** | 445.1 | 488.4 |
+
+vmstat: `us≈57.4%  sy≈16.1%  id≈17.6%  wa≈5.7%  cs≈81 K/s`. **High us% and very high cs/s** — the pre-INSERT busy poll is the dominant CPU cost. 100 writers polling every 2 ms ≈ 50 K polls/s collectively, each hitting a single-row count query on the index. iowait drops because the system is CPU-bound, not IO-bound.
+
+xact_commit_delta: ~1.28 M / 5 min ≈ 4 270 commits/s — confirms the writer poll loop is generating most of the commit rate (each `SELECT COUNT(*)` is a read-only stmt that does NOT increment xact_commit, but the 2 ms-cadence polling itself has overhead in connection scheduling).
+
+### M vs J vs L — back-pressure is the worst of the three async-outbox variants
+
+| Metric | J (no cap) | M (cap=200) | L (pseudo-sync) |
+|---|---|---|---|
+| **Commit events/s** | 365 | **971** | **2 876** |
+| Caller p99 (ms) | 108 (caller-only) | **3 748** | **547** |
+| End-to-end p99 (had-they-waited) | 364 s | 3.75 s + 4.28 s queue ≈ 8 s | **547 ms** |
+| WAL/5 min (MB) | 804 | 437 | 941 |
+| vmstat us% | 41 | 57 | 22.5 |
+| vmstat cs/s | 29 K | **82 K** | 14.6 K |
+| Caller has sync error semantics? | no | no | **yes** |
+| Architectural complexity | low | low | medium (listener+dispatcher) |
+| Worth shipping? | for fire-and-forget only | **no** | **yes, when caller can block** |
+
+**What this says.**
+
+1. **M is dominated by L on every dimension.** L beats M in throughput (3.0×), caller p99 (6.8× lower), CPU efficiency (cs rate 5.6× lower), and provides sync error semantics that M can't. There's no workload where M is the right answer if pseudo-sync is an option.
+
+2. **M still beats J in throughput** (971 vs 365 evps) because the cap forces the drainer to keep running steadily — the queue never grows so large that the drainer's super-batch SELECT has to scan deeply. But this comes at the cost of catastrophically high caller p99 (3.7 s — basically all of which is back-pressure wait).
+
+3. **The busy-poll back-pressure mechanism is the wrong primitive.** 100 writers polling a single-table count() at 2 ms cadence creates 50 K read-stmts/s plus context switches. A real implementation should use either (a) a session-level advisory lock that wakes when released, (b) a server-side wait via `pg_notify` from the drainer (effectively L), or (c) a token-bucket maintained externally (Redis, in-process semaphore — but that defeats the point of in-DB queueing).
+
+4. **M's cap (200) is somewhat arbitrary.** A sweep across cap ∈ {50, 200, 1000} would map the throughput-vs-latency curve, but L's results render that exercise moot — there's no value-of-cap where M would beat L.
+
+**For Phase 1 regression detection:** M is documented as a negative result. Don't ship; don't reference. If a future engineer asks "what about hard-cap back-pressure?", the answer is: it's strictly worse than pseudo-sync (L) and was characterized in this baseline.
+
 ## Observations
 
 1. **Lock contention is the dominant cost from C onward in the shared-credit shapes.** Every writer needs `creation_void`'s lock. The `FOR UPDATE` lock is held for the entire transaction (lock acquire → loop events → commit → fsync). Concurrent writers serialize behind that hold time. Single-row throughput limit ≈ 1 / mean-hold-time = ~2 K events/s for small batches; adding more concurrent writers redistributes that throughput across more queue depth, not into more total events/s.
@@ -643,7 +838,7 @@ Same workload, fixture, super-batch logic. Only difference: 4 concurrent drainer
 
 7. **Variance is tight in contended configs (D, E, F)** and looser in uncontended ones (A, B). At 100 writers serializing, platform jitter is a small fraction of the 1.4 s median; at 1 writer the median is 5 ms and a single bad scheduler tick shows up.
 
-8. **Zero deadlocks across all 11 shapes × 3 runs × 5 min** = ~5.1 M batches / ~23 M events. The lock-order proof in `post_transfers` is correct under every shape including the SKIP LOCKED outbox drain pattern (G), the super-batched outbox merging events from many rows into one call (J), **multi-worker concurrent super-batched drain (K)**, mixed `post_transfers` + `reserve_inventory` traffic on shared `stock_available` rows (H), and mixed qty-ledger + value-ledger traffic with multi-currency contention (I).
+8. **Zero deadlocks across all 13 shapes × 3 runs × 5 min** = ~5.3 M batches / ~24 M events. The lock-order proof in `post_transfers` is correct under every shape including the SKIP LOCKED outbox drain pattern (G), the super-batched outbox merging events from many rows into one call (J), **multi-worker concurrent super-batched drain (K)**, **pseudo-sync caller pattern with LISTEN/NOTIFY (L)**, **busy-poll back-pressure (M)**, mixed `post_transfers` + `reserve_inventory` traffic on shared `stock_available` rows (H), and mixed qty-ledger + value-ledger traffic with multi-currency contention (I).
 
 9. **The ~2.5 K events/s single-writer ceiling is real for this hardware on this schema.** Routes to higher numbers:
    - **Spread the contention** (F demonstrates this — 2.3× lift just from cross-account workload). Real ERP traffic does this naturally; account sharding (Part IV §8) is the explicit Phase 1 mechanism for when natural spread isn't enough.
@@ -660,6 +855,12 @@ Same workload, fixture, super-batch logic. Only difference: 4 concurrent drainer
 
 14. **More drainers don't help — they hurt.** Going from J (1 drainer) to K (4 drainers) HALVES commit throughput (365 → 180 evps). Two reinforcing causes: smaller per-worker super-batches (less amortization) AND `FOR UPDATE` lock contention on the 100 `stock_available` rows when 4 super-batch `post_transfers` calls run in parallel. The right operational tuning for this workload is `T4_DRAINERS=1`. Multi-worker drain would only help with either (a) much wider account spread (so 4 drainers are unlikely to overlap on rows), or (b) per-`post_transfers`-call cost so high that single-call serialization is the actual bottleneck. Neither holds for Phase 0. **Single-worker super-batch is the architectural sweet spot.**
 
+15. **Pseudo-sync via LISTEN/NOTIFY is the new throughput peak (L).** Caller INSERTs into `ledger_outbox`, then BLOCKS on a notification matching its row id. Drainer is J's super-batched single worker plus `pg_notify` per row outcome. Result: **2 876 evps committed** — 2.26× shape F (the prior realistic-traffic peak), 16 % above shape B (the prior single-writer-no-contention peak), 7.9× shape J. **Caller end-to-end p99 = 547 ms** (vs F's 8 251 ms — 15× better). The architectural mechanism: writers' INSERT and the drainer's super-batched `post_transfers` PIPELINE on the same DB. Writers never touch account `FOR UPDATE` locks, so the only contention surface is the drainer with itself (zero — single-threaded). Per-event time = 0.347 ms — *below* shape B's 0.37 ms because B's drainer paid round-trip-to-writer-and-back idle time between batches; L's drainer is continuously fed by 100 blocked writers. Queue depth is naturally bounded by the writer count (100). 0 timeouts across 207 K calls in production runs. **Pseudo-sync rewrites the outbox-vs-sync tradeoff:** if the caller can block (which most ERP flows can — they want the answer anyway), L gives both better throughput AND lower caller latency than direct sync. D3 should be reconsidered with this evidence; tracked separately.
+
+16. **Hard-cap back-pressure (M) is a strict regression vs L on every dimension.** Shape M (cap=200, busy-poll, async caller) measures 971 evps committed and caller p99 = 3 748 ms. M beats J (365 evps) because the cap throttles producers so the queue stays small enough for the drainer's super-batches to be efficient — but M loses to L by 3.0× on throughput and 6.8× on caller p99 because L's notify-rendezvous is a strictly cheaper synchronization than busy-polling a count(). Context-switch rate exposes the cost: L = 14.6 K/s, M = 81 K/s (5.5× higher). **Documented as negative result** — if a future engineer asks "what about hard-cap back-pressure?", the answer is "L dominates."
+
+17. **Pseudo-sync's caller p999/max tail is single-table page contention, not lock contention.** L's `enqueue_us` p999 spikes to ~2.3 s and max to ~2.7 s. This is the writer's `INSERT INTO ledger_outbox` round-trip occasionally landing on the same physical page the drainer is updating with `UPDATE ledger_outbox SET status='committed' WHERE id = ANY(...)`. F's tail (8 s p99) is account-lock contention, materially more severe. L's tail could be reduced further (HOT updates, per-account outbox partition, advisory-lock the depth check) but isn't load-bearing for Phase 0; filed conceptually for Phase 1.
+
 ## Top queries (representative — config D, run 3, `pg_stat_statements`)
 
 `SELECT post_transfers($1, $2)` is essentially 100 % of database CPU + wait time across every shape. No surprise — every event flows through the function. We are *not* bottlenecked on parsing, planning, or other queries.
@@ -668,7 +869,7 @@ Same workload, fixture, super-batch logic. Only difference: 4 concurrent drainer
 
 - **Single-machine consumer laptop.** Numbers reflect a developer rig, not production-class hardware. Absolute throughput is an artifact of the test rig; *relative* changes vs this baseline are the load-bearing comparison.
 - **All credits target one row.** Every event posts `credit = creation_void(qty)`. Real workloads don't do this. `acct-2ey` will phase in cross-account-set, cross-ledger, multi-currency, and reservation-interleaved batches.
-- **Outbox characterized for naive single-drainer only.** Shape G measures the 1-row-per-`post_transfers`-call drain pattern. The super-batched variant (multiple rows' events merged into one call) is the path to shape-B-class throughput; not yet built. Filed as `acct-hbg`. D3 (sync `post_transfers`) is unchanged on these results — outbox would regress throughput 9× without super-batching, and even with it the error-attribution tradeoff requires a separate decision.
+- **Outbox is now characterized across four variants.** G (naive per-row drain), J (super-batched single drainer), K (super-batched 4 drainers), L (pseudo-sync via LISTEN/NOTIFY), M (hard-cap back-pressure). The pseudo-sync variant (L) is the throughput peak across the entire matrix and changes the D3 (sync vs async outbox) calculus — see observation 15. Full perf-grounded reconsideration of D3 is deferred to a separate decision.
 - **Standard cost only.** Non-`standard` cost methods are P0006 in Phase 0. WAC/FIFO/lot perf characterization is downstream of `acct-8gg` + a fresh baseline run.
 - **Reservation traffic now characterized.** Shape H runs concurrent `reserve_inventory()` + `post_transfers` traffic. The two-statement reservation pattern (FOR UPDATE then promisable read) is safe under load. The remaining caveat is reservation lifetime: H accumulates 200 K+ reservations across 5 min without releasing any, which is not a representative production pattern. Production traffic would mix in reservation completions and cancellations; that's a Phase 1 follow-up.
 - **No NUMA / CPU pinning, no isolated cores.** Kernel scheduler treats Postgres + cargo test + everything else equally. This *is* the variance source on uncontended configs.
@@ -710,6 +911,16 @@ T4_BINARY=load_outbox_super_batch T4_CONFIGS="100:5:20" \
 T4_BINARY=load_outbox_super_batch T4_CONFIGS="100:5:20" \
   T4_DURATION_SECS=300 T4_DRAIN_TIMEOUT_S=90 T4_DRAINERS=4 \
   ./scripts/run-perf-baseline.sh
+
+# Shape L (pseudo-sync via LISTEN/NOTIFY — current throughput peak)
+T4_BINARY=load_outbox_pseudo_sync T4_CONFIGS="100:5:20" \
+  T4_DURATION_SECS=300 T4_DRAIN_TIMEOUT_S=30 \
+  ./scripts/run-perf-baseline.sh
+
+# Shape M (async outbox + hard-cap back-pressure — kept for repro; dominated by L)
+T4_BINARY=load_outbox_back_pressure T4_CONFIGS="100:5:20" \
+  T4_DURATION_SECS=300 T4_DRAIN_TIMEOUT_S=30 T4_BP_CAP=200 T4_BP_POLL_MS=2 \
+  ./scripts/run-perf-baseline.sh
 ```
 
 Override defaults to characterize a single point ad-hoc:
@@ -743,6 +954,6 @@ This file is regenerated whenever:
 3. Significant container / OS / kernel change on the dev rig.
 4. Workload shape changes (e.g., `acct-jwg` multi-currency or `acct-9i6` reservation interleaving will trigger this).
 5. The `post_transfers` function changes shape (e.g., `acct-0ig` Option B amount-from-function, or new cost methods from `acct-8gg`). G's commit rate is essentially `1 / mean_post_transfers_call_time`, so any change to per-call cost shows up there immediately.
-6. **Re-run G specifically** if D3 (sync `post_transfers`) is reopened or if `acct-hbg`'s super-batched variant lands — the comparison point for "do we adopt outbox?" is G's commit rate vs F's events/s vs the super-batch result.
+6. **Re-run G/J/L specifically** if D3 (sync `post_transfers`) is reopened — the canonical decision evidence is G/J/L commit rates vs F's events/s. L is the current throughput peak; if D3 reopens, L is the variant to ship-or-not-ship.
 
 Append a new section dated below the current one rather than overwriting; the v0 → v1 → v2 history is the diff trail that detects creep.

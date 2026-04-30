@@ -19,11 +19,19 @@ use std::time::{Duration, Instant};
 pub struct DrainConfig {
     pub batch_size: i64,
     pub idle_sleep_ms: u64,
+    /// If `Some`, emit `pg_notify(channel, '{"id":N,"status":"ok"|"failed","sqlstate":"..."}')`
+    /// per row outcome inside the drain tx (delivered on commit). Used by
+    /// shape L (pseudo-sync caller pattern, acct-yjn).
+    pub notify_channel: Option<String>,
 }
 
 impl Default for DrainConfig {
     fn default() -> Self {
-        Self { batch_size: 1000, idle_sleep_ms: 1 }
+        Self {
+            batch_size: 1000,
+            idle_sleep_ms: 1,
+            notify_channel: None,
+        }
     }
 }
 
@@ -188,7 +196,13 @@ pub async fn super_batched_drain_loop(
         if hard_stop.load(Ordering::Relaxed) {
             break;
         }
-        let processed = drain_one_super_batch(&pool, cfg.batch_size, &mut stats).await?;
+        let processed = drain_one_super_batch(
+            &pool,
+            cfg.batch_size,
+            cfg.notify_channel.as_deref(),
+            &mut stats,
+        )
+        .await?;
         if processed == 0 {
             if drain_to_empty.load(Ordering::Relaxed) {
                 break;
@@ -203,6 +217,7 @@ pub async fn super_batched_drain_loop(
 async fn drain_one_super_batch(
     pool: &PgPool,
     batch_size: i64,
+    notify_channel: Option<&str>,
     stats: &mut DrainStats,
 ) -> sqlx::Result<u64> {
     let mut tx = pool.begin().await?;
@@ -248,7 +263,7 @@ async fn drain_one_super_batch(
         if group.is_empty() {
             continue;
         }
-        try_super_batch_or_fallback(&mut tx, &group, override_flag, stats).await?;
+        try_super_batch_or_fallback(&mut tx, &group, override_flag, notify_channel, stats).await?;
     }
 
     tx.commit().await?;
@@ -259,6 +274,7 @@ async fn try_super_batch_or_fallback(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     group: &[(i64, serde_json::Value)],
     override_flag: bool,
+    notify_channel: Option<&str>,
     stats: &mut DrainStats,
 ) -> sqlx::Result<()> {
     // Concatenate every row's events array into one big JSONB array.
@@ -296,6 +312,11 @@ async fn try_super_batch_or_fallback(
             .await?;
             stats.rows_committed += group.len() as u64;
             stats.super_batch_successes += 1;
+            if let Some(channel) = notify_channel {
+                for id in &ids {
+                    notify_outcome(tx, channel, *id, "ok", None).await?;
+                }
+            }
         }
         Err(_) => {
             sp.rollback().await?;
@@ -323,6 +344,9 @@ async fn try_super_batch_or_fallback(
                         .execute(&mut **tx)
                         .await?;
                         stats.rows_committed += 1;
+                        if let Some(channel) = notify_channel {
+                            notify_outcome(tx, channel, *id, "ok", None).await?;
+                        }
                     }
                     Err(e) => {
                         sp2.rollback().await?;
@@ -341,15 +365,40 @@ async fn try_super_batch_or_fallback(
                               WHERE id = $1",
                         )
                         .bind(id)
-                        .bind(sqlstate)
+                        .bind(&sqlstate)
                         .bind(msg)
                         .execute(&mut **tx)
                         .await?;
                         stats.rows_failed += 1;
+                        if let Some(channel) = notify_channel {
+                            notify_outcome(tx, channel, *id, "failed", sqlstate.as_deref()).await?;
+                        }
                     }
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// Emit `pg_notify(channel, json)` inside the drain tx; PG delivers the
+/// notification to subscribed sessions on commit, so the channel is a
+/// faithful "row outcome committed" signal.
+async fn notify_outcome(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    channel: &str,
+    id: i64,
+    status: &str,
+    sqlstate: Option<&str>,
+) -> sqlx::Result<()> {
+    let payload = match sqlstate {
+        Some(code) => format!(r#"{{"id":{id},"status":"{status}","sqlstate":"{code}"}}"#),
+        None => format!(r#"{{"id":{id},"status":"{status}"}}"#),
+    };
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(channel)
+        .bind(&payload)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }

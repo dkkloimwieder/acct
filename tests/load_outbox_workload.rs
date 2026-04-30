@@ -297,6 +297,7 @@ async fn outbox_workload_shape_g() {
         let cfg = DrainConfig {
             batch_size: outbox_batch_size,
             idle_sleep_ms: outbox_idle_sleep_ms,
+            notify_channel: None,
         };
         let stop = drain_to_empty.clone();
         let hs = hard_stop.clone();

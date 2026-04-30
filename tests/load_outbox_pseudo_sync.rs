@@ -1,85 +1,148 @@
-//! `acct-hbg` — Shape-J: super-batched outbox drainer.
+//! `acct-yjn` — Shape-L: pseudo-sync caller via LISTEN/NOTIFY.
 //!
-//! Variant of shape G (`tests/load_outbox_workload.rs`). Same writers
-//! (100 → ledger_outbox), same fixture (50 SKUs × 2 locs of bin_move),
-//! same instrumentation. The ONE difference: the drain worker uses
-//! `super_batched_drain_loop` instead of `drain_loop`. Each iteration
-//! the worker concatenates events from up to T4_OUTBOX_BATCH_SIZE
-//! pending rows into ONE `post_transfers` call. On any error from
-//! the merged call, falls back to per-row savepoint drain so error
-//! attribution is preserved (cost: one bad event poisons the bundle's
-//! optimistic commit; recovery is a per-row pass).
+//! Variant of shape J. Same writers, same workload, same drain worker.
+//! The new behavior: writers BLOCK on a notification matching their
+//! row id before declaring the call done. Worker emits
+//! `pg_notify('ledger_outbox_done', '{"id":N,"status":"ok"|"failed",...}')`
+//! per row inside the drain tx (delivered on commit, race-free).
 //!
-//! This is THE empirical test of "can outbox deliver shape-B-class
-//! throughput on Postgres?" Shape G showed naive single-row drain
-//! cannot recover the amortization. Super-batching merges many rows'
-//! events into one call so each commit-fsync amortizes across many
-//! events — the same shape that makes config B (1 writer × 1000-event
-//! batches) the system's throughput peak.
+//! From the caller's perspective this is *pseudo-sync*: the call only
+//! returns when the ledger has actually committed (or definitively
+//! failed). Execution is decoupled — single-writer worker amortizes
+//! commits — but the caller still gets a synchronous-style
+//! "did this commit?" answer.
 //!
-//! Two distinct latency families are captured per run:
+//! ### Listener topology — single shared dispatcher
 //!
-//!   1. enqueue_us — writer's INSERT round-trip (caller-perceived
-//!      latency in the async outbox model). Reported in the same CSV
-//!      slot as F's call latency, so the F vs G headline can be a
-//!      direct compare of "how long the writer's primary call takes."
-//!   2. queue_us  — `committed_at − enqueued_at` per row (drain-side
-//!      residency, derived from ledger_outbox after the run).
+//! One `PgListener` task subscribes to the channel and dispatches
+//! per-id outcomes via in-process oneshot channels to the waiting
+//! writer task. Apples-to-apples connection count vs F (one extra
+//! pool conn for the listener) and avoids 100×PgListener noise.
 //!
-//! Approximate writer-perceived end-to-end (had the writer waited) is
-//! enqueue_us + queue_us. Reported via separate columns.
+//! ### Race handling
 //!
-//! Outbox depth is sampled every T4_OUTBOX_DEPTH_INTERVAL_S seconds; the
-//! max sample is recorded as `max_outbox_depth`.
+//! Between INSERT-commit and `dispatcher.wait_for(id)`, the worker
+//! can race ahead and emit the NOTIFY before the writer registers.
+//! The dispatcher therefore stores a per-id state machine where
+//! whichever side (writer-waits / notify-arrives) is second satisfies
+//! the rendezvous. Late-arriving writers find the outcome buffered.
 //!
-//! ### Why we don't wait for full drain
+//! ### Headline metric
 //!
-//! In an unbounded-writer / single-drainer setup, the queue grows
-//! whenever enqueue rate > drain rate, which is the common case here:
-//! INSERT is fast (~ms), `post_transfers` per-call is ~ms but executed
-//! sequentially by one worker. The headline metric we want is sustained
-//! **committed-events-per-sec** — i.e., the worker's drain rate during
-//! the run, NOT the time-to-drain-the-tail. After the writer phase, we
-//! give the worker a bounded `T4_DRAIN_TIMEOUT_S` grace window and
-//! then hard-stop it, reporting whatever final state we landed in.
+//! `caller_total_us` = enqueue_us + wait_us. This is the writer's
+//! whole wall-clock per ledger commit. Compared to F (direct sync,
+//! caller p99 ≈ 8.25s) and J (async outbox, caller p99 = 108ms but
+//! ledger lag p50 ≈ 186s — caller doesn't see it).
 //!
 //! Run via `./scripts/run-perf-baseline.sh`:
 //!
-//!   T4_BINARY=load_outbox_super_batch \
+//!   T4_BINARY=load_outbox_pseudo_sync \
 //!     T4_CONFIGS="100:5:20" \
 //!     T4_BASELINE_RUNS=3 \
 //!     T4_DURATION_SECS=300 \
 //!     ./scripts/run-perf-baseline.sh
 //!
-//! Env knobs (defaults shown):
+//! Env knobs (defaults shown, parity with shape J unless noted):
 //!
-//!   T4_DURATION_SECS=30          wall-clock per run
-//!   T4_WRITERS=32                concurrent tokio writers
-//!   T4_EVENTS_MIN=5              events per batch (lower bound)
-//!   T4_EVENTS_MAX=20             events per batch (upper bound)
-//!   T4_BENCH_SKUS=50             number of SKUs in the spread pool
-//!   T4_OUTBOX_BATCH_SIZE=1000    drain worker LIMIT N
-//!   T4_OUTBOX_IDLE_SLEEP_MS=1    drain worker sleep on empty iteration
-//!   T4_OUTBOX_DEPTH_INTERVAL_S=5 depth sampling cadence
-//!   T4_DRAIN_TIMEOUT_S=30        max grace drain after writers stop
-//!
-//! `#[ignore]` so it doesn't run with `cargo test`. Same gating as F.
+//!   T4_DURATION_SECS=30
+//!   T4_WRITERS=32
+//!   T4_EVENTS_MIN=5
+//!   T4_EVENTS_MAX=20
+//!   T4_BENCH_SKUS=50
+//!   T4_OUTBOX_BATCH_SIZE=1000
+//!   T4_OUTBOX_IDLE_SLEEP_MS=1
+//!   T4_OUTBOX_DEPTH_INTERVAL_S=5
+//!   T4_DRAIN_TIMEOUT_S=30
+//!   T4_PSEUDO_SYNC_TIMEOUT_S=30   per-call notify-wait fallback
+//!   T4_NOTIFY_CHANNEL=ledger_outbox_done
 
 mod common;
 
 use common::outbox_worker::{DrainConfig, DrainStats, super_batched_drain_loop};
 use common::*;
 use serde_json::json;
+use sqlx::postgres::PgListener;
 use std::collections::HashMap;
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
 
 #[derive(Clone, Copy)]
 struct LocPair {
     main_id: i64,
     out_id: i64,
+}
+
+#[derive(Clone, Debug)]
+struct Outcome {
+    status: String,
+    #[allow(dead_code)]
+    sqlstate: Option<String>,
+}
+
+/// Per-id state: either a writer is waiting (sender stored) or a notify
+/// arrived first (outcome buffered). First-arriver inserts; second-
+/// arriver consumes.
+enum SlotState {
+    WaitingForNotify(oneshot::Sender<Outcome>),
+    NotifyArrived(Outcome),
+}
+
+#[derive(Clone)]
+struct Dispatcher {
+    slots: Arc<Mutex<HashMap<i64, SlotState>>>,
+}
+
+impl Dispatcher {
+    fn new() -> Self {
+        Self {
+            slots: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Called by the listener task on each NOTIFY.
+    fn deliver(&self, id: i64, outcome: Outcome) {
+        let mut g = self.slots.lock().unwrap();
+        match g.remove(&id) {
+            Some(SlotState::WaitingForNotify(tx)) => {
+                let _ = tx.send(outcome);
+            }
+            Some(SlotState::NotifyArrived(_)) | None => {
+                g.insert(id, SlotState::NotifyArrived(outcome));
+            }
+        }
+    }
+
+    /// Called by writer after INSERT-commit. Returns immediately if a
+    /// notify already arrived; otherwise installs a oneshot and awaits.
+    async fn wait_for(&self, id: i64, timeout: Duration) -> Result<Outcome, ()> {
+        let rx = {
+            let mut g = self.slots.lock().unwrap();
+            match g.remove(&id) {
+                Some(SlotState::NotifyArrived(o)) => return Ok(o),
+                Some(SlotState::WaitingForNotify(_)) => {
+                    // Should not happen — same id reused before consumed.
+                    panic!("dispatcher slot collision for id {id}");
+                }
+                None => {
+                    let (tx, rx) = oneshot::channel();
+                    g.insert(id, SlotState::WaitingForNotify(tx));
+                    rx
+                }
+            }
+        };
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(o)) => Ok(o),
+            Ok(Err(_)) | Err(_) => {
+                // Cleanup our slot if still present.
+                let mut g = self.slots.lock().unwrap();
+                g.remove(&id);
+                Err(())
+            }
+        }
+    }
 }
 
 fn xorshift(state: &mut u64) -> u64 {
@@ -192,7 +255,7 @@ fn pct(sorted: &[u32], q: f64) -> u32 {
 
 #[tokio::test]
 #[ignore = "load test — runs T4_DURATION_SECS (default 30); see file header"]
-async fn outbox_super_batch_shape_j() {
+async fn outbox_pseudo_sync_shape_l() {
     let duration_secs: u64 = env::var("T4_DURATION_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -229,19 +292,20 @@ async fn outbox_super_batch_shape_j() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
-    let n_drainers: u32 = env::var("T4_DRAINERS")
+    let pseudo_sync_timeout_s: u64 = env::var("T4_PSEUDO_SYNC_TIMEOUT_S")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    assert!(n_drainers >= 1, "T4_DRAINERS must be >= 1");
+        .unwrap_or(30);
+    let notify_channel: String =
+        env::var("T4_NOTIFY_CHANNEL").unwrap_or_else(|_| "ledger_outbox_done".to_string());
     assert!(
         events_min <= events_max && events_min >= 1,
         "T4_EVENTS_MIN must be >=1 and <= T4_EVENTS_MAX"
     );
     let duration = Duration::from_secs(duration_secs);
 
-    // pool: writers + drainers + depth sampler(1) + setup/snapshot(2) headroom
-    let pool = connect_test_db_with(n_writers + n_drainers + 8).await;
+    // Pool: writers + 1 drainer + 1 listener + depth sampler(1) + headroom.
+    let pool = connect_test_db_with(n_writers + 8).await;
     reset_to_fixture(&pool).await;
 
     eprintln!("T4: setting up load fixture (n_skus={n_skus})");
@@ -257,15 +321,16 @@ async fn outbox_super_batch_shape_j() {
     let pairs: Arc<Vec<LocPair>> = Arc::new(pairs);
 
     eprintln!(
-        "T4 shape J (super-batch): writers={} drainers={} duration={}s events={}-{} pool_size={} drain_batch={} idle_sleep={}ms",
+        "T4 shape L (pseudo-sync): writers={} duration={}s events={}-{} pool_size={} drain_batch={} idle_sleep={}ms channel={} sync_timeout={}s",
         n_writers,
-        n_drainers,
         duration_secs,
         events_min,
         events_max,
         pairs.len(),
         outbox_batch_size,
-        outbox_idle_sleep_ms
+        outbox_idle_sleep_ms,
+        notify_channel,
+        pseudo_sync_timeout_s,
     );
 
     let _ = sqlx::query("SELECT pg_stat_statements_reset()")
@@ -300,36 +365,87 @@ async fn outbox_super_batch_shape_j() {
 
     let ok_count = Arc::new(AtomicU64::new(0));
     let err_count = Arc::new(AtomicU64::new(0));
+    let timeout_count = Arc::new(AtomicU64::new(0));
     let event_count = Arc::new(AtomicU64::new(0));
 
-    // ---- Spawn N drain workers. All share the same drain_to_empty /
-    //      hard_stop signals; each independently runs the SKIP LOCKED
-    //      claim-and-process loop. Multiple workers are correct under
-    //      FOR UPDATE SKIP LOCKED — claims are non-overlapping by
-    //      construction. Stays running for the entire load phase, then
-    //      drains-to-empty after writers stop (bounded by
-    //      T4_DRAIN_TIMEOUT_S — hard_stop forces an exit if the queue
-    //      isn't empty by then).
+    // ---- Spawn the listener task BEFORE writers, so we don't miss any
+    //      NOTIFY between the first INSERT and the first listen poll.
+    let dispatcher = Dispatcher::new();
+    let listener_stop = Arc::new(AtomicBool::new(false));
+    let listener_handle = {
+        let pool = pool.clone();
+        let dispatcher = dispatcher.clone();
+        let stop = listener_stop.clone();
+        let channel = notify_channel.clone();
+        tokio::spawn(async move {
+            let mut listener = PgListener::connect_with(&pool)
+                .await
+                .expect("PgListener::connect_with");
+            listener
+                .listen(&channel)
+                .await
+                .expect("PgListener::listen");
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let n = match tokio::time::timeout(
+                    Duration::from_millis(200),
+                    listener.recv(),
+                )
+                .await
+                {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => {
+                        eprintln!("listener recv error: {e}");
+                        break;
+                    }
+                    Err(_) => continue, // poll stop flag
+                };
+                let payload = n.payload();
+                // Parse minimal JSON. Fields: id (number), status (string), sqlstate (optional string).
+                let v: serde_json::Value = match serde_json::from_str(payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("listener parse error: {e} payload={payload}");
+                        continue;
+                    }
+                };
+                let id = v.get("id").and_then(|x| x.as_i64()).unwrap_or(-1);
+                let status = v
+                    .get("status")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let sqlstate = v
+                    .get("sqlstate")
+                    .and_then(|x| x.as_str())
+                    .map(String::from);
+                if id < 0 {
+                    continue;
+                }
+                dispatcher.deliver(id, Outcome { status, sqlstate });
+            }
+        })
+    };
+
+    // ---- Spawn the drain worker (single, super-batched, with notify).
     let drain_to_empty = Arc::new(AtomicBool::new(false));
     let hard_stop = Arc::new(AtomicBool::new(false));
-    let mut worker_handles = Vec::with_capacity(n_drainers as usize);
-    for _ in 0..n_drainers {
+    let worker_handle = {
         let pool = pool.clone();
         let cfg = DrainConfig {
             batch_size: outbox_batch_size,
             idle_sleep_ms: outbox_idle_sleep_ms,
-            notify_channel: None,
+            notify_channel: Some(notify_channel.clone()),
         };
         let stop = drain_to_empty.clone();
         let hs = hard_stop.clone();
-        worker_handles.push(tokio::spawn(async move {
-            super_batched_drain_loop(pool, cfg, stop, hs).await
-        }));
-    }
+        tokio::spawn(async move { super_batched_drain_loop(pool, cfg, stop, hs).await })
+    };
 
     // ---- Spawn the depth sampler.
-    let depth_samples: Arc<std::sync::Mutex<Vec<i64>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let depth_samples: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
     let depth_stop = Arc::new(AtomicBool::new(false));
     let depth_handle = {
         let pool = pool.clone();
@@ -365,7 +481,10 @@ async fn outbox_super_batch_shape_j() {
         let pairs_w = pairs.clone();
         let ok_w = ok_count.clone();
         let err_w = err_count.clone();
+        let timeout_w = timeout_count.clone();
         let ev_w = event_count.clone();
+        let dispatcher_w = dispatcher.clone();
+        let pseudo_sync_to = Duration::from_secs(pseudo_sync_timeout_s);
         handles.push(tokio::spawn(async move {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -373,6 +492,8 @@ async fn outbox_super_batch_shape_j() {
                 .as_nanos() as u64;
             let mut rng = nanos ^ ((w as u64) << 32) ^ 0x9b54_7d27_cafe_d00d;
             let mut enqueue_lats: Vec<u32> = Vec::new();
+            let mut wait_lats: Vec<u32> = Vec::new();
+            let mut total_lats: Vec<u32> = Vec::new();
             let span = (events_max - events_min + 1) as u64;
 
             while start.elapsed() < duration {
@@ -396,34 +517,81 @@ async fn outbox_super_batch_shape_j() {
                     ));
                 }
                 let batch = json!(events);
-                let t0 = Instant::now();
+
+                let t_enqueue_start = Instant::now();
                 let res: sqlx::Result<i64> = sqlx::query_scalar(
                     "INSERT INTO ledger_outbox (events) VALUES ($1) RETURNING id",
                 )
                 .bind(&batch)
                 .fetch_one(&pool_w)
                 .await;
-                let dur_us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
-                enqueue_lats.push(dur_us);
-                match res {
-                    Ok(_) => {
-                        ok_w.fetch_add(1, Ordering::Relaxed);
-                        ev_w.fetch_add(n_events as u64, Ordering::Relaxed);
-                    }
+                let enqueue_dur = t_enqueue_start.elapsed();
+                let enqueue_us = enqueue_dur.as_micros().min(u32::MAX as u128) as u32;
+                enqueue_lats.push(enqueue_us);
+
+                let id = match res {
+                    Ok(id) => id,
                     Err(e) => {
                         eprintln!("writer {w} INSERT error: {e}");
                         err_w.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                let t_wait_start = Instant::now();
+                let outcome = dispatcher_w.wait_for(id, pseudo_sync_to).await;
+                let wait_dur = t_wait_start.elapsed();
+                let wait_us = wait_dur.as_micros().min(u32::MAX as u128) as u32;
+                let total_us = (enqueue_dur + wait_dur)
+                    .as_micros()
+                    .min(u32::MAX as u128) as u32;
+                wait_lats.push(wait_us);
+                total_lats.push(total_us);
+
+                match outcome {
+                    Ok(o) => {
+                        if o.status == "ok" {
+                            ok_w.fetch_add(1, Ordering::Relaxed);
+                            ev_w.fetch_add(n_events as u64, Ordering::Relaxed);
+                        } else {
+                            // The drain reported failure; count under err.
+                            err_w.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(()) => {
+                        // Timeout fallback: poll the row.
+                        timeout_w.fetch_add(1, Ordering::Relaxed);
+                        let row: Option<(String, Option<String>)> = sqlx::query_as(
+                            "SELECT status, error_sqlstate FROM ledger_outbox WHERE id = $1",
+                        )
+                        .bind(id)
+                        .fetch_optional(&pool_w)
+                        .await
+                        .unwrap_or(None);
+                        match row {
+                            Some((status, _)) if status == "committed" => {
+                                ok_w.fetch_add(1, Ordering::Relaxed);
+                                ev_w.fetch_add(n_events as u64, Ordering::Relaxed);
+                            }
+                            _ => {
+                                err_w.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
             }
-            enqueue_lats
+            (enqueue_lats, wait_lats, total_lats)
         }));
     }
 
     let mut all_enqueue_lats: Vec<u32> = Vec::new();
+    let mut all_wait_lats: Vec<u32> = Vec::new();
+    let mut all_total_lats: Vec<u32> = Vec::new();
     for h in handles {
-        let writer_lats = h.await.expect("writer panic");
-        all_enqueue_lats.extend(writer_lats);
+        let (e, w, t) = h.await.expect("writer panic");
+        all_enqueue_lats.extend(e);
+        all_wait_lats.extend(w);
+        all_total_lats.extend(t);
     }
     let writer_elapsed = start.elapsed();
     eprintln!(
@@ -431,45 +599,24 @@ async fn outbox_super_batch_shape_j() {
         writer_elapsed.as_secs_f64()
     );
 
-    // ---- Bounded grace drain: tell all workers to exit on next-empty,
-    //      capped by T4_DRAIN_TIMEOUT_S. If the queue is too deep to
-    //      drain by then, hard_stop forces an exit and we report
-    //      partial state.
+    // ---- Bounded grace drain.
     drain_to_empty.store(true, Ordering::Relaxed);
     let drain_t0 = Instant::now();
     let drain_outcome = tokio::time::timeout(
         Duration::from_secs(drain_timeout_s),
-        async move {
-            let mut results = Vec::with_capacity(worker_handles.len());
-            for h in worker_handles {
-                results.push(h.await);
-            }
-            results
-        },
+        worker_handle,
     )
     .await;
-    let mut drain_stats = DrainStats::default();
-    match drain_outcome {
-        Ok(joined) => {
-            for j in joined {
-                let s = j.expect("drain worker panic").expect("super_batched_drain_loop");
-                drain_stats.batches += s.batches;
-                drain_stats.rows_committed += s.rows_committed;
-                drain_stats.rows_failed += s.rows_failed;
-                drain_stats.duration_ms = drain_stats.duration_ms.max(s.duration_ms);
-                drain_stats.super_batch_attempts += s.super_batch_attempts;
-                drain_stats.super_batch_successes += s.super_batch_successes;
-                drain_stats.super_batch_fallbacks += s.super_batch_fallbacks;
-            }
-        }
+    let drain_stats: DrainStats = match drain_outcome {
+        Ok(j) => j
+            .expect("drain worker panic")
+            .expect("super_batched_drain_loop"),
         Err(_) => {
             eprintln!(
                 "T4: drain timeout after {}s — forcing hard_stop",
                 drain_timeout_s
             );
             hard_stop.store(true, Ordering::Relaxed);
-            // The timeout consumed the join_all future, so we can't
-            // await the handles again. Synthesize stats from the table.
             let committed: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM ledger_outbox WHERE status = 'committed'",
             )
@@ -482,7 +629,7 @@ async fn outbox_super_batch_shape_j() {
             .fetch_one(&pool)
             .await
             .unwrap_or(0);
-            drain_stats = DrainStats {
+            DrainStats {
                 batches: 0,
                 rows_committed: committed as u64,
                 rows_failed: failed as u64,
@@ -490,12 +637,12 @@ async fn outbox_super_batch_shape_j() {
                 super_batch_attempts: 0,
                 super_batch_successes: 0,
                 super_batch_fallbacks: 0,
-            };
+            }
         }
-    }
+    };
     let drain_secs = drain_t0.elapsed().as_secs_f64();
     eprintln!(
-        "T4: drain phase ended in {:.2}s — batches={} committed={} failed={} super_batch_attempts={} super_batch_successes={} super_batch_fallbacks={} (aggregated across {} drainers)",
+        "T4: drain phase ended in {:.2}s — batches={} committed={} failed={} super_batch_attempts={} super_batch_successes={} super_batch_fallbacks={}",
         drain_secs,
         drain_stats.batches,
         drain_stats.rows_committed,
@@ -503,10 +650,10 @@ async fn outbox_super_batch_shape_j() {
         drain_stats.super_batch_attempts,
         drain_stats.super_batch_successes,
         drain_stats.super_batch_fallbacks,
-        n_drainers,
     );
 
-    // Stop depth sampler.
+    listener_stop.store(true, Ordering::Relaxed);
+    let _ = listener_handle.await;
     depth_stop.store(true, Ordering::Relaxed);
     depth_handle.abort();
     let _ = depth_handle.await;
@@ -520,7 +667,6 @@ async fn outbox_super_batch_shape_j() {
 
     let total_elapsed = start.elapsed();
 
-    // ---- Collect queue residency latencies from the outbox table.
     let queue_lats_raw: Vec<i64> = sqlx::query_scalar(
         "SELECT (EXTRACT(EPOCH FROM (committed_at - enqueued_at)) * 1000000)::BIGINT
            FROM ledger_outbox
@@ -535,9 +681,6 @@ async fn outbox_super_batch_shape_j() {
         .collect();
     queue_lats.sort_unstable();
 
-    // ---- Total events actually committed to the ledger. The headline
-    //      "G vs F throughput" comparison uses this divided by the
-    //      writer-phase duration — what F reports as events/sec.
     let committed_events: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(jsonb_array_length(events)), 0)::BIGINT
            FROM ledger_outbox WHERE status = 'committed'",
@@ -623,15 +766,30 @@ async fn outbox_super_batch_shape_j() {
 
     let ok = ok_count.load(Ordering::Relaxed);
     let err = err_count.load(Ordering::Relaxed);
+    let timeouts = timeout_count.load(Ordering::Relaxed);
     let events = event_count.load(Ordering::Relaxed);
     let total = ok + err;
 
     all_enqueue_lats.sort_unstable();
-    let p50 = pct(&all_enqueue_lats, 0.50);
-    let p95 = pct(&all_enqueue_lats, 0.95);
-    let p99 = pct(&all_enqueue_lats, 0.99);
-    let p99_9 = pct(&all_enqueue_lats, 0.999);
-    let max_lat = *all_enqueue_lats.last().unwrap_or(&0);
+    all_wait_lats.sort_unstable();
+    all_total_lats.sort_unstable();
+    let e_p50 = pct(&all_enqueue_lats, 0.50);
+    let e_p95 = pct(&all_enqueue_lats, 0.95);
+    let e_p99 = pct(&all_enqueue_lats, 0.99);
+    let e_p99_9 = pct(&all_enqueue_lats, 0.999);
+    let e_max = *all_enqueue_lats.last().unwrap_or(&0);
+
+    let w_p50 = pct(&all_wait_lats, 0.50);
+    let w_p95 = pct(&all_wait_lats, 0.95);
+    let w_p99 = pct(&all_wait_lats, 0.99);
+    let w_p99_9 = pct(&all_wait_lats, 0.999);
+    let w_max = *all_wait_lats.last().unwrap_or(&0);
+
+    let t_p50 = pct(&all_total_lats, 0.50);
+    let t_p95 = pct(&all_total_lats, 0.95);
+    let t_p99 = pct(&all_total_lats, 0.99);
+    let t_p99_9 = pct(&all_total_lats, 0.999);
+    let t_max = *all_total_lats.last().unwrap_or(&0);
 
     let q_p50 = pct(&queue_lats, 0.50);
     let q_p95 = pct(&queue_lats, 0.95);
@@ -651,9 +809,9 @@ async fn outbox_super_batch_shape_j() {
     let io_hits_d = stat_io_after.5 - stat_io_before.5;
     let io_fsyncs_d = stat_io_after.6 - stat_io_before.6;
 
-    eprintln!("===================== T4 PERF SUMMARY (shape J: super-batch) =====================");
+    eprintln!("===================== T4 PERF SUMMARY (shape L: pseudo-sync) =====================");
     eprintln!(
-        "duration_s={:.2} (writers_phase={:.2}s drain_phase={:.2}s) writers={} events={}-{} pool={} (outbox)",
+        "duration_s={:.2} (writers_phase={:.2}s drain_phase={:.2}s) writers={} events={}-{} pool={} (outbox+notify)",
         total_elapsed.as_secs_f64(),
         writer_elapsed.as_secs_f64(),
         drain_secs,
@@ -663,39 +821,34 @@ async fn outbox_super_batch_shape_j() {
         pairs.len()
     );
     eprintln!(
-        "batches: total={} ok={} err={} enqueue_throughput={:.1}/s",
+        "batches: total={} ok={} err={} timeouts={} pseudo_sync_throughput={:.1}/s",
         total,
         ok,
         err,
+        timeouts,
         total as f64 / writer_elapsed.as_secs_f64()
     );
     eprintln!(
-        "events:  enqueued={} enqueue_throughput={:.1}/s  (sustained over enqueue phase)",
+        "events:  enqueued={} committed={} commit_throughput={:.1}/s  <-- HEADLINE",
         events,
-        events as f64 / writer_elapsed.as_secs_f64()
-    );
-    eprintln!(
-        "events:  committed={} commit_throughput={:.1}/s  <-- HEADLINE (apples-to-apples vs F)",
         committed_events,
         committed_events as f64 / total_elapsed.as_secs_f64()
     );
     eprintln!(
         "enqueue_us: p50={} p95={} p99={} p99.9={} max={} (n={})",
-        p50,
-        p95,
-        p99,
-        p99_9,
-        max_lat,
-        all_enqueue_lats.len()
+        e_p50, e_p95, e_p99, e_p99_9, e_max, all_enqueue_lats.len()
+    );
+    eprintln!(
+        "wait_us:    p50={} p95={} p99={} p99.9={} max={} (n={})",
+        w_p50, w_p95, w_p99, w_p99_9, w_max, all_wait_lats.len()
+    );
+    eprintln!(
+        "total_us:   p50={} p95={} p99={} p99.9={} max={} (n={})  <-- caller wall-clock",
+        t_p50, t_p95, t_p99, t_p99_9, t_max, all_total_lats.len()
     );
     eprintln!(
         "queue_us:   p50={} p95={} p99={} p99.9={} max={} (n={})",
-        q_p50,
-        q_p95,
-        q_p99,
-        q_p99_9,
-        q_max,
-        queue_lats.len()
+        q_p50, q_p95, q_p99, q_p99_9, q_max, queue_lats.len()
     );
     eprintln!(
         "outbox: max_pending_depth={} drain_batches={} committed={} failed={} pending={}",
@@ -716,14 +869,14 @@ async fn outbox_super_batch_shape_j() {
         xact_commit_d, xact_rollbk_d, blks_read_d, blks_hit_d
     );
     eprintln!(
-        "pg_stat_io (client backend, summed across contexts): reads_delta={} read_bytes_delta={} writes_delta={} write_bytes_delta={} extends_delta={} hits_delta={} fsyncs_delta={}",
+        "pg_stat_io (client backend): reads_delta={} read_bytes_delta={} writes_delta={} write_bytes_delta={} extends_delta={} hits_delta={} fsyncs_delta={}",
         io_reads_d, io_rbytes_d, io_writes_d, io_wbytes_d, io_extends_d, io_hits_d, io_fsyncs_d
     );
     eprintln!(
         "wal_bytes_delta={} (lsn {} -> {})",
         wal_bytes_delta, wal_lsn_before, wal_lsn_after
     );
-    eprintln!("pg_stat_statements (top 10 by total_exec_time on this DB):");
+    eprintln!("pg_stat_statements (top 10):");
     for (q, calls, total_ms, mean_ms) in &top_queries {
         eprintln!(
             "  calls={:>10} total_ms={:>10.1} mean_ms={:>8.3}  query={}",
@@ -733,10 +886,10 @@ async fn outbox_super_batch_shape_j() {
     eprintln!("=======================================================================");
 
     eprintln!(
-        "T4_CSV_HEADER: duration_s,writers,batches_total,batches_ok,batches_err,events_total,throughput_bps,throughput_evps,p50_us,p95_us,p99_us,p999_us,max_us,deadlocks_delta,xact_commit_delta,xact_rollback_delta,blks_read_delta,blks_hit_delta,io_reads_delta,io_read_bytes_delta,io_writes_delta,io_write_bytes_delta,io_extends_delta,io_hits_delta,io_fsyncs_delta,wal_bytes_delta,queue_p50_us,queue_p95_us,queue_p99_us,queue_p999_us,queue_max_us,max_outbox_depth,final_committed,final_failed,drain_secs,committed_events,commit_evps"
+        "T4_CSV_HEADER: duration_s,writers,batches_total,batches_ok,batches_err,events_total,throughput_bps,throughput_evps,p50_us,p95_us,p99_us,p999_us,max_us,deadlocks_delta,xact_commit_delta,xact_rollback_delta,blks_read_delta,blks_hit_delta,io_reads_delta,io_read_bytes_delta,io_writes_delta,io_write_bytes_delta,io_extends_delta,io_hits_delta,io_fsyncs_delta,wal_bytes_delta,queue_p50_us,queue_p95_us,queue_p99_us,queue_p999_us,queue_max_us,max_outbox_depth,final_committed,final_failed,drain_secs,committed_events,commit_evps,wait_p50_us,wait_p95_us,wait_p99_us,wait_p999_us,wait_max_us,total_p50_us,total_p95_us,total_p99_us,total_p999_us,total_max_us,timeouts"
     );
     eprintln!(
-        "T4_CSV_VALUES: {:.3},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{:.3}",
+        "T4_CSV_VALUES: {:.3},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{:.3},{},{},{},{},{},{},{},{},{},{},{}",
         writer_elapsed.as_secs_f64(),
         n_writers,
         total,
@@ -745,35 +898,21 @@ async fn outbox_super_batch_shape_j() {
         events,
         total as f64 / writer_elapsed.as_secs_f64(),
         events as f64 / writer_elapsed.as_secs_f64(),
-        p50,
-        p95,
-        p99,
-        p99_9,
-        max_lat,
+        e_p50, e_p95, e_p99, e_p99_9, e_max,
         deadlocks_after - deadlocks_before,
-        xact_commit_d,
-        xact_rollbk_d,
-        blks_read_d,
-        blks_hit_d,
-        io_reads_d,
-        io_rbytes_d,
-        io_writes_d,
-        io_wbytes_d,
-        io_extends_d,
-        io_hits_d,
-        io_fsyncs_d,
+        xact_commit_d, xact_rollbk_d, blks_read_d, blks_hit_d,
+        io_reads_d, io_rbytes_d, io_writes_d, io_wbytes_d, io_extends_d, io_hits_d, io_fsyncs_d,
         wal_bytes_delta,
-        q_p50,
-        q_p95,
-        q_p99,
-        q_p99_9,
-        q_max,
+        q_p50, q_p95, q_p99, q_p99_9, q_max,
         max_depth,
         final_committed,
         final_failed,
         drain_secs,
         committed_events,
         committed_events as f64 / total_elapsed.as_secs_f64(),
+        w_p50, w_p95, w_p99, w_p99_9, w_max,
+        t_p50, t_p95, t_p99, t_p99_9, t_max,
+        timeouts,
     );
 
     assert_eq!(
@@ -781,7 +920,6 @@ async fn outbox_super_batch_shape_j() {
         0,
         "deadlock counter rose during run"
     );
-    assert_eq!(err, 0, "non-deadlock writer INSERT errors during run");
     assert!(total > 0, "no batches enqueued");
     assert!(final_committed > 0, "worker committed nothing");
 }
