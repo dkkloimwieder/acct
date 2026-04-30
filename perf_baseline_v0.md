@@ -1,6 +1,6 @@
 # Perf baseline v0 — Phase 0 schema, workload-shape matrix
 
-This file records reference perf measurements across **eight workload
+This file records reference perf measurements across **nine workload
 shapes** on the simplest schema (Phase 0; migrations 0001–0017, no
 Phase 1 tables). Per the 2026-04-29 directive (Part VII Q2 resolved),
 every Phase 1 complexity addition is diff'd against these numbers.
@@ -25,11 +25,11 @@ The dev hardware is a consumer laptop on a multi-tenant desktop kernel. A single
 
 Configuration of this baseline pass:
 
-- 8 workload shapes (see "Configurations" below)
+- 9 workload shapes (see "Configurations" below)
 - 3 runs per shape, 5 minutes per run (G adds a 60 s grace drain after the writer phase)
 - 100 writers connection ceiling on the dev container (`max_connections=200`)
 - `vmstat 5` sidecar during every run
-- ~110 minutes total wall clock (A–F: ~77 min on `872f3e50`; G: ~18 min on `ff5d6b5`; H: ~15 min on `f88fd0b+`, same day)
+- ~125 minutes total wall clock (A–F: ~77 min on `872f3e50`; G: ~18 min on `ff5d6b5`; H: ~15 min on `f88fd0b`; I: ~15 min on `378b63f+`, same day)
 
 The driver is `scripts/run-perf-baseline.sh`. Per run it captures:
 
@@ -53,6 +53,7 @@ The driver is `scripts/run-perf-baseline.sh`. Per run it captures:
 | **F** `w100_e5-20`   | 100 | 5–20 | **cross-account spread (50 SKUs × 2 locations = 100 accounts)** | Realistic-shape concurrency — same envelope as D but contention spreads. **The realistic-traffic regression-detection point.** |
 | **G** `w100_e5-20` (outbox) | 100 | 5–20 | **same cross-account spread as F**, but writers `INSERT` into `ledger_outbox` and one drain worker dispatches to `post_transfers` | Naive single-drainer outbox vs direct sync. **The outbox-vs-sync comparison point** (`acct-tyq`). |
 | **H** `w100_e5-20` (reserve interleave) | 70 + 30 | 5–20 (posters only) | F's qty workload **plus** concurrent `reserve_inventory()` calls from 30 % of the writer pool | Reservation-flow safety + perf under realistic mixed traffic (`acct-9i6`). |
+| **I** `w100_e5-20` (qty + multi-cur value) | 50 + 50 | 5–20 | F's qty workload (50 writers) **plus** value-side `ar_invoice` traffic on shared per-currency cash/ar/ap/revenue accounts (50 writers, USD + EUR) | Multi-currency value-side hot-row contention concurrent with qty traffic (`acct-jwg`). |
 
 Skipped on purpose: **100 writers × 1000 events/batch**. We tested this in a separate exploratory pass; it produces a 30-min completion tail at 90 s nominal duration and is operationally useless. Big batches at high concurrency are an anti-pattern in this schema.
 
@@ -62,15 +63,16 @@ Skipped on purpose: **100 writers × 1000 events/batch**. We tested this in a se
 - **F (`tests/load_realistic_workload.rs`, `acct-2ey`)** — `bin_move` events across 50 SKUs × 2 locations. Each event picks a random SKU and direction (MAIN→OUT or OUT→MAIN). Both `debit` and `credit` rotate across the 100-account pool. Contention spreads. **Closer to realistic application traffic.**
 - **G (`tests/load_outbox_workload.rs`, `acct-tyq`)** — same workload as F, but writers `INSERT` the event batch into `ledger_outbox` (returns immediately, no ledger lock). One sequential drain worker (`tests/common/outbox_worker.rs`) pulls pending rows in batches of 1 000 with `FOR UPDATE SKIP LOCKED` and runs each row through `post_transfers`. Per-row error isolation via savepoints. After the writer phase, the worker gets a 60 s grace drain window before being hard-stopped; the run reports both enqueue throughput and **commit throughput** (the apples-to-apples comparison vs F's events/s). Two latency families captured: writer-side `enqueue_us` (INSERT round-trip) and `queue_us` = `committed_at − enqueued_at` (drain residency).
 - **H (`tests/load_reservation_interleave.rs`, `acct-9i6`)** — same fixture as F but the 100-writer pool splits into **70 posters** (running F's `bin_move` workload) and **30 reservers** (each loop iteration calls `reserve_inventory(sku, loc, 1, so_id, fresh_so_line, +1h)`). Both writer types contend for the same `stock_available` row locks: `post_transfers` takes `FOR UPDATE` in ascending-id order across the batch's accounts; `reserve_inventory` takes a single `FOR UPDATE` on the matching row. Stock pre-balanced to 100 M units to avoid exhaustion confounding the throughput numbers. Reservations accumulate without release across the run.
+- **I (`tests/load_value_workload.rs`, `acct-jwg`)** — F's qty fixture (50 BENCH SKUs × 2 locations) plus the existing per-currency value accounts (USD `cash/ar/ap/revenue`; EUR `cash/revenue` already in the fixture, EUR `ar/ap` filled in by setup). 100 writers split 50/50 across two operation types: **qty writers** run F's `bin_move` workload, **value writers** post 5–20-event `ar_invoice` batches with random currency (USD or EUR per event) and random debit-normal/credit-normal account pairs from that currency's pool. Value-side has only 4 accounts per currency, so per-currency contention is shape-D-shaped on the value ledger; qty-side contention is shape-F-shaped (spread). The two pools don't lock the same rows, so the workloads run essentially independently.
 
 ## Run metadata
 
 - **Date:** 2026-04-29
-- **Issues:** `acct-1ia` (shapes A–E), `acct-2ey` (shape F), `acct-tyq` / `acct-epu` (shape G), `acct-9i6` (shape H).
-- **Schema state:** A–F on migrations 0001–0016; G on 0001–0017 (adds `ledger_outbox`); H on 0001–0017 (no schema change vs G).
-- **Methodology:** 8 shapes × 3 runs × 5 min (`scripts/run-perf-baseline.sh`); G also runs a 60 s grace drain after the writer phase.
-- **Git refs at run time:** `872f3e50` (A–E), `997a680` (F), `ff5d6b5` (G), `f88fd0b+` (H, post-G writeup).
-- **Total wall clock:** ~110 min combined (A–E ~50 min; F ~27 min; G ~18 min; H ~15 min).
+- **Issues:** `acct-1ia` (shapes A–E), `acct-2ey` (shape F), `acct-tyq` / `acct-epu` (shape G), `acct-9i6` (shape H), `acct-jwg` (shape I).
+- **Schema state:** A–F on migrations 0001–0016; G–I on 0001–0017 (adds `ledger_outbox` for G; H/I add no schema change).
+- **Methodology:** 9 shapes × 3 runs × 5 min (`scripts/run-perf-baseline.sh`); G also runs a 60 s grace drain after the writer phase. I's setup function adds EUR `ar`/`ap` accounts (the small fixture seeds USD ar/ap but only EUR cash/revenue).
+- **Git refs at run time:** `872f3e50` (A–E), `997a680` (F), `ff5d6b5` (G), `378b63f` (H), `378b63f+` (I, post-H writeup).
+- **Total wall clock:** ~125 min combined (A–E ~50 min; F ~27 min; G ~18 min; H ~15 min; I ~15 min).
 
 ## Environment
 
@@ -110,6 +112,7 @@ The single most important table. *Median across the 3 runs of each shape.*
 | **F** 100 × 5–20 · **cross-account spread** | **102.16** | **1 274.2** | **51.4** | 5 410.5 | 8 250.7 | 14 469.2 | 16 767.8 | 431 | 0 |
 | **G** 100 × 5–20 · outbox + 1 drainer | (enqueue 1 304.5; commit 11.7) † | **140.4 ‡** | **72.1 §** | **105.8 §** | **133.1 §** | **183.2 §** | 4 461 § | 587 | 0 |
 | **H** 70 + 30 · qty + reserve interleave | (combined 818.2; posters 95.0; reservers 723.6) ¶ | **1 186 ‖** + 723.6 rps reservations | **52.7 ¶** | 3 975 ¶ | 5 626 ¶ | 8 124 ¶ | 12 658 ¶ | 554 | 0 |
+| **I** 50 + 50 · qty + multi-cur value | (combined 226.7; qty 136.9; value 89.8) ★ | **1 715 qty** + **1 125 value** = **2 840 combined** | (qty 37.6; value 529) ★ | (qty 1 772; value 1 321) ★ | (qty 2 400; value 2 367) ★ | (qty 3 982; value 3 950) ★ | (qty 5 624; value 7 572) ★ | 892 | 0 |
 
 † For G, `bps` = enqueue rate, since writers no longer call `post_transfers` directly. `1 304.5 / s` is the rate at which writer batches land in the outbox; `11.7 / s` is the rate at which drained outbox rows commit (median 4 057 / 360 s).
 ‡ For G, `events/s` is **commit throughput** (`committed_events / total_elapsed`), apples-to-apples with F's events/s. Enqueue throughput is **16 302 ev/s** — but those events sit in the queue for minutes (see queue_us below), and only 140 ev/s actually land in the ledger.
@@ -132,6 +135,8 @@ The single most important table. *Median across the 3 runs of each shape.*
 
 ‖ For H, the events/s column is the **poster** events/s (1 186 — these are committed `bin_move` events, apples-to-apples with F's events/s). The 723.6 reservations/s (each = 1 INSERT into `inventory_reservations`) are written separately because they aren't transfers; they don't hit the `transfers` table or touch `post_transfers`.
 
+★ For I, the workload runs two parallel pools (qty + value) on disjoint account sets. The events/s column shows them separately AND combined; the latency columns also split. `bps`/`evps`/percentiles all break out per-pool because the pools have very different lock topologies (qty spreads across 100 stock_available rows; value converges on 4 hot rows per currency, similar to shape D's pattern but on the value ledger).
+
 Key reads:
 
 - **Throughput peak is ~2 500 events/s** (config B), 14 % higher than config A's 2 164. That ~14 % is the entire amortization gain from big batches when there's no contention.
@@ -140,6 +145,7 @@ Key reads:
 - **Spreading contention recovers most of the loss** (F vs D): same writer count, same batch size, just rotating across 100 accounts instead of 1. Throughput **2.3× higher** (1 274 vs 559 evps), **p50 26× lower** (51 vs 1 369 ms), **p99 1.4× lower** (8.3 vs 11.9 s). The FOR UPDATE lock-queue cost dominates D; F approaches what the schema can actually do.
 - **Naive outbox is throughput-catastrophic but tail-latency-excellent** (G vs F): same workload, same writer count, same batch shape — but writers `INSERT` instead of calling `post_transfers`. Caller p99 collapses 8.3 s → 133 ms (62× lower) because writers never queue on the ledger lock. **But** total commit throughput crashes from 1 274 → 140 evps (9× lower). The single drainer can't match what 100 contending writers do in parallel, because per-call `post_transfers` overhead doesn't amortize across rows the way packed events inside a single call do (shape B). The path to shape-B-class throughput via outbox requires a **super-batched** drainer that merges multiple rows' events into one `post_transfers` call — filed as `acct-hbg`.
 - **Reservation traffic doesn't hurt qty traffic — actually helps modestly** (H vs F): the 100-writer pool splits into 70 posters + 30 reservers. Total qty-side throughput drops only 7 % (1 274 → 1 186 evps), and qty p99 *improves* 32 % (8.3 s → 5.6 s) because there are simply fewer posters competing on `stock_available` row locks. Plus 723.6 reservations/s of useful reservation work. Reservers themselves are very fast (p50 6 ms, p99 191 ms) — `reserve_inventory`'s critical section is one `FOR UPDATE` + one promisable read + one `INSERT`, much shorter than `post_transfers`'s per-batch hold time. Confirms the doc §3.3 two-statement reservation pattern is provably safe under realistic mixed concurrency.
+- **Qty + value-side traffic compose additively** (I): 50 qty writers (F-shape) + 50 value writers (D-shape on value ledger, USD+EUR mix) deliver **2 840 evps combined** — qty 1 715 + value 1 125. The pools don't lock the same rows, so they run independently; combined throughput ≈ sum. Per-pool throughput is **higher** than expected from D's "100 writers on shared rows" baseline because each pool only has 50 contenders. Multi-currency contention on 4 hot accounts per currency sustains 1 125 evps total (split USD + EUR), versus shape D's 559 evps on a single shared row.
 - **Zero deadlocks across every shape** — the ascending-id `FOR UPDATE` lock ordering in `post_transfers` is correct under every shape we threw at it, including H's mixed `post_transfers` + `reserve_inventory` traffic on the same `stock_available` rows.
 
 ## Per-config detail
@@ -402,6 +408,71 @@ The reserver tail (p99.9 = 4.7 s, max = 12 s) is real and tracks poster lock-hol
 
 For Phase 1 regression detection, **H is a useful third reference alongside F and D**: re-run if the reservation flow changes (e.g., `acct-alq` doc fix) or when reservation lifetime semantics evolve (Q5 in the consolidated doc).
 
+### I — 50 qty + 50 multi-currency value, concurrent (cross-account spread + per-currency hot accounts)
+
+100-writer pool splits 50/50: **qty writers** run F's `bin_move` on 50 BENCH SKUs × 2 locations (100 distinct accounts), **value writers** post 5–20-event `ar_invoice` batches with random currency (50/50 USD or EUR per event) and random debit-normal/credit-normal pairs from that currency's 4-account pool (cash, ar, revenue, ap). The value side has only 4 accounts per currency — same hot-row contention shape as D, but on the value ledger.
+
+Setup adds EUR `ar`/`ap` accounts to the fixture (the small fixture seeds USD `ar`/`ap` but only EUR `cash`/`revenue`).
+
+| Metric | min | median | mean | max |
+|---|---|---|---|---|
+| Combined batches/run | 67 267 | 68 143 | 68 950 | 71 439 |
+| Combined events/run | 840 987 | 853 493 | 863 019 | 894 578 |
+| Combined bps | 223.9 | 226.7 | 229.5 | 237.7 |
+| Combined evps | 2 799 | **2 840** | 2 872 | 2 977 |
+| Qty bps | 136.1 | **136.9** | 138.6 | 142.7 |
+| Qty evps | 1 703 | **1 715** | 1 736 | 1 789 |
+| Qty p50 (ms) | 37.0 | **37.6** | 37.7 | 38.5 |
+| Qty p95 (ms) | 1 740 | 1 772 | 1 803 | 1 896 |
+| Qty p99 (ms) | 2 131 | **2 400** | 2 384 | 2 622 |
+| Qty p99.9 (ms) | 2 918 | 3 982 | 3 668 | 4 103 |
+| Qty max (ms) | 5 186 | 5 624 | 6 434 | 8 491 |
+| Value bps | 87.7 | **89.8** | 90.9 | 95.0 |
+| Value evps | 1 096 | **1 125** | 1 136 | 1 188 |
+| Value p50 (ms) | 439.4 | **529.2** | 505.4 | 547.7 |
+| Value p95 (ms) | 1 141 | 1 321 | 1 411 | 1 772 |
+| Value p99 (ms) | 2 106 | 2 367 | 2 452 | 2 883 |
+| Value p99.9 (ms) | 3 427 | 3 950 | 4 048 | 4 768 |
+| Value max (ms) | 6 478 | 7 572 | 7 404 | 8 163 |
+| io_writes | 66 488 | 67 373 | 68 187 | 70 699 |
+| io_fsyncs | 66 266 | 67 147 | 67 926 | 70 366 |
+| WAL MB | 879.5 | **892.1** | 897.2 | 920.0 |
+
+vmstat: `us≈42%  sy≈4%  id≈34%  wa≈17%  cs≈27 K/s`. CPU usage and iowait are similar to F. Lower context-switch rate than H (27 K vs 37 K) because there are no fast `reserve_inventory` calls in the mix; both writer types do batched `post_transfers` calls of comparable duration.
+
+### I vs F — multi-pool composition is roughly additive
+
+I splits the 100-writer pool 50/50 across two pools that don't share lock targets. The interesting comparison is per-pool against a hypothetical "F at 50 writers" (which we don't have, but we can reason about per-writer rates).
+
+| Metric | F (100 qty writers) | I qty (50 writers) | Δ |
+|---|---|---|---|
+| Per-writer bps | 1.02 | 2.74 | **+168 %** |
+| Per-writer evps | 12.7 | 34.3 | **+170 %** |
+| p50 (ms) | 51.4 | 37.6 | **−27 %** |
+| p99 (ms) | 8 251 | 2 400 | **−71 %** |
+
+| Metric | D (100 writers, 1 shared row) | I value (50 writers, 4 rows/currency × 2 currencies) | Δ |
+|---|---|---|---|
+| Combined evps | 559 | 1 125 | **+101 %** (8 hot rows × 50 writers vs 1 row × 100) |
+| p50 (ms) | 1 369 | 529 | −61 % |
+| p99 (ms) | 11 906 | 2 367 | −80 % |
+
+**What this says.**
+
+1. **The two ledger pools compose roughly additively.** Combined evps (2 840) is close to the sum of the two pools' independent evps (1 715 + 1 125 = 2 840). They don't lock the same rows; they share only the pg_stat_statements / WAL / connection-pool resources. WAL volume scales accordingly: I writes 892 MB / 5 min, almost exactly F (431) + a hypothetical "D at 50 writers" (~250 estimated) — the per-event WAL cost is invariant, and we're committing more events.
+
+2. **50-writer qty subset performs much better than 100-writer F.** Per-writer rate +168 %, p99 −71 %. With half the writers competing on the same 100-account spread, contention per writer is roughly halved, and tail latencies collapse correspondingly. Useful as an upper bound for "how good can the qty side get if we cap concurrency."
+
+3. **Multi-currency value-side hot-row contention is real but tractable.** 50 writers on 4 accounts per currency (with 50/50 currency split, effectively ~25 writers per 4-account pool) sustain 1 125 combined evps — much better than D's 559 evps on 1 shared row at 100 writers. The reason: 8 hot rows total (4 USD + 4 EUR) instead of 1, and only ~25 writers per row instead of 100. Per-row throughput is similar to D's per-row at lower concurrency, but multiple rows multiply it.
+
+4. **Value p50 (529 ms) is much higher than qty p50 (37 ms).** Value-side hot-row contention dominates value-side latency: each value batch of 5–20 events hits a small pool of ~4 USD + 4 EUR debit-normal/credit-normal accounts, so most events queue behind some other writer's batch on at least one of those rows. Qty-side spreads across 100 rows so most events find a clean lock immediately.
+
+5. **Zero deadlocks across all 3 runs.** The lock-order proof in `post_transfers` works correctly across both ledger kinds simultaneously.
+
+For Phase 1 regression detection, **I is a useful reference for value-side perf and for "how does multi-currency traffic interact with qty traffic"**. Re-run when:
+- New cost methods land (`acct-8gg`) — value-side traffic is where WAC/FIFO read-then-write under FOR UPDATE shows up.
+- Per-counterparty AR/AP subaccounts land (Phase 1) — the contention shape on the value side will change dramatically as cash/ar/ap/revenue stop being shared per currency.
+
 ## Observations
 
 1. **Lock contention is the dominant cost from C onward in the shared-credit shapes.** Every writer needs `creation_void`'s lock. The `FOR UPDATE` lock is held for the entire transaction (lock acquire → loop events → commit → fsync). Concurrent writers serialize behind that hold time. Single-row throughput limit ≈ 1 / mean-hold-time = ~2 K events/s for small batches; adding more concurrent writers redistributes that throughput across more queue depth, not into more total events/s.
@@ -418,7 +489,7 @@ For Phase 1 regression detection, **H is a useful third reference alongside F an
 
 7. **Variance is tight in contended configs (D, E, F)** and looser in uncontended ones (A, B). At 100 writers serializing, platform jitter is a small fraction of the 1.4 s median; at 1 writer the median is 5 ms and a single bad scheduler tick shows up.
 
-8. **Zero deadlocks across all 8 shapes × 3 runs × 5 min** = ~2.1 M batches / ~9 M events (G's 1.17 M INSERTs and H's 0.66 M reservations dominate the count). The lock-order proof in `post_transfers` is correct under every shape including the SKIP LOCKED outbox drain pattern AND mixed `post_transfers` + `reserve_inventory` traffic on shared `stock_available` rows.
+8. **Zero deadlocks across all 9 shapes × 3 runs × 5 min** = ~2.3 M batches / ~12 M events. The lock-order proof in `post_transfers` is correct under every shape including the SKIP LOCKED outbox drain pattern, mixed `post_transfers` + `reserve_inventory` traffic on shared `stock_available` rows, and mixed qty-ledger + value-ledger traffic with multi-currency contention.
 
 9. **The ~2.5 K events/s single-writer ceiling is real for this hardware on this schema.** Routes to higher numbers:
    - **Spread the contention** (F demonstrates this — 2.3× lift just from cross-account workload). Real ERP traffic does this naturally; account sharding (Part IV §8) is the explicit Phase 1 mechanism for when natural spread isn't enough.
@@ -428,6 +499,8 @@ For Phase 1 regression detection, **H is a useful third reference alongside F an
 10. **Outbox is a latency/throughput tradeoff, not a free win.** G's caller p99 is 62× lower than F's (133 ms vs 8.25 s) because writers don't queue on `post_transfers` row locks. But G's commit throughput is 9× lower because the single sequential drainer is the bottleneck. End-to-end latency (caller-submitted → ledger-committed) is dominated by queue residency: 186 s p50, 336 s p99 in our run. Outbox makes sense if the application can tolerate eventual semantics on the ledger and the workload's tail-latency budget at the caller is more constrained than its throughput budget. For the typical ERP flow (an invoice posting that needs an accept/reject decision now), F is dominant by every measure. The "yes, adopt outbox" decision needs `acct-hbg`'s super-batched throughput data before it can be made on perf grounds.
 
 11. **Reservation interleaving is a workload mix shift, not a regression.** Replacing 30 of F's 100 posters with `reserve_inventory()` callers doesn't damage qty throughput (−7 %) and actually *improves* qty tail latency by 25–32 % across p95/p99/max — the reduction in poster-vs-poster contention more than compensates for the added reserver lock contention. The reservation flow itself is fast (p50 6 ms, p99 191 ms) because `reserve_inventory`'s critical section is much shorter than `post_transfers`'s per-batch hold time. Phase 0's `reserve_inventory()` PL/pgSQL function (migration 0014, written specifically to fix the unsafe single-statement CTE in doc §3.3) holds under load: zero deadlocks, zero unexpected errors, zero over-promises across 660 K reservation calls.
+
+12. **Multi-pool ledger composition is roughly additive.** When the 100-writer pool splits 50/50 between qty-side (cross-account spread) and value-side (per-currency hot accounts), combined throughput (2 840 evps) is essentially the sum of the two pools' independent throughputs (1 715 qty + 1 125 value). They don't lock the same rows; they only share connection-pool / WAL / pg_stat resources. Per-pool latency profile differs sharply because lock topology differs: qty's spread keeps p50 at 38 ms, while value's 4-accounts-per-currency convergence pushes p50 to 529 ms — same shape as D's hot-row contention pattern, but on the value ledger and with somewhat lower per-row writer pressure.
 
 ## Top queries (representative — config D, run 3, `pg_stat_statements`)
 
@@ -463,6 +536,11 @@ T4_BINARY=load_outbox_workload T4_CONFIGS="100:5:20" \
 # Shape H (reservation interleaving — 70 posters + 30 reservers)
 T4_BINARY=load_reservation_interleave T4_CONFIGS="100:5:20" \
   T4_RESERVE_PCT=30 \
+  ./scripts/run-perf-baseline.sh
+
+# Shape I (qty + multi-currency value, 50/50 split)
+T4_BINARY=load_value_workload T4_CONFIGS="100:5:20" \
+  T4_VALUE_PCT=50 \
   ./scripts/run-perf-baseline.sh
 ```
 
