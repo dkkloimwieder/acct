@@ -109,7 +109,14 @@ Phase 0 calls it **synchronously inside the same Postgres transaction** as docum
 
 `document_line_id`, `routing_op`, `counterparty_id` are optional and may be omitted. All other fields are required — the function does **not** validate field presence upfront; missing required fields surface as Postgres cast or NOT NULL errors.
 
-In Phase 0 the caller pre-computes `amount`. W2 (acct-93b.15) adds a **gating** dispatch on `skus.cost_method` for cost-relevant reasons (`op_move`, `scrap`, `wo_complete`, `so_ship`): if the resolved sku's cost_method is anything other than `'standard'`, the function raises `P0006` (see error table below). Caller still computes `amount` themselves (`qty × skus.standard_cost`). The function-computed-amount path required for non-standard cost methods is tracked as `acct-0ig`, which `acct-8gg` (WAC/FIFO/lot) depends on.
+**Bifurcated input contract for cost-relevant reasons** (acct-0ig, migration 0019). For reasons in `{op_move, scrap, wo_complete, so_ship}`:
+
+- **Value-ledger events**: caller MUST send `qty`, NOT `amount`. The function computes amount via the `_post_transfers_compute_amount` dispatcher keyed on `skus.cost_method`. Caller-supplied `amount` is ignored on these events.
+- **Qty-ledger events**: caller still sends `amount` (= qty by convention). Unchanged from earlier behavior.
+
+The dispatcher's `'standard'` branch is real: `amount = qty × skus.standard_cost`. The `'wac'`, `'lot'`, `'fifo'` branches RAISE `P0006` with a TODO referencing their downstream issues (`acct-uxu` for WAC, `acct-8gg` for lot/FIFO). When a non-`standard` SKU is referenced via a cost-relevant qty-side event, the function still raises `P0006` (qty-side gate), preserving migration 0013's behavior — that gate relaxes when WAC ships.
+
+For all other reasons (anything not in the cost-relevant set): caller sends `amount`. Unchanged.
 
 ### Per-event return
 
@@ -129,7 +136,7 @@ In Phase 0 the caller pre-computes `amount`. W2 (acct-93b.15) adds a **gating** 
 | `P0003` | `currency_mismatch` | both ledger_kind=`'value'`, currencies differ |
 | `P0004` | `period_missing` | no period contains `business_date` |
 | `P0005` | `period_closed` | period `closed_at IS NOT NULL` and `p_override_closed_period = FALSE` |
-| `P0006` | `cost_method_not_implemented` | `reason ∈ {op_move, scrap, wo_complete, so_ship}` and resolved sku's `cost_method ≠ 'standard'` (or sku not resolvable from either account) |
+| `P0006` | `cost_method_not_implemented` | `reason ∈ {op_move, scrap, wo_complete, so_ship}` AND any of: (a) sku not resolvable from either account, (b) sku's `cost_method ≠ 'standard'` on a qty-side event, (c) value-side event missing `qty`, (d) value-side event with sku's `cost_method ∈ {'wac','lot','fifo'}` (raised inside the dispatcher) |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 

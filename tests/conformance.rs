@@ -72,7 +72,15 @@ struct EventInput {
     reason: String,
     debit: Selector,
     credit: Selector,
-    amount: i64,
+    /// Optional after acct-0ig: cost-relevant value-side events use
+    /// `qty` instead. Cases providing neither pass through and let
+    /// the function raise (used for negative cases).
+    #[serde(default)]
+    amount: Option<i64>,
+    /// Bifurcated input contract per acct-0ig: cost-relevant value-side
+    /// events carry `qty` and the function computes amount internally.
+    #[serde(default)]
+    qty: Option<i64>,
     business_date: String,
     #[serde(default)]
     idempotency_tag: Option<String>,
@@ -182,12 +190,17 @@ async fn build_event_json(
         "document_id":       fresh_uuid_str(rng),
         "debit_account_id":  debit_id,
         "credit_account_id": credit_id,
-        "amount":            ev.amount,
         "business_date":     ev.business_date,
         "idempotency_key":   key,
         "posted_by":         fresh_uuid_str(rng),
     });
     let m = obj.as_object_mut().unwrap();
+    if let Some(a) = ev.amount {
+        m.insert("amount".into(), json!(a));
+    }
+    if let Some(q) = ev.qty {
+        m.insert("qty".into(), json!(q));
+    }
     if let Some(v) = &ev.document_line_id {
         m.insert("document_line_id".into(), json!(v));
     }

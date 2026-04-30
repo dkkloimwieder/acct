@@ -1123,9 +1123,11 @@ For long-cycle/regulated job-cost WOs, opt in to per-WO per-op accounts at WO cr
 
 **Default: standard costing with variance capture.** Standard costs from `skus.standard_cost` and `routings.std_*_cost`. PPV at receipt, MUV/LV/OHV at apply, scrap_v at scrap, wo_close_v at close.
 
-**WAC available without performance penalty.** Read-then-write under lock is safe in Postgres (B2 resolved). The choice between standard, WAC, or hybrid is now business-driven, not system-constrained.
+**Cost is computed inside `post_transfers`.** As of acct-0ig (migration 0019), the value-side amount on cost-relevant events (`op_move`, `scrap`, `wo_complete`, `so_ship`) is computed by a dispatcher helper keyed on `skus.cost_method`. The system is the cost engine — there is no external cost engine. Phase 0 ships only the `'standard'` branch (`amount = qty × skus.standard_cost`); other branches RAISE `P0006` with TODO comments.
 
-**FIFO/LIFO cost layers remain out of scope.** If needed, an external cost engine produces unit costs and posts the resulting transfer; the ledger does not maintain layers.
+**WAC available without performance penalty.** Read-then-write under lock is safe in Postgres (B2 resolved). The implementation needs a schema decision (per-location and per-routing-op granularity on value accounts; tracked as `acct-5re`) before WAC can land cleanly. Filed for implementation as `acct-uxu`.
+
+**FIFO/LIFO scaffolded but unimplemented.** The dispatcher has FIFO/LIFO branches that RAISE `P0006`. Real implementation requires lot-tracking infrastructure (lot creation, expiry, traceability), which is a feature larger than just costing. Tracked as `acct-8gg` once lot infrastructure is scoped.
 
 ### 4.3 Operational queries
 
