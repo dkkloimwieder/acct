@@ -1123,7 +1123,6 @@ The schema partitions value accounts by the same dimensions as their qty-side co
 | `inv_value_wip` (value) | `(sku, routing_op, currency)` | Per-op WIP value pool — pairs with `stock_wip`. |
 | `inv_value_fg` (value) | `(sku, location, currency)` | Per-location finished-goods value pool — pairs with `stock_available` (FG location). |
 | `cogs`, `revenue`, `cash`, `ar`, `ap`, `variance_*`, `labor_applied`, etc. | `(currency)` only | No per-sku, per-loc, or per-op partition. Aggregated. |
-| `price_trueup_inventory`, `price_trueup_cogs`, `price_trueup_wip` | `(sku, currency)` | Per-SKU variance accounts (no location/op). |
 
 **Per-WO breakdown:** reconstructed via `SELECT * FROM transfers WHERE document_kind='work_order' AND document_id=$wo_id`. Single B-tree lookup, no projector required.
 

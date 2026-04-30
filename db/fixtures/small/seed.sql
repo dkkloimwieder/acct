@@ -69,13 +69,21 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('cogs',                 'value', 'USD', 'debit'),
   ('variance_wo_close',    'value', 'USD', 'unrestricted');
 
--- SKU-A value accounts (USD)
-INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id)
-  SELECT 'inv_value_raw', 'value', 'USD', 'debit', id FROM skus WHERE code='SKU-A';
-INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id)
-  SELECT 'inv_value_wip', 'value', 'USD', 'debit', id FROM skus WHERE code='SKU-A';
-INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id)
-  SELECT 'inv_value_fg',  'value', 'USD', 'debit', id FROM skus WHERE code='SKU-A';
+-- SKU-A value accounts (USD).
+-- After acct-nfr (migration 0020), value accounts partition by the
+-- same dimensions as their qty-side counterparts:
+--   inv_value_raw / inv_value_fg -> (sku, location, currency)
+--   inv_value_wip                -> (sku, routing_op, currency)
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, location_id)
+  SELECT 'inv_value_raw', 'value', 'USD', 'debit', s.id, l.id
+    FROM skus s, locations l WHERE s.code='SKU-A' AND l.code='MAIN';
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, routing_op)
+  SELECT 'inv_value_wip', 'value', 'USD', 'debit', s.id, 10 FROM skus s WHERE s.code='SKU-A';
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, routing_op)
+  SELECT 'inv_value_wip', 'value', 'USD', 'debit', s.id, 20 FROM skus s WHERE s.code='SKU-A';
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, location_id)
+  SELECT 'inv_value_fg',  'value', 'USD', 'debit', s.id, l.id
+    FROM skus s, locations l WHERE s.code='SKU-A' AND l.code='MAIN';
 
 -- SKU-A qty accounts: stock_available x 2 locations, stock_wip x 2 routing_ops, stock_consumed
 INSERT INTO accounts (kind, ledger_kind, sku_id, location_id, normal_side)
