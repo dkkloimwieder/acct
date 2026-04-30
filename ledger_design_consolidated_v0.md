@@ -1113,11 +1113,23 @@ events:
 
 ### 4.1 Account grain
 
-- **WIP qty:** one account per `(parent_sku, routing_op)`. Aggregated across WOs.
-- **WIP value:** one account per `(parent_sku, routing_op, currency)`. Aggregated.
-- **Per-WO breakdown:** reconstructed via `SELECT * FROM transfers WHERE document_kind='work_order' AND document_id=$wo_id`. Single B-tree lookup, no projector required.
+The schema partitions value accounts by the same dimensions as their qty-side counterparts so WAC-style cost computation can be done per-pool with a clean lookup.
+
+| Account kind | Partitioned by | Notes |
+|---|---|---|
+| `stock_available` (qty) | `(sku, location)` | Per migration 0006 `accounts_stock_avail_uk`. |
+| `stock_wip` (qty) | `(sku, routing_op)` | Per migration 0006 `accounts_wip_uk`. WIP qty is intrinsic to an op; location is not on the key. |
+| `inv_value_raw` (value) | `(sku, location, currency)` | Per-location raw-materials value pool — pairs with `stock_available`. |
+| `inv_value_wip` (value) | `(sku, routing_op, currency)` | Per-op WIP value pool — pairs with `stock_wip`. |
+| `inv_value_fg` (value) | `(sku, location, currency)` | Per-location finished-goods value pool — pairs with `stock_available` (FG location). |
+| `cogs`, `revenue`, `cash`, `ar`, `ap`, `variance_*`, `labor_applied`, etc. | `(currency)` only | No per-sku, per-loc, or per-op partition. Aggregated. |
+| `price_trueup_inventory`, `price_trueup_cogs`, `price_trueup_wip` | `(sku, currency)` | Per-SKU variance accounts (no location/op). |
+
+**Per-WO breakdown:** reconstructed via `SELECT * FROM transfers WHERE document_kind='work_order' AND document_id=$wo_id`. Single B-tree lookup, no projector required.
 
 For long-cycle/regulated job-cost WOs, opt in to per-WO per-op accounts at WO creation time. Close them via `is_closed=true` on WO completion. Default off; enable per SKU family or WO type.
+
+**Phase 0 schema state:** migration 0006 ships value accounts with UK `(kind, sku_id, currency)` only — pre-WAC, this works because cost is global per (sku, currency) on the standard path. The per-location / per-op partition lands as a single migration when WAC is implemented (`acct-uxu`'s prereq — schema migration sub-issue).
 
 ### 4.2 Cost method
 
