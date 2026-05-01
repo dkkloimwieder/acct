@@ -1300,7 +1300,18 @@ For long-cycle/regulated job-cost WOs, opt in to per-WO per-op accounts at WO cr
 
 **Cost is computed inside `post_transfers`.** As of acct-0ig (migration 0019), the value-side amount on cost-relevant events (`op_move`, `scrap`, `wo_complete`, `so_ship`) is computed by a dispatcher helper keyed on `skus.cost_method`. The system is the cost engine — there is no external cost engine.
 
-**Implemented branches:** `'standard'` (migration 0019, `amount = qty × skus.standard_cost`) and `'wac_perpetual'` (migration 0021 / `acct-uxu`, with the `'wac'` → `'wac_perpetual'` rename in migration 0023 / `acct-5ox`; `amount = qty × value_pool_balance / qty_pool_balance` with FOR UPDATE on both pool accounts). The qty-side gate relaxes for both. `wac_perpetual` raises `P0006` only when the qty pool is zero.
+**Implemented branches:** `'standard'` (migration 0019, `amount = qty × resolve_standard_cost_at(sku, business_date)` after the standard-cost refactor in migration 0027 / `acct-x4t`) and `'wac_perpetual'` (migration 0021 / `acct-uxu`, refactored in migration 0030 / `acct-1vr` for per-class qty correctness). The qty-side gate relaxes for both. `wac_perpetual` raises `P0006` only when the qty pool is zero.
+
+**Per-class qty divisor (acct-1vr, migration 0030).** `wac_perpetual` and `wac_periodic` no longer divide by `stock_available.balance` — that account pools qty across raw and fg lifecycle states for the same `(sku, location)`, which gave incorrect per-class unit costs when a SKU had multiple value pools active. Instead, the divisor is a per-pool sum from transfer history:
+
+```sql
+SELECT SUM(CASE WHEN t.debit_account_id  = pool_id THEN  t.qty
+                WHEN t.credit_account_id = pool_id THEN -t.qty END)
+  FROM transfers t
+ WHERE pool_id IN (t.debit_account_id, t.credit_account_id) AND t.qty IS NOT NULL
+```
+
+Each transfer that touches the value pool carries `qty` (added as a column in 0030, populated at INSERT time from the event JSONB), so the sum is class-isolated. Numerator (`pool.balance`) is unchanged — value-side accounts are already partitioned per class. `_post_transfers_lookup_qty_account` is retained for `post_transfers`'s lock pre-scan but no longer participates in divisor computation.
 
 **Three WAC variants (Oracle/PeopleSoft taxonomy).** `wac_perpetual` is one of three textbook variants:
 - `wac_perpetual` — live average, recomputed on every putaway (shipped).

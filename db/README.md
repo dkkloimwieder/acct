@@ -114,7 +114,9 @@ Phase 0 calls it **synchronously inside the same Postgres transaction** as docum
 - **Value-ledger events**: caller MUST send `qty`, NOT `amount`. The function computes amount via the `_post_transfers_compute_amount` dispatcher keyed on `skus.cost_method`. Caller-supplied `amount` is ignored on these events.
 - **Qty-ledger events**: caller still sends `amount` (= qty by convention). Unchanged from earlier behavior.
 
-The dispatcher has two real branches: `'standard'` (`amount = qty × skus.standard_cost`) and `'wac'` (acct-uxu, migration 0021 — `amount = qty × (value_pool_balance / qty_pool_balance)` with FOR UPDATE on both pool accounts; raises `P0006` only when the qty pool is zero). The `'lot'` and `'fifo'` branches RAISE `P0006` with a TODO referencing `acct-8gg`. The qty-side gate relaxes for `'wac'` (so SKU-WAC stock_available transfers post normally); it still fires for `'lot'`/`'fifo'`.
+The dispatcher has these real branches: `'standard'` (`amount = qty × resolve_standard_cost_at(sku, business_date)` after migration 0027), `'wac_perpetual'` and `'wac_periodic'` (migration 0030 / `acct-1vr`: `amount = qty × (pool_value_balance / per_class_qty)` where `per_class_qty` is `SUM(transfers.qty signed by debit/credit on the value pool)` — no longer `stock_available.balance`, which would have pooled raw and fg qty for the same SKU). The `'lot'` and `'fifo'` branches RAISE `P0006` with a TODO referencing `acct-8gg`. The qty-side gate relaxes for `'standard'`, `'wac_perpetual'`, and `'wac_periodic'`.
+
+**Per-event qty column on `transfers`** (acct-1vr, migration 0030). `transfers.qty BIGINT NULL` carries the physical quantity for inventory-touching events. Populated at INSERT time from the event JSONB or, for qty-leg events where both sides are `ledger_kind='qty'`, inferred from `amount`. NULL for non-inventory transfers (cash, AR, AP, FX) and pre-0030 historical rows. The new column is what makes per-class WAC math work: each value pool's qty divisor is computed from its own transfer history, not the pooled `stock_available` balance.
 
 For all other reasons (anything not in the cost-relevant set): caller sends `amount`. Unchanged.
 
