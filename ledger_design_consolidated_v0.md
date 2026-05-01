@@ -1142,11 +1142,13 @@ Notes:
 | `cost_method` | `p_unit_cost = NULL` | `p_unit_cost = explicit` |
 |---|---|---|
 | `standard` | use `skus.standard_cost` | **P0011** — standard SKUs have a fixed cost; do not pass one |
-| `wac` IN | use pool average; **P0011** if pool empty (caller must seed) | use it; pool re-averages |
-| `wac` OUT | use pool average (classic WAC; pool average preserved) | use it; pool average drifts to reflect the true remaining cost (caller has asserted lot knowledge) |
-| `fifo` / `lot` | always **P0006** | always **P0006** |
+| `wac_perpetual` IN | use pool average; **P0011** if pool empty (caller must seed) | use it; pool re-averages |
+| `wac_perpetual` OUT | use pool average (classic WAC; pool average preserved); **P0010** if pool empty | **P0011** — asserted-cost-on-depletion belongs in `'lot'` cost_method (see `acct-8gg`) |
+| `wac_periodic` | always **P0006** (`acct-qfj`; depends on period-close machinery) | always **P0006** |
+| `wac_retroactive` | always **P0006** (`acct-9tw`; depends on period-close machinery) | always **P0006** |
+| `fifo` / `lot` | always **P0006** (`acct-8gg`) | always **P0006** |
 
-The WAC OUT explicit path is the deliberate concession that real-world adjustments often involve partial lot knowledge: if the caller knows the leaving material was cheaper than the pool average, asserting the cost lets the pool drift up to reflect what is genuinely left. This conceptually departs from textbook WAC (which preserves average on OUT) but produces honest accounting given the caller's information. True lot identity is `acct-8gg`'s domain. The audit row records the **effective** unit cost — what was actually applied — not the caller's input.
+WAC perpetual is one of three textbook WAC variants (per Oracle/PeopleSoft): perpetual (live average, recomputed every putaway), periodic (single average per period applied at close), and retroactive perpetual (perpetual chain with late-data corrections at close). Phase 1 ships only perpetual; the other two are filed as future epics. The audit row records the **effective** unit cost — what was actually applied — not the caller's input.
 
 ## §4. WIP model
 
@@ -1175,7 +1177,12 @@ For long-cycle/regulated job-cost WOs, opt in to per-WO per-op accounts at WO cr
 
 **Cost is computed inside `post_transfers`.** As of acct-0ig (migration 0019), the value-side amount on cost-relevant events (`op_move`, `scrap`, `wo_complete`, `so_ship`) is computed by a dispatcher helper keyed on `skus.cost_method`. The system is the cost engine — there is no external cost engine.
 
-**Implemented branches:** `'standard'` (migration 0019, `amount = qty × skus.standard_cost`) and `'wac'` (migration 0021 / `acct-uxu`, `amount = qty × value_pool_balance / qty_pool_balance` with FOR UPDATE on both pool accounts). The qty-side gate relaxes for both. WAC raises `P0006` only when the qty pool is zero.
+**Implemented branches:** `'standard'` (migration 0019, `amount = qty × skus.standard_cost`) and `'wac_perpetual'` (migration 0021 / `acct-uxu`, with the `'wac'` → `'wac_perpetual'` rename in migration 0023 / `acct-5ox`; `amount = qty × value_pool_balance / qty_pool_balance` with FOR UPDATE on both pool accounts). The qty-side gate relaxes for both. `wac_perpetual` raises `P0006` only when the qty pool is zero.
+
+**Three WAC variants (Oracle/PeopleSoft taxonomy).** `wac_perpetual` is one of three textbook variants:
+- `wac_perpetual` — live average, recomputed on every putaway (shipped).
+- `wac_periodic` — single average per period, computed at period close, applied to all depletions in the period (filed as `acct-qfj`; depends on period-close machinery).
+- `wac_retroactive` — perpetual chain with late-data corrections at period close (filed as `acct-9tw`; depends on Epic B's machinery).
 
 **FIFO/LIFO/lot scaffolded but unimplemented.** The dispatcher's `'fifo'` and `'lot'` branches RAISE `P0006`. Real implementation requires lot-tracking infrastructure (lot creation, expiry, traceability), which is a feature larger than just costing. Tracked as `acct-8gg` once lot infrastructure is scoped.
 

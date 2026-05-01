@@ -174,9 +174,11 @@ Behavior:
 | `cost_method` | `p_unit_cost = NULL` | `p_unit_cost = explicit` |
 |---|---|---|
 | `standard` | use `skus.standard_cost` | **P0011** — standard SKUs have a fixed cost; do not pass one |
-| `wac` IN | use pool average; **P0011** if pool empty (must seed) | use it; pool re-averages |
-| `wac` OUT | use pool average (classic WAC) | use it; pool average drifts to reflect true remaining cost |
-| `fifo` / `lot` | always **P0006** | always **P0006** |
+| `wac_perpetual` IN | use pool average; **P0011** if pool empty (must seed) | use it; pool re-averages |
+| `wac_perpetual` OUT | use pool average; **P0010** if pool empty | **P0011** — asserted cost on depletion belongs in `'lot'` cost_method (acct-8gg) |
+| `wac_periodic` | always **P0006** (acct-qfj; depends on period-close machinery) | always **P0006** |
+| `wac_retroactive` | always **P0006** (acct-9tw; depends on period-close machinery) | always **P0006** |
+| `fifo` / `lot` | always **P0006** (acct-8gg) | always **P0006** |
 
   Pool reads happen under `FOR UPDATE` on the qty + value accounts, locked in ascending id order to match `post_transfers`' lock-order invariant.
 

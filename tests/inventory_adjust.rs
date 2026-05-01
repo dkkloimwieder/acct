@@ -276,77 +276,28 @@ async fn wac_out_with_null_uses_pool_avg_classic_wac() {
 }
 
 #[tokio::test]
-async fn wac_out_explicit_cheaper_drifts_pool_avg_up() {
+async fn wac_perpetual_out_with_explicit_cost_raises_p0011() {
+    // The previously-shipped explicit-cost-on-OUT extension was reverted
+    // in Epic A (acct-5ox). Asserted-cost-per-transaction belongs in
+    // 'lot' cost_method (acct-8gg), not in WAC. WAC OUT now strictly
+    // uses pool average.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
     let sku = sku_id(&pool, "SKU-WAC").await;
     let loc = loc_id(&pool, "MAIN").await;
-    let qty_acct = account_id_stock_available(&pool, "SKU-WAC", "MAIN").await;
-    let val_acct = account_id_for_selector(
-        &pool, "inv_value_fg", Some("SKU-WAC"), Some("MAIN"), Some("USD"), None,
-    )
-    .await;
 
-    // Seed: 100 at $5, 100 at $7. Pool: 200 units, $1200, avg $6.
+    // Seed pool so OUT is even possible.
     adjust(&pool, &sku, &loc, 100, Some(5), "USD", "fg", "2026-04-15",
-           &fresh_uuid(&pool).await).await.expect("a");
-    adjust(&pool, &sku, &loc, 100, Some(7), "USD", "fg", "2026-04-15",
-           &fresh_uuid(&pool).await).await.expect("b");
+           &fresh_uuid(&pool).await).await.expect("seed");
 
-    // Caller asserts: 30 leaving at $5 (the cheaper lot they know is gone).
-    // Value-side credit: 30 × $5 = $150 (not $180 at pool avg).
-    adjust(&pool, &sku, &loc, -30, Some(5), "USD", "fg", "2026-04-15",
-           &fresh_uuid(&pool).await).await.expect("out at asserted $5");
-
-    // Pool: 170 units, $1200 - $150 = $1050. New avg = 1050 / 170 ≈ 6.176
-    // (BIGINT truncates to 6 — so the assertion below uses exact values).
-    assert_eq!(balance(&pool, qty_acct).await, 170);
-    assert_eq!(balance(&pool, val_acct).await, 1050,
-               "1200 - 150 (asserted cost), not 1200 - 180 (pool avg)");
-
-    // The remaining 170 units' true average is $6.176 — drifted UP from
-    // $6 because the cheaper material left. (BIGINT division truncates
-    // to 6 for the cheap eyeball check, but the dollar-precise balance
-    // confirms the drift is recorded.)
-    let drift_check_value: i64 = balance(&pool, val_acct).await;
-    let drift_check_qty: i64 = balance(&pool, qty_acct).await;
-    assert!(drift_check_value * 100 / drift_check_qty > 600,
-            "pool avg (×100) drifted above 600 (was 600 before): got {}",
-            drift_check_value * 100 / drift_check_qty);
-}
-
-#[tokio::test]
-async fn wac_out_explicit_more_expensive_drifts_pool_avg_down() {
-    let pool = connect_test_db().await;
-    reset_to_fixture(&pool).await;
-
-    let sku = sku_id(&pool, "SKU-WAC").await;
-    let loc = loc_id(&pool, "MAIN").await;
-    let qty_acct = account_id_stock_available(&pool, "SKU-WAC", "MAIN").await;
-    let val_acct = account_id_for_selector(
-        &pool, "inv_value_fg", Some("SKU-WAC"), Some("MAIN"), Some("USD"), None,
-    )
+    let key = fresh_uuid(&pool).await;
+    expect_sqlstate("P0011", || async {
+        adjust(&pool, &sku, &loc, -30, Some(5), "USD", "fg", "2026-04-15", &key)
+            .await
+            .map(|_| ())
+    })
     .await;
-
-    // Seed: 100 at $5, 100 at $7 → pool avg $6.
-    adjust(&pool, &sku, &loc, 100, Some(5), "USD", "fg", "2026-04-15",
-           &fresh_uuid(&pool).await).await.expect("a");
-    adjust(&pool, &sku, &loc, 100, Some(7), "USD", "fg", "2026-04-15",
-           &fresh_uuid(&pool).await).await.expect("b");
-
-    // Caller asserts: 30 leaving at $7 (the expensive lot left).
-    adjust(&pool, &sku, &loc, -30, Some(7), "USD", "fg", "2026-04-15",
-           &fresh_uuid(&pool).await).await.expect("out at asserted $7");
-
-    // Pool: 170 units, $1200 - $210 = $990. Avg = 990/170 ≈ 5.82.
-    assert_eq!(balance(&pool, qty_acct).await, 170);
-    assert_eq!(balance(&pool, val_acct).await, 990, "1200 - 210");
-
-    let v: i64 = balance(&pool, val_acct).await;
-    let q: i64 = balance(&pool, qty_acct).await;
-    assert!(v * 100 / q < 600,
-            "pool avg (×100) drifted below 600: got {}", v * 100 / q);
 }
 
 // ---- Sign + P&L direction ----

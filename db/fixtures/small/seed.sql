@@ -14,7 +14,7 @@ INSERT INTO skus (code, uom, standard_cost, cost_method) VALUES
   ('SKU-F',  'EA',  300, 'standard'),
   ('SKU-G',  'EA',   25, 'standard'),
   ('SKU-H',  'EA',  500, 'standard'),
-  ('SKU-WAC','EA',  100, 'wac'),
+  ('SKU-WAC','EA',  100, 'wac_perpetual'),
   ('SKU-FIF','EA',  100, 'fifo');
 
 -- ============================================================
