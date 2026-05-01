@@ -1273,6 +1273,57 @@ Each tells a different income-statement story.
 
 **Known limitation.** `p_posted_by` is unvalidated (RBAC = Part VII Q6, still open). Same convention as the other document-layer functions.
 
+### 3.14 Cost adjustment retroactive (period-close-applied)
+
+A second cost-adjustment workflow that complements §3.12. §3.12 (`post_cost_adjustment`) revalues the **live pool** at the moment of call — instantaneous effect, only on the value side, only on `wac_perpetual` pools. §3.14 (`post_cost_adjustment_retroactive`) is **operator-queued** and **flushes at period close** — it walks every credit-side qty-bearing depletion in the target period and re-costs it against an operator-supplied `target_avg`, posting one variance batch per non-zero-variance depletion through `variance_cost_adjust_retro`.
+
+Use cases (different from §3.12):
+- Audit determines the period's effective cost should have been different from what mid-period perpetual produced.
+- Late vendor pricing data arrives after the period's first depletion but before close, and the operator wants every depletion re-costed (not just the live pool).
+- Regulatory or reporting cost basis correction across all in-period consumption.
+
+Document layer: `inventory_cost_adjustments_retroactive` table (queue, migration 0032). Function: `post_cost_adjustment_retroactive`. Underlying ledger reason: `cost_restate` (same as wac_periodic / wac_retroactive variances). Document kind: `cost_adjust_retroactive_close`. P&L counterpart: `variance_cost_adjust_retro` (added in migration 0025; seeded in `db/fixtures/small/seed.sql` for USD + EUR).
+
+```
+post_cost_adjustment_retroactive(
+  p_target_period_id, p_sku_id, p_location_id, p_currency,
+  p_inventory_class, p_target_avg, p_business_date,
+  p_posted_by, p_idempotency_key, p_notes
+) RETURNS UUID
+
+queue-time (synchronous):
+  - validate target period exists AND open       → P0014 / P0021
+  - validate p_business_date in period bounds    → P0004
+  - validate inventory_class in (raw, fg)        → P0006 if wip (acct-p7v)
+  - validate target_avg >= 0                     → 23514
+  - validate sku exists, pool exists             → P0010
+  - INSERT queue row, return its id (no transfers posted yet)
+
+close-time (cost_adjust_retroactive_hook):
+  for each un-finalized queue row in this period (FOR UPDATE):
+    walk transfers WHERE credit_account_id = pool
+                     AND business_date IN period
+                     AND qty IS NOT NULL AND qty > 0
+    for each depletion:
+      provisional_unit = amount / qty
+      variance = qty × (target_avg − provisional_unit)
+      if variance != 0:
+        post 2-transfer batch routed through variance_cost_adjust_retro
+    UPDATE queue row finalized_at, finalized_count, total_variance
+```
+
+**Method-agnostic.** Works on any `cost_method` — `standard`, `wac_perpetual`, `wac_periodic`, `wac_retroactive`. Operator override of whatever cost was originally applied. With `wac_periodic` / `wac_retroactive` the close-time variance posted by their own hooks is **already in place** (their hooks run before this one); §3.14 then layers an additional variance on top. Documented as "double-correction is acceptable" — the simplest semantic, matching what the operator sees in the depletion's `amount` (the original, not the wac-corrected value).
+
+**Why qty=NULL on prior-hook variances matters.** Variance transfers from `wac_periodic_close_hook` and `wac_retroactive_close_hook` carry `qty=NULL` (they're value-only corrections, not new physical movement). The `qty IS NOT NULL AND qty > 0` filter on the depletion walk naturally excludes those rows from being re-walked, so each depletion contributes to §3.14's variance exactly once even when other hooks have already posted variance.
+
+**Period must be open at queue time.** Closed periods raise **P0021** (`target_period_closed`) referencing `acct-7h4` (Phase 2 Epic K — period reopen workflow). For a closed period the operator must reopen it first, then queue, then re-close. This is intentional — the queue is the period's audit trail and must be seen by `close_period`.
+
+**WIP class.** Deferred. `inventory_class='wip'` raises **P0006** referencing `acct-p7v` (Phase 2 Epic J — wac_periodic / wac_retroactive across WIP pools). The cost-adjustment-retroactive workflow on WIP requires the same machinery as periodic-WAC on WIP, so they ship together.
+
+**Idempotency.** `idempotency_key UUID NOT NULL UNIQUE` on the queue table. Replay returns the existing queue row's id without re-inserting; the hook's `FOR UPDATE` walk also tolerates concurrent close attempts.
+
+The audit row records `target_avg`, `business_date`, `posted_by`, `posted_at`, `finalized_at`, `finalized_count` (depletions processed at close), `total_variance` (signed sum of variance_amount across all 2-transfer batches), and free-form `notes`. The full lifecycle is reconstructable from this row plus the variance transfers (joined via `document_id = queue_row.id`, `document_kind = 'cost_adjust_retroactive_close'`).
+
 ## §4. WIP model
 
 ### 4.1 Account grain
@@ -1360,12 +1411,12 @@ Sequence inside `close_period`:
 
 1. **Validate** — `SELECT ... FROM periods WHERE id = p_period_id FOR UPDATE`. Raises **P0014** (`period_close_invalid`) if the period is missing or already closed. The row-level lock serializes concurrent close attempts on the same period — the loser re-reads `closed_at` after the winner commits and surfaces P0014.
 
-2. **Run hooks** in a fixed order:
-   - `wac_periodic_close_hook(period_id)` — Epic B (`acct-qfj`) replaces this body.
+2. **Run hooks** in a fixed order. As of `acct-og1` (migration 0032) all three hooks have real bodies; the s6n stub-bullet era is over.
+   - `wac_periodic_close_hook(period_id, p_force_provisional)` — real body landed `acct-qfj` (migration 0029). For each pool with un-finalized `wac_periodic` provisional rows, computes the period avg as `Σ(in-period receipts value) / Σ(in-period qty)` and re-costs every depletion in the period against it; posts variance through `variance_wac_period`. Oracle PAC convention.
    - `wac_retroactive_close_hook(period_id, p_force_provisional)` — real body landed `acct-9tw` (migration 0031). Walks pool events chronologically `(business_date, posted_at, id)`, re-costs each provisional depletion against the recomputed running avg, posts variance through `variance_wac_retroactive`.
-   - `cost_adjust_retroactive_hook(period_id)` — Epic E (`acct-og1`) replaces this body.
+   - `cost_adjust_retroactive_hook(period_id, p_force_provisional)` — real body landed `acct-og1` (migration 0032). Walks the `inventory_cost_adjustments_retroactive` queue rows for this period (operator-queued via §3.14); for each, walks every in-period credit-side qty-bearing depletion on the pool and posts a 2-transfer variance batch through `variance_cost_adjust_retro` per non-zero-variance depletion. Method-agnostic — works regardless of the SKU's `cost_method`.
 
-   Each hook returns `BIGINT` — the count of rows it finalized. In `acct-s6n` all three are stubs that return 0 and touch nothing; the contract is in place so the dependent epics can replace bodies without modifying `close_period` itself. Hooks run **before** step 5 stamps `closed_at` so any variance transfers they post don't trip `post_transfers`' P0005 gate on the period being closed.
+   Each hook returns `BIGINT` — the count of rows it finalized. Hooks run **before** step 5 stamps `closed_at` so any variance transfers they post don't trip `post_transfers`' P0005 gate on the period being closed.
 
 3. **Provisional gate** — count `transfers_provisional` rows in this period with `finalized_at IS NULL`. If > 0 and `p_force_provisional = FALSE`, raise **P0015** (`period_close_provisional`). Forced close leaves un-finalized rows on the side table as-is for forensics — it does not auto-finalize them.
 

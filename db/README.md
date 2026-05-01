@@ -147,8 +147,11 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 | `P0017` | `optimistic_concurrency_violation` | `post_standard_cost_roll` caller passed `p_expected_old_cost` that does not match the active standard at `p_business_date`. Surfaces stale-read bugs in callers (UI showed an old value before another roll landed). NULL/non-NULL mismatch in either direction also raises this. |
 | `P0018` | `standard_cost_not_established` | A cost-relevant operation on a standard-method SKU was attempted but no `standard_costs` row is in effect at the requested `business_date`. Resolved by calling `post_standard_cost_roll()` first. Backdated transactions before the earliest `effective_at` also surface this code. Raised by `resolve_standard_cost_at` and inherited by every consumer that goes through it (currently `_post_transfers_compute_amount` standard branch, `post_inventory_adjustment` standard branch with NULL `p_unit_cost`). |
 | `P0019` | `retroactive_std_cost_roll_blocked` | `post_standard_cost_roll` caller passed `p_effective_at` that is not strictly greater than every existing `standard_costs.effective_at` for the SKU. Phase 1 does not support retroactive corrections to past standard costs. |
+| `P0021` | `target_period_closed` | `post_cost_adjustment_retroactive` caller passed `p_target_period_id` for a period whose `closed_at IS NOT NULL`. The retroactive cost-adjustment workflow only operates on currently-open periods (the queue is the period's audit trail and must be visible to `close_period`). To fix a closed period, reopen it first; reopen workflow is tracked as `acct-7h4` (Phase 2 Epic K). |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
+
+P0020 (`wac_periodic_close_no_receipts`) is raised by `wac_periodic_close_hook` when a pool with un-finalized provisional rows received no in-period receipts — there is no period avg to compute. Bypassable with `p_force_provisional := TRUE`, which leaves the un-processable rows on the side table for forensics. Documented separately because the hook composes through `close_period` rather than `post_transfers`.
 
 ## Document-layer wrappers
 
@@ -256,7 +259,7 @@ close_period(
 Steps inside `close_period`:
 
 1. `SELECT ... FROM periods WHERE id = $1 FOR UPDATE` — serializes concurrent close calls; raises **P0014** if the period is missing or already closed.
-2. Calls `wac_periodic_close_hook`, `wac_retroactive_close_hook`, `cost_adjust_retroactive_hook` in that order. As of `acct-9tw` (migration 0031), the first two have real bodies (wac_periodic re-costs each provisional depletion at the period's final avg `Σ(in-period receipts)/Σ(in-period qty)`; wac_retroactive does chronological replay re-costing each depletion against the running avg it should have had given full-period data). `cost_adjust_retroactive_hook` remains a stub returning 0 until Epic E (`acct-og1`). Hook variance transfers post **before** `closed_at` is stamped so they don't trip P0005.
+2. Calls `wac_periodic_close_hook`, `wac_retroactive_close_hook`, `cost_adjust_retroactive_hook` in that order. As of `acct-og1` (migration 0032) **all three have real bodies**: wac_periodic re-costs each provisional depletion at the period's final avg `Σ(in-period receipts)/Σ(in-period qty)`; wac_retroactive does chronological replay re-costing each depletion against the running avg it should have had given full-period data; cost_adjust_retroactive walks operator-queued `inventory_cost_adjustments_retroactive` rows and posts variance through `variance_cost_adjust_retro` per non-zero-variance in-period depletion (method-agnostic — see `post_cost_adjustment_retroactive` below). Hook variance transfers post **before** `closed_at` is stamped so they don't trip P0005.
 3. **Provisional gate**: counts `transfers_provisional` rows in this period with `finalized_at IS NULL`. Raises **P0015** unless `p_force_provisional = TRUE`.
 4. **Reconciliation gate**: calls `run_daily_reconciliation()`. Raises **P0016** unless `p_force_recon = TRUE`. Force still records the alerts.
 5. Stamps `closed_at = clock_timestamp()`, `closed_by = p_actor`.
@@ -264,11 +267,45 @@ Steps inside `close_period`:
 
 Force flags are independent — `p_force_provisional` does NOT bypass recon, `p_force_recon` does NOT bypass provisional. Operators can force one gate while keeping the other in effect.
 
-Hook contract: `<name>(p_period_id BIGINT) RETURNS BIGINT` (count finalized). Epics B/C/E may extend the signature when they replace the body — the change is additive (call sites in `close_period` updated in the same migration).
+Hook contract: `<name>(p_period_id BIGINT, p_force_provisional BOOLEAN DEFAULT FALSE) RETURNS BIGINT`. The 2-arg signature stabilized after `acct-og1` (migration 0032) when the last stub got its real body — all three hooks now receive `p_force_provisional` so they can skip un-processable rows when forced rather than raising `P0006` / `P0020`.
 
 **Known limitation.** `p_actor` is unvalidated — `close_period` accepts any UUID and stores it as `closed_by`. RBAC is Part VII Q6, still open.
 
 See consolidated doc §6 for the full design notes.
+
+### `post_cost_adjustment_retroactive` (migration 0032, acct-og1)
+
+Operator-queued retroactive cost override that flushes at the target period's close. Distinct from `post_cost_adjustment` (§3.12, migration 0024), which revalues the **live pool** instantaneously on `wac_perpetual` only. This one is **method-agnostic** and processes every credit-side qty-bearing depletion in the period.
+
+Signature:
+```
+post_cost_adjustment_retroactive(
+  p_target_period_id BIGINT,
+  p_sku_id           UUID,
+  p_location_id      UUID,
+  p_currency         TEXT,
+  p_inventory_class  TEXT,        -- 'raw' or 'fg' (wip → P0006 ref acct-p7v)
+  p_target_avg       BIGINT,      -- the unit cost the operator wants
+  p_business_date    DATE,        -- must fall in target period bounds
+  p_posted_by        UUID,
+  p_idempotency_key  UUID,
+  p_notes            TEXT      DEFAULT NULL
+) RETURNS UUID                    -- inventory_cost_adjustments_retroactive.id
+```
+
+Behavior:
+- **Queue-time** (synchronous): replay check via idempotency_key; validate `target_avg >= 0`, target period exists and is open (closed → **P0021** ref acct-7h4), business_date in period bounds (else P0004), SKU exists, pool exists. INSERT queue row. **No transfers posted yet.**
+- **Close-time** (`cost_adjust_retroactive_hook` walks the queue): for each un-finalized queue row in the closing period, walk every transfer where `credit_account_id = pool AND business_date IN period AND qty IS NOT NULL AND qty > 0`. For each such depletion: `provisional_unit = amount / qty`, `variance = qty × (target_avg − provisional_unit)`. If non-zero, post a 2-transfer batch routed through `variance_cost_adjust_retro`. UPDATE the queue row's `finalized_at`, `finalized_count`, `total_variance`.
+
+The `qty IS NOT NULL` filter naturally excludes prior-hook variance transfers (`wac_periodic_close_hook` and `wac_retroactive_close_hook` post their variances with `qty=NULL`), so each depletion contributes to this hook's variance exactly once.
+
+Method-agnostic. Works for any `cost_method`. With `wac_periodic` / `wac_retroactive` the corresponding hooks run first and post their own variance; this hook then layers an additional variance on top — "double-correction is acceptable" per documented design (the operator's `target_avg` is computed against the original depletion's `amount/qty`, not the wac-corrected amount).
+
+Variance routing: `cost_restate` reason, `cost_adjust_retroactive_close` document_kind, `variance_cost_adjust_retro` P&L account (one per currency, seeded for USD + EUR in the small fixture). Two transfers per processed depletion (write-up: dr orig_debit / cr variance, dr variance / cr pool; write-down: reverse). Variance accumulator nets to zero per close.
+
+Idempotent at the queue table (`UNIQUE(idempotency_key)`); replay returns the existing row's id without re-inserting.
+
+See consolidated doc §3.14 for the full design notes.
 
 ### `post_standard_cost_roll` (migrations 0027 + 0028, acct-hlr)
 
