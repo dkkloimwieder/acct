@@ -1133,10 +1133,20 @@ qty_delta < 0 (out): debit and credit roles flip on both legs.
 
 Notes:
 - `inventory_class` is `'raw'` or `'fg'` (MVP); WIP adjustments require routing_op resolution and are deferred.
-- `unit_cost = 0` is legal (qty-only adjustment); the value leg is omitted.
 - Idempotent on `idempotency_key` at the document-table level — replay returns the existing document id without re-posting.
 - **Qty-side counterpart is `creation_void` (qty has no P&L concept). Value-side counterpart is `inv_adj_expense` — a bidirectional P&L account (`normal_side='unrestricted'`) that holds adjustment income (credit balance) and adjustment expense (debit balance). The accumulated balance at period close is the net adjustment gain/loss on the income statement.**
 - The ledger reason `inventory_adjustment` is added in migration 0022. Down-migration drops the table and function but leaves the enum value in place (Postgres can't cleanly remove an enum value once added without recreating the type).
+
+**Cost-method dispatch.** `p_unit_cost` is NULLable. The SKU's `cost_method` determines what cost is applied:
+
+| `cost_method` | `p_unit_cost = NULL` | `p_unit_cost = explicit` |
+|---|---|---|
+| `standard` | use `skus.standard_cost` | **P0011** — standard SKUs have a fixed cost; do not pass one |
+| `wac` IN | use pool average; **P0011** if pool empty (caller must seed) | use it; pool re-averages |
+| `wac` OUT | use pool average (classic WAC; pool average preserved) | use it; pool average drifts to reflect the true remaining cost (caller has asserted lot knowledge) |
+| `fifo` / `lot` | always **P0006** | always **P0006** |
+
+The WAC OUT explicit path is the deliberate concession that real-world adjustments often involve partial lot knowledge: if the caller knows the leaving material was cheaper than the pool average, asserting the cost lets the pool drift up to reflect what is genuinely left. This conceptually departs from textbook WAC (which preserves average on OUT) but produces honest accounting given the caller's information. True lot identity is `acct-8gg`'s domain. The audit row records the **effective** unit cost — what was actually applied — not the caller's input.
 
 ## §4. WIP model
 

@@ -136,7 +136,9 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 | `P0003` | `currency_mismatch` | both ledger_kind=`'value'`, currencies differ |
 | `P0004` | `period_missing` | no period contains `business_date` |
 | `P0005` | `period_closed` | period `closed_at IS NOT NULL` and `p_override_closed_period = FALSE` |
-| `P0006` | `cost_method_not_implemented` / `wac_zero_qty_pool` | `reason ∈ {op_move, scrap, wo_complete, so_ship}` AND any of: (a) sku not resolvable from either account, (b) sku's `cost_method ∈ {'lot','fifo'}` on a qty-side event (the qty-side gate relaxes for `'standard'` and `'wac'`), (c) value-side event missing `qty`, (d) value-side event with sku's `cost_method ∈ {'lot','fifo'}` (raised inside the dispatcher), (e) value-side event with sku's `cost_method = 'wac'` and the qty pool is zero |
+| `P0006` | `cost_method_not_implemented` / `wac_zero_qty_pool` | `reason ∈ {op_move, scrap, wo_complete, so_ship}` AND any of: (a) sku not resolvable from either account, (b) sku's `cost_method ∈ {'lot','fifo'}` on a qty-side event (the qty-side gate relaxes for `'standard'` and `'wac'`), (c) value-side event missing `qty`, (d) value-side event with sku's `cost_method ∈ {'lot','fifo'}` (raised inside the dispatcher), (e) value-side event with sku's `cost_method = 'wac'` and the qty pool is zero. Also raised by `post_inventory_adjustment` when called against a `'fifo'` or `'lot'` SKU. |
+| `P0010` | `caller_bug_account_missing` | A required account does not exist for the (sku, location, currency) tuple. Raised by `reserve_inventory()` (no open `stock_available` for the sku/location pair) and by `post_inventory_adjustment` (no open `stock_available`, no open `inv_value_{class}`, no `creation_void(qty)`, or no `inv_adj_expense(currency)`). Indicates accounts must be pre-created. |
+| `P0011` | `cost_assertion_invalid` | Caller's `p_unit_cost` violates the contract for the SKU's `cost_method`. Raised by `post_inventory_adjustment` when: (a) the SKU is `'standard'` and caller passed any non-NULL `p_unit_cost` (standard SKUs have a fixed cost; do not pass one), (b) the SKU is `'wac'` IN with `p_unit_cost = NULL` and the pool is empty (must seed at known cost), (c) `cost_method` is otherwise unrecognized. |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 
@@ -154,7 +156,7 @@ post_inventory_adjustment(
   p_sku_id          UUID,
   p_location_id     UUID,
   p_qty_delta       BIGINT,   -- signed; >0 = in, <0 = out
-  p_unit_cost       BIGINT,   -- per-unit; 0 means qty-only (no value leg)
+  p_unit_cost       BIGINT,   -- NULL = use system cost (see dispatch below)
   p_currency        TEXT,
   p_inventory_class TEXT,     -- 'raw' or 'fg' (MVP; wip deferred)
   p_business_date   DATE,
@@ -167,8 +169,20 @@ post_inventory_adjustment(
 Behavior:
 - Inserts an `inventory_adjustments` row (UNIQUE on `idempotency_key`); a replay with the same key returns the existing id without re-posting.
 - Resolves `stock_available(sku, location)`, `inv_value_{class}(sku, location, currency)`, `creation_void(qty)`, and `inv_adj_expense(currency)` (the bidirectional P&L counterpart); raises `P0010` if any account is missing.
-- Builds a 2-event batch with reason `inventory_adjustment` (qty leg + value leg), sign-flipped on negative `qty_delta`. Skips the value leg when `unit_cost = 0`.
-- Calls `post_transfers(batch, FALSE)` — closed-period override is not exposed here yet.
+- Dispatches on the SKU's `cost_method` to determine the effective unit cost:
+
+| `cost_method` | `p_unit_cost = NULL` | `p_unit_cost = explicit` |
+|---|---|---|
+| `standard` | use `skus.standard_cost` | **P0011** — standard SKUs have a fixed cost; do not pass one |
+| `wac` IN | use pool average; **P0011** if pool empty (must seed) | use it; pool re-averages |
+| `wac` OUT | use pool average (classic WAC) | use it; pool average drifts to reflect true remaining cost |
+| `fifo` / `lot` | always **P0006** | always **P0006** |
+
+  Pool reads happen under `FOR UPDATE` on the qty + value accounts, locked in ascending id order to match `post_transfers`' lock-order invariant.
+
+- Builds a 2-event batch with reason `inventory_adjustment` (qty leg + value leg), sign-flipped on negative `qty_delta`. Skips the value leg when the effective unit cost is 0 (only possible when `standard_cost = 0`).
+- Calls `post_transfers(batch, FALSE)` — closed-period override is not exposed here.
+- Records the **effective** unit cost (what was actually applied) in the audit row's `unit_cost` column, not the caller's input.
 
 The `inventory_adjustment` transfer_reason is added by migration 0022 alongside the table and function. It is distinct from `cycle_count_adj`, which is reserved for cycle-count document workflows.
 
