@@ -16,10 +16,14 @@
 --     no production data; down is best-effort." A future migration
 --     could full-recreate the enum if a clean removal is ever needed.
 --
---   * Counterpart accounts are creation_void on both qty and value
---     sides — matches the existing conformance pattern for
---     cycle_count_adj. P&L counterpart (inv_adj_expense) is a future
---     revisit when accountant-facing income statements are in scope.
+--   * Qty-side counterpart is creation_void (qty has no P&L concept).
+--     Value-side counterpart is inv_adj_expense — a bidirectional P&L
+--     account so adjustment-in posts as adjustment income (counterpart
+--     credited) and adjustment-out posts as adjustment expense
+--     (counterpart debited). The accumulated balance at period close
+--     is the net adjustment gain/loss on the income statement.
+--     normal_side='unrestricted' on inv_adj_expense lets it swing both
+--     ways without violating the schema CHECK.
 --
 --   * inventory_class ∈ ('raw','fg') for MVP. WIP adjustments with
 --     routing_op are deferred (the value-side account would need to
@@ -135,7 +139,13 @@ BEGIN
       USING ERRCODE = 'P0010';
   END IF;
 
-  -- Resolve creation_void counterparts.
+  -- Resolve counterparts. Qty side has no P&L concept, so the qty leg
+  -- still uses creation_void (units appearing/disappearing). The value
+  -- leg uses inv_adj_expense — a bidirectional P&L account so adjustment
+  -- income (we found inventory, account credited) and adjustment expense
+  -- (we lost inventory, account debited) both flow through it. The
+  -- accumulated balance at period close is the net adjustment gain/loss
+  -- on the income statement.
   SELECT id INTO v_void_qty
     FROM accounts
    WHERE kind = 'creation_void' AND ledger_kind = 'qty' AND NOT is_closed;
@@ -146,16 +156,18 @@ BEGIN
 
   SELECT id INTO v_void_val
     FROM accounts
-   WHERE kind = 'creation_void' AND ledger_kind = 'value'
+   WHERE kind = 'inv_adj_expense' AND ledger_kind = 'value'
      AND currency = p_currency AND NOT is_closed;
   IF v_void_val IS NULL THEN
-    RAISE EXCEPTION 'no creation_void(value, ccy=%) account configured', p_currency
+    RAISE EXCEPTION 'no inv_adj_expense(value, ccy=%) account configured', p_currency
       USING ERRCODE = 'P0010';
   END IF;
 
   -- Sign-flip on qty_delta < 0: an "in" adjustment debits stock_available
-  -- (more inventory) and credits creation_void; an "out" adjustment is
-  -- the reverse.
+  -- (more inventory) and credits the counterpart; an "out" adjustment
+  -- is the reverse. On the value side this means: in -> credit
+  -- inv_adj_expense (adjustment income); out -> debit inv_adj_expense
+  -- (adjustment loss).
   v_qty_amount := abs(p_qty_delta);
   v_val_amount := v_qty_amount * p_unit_cost;
 

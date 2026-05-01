@@ -69,6 +69,16 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('cogs',                 'value', 'USD', 'debit'),
   ('variance_wo_close',    'value', 'USD', 'unrestricted');
 
+-- Inventory adjustment account (USD + EUR). Bidirectional P&L line:
+-- credit balance = net adjustment income (we found inventory),
+-- debit  balance = net adjustment expense (we lost inventory).
+-- normal_side='unrestricted' so the CHECK constraint allows either
+-- direction; period-close reporting splits gain vs loss by walking
+-- the underlying transfers.
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('inv_adj_expense', 'value', 'USD', 'unrestricted'),
+  ('inv_adj_expense', 'value', 'EUR', 'unrestricted');
+
 -- SKU-A value accounts (USD).
 -- After acct-nfr (migration 0020), value accounts partition by the
 -- same dimensions as their qty-side counterparts:

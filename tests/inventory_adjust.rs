@@ -83,7 +83,7 @@ async fn adjust_in_creates_balances_and_audit_row() {
     )
     .await;
     let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
-    let void_val = account_id_by_kind_currency(&pool, "creation_void", Some("USD")).await;
+    let adj_expense = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
 
     let key = fresh_uuid(&pool).await;
     let doc_id = adjust(&pool, &sku, &loc, 50, 10, "USD", "fg", "2026-04-15", &key)
@@ -103,7 +103,36 @@ async fn adjust_in_creates_balances_and_audit_row() {
     assert_eq!(balance(&pool, qty_acct).await, 50, "stock_available");
     assert_eq!(balance(&pool, val_acct).await, 500, "inv_value_fg = 50 * 10");
     assert_eq!(balance(&pool, void_qty).await, -50, "creation_void(qty)");
-    assert_eq!(balance(&pool, void_val).await, -500, "creation_void(USD)");
+    // Adjustment IN posts as adjustment income — credit on the
+    // bidirectional P&L account. (debits-credits) goes negative.
+    assert_eq!(balance(&pool, adj_expense).await, -500,
+               "inv_adj_expense(USD) credited (adjustment income)");
+}
+
+#[tokio::test]
+async fn adjust_out_posts_as_adjustment_expense() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = sku_id(&pool, "SKU-A").await;
+    let loc = loc_id(&pool, "MAIN").await;
+    let adj_expense =
+        account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
+
+    // Seed an in (income +$1000), then take half out (expense $500). Net
+    // P&L: -$500 (still net income). Single bidirectional account holds
+    // the net.
+    adjust(&pool, &sku, &loc, 100, 10, "USD", "fg", "2026-04-15",
+           &fresh_uuid(&pool).await).await.expect("seed in");
+    assert_eq!(balance(&pool, adj_expense).await, -1000, "all income so far");
+
+    adjust(&pool, &sku, &loc, -50, 10, "USD", "fg", "2026-04-15",
+           &fresh_uuid(&pool).await).await.expect("adjust out");
+
+    // Out posts a debit on inv_adj_expense (loss). Net = -1000 + 500 = -500
+    // (still net income, since we found more than we lost).
+    assert_eq!(balance(&pool, adj_expense).await, -500,
+               "net adjustment income after one in + one out");
 }
 
 #[tokio::test]
