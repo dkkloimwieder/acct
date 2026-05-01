@@ -540,7 +540,7 @@ async fn mixed_receipt_reasons_aggregate_into_period_avg() {
         &pool,
         serde_json::json!([
             make_event("cycle_count_adj", qty, void_qty, 50, "2026-04-08", &fresh_uuid(&pool).await),
-            make_event("cycle_count_adj", val, void_val, 350, "2026-04-08", &fresh_uuid(&pool).await),
+            make_event_with_qty("cycle_count_adj", val, void_val, 350, 50, "2026-04-08", &fresh_uuid(&pool).await),
         ]),
         false,
     ).await.expect("cycle count");
@@ -638,7 +638,7 @@ async fn force_bypass_processes_some_skips_unprocessable() {
         &pool,
         serde_json::json!([
             make_event("cycle_count_adj", qty_b, void_qty, 100, "2026-04-01", &fresh_uuid(&pool).await),
-            make_event("cycle_count_adj", val_b, void_val, 500, "2026-04-01", &fresh_uuid(&pool).await),
+            make_event_with_qty("cycle_count_adj", val_b, void_val, 500, 100, "2026-04-01", &fresh_uuid(&pool).await),
         ]),
         false,
     ).await.expect("seed B");
@@ -680,7 +680,7 @@ async fn close_fails_then_retries_after_posting_receipts() {
         &pool,
         serde_json::json!([
             make_event("cycle_count_adj", qty, void_qty, 100, "2026-04-01", &fresh_uuid(&pool).await),
-            make_event("cycle_count_adj", val, void_val, 500, "2026-04-01", &fresh_uuid(&pool).await),
+            make_event_with_qty("cycle_count_adj", val, void_val, 500, 100, "2026-04-01", &fresh_uuid(&pool).await),
         ]),
         false,
     ).await.unwrap();

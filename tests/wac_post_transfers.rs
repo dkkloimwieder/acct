@@ -69,13 +69,18 @@ async fn seed_wac_pool(pool: &sqlx::PgPool, qty: i64, value_usd: i64) {
     }
     if value_usd > 0 {
         let key = fresh_uuid(pool).await;
+        // Value-leg seed needs qty for the per-class WAC divisor
+        // (migration 0030, transfers.qty). qty here is the same `qty`
+        // passed to seed_pool — we're seeding a pool that started empty,
+        // so total $ corresponds to total units.
         let res = post_one(
             pool,
-            make_event(
+            make_event_with_qty(
                 "cycle_count_adj",
                 val_acct,
                 void_val,
                 value_usd,
+                qty,
                 "2026-04-15",
                 &key,
             ),

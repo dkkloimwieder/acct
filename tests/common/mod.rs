@@ -241,10 +241,43 @@ pub async fn snapshot_balances(pool: &PgPool) -> std::collections::HashMap<i64, 
     rows.into_iter().map(|(id, d, c)| (id, (d, c))).collect()
 }
 
+/// Build a `post_transfers` event JSON with explicit qty. Use this for
+/// value-leg receipts that go through wac_perpetual or wac_periodic
+/// pools — the per-class qty divisor (migration 0030, transfers.qty
+/// column) needs the qty to populate. For qty-leg events where qty
+/// equals amount, the regular `make_event` is fine; the post_transfers
+/// INSERT logic infers qty := amount when both sides are qty-class.
+pub fn make_event_with_qty(
+    reason: &str,
+    debit_account_id: i64,
+    credit_account_id: i64,
+    amount: i64,
+    qty: i64,
+    business_date: &str,
+    idempotency_key: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "reason":            reason,
+        "document_kind":     "test_doc",
+        "document_id":       "00000000-0000-0000-0000-0000000000aa",
+        "debit_account_id":  debit_account_id,
+        "credit_account_id": credit_account_id,
+        "amount":            amount,
+        "qty":               qty,
+        "business_date":     business_date,
+        "idempotency_key":   idempotency_key,
+        "posted_by":         "00000000-0000-0000-0000-0000000000bb",
+    })
+}
+
 /// Build a minimal `post_transfers` event JSON. Fixed `document_kind`,
 /// `document_id`, and `posted_by` — those don't affect any invariant the
 /// T2 suite exercises. Optional fields (document_line_id, routing_op,
 /// counterparty_id) are omitted; `post_transfers` casts them as NULL.
+///
+/// Note: as of acct-1vr (migration 0030), value-leg events posting to
+/// wac_perpetual / wac_periodic pools must include qty for the per-class
+/// divisor to compute correctly. Use `make_event_with_qty` for those.
 pub fn make_event(
     reason: &str,
     debit_account_id: i64,

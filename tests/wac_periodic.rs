@@ -417,7 +417,7 @@ async fn wac_periodic_close_no_receipts_raises_p0020() {
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 50, "2026-04-05", &fresh_uuid(&pool).await),
-            make_event("inventory_adjustment", val_acct, void_val, 250, "2026-04-05", &fresh_uuid(&pool).await),
+            make_event_with_qty("inventory_adjustment", val_acct, void_val, 250, 50, "2026-04-05", &fresh_uuid(&pool).await),
         ]),
         false,
     )
