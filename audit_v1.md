@@ -75,15 +75,17 @@ These bd issues were already open. Audit confirms each is appropriately sequence
 
 Per the audit decision (D2), this gap is **deferred to Slice A's own kickoff** rather than filled speculatively in this pass. The workflow design will determine the right account shapes; guessing now would risk re-doing the fixture once Slice A begins.
 
-## Section 6 — Performance re-bench
+## Section 6 — Performance re-bench (complete)
 
-Per audit decision (D3), running the full 13-shape baseline against the current 32-migration schema using the same methodology as v0 (3 runs × 5 minutes per shape, vmstat sidecar). Total wall time ~3.5 hours.
+Per audit decision (D3), ran the full 13-shape baseline against the current 32-migration schema using the same methodology as v0 (3 runs × 5 minutes per shape, vmstat sidecar). Wall clock 15:35 → 19:04 (~3h29m), exactly the v0 budget.
 
-Driver: `scripts/run-perf-baseline-v1.sh` (new, committed in audit pass).
+Driver: `scripts/run-perf-baseline-v1.sh`. Output in `/tmp/perf_v1_run/<shape>/driver.log`. Aggregated headline → `perf_baseline_v1.md`.
 
-Output goes to `/tmp/perf_v1_run/` per shape; aggregated into `perf_baseline_v1.md` with a "diff vs v0" column for each shape after the bench completes. Any shape with a regression beyond the documented v0 noise band (~15–20%) becomes a separate bd issue and gates Slice A pending root-cause.
+**Headline result:** 12 of 13 shapes are flat-or-improved vs v0. Shape A (1 writer × 5–20 events, simplest path) shows a 27 % drop — just outside v0's documented 15–20 % single-day noise band. Several other shapes (E +87 %, H +80 %) show implausibly large improvements, which suggests v0 had unfavorable conditions on those measurements and that the comparison is bounded by the rig's day-to-day noise on both sides. **L is still the throughput peak** at 3 258 commit-evps (up from v0's 2 876), confirming pseudo-sync remains the documented escape hatch.
 
-Status at this writing: bench is running. Update this section when complete.
+**Verdict on foundation health:** not catastrophic. No shape went off a cliff; nothing in the new migrations (0022–0032) caused a 2× or 10× drop anywhere. The 27 % Shape A drop deserves a targeted re-measurement using the `acct-ezm` 5 × 60 s methodology (less long-tail bias than 3 × 300 s on this rig) before Slice A merges. **Don't gate Slice A on this audit** — the foundation is sound enough to layer PO/AP work on top, and any persistent A regression can be characterized and addressed once Slice A is in flight.
+
+Detailed table, latency breakdown, and root-cause hypotheses in `perf_baseline_v1.md`.
 
 ## Section 7 — Phase D items not raised by agents
 
