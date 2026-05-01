@@ -103,6 +103,15 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('variance_cost_adjustment', 'value', 'USD', 'unrestricted'),
   ('variance_cost_adjustment', 'value', 'EUR', 'unrestricted');
 
+-- Standard cost roll variance (USD + EUR; acct-8rv / acct-hlr).
+-- Bidirectional P&L for revaluation transfers when standard cost
+-- changes via post_standard_cost_roll. Distinct from
+-- variance_cost_adjustment (WAC pool revaluation) and inv_adj_expense
+-- (qty-driven adjustments).
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('variance_std_cost_roll', 'value', 'USD', 'unrestricted'),
+  ('variance_std_cost_roll', 'value', 'EUR', 'unrestricted');
+
 -- Period-close variance lines (USD + EUR; acct-4mt / acct-s6n).
 -- All bidirectional — write-ups credit, write-downs debit. Three
 -- separate kinds (not one shared 'variance_close') so the income
