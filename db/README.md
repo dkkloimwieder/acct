@@ -114,7 +114,7 @@ Phase 0 calls it **synchronously inside the same Postgres transaction** as docum
 - **Value-ledger events**: caller MUST send `qty`, NOT `amount`. The function computes amount via the `_post_transfers_compute_amount` dispatcher keyed on `skus.cost_method`. Caller-supplied `amount` is ignored on these events.
 - **Qty-ledger events**: caller still sends `amount` (= qty by convention). Unchanged from earlier behavior.
 
-The dispatcher has these real branches: `'standard'` (`amount = qty × resolve_standard_cost_at(sku, business_date)` after migration 0027), `'wac_perpetual'` and `'wac_periodic'` (migration 0030 / `acct-1vr`: `amount = qty × (pool_value_balance / per_class_qty)` where `per_class_qty` is `SUM(transfers.qty signed by debit/credit on the value pool)` — no longer `stock_available.balance`, which would have pooled raw and fg qty for the same SKU). The `'lot'` and `'fifo'` branches RAISE `P0006` with a TODO referencing `acct-8gg`. The qty-side gate relaxes for `'standard'`, `'wac_perpetual'`, and `'wac_periodic'`.
+The dispatcher has these real branches: `'standard'` (`amount = qty × resolve_standard_cost_at(sku, business_date)` after migration 0027 / `acct-x4t`); `'wac_perpetual'` (migration 0021 / `acct-uxu`); `'wac_periodic'` (dispatcher branch added in migration 0029 / `acct-qfj`); `'wac_retroactive'` (dispatcher branch added in migration 0031 / `acct-9tw`). All three WAC branches use `amount = qty × (pool_value_balance / per_class_qty)` where `per_class_qty` is `SUM(transfers.qty signed by debit/credit on the value pool)` — refactored in migration 0030 / `acct-1vr` from the previous `stock_available.balance` divisor, which would have pooled raw and fg qty for the same SKU. The `'lot'` and `'fifo'` branches RAISE `P0006` with a TODO referencing `acct-8gg`. The qty-side gate relaxes for `'standard'`, `'wac_perpetual'`, `'wac_periodic'`, and `'wac_retroactive'`.
 
 **Per-event qty column on `transfers`** (acct-1vr, migration 0030). `transfers.qty BIGINT NULL` carries the physical quantity for inventory-touching events. Populated at INSERT time from the event JSONB or, for qty-leg events where both sides are `ledger_kind='qty'`, inferred from `amount`. NULL for non-inventory transfers (cash, AR, AP, FX) and pre-0030 historical rows. The new column is what makes per-class WAC math work: each value pool's qty divisor is computed from its own transfer history, not the pooled `stock_available` balance.
 
@@ -151,6 +151,8 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 | `P0021` | `target_period_closed` | `post_cost_adjustment_retroactive` caller passed `p_target_period_id` for a period whose `closed_at IS NOT NULL`. The retroactive cost-adjustment workflow only operates on currently-open periods (the queue is the period's audit trail and must be visible to `close_period`). To fix a closed period, reopen it first; reopen workflow is tracked as `acct-7h4` (Phase 2 Epic K). |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
+
+The numbering gaps (P0007–P0009, P0012–P0013) are intentional. Codes were considered during Phase 0 / Phase 1 design but either dropped (replaced by the broader codes that landed) or rolled into adjacent ones. The gaps are reserved; new codes claim the next un-used number rather than refilling.
 
 ## Document-layer wrappers
 

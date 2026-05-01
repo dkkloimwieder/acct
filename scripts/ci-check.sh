@@ -73,7 +73,12 @@ if echo "$INFO_OUTPUT" | grep -qE 'pending'; then
 fi
 
 echo "==> Step 5/5: schema digest"
+# PG 18 pg_dump emits a randomized `\restrict <key>` / `\unrestrict <key>`
+# header/footer pair on every invocation (security hardening; prevents
+# psql-restriction replay). Strip them before hashing so the digest is
+# stable across runs of the same schema.
 SHA=$(docker compose exec -T postgres pg_dump -U "$PG_USER" -s "$CI_DB" \
+        | grep -vE '^\\(restrict|unrestrict) ' \
         | sha256sum | awk '{print $1}')
 echo "schema SHA256 = $SHA"
 

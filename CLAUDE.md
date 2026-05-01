@@ -4,16 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-**Phase 0 is functionally complete** (consolidated doc Part IV §13). All `acct-93b.*` foundational issues are closed. The three remaining open issues (`acct-0oy`, `acct-e8g`, `acct-8gg`) are all P3 and explicitly gated on Phase 1 framing or §14.1 follow-up evidence — they are *not* speculative work to claim.
+**Phase 0 + Phase 1 cost-method matrix are functionally complete.** Phase 0 (consolidated doc Part IV §13) shipped the `post_transfers` foundation, reservations, period orchestration, daily reconciliation, and the standard-cost dispatcher. Phase 1 layered on document-level workflows (inventory_adjustment, cost_adjustment, cost_adjustment_retroactive), period-close orchestration with three real close hooks, the standard-cost-as-separate-entity refactor, and the wac_perpetual / wac_periodic / wac_retroactive cost-method trio. Both phases shipped under bd issue prefixes; the next slice (Slice A — PO + AP / vendor bill) is the formal Phase-1-feature kickoff. The remaining open bd issues are all P3 — Phase 2 epics and infrastructure deferrals.
 
 What exists now:
 - Postgres 18 dev environment in Docker (`docker-compose.yml`, `db/Dockerfile`, `db/init/`).
 - Helper scripts (`scripts/dev-up.sh`, `scripts/dev-down.sh`, `scripts/run-migrations.sh`, `scripts/run-tests.sh`, `scripts/ci-check.sh`, `scripts/run-perf-baseline.sh`).
 - Rust crate root (`Cargo.toml`, `src/lib.rs`) — library only, sqlx + tokio.
-- 21 sequential reversible migrations under `db/migrations/` (`0001_enable_extensions` through `0021_post_transfers_wac`). Schema, `post_transfers`, `reserve_inventory`, `run_daily_reconciliation`, the `_post_transfers_compute_amount` cost dispatcher (real `'standard'` and `'wac'` branches; `'fifo'`/`'lot'` raise `P0006`), `pg_cron` reservation expiry, the optional `ledger_outbox` table.
-- 26 integration test binaries under `tests/`: per-invariant probes (T2/T3), the conformance harness (T5, 107 cases + 11 batch-vs-split), the WAC integration suite, and the perf load matrix (shapes A-M).
-- `db/fixtures/small/seed.sql` — minimal-but-realistic seed for `cargo test`.
-- `perf_baseline_v0.md` — 13-shape baseline matrix (acct-1ia/yjn/ezm follow-ups).
+- 32 sequential reversible migrations under `db/migrations/` (`0001_enable_extensions` through `0032_cost_adjust_retroactive`). Schema, `post_transfers`, `reserve_inventory`, `run_daily_reconciliation`, the `_post_transfers_compute_amount` cost dispatcher with real `'standard'` / `'wac_perpetual'` / `'wac_periodic'` / `'wac_retroactive'` branches (`'fifo'`/`'lot'` raise `P0006`); document-layer wrappers (`post_inventory_adjustment`, `post_cost_adjustment`, `post_standard_cost_roll`, `post_cost_adjustment_retroactive`); period-close orchestration (`close_period` + three real hook bodies); `pg_cron` reservation expiry; the optional `ledger_outbox` table.
+- 38 integration test binaries under `tests/`: per-invariant probes (T1), workflow matrices (T2 — wac_periodic, wac_retroactive, cost_adjust, cost_adjust_retroactive, standard_cost, period_close), the conformance harness (T5, 107 cases), the WAC integration suite, and the perf load matrix (shapes A-M, 8 `#[ignore]`'d).
+- `db/fixtures/small/seed.sql` — minimal-but-realistic seed for `cargo test`. (Slice A will need PO/AP/supplier expansion; tracked at slice kickoff.)
+- `perf_baseline_v0.md` — 13-shape baseline matrix (acct-1ia/yjn/ezm follow-ups, set on the 21-migration schema).
 - The design spec (`ledger_design_consolidated_v0.md`) and `ARCHIVE/` of predecessor docs.
 
 When adding new categories of code, update this file.
@@ -99,15 +99,15 @@ Part VII of the consolidated doc lists 10 gating questions. **Q1 (TB optionality
 
 These don't gate further engineering work the way Q1/Q2 did. Surface them when a task forces a choice; default behaviors above otherwise.
 
-## Testing methodology (when implementation starts)
+## Testing methodology
 
-Part IV §14 specifies a three-layer progression:
+Part IV §14 specifies a three-layer progression. Status as of Phase 1 cost-method completion:
 
-1. **Exploratory** — measure on real hardware, populate `perf_baseline_vN.md`, replace the envelope estimates in §12.3 with real numbers.
-2. **Structured** — five reference workloads (ecommerce / manufacturing / distribution / month-end close / backfill); SLOs filled in from exploratory output; perf-regression CI gates.
-3. **Integrated** — full path through API tier, optional outbox, pgBouncer, DB; OpenTelemetry traces per layer.
+1. **Exploratory** — DONE for the 21-migration schema (`perf_baseline_v0.md`, 13 shapes A-M, acct-1ia/yjn/ezm). Re-measurement against the current 32-migration schema is tracked separately and produces `perf_baseline_v1.md` when run.
+2. **Structured** — NOT YET. Five reference workloads (ecommerce / manufacturing / distribution / month-end close / backfill); SLOs filled in from exploratory output; perf-regression CI gates. Pre-Slice-A baseline regression is the trigger to formalize this.
+3. **Integrated** — NOT YET. Full path through API tier, optional outbox, pgBouncer, DB; OpenTelemetry traces per layer. No API tier currently in scope; this stays deferred until one exists.
 
-SLO numbers in §14.2 are deliberately TBD — they get filled in after the exploratory pass, not before.
+SLO numbers in §14.2 are deliberately TBD — they get filled in after Structured lands, not before.
 
 ## Working with the consolidated doc
 

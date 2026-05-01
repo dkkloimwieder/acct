@@ -114,11 +114,12 @@ pub async fn call_post_transfers(
         .await
 }
 
-/// Insert a standard_costs row directly (bypasses post_standard_cost_roll,
-/// which doesn't exist until acct-8rv lands). Use this in tests that
-/// create a SKU mid-run and need it usable immediately. The fixture
-/// already seeds standard_costs for SKU-A through SKU-H at
-/// effective_at='1970-01-01'; this helper is for ad-hoc SKUs.
+/// Insert a standard_costs row directly (bypasses post_standard_cost_roll).
+/// Use this in tests that create a SKU mid-run and need it usable
+/// immediately without going through the OCC + WIP + revaluation gates
+/// of the production roll function. The fixture already seeds
+/// standard_costs for SKU-A through SKU-H at effective_at='1970-01-01';
+/// this helper is for ad-hoc SKUs.
 pub async fn seed_standard_cost(pool: &PgPool, sku_code: &str, cost: i64) {
     sqlx::query(
         "INSERT INTO standard_costs (sku_id, cost, effective_at, posted_by, idempotency_key)
