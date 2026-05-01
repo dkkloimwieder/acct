@@ -87,6 +87,25 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('variance_cost_adjustment', 'value', 'USD', 'unrestricted'),
   ('variance_cost_adjustment', 'value', 'EUR', 'unrestricted');
 
+-- Period-close variance lines (USD + EUR; acct-4mt / acct-s6n).
+-- All bidirectional — write-ups credit, write-downs debit. Three
+-- separate kinds (not one shared 'variance_close') so the income
+-- statement reports the three close-time correction stories
+-- separately:
+--   variance_wac_period          — wac_periodic close adjustment
+--                                   (Epic B, acct-qfj)
+--   variance_wac_retroactive     — wac_retroactive late-data
+--                                   correction (Epic C, acct-9tw)
+--   variance_cost_adjust_retro   — retroactive cost_adjustment
+--                                   correction (Epic E, acct-og1)
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('variance_wac_period',         'value', 'USD', 'unrestricted'),
+  ('variance_wac_period',         'value', 'EUR', 'unrestricted'),
+  ('variance_wac_retroactive',    'value', 'USD', 'unrestricted'),
+  ('variance_wac_retroactive',    'value', 'EUR', 'unrestricted'),
+  ('variance_cost_adjust_retro',  'value', 'USD', 'unrestricted'),
+  ('variance_cost_adjust_retro',  'value', 'EUR', 'unrestricted');
+
 -- SKU-A value accounts (USD).
 -- After acct-nfr (migration 0020), value accounts partition by the
 -- same dimensions as their qty-side counterparts:
