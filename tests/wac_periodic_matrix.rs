@@ -369,15 +369,12 @@ async fn multi_location_pools_close_independently() {
 
 #[tokio::test]
 async fn raw_class_and_fg_class_close_independently_via_separate_skus() {
-    // Architectural assumption: a single SKU has one inventory class
-    // (raw OR fg) — _post_transfers_lookup_qty_account maps both
-    // inv_value_raw and inv_value_fg to the SAME stock_available
-    // account, so a SKU with both pools would have its qty divisor
-    // pooled across classes (incorrect for per-class avg).
-    //
-    // Real workflows give each SKU one class. This test uses two SKUs
-    // to verify the close hook handles raw-class and fg-class pools
-    // identically and independently.
+    // Sister of raw_class_and_fg_class_close_independently_via_one_sku
+    // (below). This version uses two SKUs — one for each class — and
+    // verifies the close hook handles each class identically and
+    // independently. The single-SKU version proves the same fix when
+    // both classes are open on ONE SKU (was an "architectural assumption"
+    // pre-acct-1vr; fixed by migration 0030's per-class qty SUM).
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
@@ -412,6 +409,84 @@ async fn raw_class_and_fg_class_close_independently_via_separate_skus() {
     ).bind(v_fg).fetch_one(&pool).await.expect("fg variance");
     assert_eq!(raw_var, 40);
     assert_eq!(fg_var, 0);
+}
+
+#[tokio::test]
+async fn raw_class_and_fg_class_close_independently_via_one_sku() {
+    // Single SKU has BOTH inv_value_raw AND inv_value_fg pools open.
+    // Both classes have receipts and depletions in 2026-04. Close
+    // verifies per-class avgs are computed independently — the raw
+    // class's variance is unaffected by fg class's avg, and vice versa.
+    //
+    // This test is the proof that acct-1vr (migration 0030) fixed the
+    // structural coupling. Pre-fix, the close hook would have computed
+    // qty_in via stock_available which pools both classes' qty —
+    // poisoning per-class avgs. Post-fix, qty_in reads transfers.qty
+    // tagged on the specific value pool.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = insert_wac_periodic_sku(&pool, "MX-1SKU-MULTI").await;
+    let qty_acct = open_qty_account(&pool, &sku, "MAIN").await;
+    let v_raw = open_value_account(&pool, &sku, "MAIN", "inv_value_raw", "USD").await;
+    let v_fg = open_value_account(&pool, &sku, "MAIN", "inv_value_fg", "USD").await;
+
+    let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
+
+    // RAW activity: receive 100@5, deplete 20, receive 100@9.
+    // Per-class final avg = (500+900)/(100+100) = 7. Variance = 20 × (7-5) = 40.
+    adjust_with_class(&pool, &sku, "MAIN", 100, Some(5), "USD", "raw", "2026-04-05")
+        .await.expect("raw r1");
+    adjust_with_class(&pool, &sku, "MAIN", -20, None, "USD", "raw", "2026-04-10")
+        .await.expect("raw dep");
+    adjust_with_class(&pool, &sku, "MAIN", 100, Some(9), "USD", "raw", "2026-04-15")
+        .await.expect("raw r2");
+
+    // FG activity: receive 50@10, deplete 30. Pre-deplete pool: 50u/$500 → avg $10.
+    // Per-class final avg = 500/50 = 10. Variance = 30 × (10-10) = 0.
+    //
+    // Cross-class qty contamination check: stock_available now contains
+    // raw qty (100-20+100=180) plus fg qty (50). Pre-fix, the periodic
+    // close hook would compute fg's qty_in as the cross-class total
+    // (180+50=230), giving fg a corrupted denominator and corrupted
+    // variance. Post-fix, fg's qty_in is its own per-class transfers.qty
+    // (50), and the variance is correctly 0.
+    adjust_with_class(&pool, &sku, "MAIN", 50, Some(10), "USD", "fg", "2026-04-05")
+        .await.expect("fg r1");
+    adjust_with_class(&pool, &sku, "MAIN", -30, None, "USD", "fg", "2026-04-10")
+        .await.expect("fg dep");
+
+    let pid = period_id(&pool, "2026-04").await;
+    let actor = fresh_uuid(&pool).await;
+    let summary: serde_json::Value =
+        sqlx::query_scalar("SELECT close_period($1, $2::UUID, FALSE, FALSE)")
+            .bind(pid)
+            .bind(&actor)
+            .fetch_one(&pool)
+            .await
+            .expect("close");
+
+    assert_eq!(summary["hook_results"]["wac_periodic"].as_i64(), Some(2),
+               "two depletions finalized — one per class");
+
+    let raw_var: i64 = sqlx::query_scalar(
+        "SELECT tp.variance_amount FROM transfers_provisional tp
+           JOIN transfers t ON t.id = tp.transfer_id
+          WHERE tp.cost_method='wac_periodic' AND t.credit_account_id = $1",
+    ).bind(v_raw).fetch_one(&pool).await.expect("raw variance");
+    let fg_var: i64 = sqlx::query_scalar(
+        "SELECT tp.variance_amount FROM transfers_provisional tp
+           JOIN transfers t ON t.id = tp.transfer_id
+          WHERE tp.cost_method='wac_periodic' AND t.credit_account_id = $1",
+    ).bind(v_fg).fetch_one(&pool).await.expect("fg variance");
+
+    assert_eq!(raw_var, 40, "raw class: 20 × ($7 final - $5 provisional) = $40");
+    assert_eq!(fg_var, 0, "fg class: 30 × ($10 final - $10 provisional) = $0");
+
+    // Sanity: stock_available has cross-class qty.
+    assert_eq!(balance(&pool, qty_acct).await, 100 - 20 + 100 + 50 - 30,
+               "stock_available aggregates raw + fg qty");
 }
 
 #[tokio::test]
