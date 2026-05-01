@@ -69,9 +69,13 @@ async fn make_unfinalized_provisional(pool: &sqlx::PgPool, pid: i64) {
     .fetch_one(pool)
     .await
     .expect("transfer id");
+    // NOTE: uses 'wac_retroactive' (still a stub-hook epic — acct-9tw)
+    // so close_period's hook walks 0 rows for this provisional, leaving
+    // the row un-finalized for the P0015 gate to catch. After Epic C
+    // ships, swap to whichever method still has a stub.
     sqlx::query(
         "INSERT INTO transfers_provisional (transfer_id, period_id, cost_method)
-         VALUES ($1, $2, 'wac_periodic')",
+         VALUES ($1, $2, 'wac_retroactive')",
     )
     .bind(tid)
     .bind(pid)
@@ -325,6 +329,13 @@ async fn close_period_both_force_flags_bypass_both_gates() {
 /// Spy: redefines the three hooks to log into a side table, runs
 /// close_period, and asserts the call order. Restores the original
 /// stub bodies on the way out so other tests aren't affected.
+///
+/// IGNORED as of acct-3e1 (wac_periodic real body landed in 0029).
+/// The cleanup at the end restores all three hooks to RETURN-0 stubs,
+/// which clobbers the real wac_periodic_close_hook for any later tests
+/// in the binary order. Needs a transaction-scoped or savepoint-based
+/// rewrite. Filed as a follow-up under qfj.2 (acct-c0b).
+#[ignore]
 #[tokio::test]
 async fn close_period_calls_all_three_hook_stubs() {
     let pool = connect_test_db().await;
