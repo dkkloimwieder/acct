@@ -1145,7 +1145,7 @@ Notes:
 | `wac_perpetual` IN | use pool average; **P0011** if pool empty (caller must seed) | use it; pool re-averages |
 | `wac_perpetual` OUT | use pool average (classic WAC; pool average preserved); **P0010** if pool empty | **P0011** — asserted-cost-on-depletion belongs in `'lot'` cost_method (see `acct-8gg`) |
 | `wac_periodic` | always **P0006** (`acct-qfj`; depends on period-close machinery) | always **P0006** |
-| `wac_retroactive` | always **P0006** (`acct-9tw`; depends on period-close machinery) | always **P0006** |
+| `wac_retroactive` | use pool average; flagged in `transfers_provisional` for chronological replay at close (`acct-9tw`, migration 0031) | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
 | `fifo` / `lot` | always **P0006** (`acct-8gg`) | always **P0006** |
 
 WAC perpetual is one of three textbook WAC variants (per Oracle/PeopleSoft): perpetual (live average, recomputed every putaway), periodic (single average per period applied at close), and retroactive perpetual (perpetual chain with late-data corrections at close). Phase 1 ships only perpetual; the other two are filed as future epics. The audit row records the **effective** unit cost — what was actually applied — not the caller's input.
@@ -1316,7 +1316,7 @@ Each transfer that touches the value pool carries `qty` (added as a column in 00
 **Three WAC variants (Oracle/PeopleSoft taxonomy).** `wac_perpetual` is one of three textbook variants:
 - `wac_perpetual` — live average, recomputed on every putaway (shipped).
 - `wac_periodic` — single average per period, computed at period close, applied to all depletions in the period (filed as `acct-qfj`; depends on period-close machinery).
-- `wac_retroactive` — perpetual chain with late-data corrections at period close (filed as `acct-9tw`; depends on Epic B's machinery).
+- `wac_retroactive` — perpetual chain mid-period; chronological replay at period close re-costs each depletion against the running avg it should have had given full-period data, including late-arriving receipts that were originally booked out of order (acct-9tw, migration 0031). Replay order is `(business_date, posted_at, id)` with full determinism. Variance per depletion routes through `variance_wac_retroactive`. WIP class deferred (`acct-p7v`).
 
 **FIFO/LIFO/lot scaffolded but unimplemented.** The dispatcher's `'fifo'` and `'lot'` branches RAISE `P0006`. Real implementation requires lot-tracking infrastructure (lot creation, expiry, traceability), which is a feature larger than just costing. Tracked as `acct-8gg` once lot infrastructure is scoped.
 
@@ -1362,7 +1362,7 @@ Sequence inside `close_period`:
 
 2. **Run hooks** in a fixed order:
    - `wac_periodic_close_hook(period_id)` — Epic B (`acct-qfj`) replaces this body.
-   - `wac_retroactive_close_hook(period_id)` — Epic C (`acct-9tw`) replaces this body.
+   - `wac_retroactive_close_hook(period_id, p_force_provisional)` — real body landed `acct-9tw` (migration 0031). Walks pool events chronologically `(business_date, posted_at, id)`, re-costs each provisional depletion against the recomputed running avg, posts variance through `variance_wac_retroactive`.
    - `cost_adjust_retroactive_hook(period_id)` — Epic E (`acct-og1`) replaces this body.
 
    Each hook returns `BIGINT` — the count of rows it finalized. In `acct-s6n` all three are stubs that return 0 and touch nothing; the contract is in place so the dependent epics can replace bodies without modifying `close_period` itself. Hooks run **before** step 5 stamps `closed_at` so any variance transfers they post don't trip `post_transfers`' P0005 gate on the period being closed.

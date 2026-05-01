@@ -185,7 +185,7 @@ Behavior:
 | `wac_perpetual` IN | use pool average; **P0011** if pool empty (must seed) | use it; pool re-averages |
 | `wac_perpetual` OUT | use pool average; **P0010** if pool empty | **P0011** — asserted cost on depletion belongs in `'lot'` cost_method (acct-8gg) |
 | `wac_periodic` | always **P0006** (acct-qfj; depends on period-close machinery) | always **P0006** |
-| `wac_retroactive` | always **P0006** (acct-9tw; depends on period-close machinery) | always **P0006** |
+| `wac_retroactive` | use pool average; flagged in `transfers_provisional` for chronological replay at close (`acct-9tw`, migration 0031) | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
 | `fifo` / `lot` | always **P0006** (acct-8gg) | always **P0006** |
 
   Pool reads happen under `FOR UPDATE` on the qty + value accounts, locked in ascending id order to match `post_transfers`' lock-order invariant.
@@ -256,7 +256,7 @@ close_period(
 Steps inside `close_period`:
 
 1. `SELECT ... FROM periods WHERE id = $1 FOR UPDATE` — serializes concurrent close calls; raises **P0014** if the period is missing or already closed.
-2. Calls `wac_periodic_close_hook`, `wac_retroactive_close_hook`, `cost_adjust_retroactive_hook` in that order. All three are stubs that return 0 in `acct-s6n`; Epics B (`acct-qfj`), C (`acct-9tw`), E (`acct-og1`) replace the bodies. Hook variance transfers post **before** `closed_at` is stamped so they don't trip P0005.
+2. Calls `wac_periodic_close_hook`, `wac_retroactive_close_hook`, `cost_adjust_retroactive_hook` in that order. As of `acct-9tw` (migration 0031), the first two have real bodies (wac_periodic re-costs each provisional depletion at the period's final avg `Σ(in-period receipts)/Σ(in-period qty)`; wac_retroactive does chronological replay re-costing each depletion against the running avg it should have had given full-period data). `cost_adjust_retroactive_hook` remains a stub returning 0 until Epic E (`acct-og1`). Hook variance transfers post **before** `closed_at` is stamped so they don't trip P0005.
 3. **Provisional gate**: counts `transfers_provisional` rows in this period with `finalized_at IS NULL`. Raises **P0015** unless `p_force_provisional = TRUE`.
 4. **Reconciliation gate**: calls `run_daily_reconciliation()`. Raises **P0016** unless `p_force_recon = TRUE`. Force still records the alerts.
 5. Stamps `closed_at = clock_timestamp()`, `closed_by = p_actor`.
