@@ -69,13 +69,18 @@ async fn make_unfinalized_provisional(pool: &sqlx::PgPool, pid: i64) {
     .fetch_one(pool)
     .await
     .expect("transfer id");
-    // NOTE: uses 'wac_retroactive' (still a stub-hook epic — acct-9tw)
-    // so close_period's hook walks 0 rows for this provisional, leaving
-    // the row un-finalized for the P0015 gate to catch. After Epic C
-    // ships, swap to whichever method still has a stub.
+    // NOTE: uses cost_method='fifo' as a sentinel that no close hook
+    // processes (wac_periodic_close_hook only matches wac_periodic;
+    // wac_retroactive_close_hook only matches wac_retroactive; the
+    // cost_adjust_retroactive hook is still a stub returning 0).
+    // 'fifo' and 'lot' are valid cost_method enum values but have
+    // no close-time processing, so the row stays un-finalized for the
+    // P0015 gate to catch. (When fifo/lot infrastructure ships under
+    // acct-8gg, this gate test will need a different sentinel — possibly
+    // rewriting to a tx-rollback pattern like the spy test.)
     sqlx::query(
         "INSERT INTO transfers_provisional (transfer_id, period_id, cost_method)
-         VALUES ($1, $2, 'wac_retroactive')",
+         VALUES ($1, $2, 'fifo')",
     )
     .bind(tid)
     .bind(pid)
