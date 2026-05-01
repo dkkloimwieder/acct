@@ -1187,7 +1187,7 @@ Cost-method dispatch:
 
 | `cost_method` | Behavior |
 |---|---|
-| `standard` | **P0011** — to change a standard SKU's cost, update `skus.standard_cost` via a separate workflow (not yet implemented) |
+| `standard` | **P0011** — to change a standard SKU's cost, use `post_standard_cost_roll` (§3.13) |
 | `wac_perpetual` | computes delta against the live pool average; posts immediately |
 | `wac_periodic` | **P0006** — depends on period-close machinery (`acct-s6n`) and the `wac_periodic` epic (`acct-qfj`) |
 | `wac_retroactive` | **P0006** — same dependency chain, plus `acct-9tw` |
@@ -1198,6 +1198,80 @@ Empty pool (qty ≤ 0): **P0010** — there's no average to adjust on an empty p
 The audit row records the **prior** unit cost (pool avg before adjustment), the **target** unit cost, the resulting **delta_value**, and the **pool_qty** at adjustment time. This makes the operation self-explanatory in reports without needing to look elsewhere.
 
 Idempotent at the document-table level: replay returns the existing id without re-posting.
+
+### 3.13 Standard cost as a separate transactional entity
+
+`skus.standard_cost` does not exist as a column. Standard cost is a **stream of cost estimates with effective dates** (Oracle/SAP idiom: "cost estimate" / "cost update"), tracked in its own table. The item master records that a SKU exists; the cost stream records what its standard is at any given date.
+
+```sql
+CREATE TABLE standard_costs (
+  id              UUID PRIMARY KEY DEFAULT uuidv7(),
+  sku_id          UUID NOT NULL REFERENCES skus(id),
+  cost            BIGINT NOT NULL CHECK (cost >= 0),
+  effective_at    DATE NOT NULL,
+  posted_by       UUID NOT NULL,
+  posted_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  idempotency_key UUID NOT NULL UNIQUE,
+  notes           TEXT
+);
+```
+
+Append-only by convention. Each row is the standard that takes effect on `effective_at`. Multiple rows per SKU are expected — the cost stream evolves over time.
+
+**Canonical lookup.** All cost-relevant operations on standard-method SKUs go through one helper:
+
+```sql
+resolve_standard_cost_at(p_sku_id UUID, p_business_date DATE) RETURNS BIGINT
+```
+
+Returns the cost from the latest row with `effective_at <= p_business_date`, or raises **P0018** (`standard_cost_not_established`) if no such row exists for the SKU at that date. This is a STABLE function (no side effects).
+
+**P0018 gate.** A standard-method SKU with no `standard_costs` row in effect at `business_date` is in an incomplete state. Cost-relevant operations refuse with P0018. Currently caught by:
+- `_post_transfers_compute_amount` — `post_transfers` value-side dispatcher (touches `op_move`, `scrap`, `wo_complete`, `so_ship`).
+- `post_inventory_adjustment` — standard branch with `NULL` p_unit_cost.
+
+Future workflows (PO receipt, SO ship, etc.) inherit the gate by going through these helpers. Operations that don't read the cost — qty-only events, account creation, metadata queries — are unaffected.
+
+**Establishing or rolling the cost.** `post_standard_cost_roll` is the single entry point:
+
+```sql
+post_standard_cost_roll(
+  p_sku_id            UUID,
+  p_new_cost          BIGINT,
+  p_effective_at      DATE,                     -- when the new standard takes effect
+  p_business_date     DATE,                     -- date for variance transfers
+  p_posted_by         UUID,
+  p_idempotency_key   UUID,
+  p_notes             TEXT   DEFAULT NULL,
+  p_expected_old_cost BIGINT DEFAULT NULL       -- optimistic concurrency guard
+) RETURNS UUID                                  -- inventory_standard_cost_rolls.id
+```
+
+Behavior:
+
+1. **Replay check** — same `idempotency_key` returns the existing audit id without re-posting.
+2. **Cost-method dispatch** — standard ✓; `wac_perpetual` / `wac_periodic` / `wac_retroactive` → **P0011** (use `post_cost_adjustment` instead, §3.12); `fifo` / `lot` → **P0006** (acct-8gg).
+3. **Retroactive guard** — `p_effective_at` must be strictly greater than every existing `standard_costs.effective_at` for the SKU. Otherwise raises **P0019** (`retroactive_std_cost_roll_blocked`). Phase 1 doesn't support retroactive corrections to past costs.
+4. **Optimistic concurrency** — if `p_expected_old_cost` is non-NULL it must match the active standard at `p_business_date` (or both must be NULL for the first roll). Mismatch raises **P0017**.
+5. **WIP guard** — if any open `inv_value_wip` pool exists for the SKU with a non-zero balance, raises **P0006** referencing `acct-bru` (Epic G — WIP material revaluation companion). Phase 1 blocks rolls when WIP is in flight; the companion workflow is deferred to Phase 2.
+6. **INSERT** the new `standard_costs` row.
+7. **Revaluation pass** — if the new cost takes effect at or before `p_business_date`, walk every open `inv_value_raw` and `inv_value_fg` pool for the SKU; per pool with non-zero on-hand, post a variance transfer for `on_hand × (new − prior)` against `variance_std_cost_roll(currency)`. Write-up: dr inventory, cr variance. Write-down: reverse. WIP excluded by step 5's guard.
+8. **Audit row** — records `prior_standard_cost` (NULLABLE; first roll has no prior), `target_standard_cost`, `total_delta_value`, `pool_qty`, plus `effective_at` and `business_date` for self-explanatory reporting.
+
+**Future-dated rolls.** If `p_effective_at > p_business_date`, the new cost is queued (INSERT only) but no revaluation posts. Transactions whose `business_date >= effective_at` automatically pick up the new standard via `resolve_standard_cost_at`. Phase 1 has no scheduled-revaluation mechanism for the future-dated case — when the effective date passes, on-hand pools simply continue to carry the prior standard until they flow out or a follow-up roll re-revalues. This is acknowledged imprecision; out of scope for Phase 1 to schedule.
+
+**Lock order.** `skus` row `FOR UPDATE` first (serializes concurrent rolls on the same SKU even though we don't UPDATE the row directly), then `inv_value_raw` + `inv_value_fg` accounts in ascending id order. Matches `post_transfers`' lock-order invariant.
+
+**Variance account.** `variance_std_cost_roll` (one per currency, `normal_side='unrestricted'`). Distinct from:
+- `variance_cost_adjustment` (§3.12) — WAC pool revaluation
+- `inv_adj_expense` (§3.11) — qty-driven adjustments
+- `variance_ppv` — purchase price variance per receipt
+
+Each tells a different income-statement story.
+
+**Audit table.** `inventory_standard_cost_rolls` records every roll, including no-ops (target == prior) and first rolls (prior IS NULL). The full history is preserved.
+
+**Known limitation.** `p_posted_by` is unvalidated (RBAC = Part VII Q6, still open). Same convention as the other document-layer functions.
 
 ## §4. WIP model
 

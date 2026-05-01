@@ -142,6 +142,9 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 | `P0014` | `period_close_invalid` | `close_period(p_period_id, ...)` called against a missing period or one whose `closed_at IS NOT NULL`. Raised by `close_period`. Two concurrent calls on the same period both raise this — the loser re-reads `closed_at` after the `FOR UPDATE` lock is released and finds it stamped. |
 | `P0015` | `period_close_provisional` | `close_period` refused: `transfers_provisional` has rows in this period with `finalized_at IS NULL`. Caller can pass `p_force_provisional := TRUE` to bypass; un-finalized rows are then left on the side table for forensics. |
 | `P0016` | `period_close_reconciliation` | `close_period` refused: `run_daily_reconciliation()` raised one or more new alerts. Caller can pass `p_force_recon := TRUE` to bypass; alerts are still recorded. |
+| `P0017` | `optimistic_concurrency_violation` | `post_standard_cost_roll` caller passed `p_expected_old_cost` that does not match the active standard at `p_business_date`. Surfaces stale-read bugs in callers (UI showed an old value before another roll landed). NULL/non-NULL mismatch in either direction also raises this. |
+| `P0018` | `standard_cost_not_established` | A cost-relevant operation on a standard-method SKU was attempted but no `standard_costs` row is in effect at the requested `business_date`. Resolved by calling `post_standard_cost_roll()` first. Backdated transactions before the earliest `effective_at` also surface this code. Raised by `resolve_standard_cost_at` and inherited by every consumer that goes through it (currently `_post_transfers_compute_amount` standard branch, `post_inventory_adjustment` standard branch with NULL `p_unit_cost`). |
+| `P0019` | `retroactive_std_cost_roll_blocked` | `post_standard_cost_roll` caller passed `p_effective_at` that is not strictly greater than every existing `standard_costs.effective_at` for the SKU. Phase 1 does not support retroactive corrections to past standard costs. |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 
@@ -176,7 +179,7 @@ Behavior:
 
 | `cost_method` | `p_unit_cost = NULL` | `p_unit_cost = explicit` |
 |---|---|---|
-| `standard` | use `skus.standard_cost` | **P0011** — standard SKUs have a fixed cost; do not pass one |
+| `standard` | use `resolve_standard_cost_at(sku, business_date)` — raises **P0018** if no `standard_costs` row in effect | **P0011** — standard SKUs have a fixed cost; do not pass one |
 | `wac_perpetual` IN | use pool average; **P0011** if pool empty (must seed) | use it; pool re-averages |
 | `wac_perpetual` OUT | use pool average; **P0010** if pool empty | **P0011** — asserted cost on depletion belongs in `'lot'` cost_method (acct-8gg) |
 | `wac_periodic` | always **P0006** (acct-qfj; depends on period-close machinery) | always **P0006** |
@@ -185,7 +188,7 @@ Behavior:
 
   Pool reads happen under `FOR UPDATE` on the qty + value accounts, locked in ascending id order to match `post_transfers`' lock-order invariant.
 
-- Builds a 2-event batch with reason `inventory_adjustment` (qty leg + value leg), sign-flipped on negative `qty_delta`. Skips the value leg when the effective unit cost is 0 (only possible when `standard_cost = 0`).
+- Builds a 2-event batch with reason `inventory_adjustment` (qty leg + value leg), sign-flipped on negative `qty_delta`. Skips the value leg when the effective unit cost is 0 (only possible when the SKU's resolved standard is 0).
 - Calls `post_transfers(batch, FALSE)` — closed-period override is not exposed here.
 - Records the **effective** unit cost (what was actually applied) in the audit row's `unit_cost` column, not the caller's input.
 
@@ -264,6 +267,47 @@ Hook contract: `<name>(p_period_id BIGINT) RETURNS BIGINT` (count finalized). Ep
 **Known limitation.** `p_actor` is unvalidated — `close_period` accepts any UUID and stores it as `closed_by`. RBAC is Part VII Q6, still open.
 
 See consolidated doc §6 for the full design notes.
+
+### `post_standard_cost_roll` (migrations 0027 + 0028, acct-hlr)
+
+Establishes or rolls a standard-method SKU's standard cost. INSERTs a new row into `standard_costs`, revalues existing on-hand inventory at the new standard, posts variance to `variance_std_cost_roll`. The standard cost itself lives in `standard_costs` (an append-only stream); `skus.standard_cost` does not exist as a column.
+
+Signature:
+```
+post_standard_cost_roll(
+  p_sku_id            UUID,
+  p_new_cost          BIGINT,
+  p_effective_at      DATE,
+  p_business_date     DATE,
+  p_posted_by         UUID,
+  p_idempotency_key   UUID,
+  p_notes             TEXT   DEFAULT NULL,
+  p_expected_old_cost BIGINT DEFAULT NULL    -- optimistic concurrency
+) RETURNS UUID                                -- inventory_standard_cost_rolls.id
+```
+
+Behavior:
+- Replay check via `idempotency_key` returns the existing audit row's id without re-posting.
+- Cost-method dispatch:
+
+| `cost_method` | Behavior |
+|---|---|
+| `standard` | proceed |
+| `wac_perpetual` / `wac_periodic` / `wac_retroactive` | **P0011** — use `post_cost_adjustment` (Epic D) for WAC pools |
+| `fifo` / `lot` | **P0006** (acct-8gg) |
+
+- **Retroactive guard**: `p_effective_at` must be strictly greater than every existing `standard_costs.effective_at` for the SKU. Otherwise **P0019**. Phase 1 does not support retroactive corrections.
+- **Optimistic concurrency**: if `p_expected_old_cost` is non-NULL, must equal `resolve_standard_cost_at(sku, business_date)` (or both NULL for the first roll). Mismatch raises **P0017**.
+- **WIP guard**: if any open `inv_value_wip` pool exists for the SKU with non-zero balance, raises **P0006** with reference to `acct-bru` (Epic G — WIP material revaluation companion). Phase 1 blocks; the companion workflow is deferred.
+- **First roll** (no prior standard at `business_date`): INSERT only; audit row records `prior_standard_cost = NULL`, `target`, `delta = 0`, `pool_qty = 0`. No transfers posted.
+- **Future-dated** (`p_effective_at > p_business_date`): INSERT only, no revaluation. New cost takes effect for transactions whose `business_date >= effective_at` via `resolve_standard_cost_at`.
+- **No-op** (`p_new_cost = prior`): audit row recorded with `delta = 0`; no transfers.
+- **Revaluation pass**: walks `inv_value_raw` + `inv_value_fg` pools for the SKU (WIP excluded by the guard above), locks each in ascending id order under `FOR UPDATE`, computes `delta = on_hand_qty × (target − prior)` per pool. Builds one variance event per non-zero pool with `reason='standard_cost_roll'`; direction by sign (write-up: dr inventory, cr variance). Calls `post_transfers(batch, FALSE)` — closed-period override not exposed.
+- **Audit table** `inventory_standard_cost_rolls` (`prior_standard_cost` is **NULLABLE**, see first-roll case): records `prior`, `target`, `total_delta_value`, `pool_qty`, `effective_at`, `business_date`.
+
+**Known limitation.** `p_posted_by` is unvalidated — same convention as the other document-layer functions. RBAC is Part VII Q6, still open.
+
+See consolidated doc §3.13 for the full design notes.
 
 ## Schema integrity check (`scripts/ci-check.sh`)
 
