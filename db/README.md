@@ -166,7 +166,7 @@ post_inventory_adjustment(
 
 Behavior:
 - Inserts an `inventory_adjustments` row (UNIQUE on `idempotency_key`); a replay with the same key returns the existing id without re-posting.
-- Resolves `stock_available(sku, location)`, `inv_value_{class}(sku, location, currency)`, and `creation_void` counterparts; raises `P0010` if any account is missing.
+- Resolves `stock_available(sku, location)`, `inv_value_{class}(sku, location, currency)`, `creation_void(qty)`, and `inv_adj_expense(currency)` (the bidirectional P&L counterpart); raises `P0010` if any account is missing.
 - Builds a 2-event batch with reason `inventory_adjustment` (qty leg + value leg), sign-flipped on negative `qty_delta`. Skips the value leg when `unit_cost = 0`.
 - Calls `post_transfers(batch, FALSE)` — closed-period override is not exposed here yet.
 

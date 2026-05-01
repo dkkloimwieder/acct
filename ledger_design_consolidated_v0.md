@@ -1123,17 +1123,19 @@ qty_delta > 0 (in):
     amount: |qty_delta|
   - reason='inventory_adjustment'
     debit:  accounts(inv_value_{class}, sku, loc, ccy).id   -- class ∈ {'raw','fg'}
-    credit: accounts(creation_void, value, ccy).id
+    credit: accounts(inv_adj_expense, ccy).id               -- adjustment income
     amount: |qty_delta| * unit_cost
 
 qty_delta < 0 (out): debit and credit roles flip on both legs.
+  -- value leg becomes: debit inv_adj_expense, credit inv_value_*
+  --                    (adjustment expense)
 ```
 
 Notes:
 - `inventory_class` is `'raw'` or `'fg'` (MVP); WIP adjustments require routing_op resolution and are deferred.
 - `unit_cost = 0` is legal (qty-only adjustment); the value leg is omitted.
 - Idempotent on `idempotency_key` at the document-table level — replay returns the existing document id without re-posting.
-- Counterpart is `creation_void` on both qty and value sides. P&L counterpart (`inv_adj_expense`) is a future revisit when income-statement-shaped reporting is in scope.
+- **Qty-side counterpart is `creation_void` (qty has no P&L concept). Value-side counterpart is `inv_adj_expense` — a bidirectional P&L account (`normal_side='unrestricted'`) that holds adjustment income (credit balance) and adjustment expense (debit balance). The accumulated balance at period close is the net adjustment gain/loss on the income statement.**
 - The ledger reason `inventory_adjustment` is added in migration 0022. Down-migration drops the table and function but leaves the enum value in place (Postgres can't cleanly remove an enum value once added without recreating the type).
 
 ## §4. WIP model
