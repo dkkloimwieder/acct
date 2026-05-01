@@ -1,15 +1,25 @@
 -- acct-dj8 / acct-sb6 — first Phase 1 feature: pure inventory adjustment.
 --
--- A thin document-layer wrapper around the existing cycle_count_adj
--- ledger primitive. Lets callers adjust inventory in/out at a given
--- (qty, unit_cost) without constructing the JSONB event batch by hand.
+-- A thin document-layer wrapper that lets callers adjust inventory
+-- in/out at a given (qty, unit_cost) without constructing the JSONB
+-- event batch by hand. Distinct from cycle_count_adj — that reason
+-- stays for cycle-count-specific document workflows; this one is the
+-- generic primitive.
 --
 -- Design notes:
 --
+--   * New transfer_reason enum value 'inventory_adjustment'. Adding an
+--     enum value is one-way: Postgres can't cleanly drop a value once
+--     added, so the down migration drops the table and function but
+--     leaves the enum value in place. This matches the project's
+--     convention (see migration 0020's down-comment) of "Phase 0/1 has
+--     no production data; down is best-effort." A future migration
+--     could full-recreate the enum if a clean removal is ever needed.
+--
 --   * Counterpart accounts are creation_void on both qty and value
---     sides — matches the existing conformance pattern. P&L counterpart
---     (inv_adj_expense) is a future revisit when accountant-facing
---     income statements are in scope.
+--     sides — matches the existing conformance pattern for
+--     cycle_count_adj. P&L counterpart (inv_adj_expense) is a future
+--     revisit when accountant-facing income statements are in scope.
 --
 --   * inventory_class ∈ ('raw','fg') for MVP. WIP adjustments with
 --     routing_op are deferred (the value-side account would need to
@@ -22,12 +32,8 @@
 --     post_transfers events generate fresh idempotency_keys internally
 --     (gen_random_uuid()) since their idempotency surface is a level
 --     deeper than the document's.
---
---   * The reason on the underlying transfers is cycle_count_adj. The
---     reason name is historical; the primitive itself is general
---     "qty/value adjustment with creation_void counterpart." We don't
---     add a new transfer_reason enum value because Postgres can't
---     drop one cleanly on the down-migration.
+
+ALTER TYPE transfer_reason ADD VALUE IF NOT EXISTS 'inventory_adjustment';
 
 CREATE TABLE inventory_adjustments (
   id              UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
@@ -166,7 +172,7 @@ BEGIN
   IF v_val_amount > 0 THEN
     v_batch := jsonb_build_array(
       jsonb_build_object(
-        'reason',            'cycle_count_adj',
+        'reason',            'inventory_adjustment',
         'document_kind',     'inventory_adjustment',
         'document_id',       v_doc_id,
         'debit_account_id',  v_qty_debit,
@@ -177,7 +183,7 @@ BEGIN
         'posted_by',         p_posted_by
       ),
       jsonb_build_object(
-        'reason',            'cycle_count_adj',
+        'reason',            'inventory_adjustment',
         'document_kind',     'inventory_adjustment',
         'document_id',       v_doc_id,
         'debit_account_id',  v_val_debit,
@@ -191,7 +197,7 @@ BEGIN
   ELSE
     v_batch := jsonb_build_array(
       jsonb_build_object(
-        'reason',            'cycle_count_adj',
+        'reason',            'inventory_adjustment',
         'document_kind',     'inventory_adjustment',
         'document_id',       v_doc_id,
         'debit_account_id',  v_qty_debit,

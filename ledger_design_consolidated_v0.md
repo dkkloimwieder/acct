@@ -1111,17 +1111,17 @@ events:
 
 ### 3.11 Inventory adjustment (general — not cycle-count-specific)
 
-Inventory adjustments bring inventory into or out of the system without an external counterparty (no PO, no SO, no WO). Use cases include physical-count corrections, write-downs, write-ins, post-receipt damage detected before a return, and rounding reconciliations.
+Inventory adjustments bring inventory into or out of the system without an external counterparty (no PO, no SO, no WO). Use cases include physical-count corrections, write-downs, write-ins, post-receipt damage detected before a return, and rounding reconciliations. This is distinct from `cycle_count_adj`, which is reserved for cycle-count-specific document workflows.
 
-The document layer is the `inventory_adjustments` table (migration 0022); the function `post_inventory_adjustment` wraps the `cycle_count_adj` ledger primitive. Caller passes a signed `qty_delta` (positive = in, negative = out) and a `unit_cost`. The function generates the 2-event batch:
+The document layer is the `inventory_adjustments` table (migration 0022); the function `post_inventory_adjustment` wraps the `inventory_adjustment` ledger primitive (also added in migration 0022). Caller passes a signed `qty_delta` (positive = in, negative = out) and a `unit_cost`. The function generates the 2-event batch:
 
 ```
 qty_delta > 0 (in):
-  - reason='cycle_count_adj'
+  - reason='inventory_adjustment'
     debit:  accounts(stock_available, sku, loc).id
     credit: accounts(creation_void, qty).id
     amount: |qty_delta|
-  - reason='cycle_count_adj'
+  - reason='inventory_adjustment'
     debit:  accounts(inv_value_{class}, sku, loc, ccy).id   -- class ∈ {'raw','fg'}
     credit: accounts(creation_void, value, ccy).id
     amount: |qty_delta| * unit_cost
@@ -1133,8 +1133,8 @@ Notes:
 - `inventory_class` is `'raw'` or `'fg'` (MVP); WIP adjustments require routing_op resolution and are deferred.
 - `unit_cost = 0` is legal (qty-only adjustment); the value leg is omitted.
 - Idempotent on `idempotency_key` at the document-table level — replay returns the existing document id without re-posting.
-- Counterpart is `creation_void` on both qty and value sides (matches existing conformance pattern). P&L counterpart (`inv_adj_expense`) is a future revisit when income-statement-shaped reporting is in scope.
-- The ledger reason is `cycle_count_adj` because that is the existing primitive — the name is historical. The document's `subtype`/intent (count, damage, write-down, write-in) lives on the `inventory_adjustments` row, not on the ledger reason. Future work may rename the underlying reason; until then, treat `cycle_count_adj` as the generic adjustment primitive.
+- Counterpart is `creation_void` on both qty and value sides. P&L counterpart (`inv_adj_expense`) is a future revisit when income-statement-shaped reporting is in scope.
+- The ledger reason `inventory_adjustment` is added in migration 0022. Down-migration drops the table and function but leaves the enum value in place (Postgres can't cleanly remove an enum value once added without recreating the type).
 
 ## §4. WIP model
 
