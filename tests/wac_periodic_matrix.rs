@@ -970,7 +970,8 @@ async fn hooks_called_in_documented_order_with_real_body_preserved() {
          BEGIN INSERT INTO _hook_log (hook_name) VALUES ('wac_retroactive'); RETURN 0; END;
          $$;
 
-         CREATE OR REPLACE FUNCTION cost_adjust_retroactive_hook(p_period_id BIGINT)
+         DROP FUNCTION cost_adjust_retroactive_hook(BIGINT, BOOLEAN);
+         CREATE OR REPLACE FUNCTION cost_adjust_retroactive_hook(p_period_id BIGINT, p_force_provisional BOOLEAN DEFAULT FALSE)
          RETURNS BIGINT LANGUAGE plpgsql AS $$
          BEGIN INSERT INTO _hook_log (hook_name) VALUES ('cost_adjust_retroactive'); RETURN 0; END;
          $$;",
