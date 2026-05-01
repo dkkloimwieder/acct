@@ -1144,7 +1144,7 @@ Notes:
 | `standard` | use `skus.standard_cost` | **P0011** — standard SKUs have a fixed cost; do not pass one |
 | `wac_perpetual` IN | use pool average; **P0011** if pool empty (caller must seed) | use it; pool re-averages |
 | `wac_perpetual` OUT | use pool average (classic WAC; pool average preserved); **P0010** if pool empty | **P0011** — asserted-cost-on-depletion belongs in `'lot'` cost_method (see `acct-8gg`) |
-| `wac_periodic` | always **P0006** (`acct-qfj`; depends on period-close machinery) | always **P0006** |
+| `wac_periodic` | use pool average; flagged in `transfers_provisional` for re-cost at close (`acct-qfj`, migration 0029); P0006 if pool empty on depletion | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
 | `wac_retroactive` | use pool average; flagged in `transfers_provisional` for chronological replay at close (`acct-9tw`, migration 0031) | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
 | `fifo` / `lot` | always **P0006** (`acct-8gg`) | always **P0006** |
 
@@ -1351,7 +1351,7 @@ For long-cycle/regulated job-cost WOs, opt in to per-WO per-op accounts at WO cr
 
 **Cost is computed inside `post_transfers`.** As of acct-0ig (migration 0019), the value-side amount on cost-relevant events (`op_move`, `scrap`, `wo_complete`, `so_ship`) is computed by a dispatcher helper keyed on `skus.cost_method`. The system is the cost engine — there is no external cost engine.
 
-**Implemented branches:** `'standard'` (migration 0019, `amount = qty × resolve_standard_cost_at(sku, business_date)` after the standard-cost refactor in migration 0027 / `acct-x4t`) and `'wac_perpetual'` (migration 0021 / `acct-uxu`, refactored in migration 0030 / `acct-1vr` for per-class qty correctness). The qty-side gate relaxes for both. `wac_perpetual` raises `P0006` only when the qty pool is zero.
+**Implemented branches:** `'standard'` (migration 0019, `amount = qty × resolve_standard_cost_at(sku, business_date)` after the standard-cost refactor in migration 0027 / `acct-x4t`); `'wac_perpetual'` (migration 0021 / `acct-uxu`, refactored in migration 0030 / `acct-1vr` for per-class qty correctness); `'wac_periodic'` (migration 0029 / `acct-qfj`, mid-period dispatcher matches wac_perpetual but flags depletions in `transfers_provisional` for re-cost at close); `'wac_retroactive'` (migration 0031 / `acct-9tw`, same mid-period dispatcher and provisional flagging as wac_periodic; differs only at close-time replay). The qty-side gate relaxes for all four. `wac_perpetual` / `wac_periodic` / `wac_retroactive` raise `P0006` only when the qty pool is zero at depletion time.
 
 **Per-class qty divisor (acct-1vr, migration 0030).** `wac_perpetual` and `wac_periodic` no longer divide by `stock_available.balance` — that account pools qty across raw and fg lifecycle states for the same `(sku, location)`, which gave incorrect per-class unit costs when a SKU had multiple value pools active. Instead, the divisor is a per-pool sum from transfer history:
 
@@ -1364,9 +1364,9 @@ SELECT SUM(CASE WHEN t.debit_account_id  = pool_id THEN  t.qty
 
 Each transfer that touches the value pool carries `qty` (added as a column in 0030, populated at INSERT time from the event JSONB), so the sum is class-isolated. Numerator (`pool.balance`) is unchanged — value-side accounts are already partitioned per class. `_post_transfers_lookup_qty_account` is retained for `post_transfers`'s lock pre-scan but no longer participates in divisor computation.
 
-**Three WAC variants (Oracle/PeopleSoft taxonomy).** `wac_perpetual` is one of three textbook variants:
-- `wac_perpetual` — live average, recomputed on every putaway (shipped).
-- `wac_periodic` — single average per period, computed at period close, applied to all depletions in the period (filed as `acct-qfj`; depends on period-close machinery).
+**Three WAC variants (Oracle/PeopleSoft taxonomy).** `wac_perpetual` is one of three textbook variants — all three are shipped:
+- `wac_perpetual` — live average, recomputed on every putaway. Mid-period and post-close are the same number.
+- `wac_periodic` — single average per period, computed at close, applied to every depletion in the period (acct-qfj, migration 0029). Mid-period the dispatcher posts depletions at the running pool average — exact same math as wac_perpetual — but the value-leg transfer is flagged in `transfers_provisional` with `cost_method='wac_periodic'`. At close, `wac_periodic_close_hook` walks each pool with un-finalized rows, computes `final_avg = Σ(in-period receipts value) / Σ(in-period receipts qty)` (Oracle PAC convention; numerator and denominator both per-pool, signed by debit/credit on the value account), and posts variance per depletion routed through `variance_wac_period`. Empty-pool-on-depletion = P0006 (same as wac_perpetual). Zero-receipts-in-period = **P0020** (`wac_periodic_close_no_receipts`); operator either posts a receipt and retries, or closes with `p_force_provisional=TRUE` to leave un-finalized rows on the side table for forensics. Receipts on wac_periodic SKUs do not flag — they post at their actual asserted cost (po_unit_price, cycle_count_adj amount, etc.) and contribute to `final_avg` directly. Alternate provisional cost sources (last period close avg, last purchase price, configured value, zero, standard) tracked as Epic I (`acct-cms`).
 - `wac_retroactive` — perpetual chain mid-period; chronological replay at period close re-costs each depletion against the running avg it should have had given full-period data, including late-arriving receipts that were originally booked out of order (acct-9tw, migration 0031). Replay order is `(business_date, posted_at, id)` with full determinism. Variance per depletion routes through `variance_wac_retroactive`. WIP class deferred (`acct-p7v`).
 
 **FIFO/LIFO/lot scaffolded but unimplemented.** The dispatcher's `'fifo'` and `'lot'` branches RAISE `P0006`. Real implementation requires lot-tracking infrastructure (lot creation, expiry, traceability), which is a feature larger than just costing. Tracked as `acct-8gg` once lot infrastructure is scoped.

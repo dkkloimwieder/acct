@@ -147,11 +147,10 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 | `P0017` | `optimistic_concurrency_violation` | `post_standard_cost_roll` caller passed `p_expected_old_cost` that does not match the active standard at `p_business_date`. Surfaces stale-read bugs in callers (UI showed an old value before another roll landed). NULL/non-NULL mismatch in either direction also raises this. |
 | `P0018` | `standard_cost_not_established` | A cost-relevant operation on a standard-method SKU was attempted but no `standard_costs` row is in effect at the requested `business_date`. Resolved by calling `post_standard_cost_roll()` first. Backdated transactions before the earliest `effective_at` also surface this code. Raised by `resolve_standard_cost_at` and inherited by every consumer that goes through it (currently `_post_transfers_compute_amount` standard branch, `post_inventory_adjustment` standard branch with NULL `p_unit_cost`). |
 | `P0019` | `retroactive_std_cost_roll_blocked` | `post_standard_cost_roll` caller passed `p_effective_at` that is not strictly greater than every existing `standard_costs.effective_at` for the SKU. Phase 1 does not support retroactive corrections to past standard costs. |
+| `P0020` | `wac_periodic_close_no_receipts` | `wac_periodic_close_hook` (composed through `close_period`) found a pool with un-finalized `wac_periodic` provisional rows but zero in-period receipts; cannot compute the period's `final_avg = Σ(receipts value) / Σ(receipts qty)`. Operator either (a) posts a receipt for the period and retries close, or (b) calls `close_period(..., p_force_provisional := TRUE)` which skips the un-processable rows and leaves them on the side table for forensics. |
 | `P0021` | `target_period_closed` | `post_cost_adjustment_retroactive` caller passed `p_target_period_id` for a period whose `closed_at IS NOT NULL`. The retroactive cost-adjustment workflow only operates on currently-open periods (the queue is the period's audit trail and must be visible to `close_period`). To fix a closed period, reopen it first; reopen workflow is tracked as `acct-7h4` (Phase 2 Epic K). |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
-
-P0020 (`wac_periodic_close_no_receipts`) is raised by `wac_periodic_close_hook` when a pool with un-finalized provisional rows received no in-period receipts — there is no period avg to compute. Bypassable with `p_force_provisional := TRUE`, which leaves the un-processable rows on the side table for forensics. Documented separately because the hook composes through `close_period` rather than `post_transfers`.
 
 ## Document-layer wrappers
 
@@ -187,7 +186,7 @@ Behavior:
 | `standard` | use `resolve_standard_cost_at(sku, business_date)` — raises **P0018** if no `standard_costs` row in effect | **P0011** — standard SKUs have a fixed cost; do not pass one |
 | `wac_perpetual` IN | use pool average; **P0011** if pool empty (must seed) | use it; pool re-averages |
 | `wac_perpetual` OUT | use pool average; **P0010** if pool empty | **P0011** — asserted cost on depletion belongs in `'lot'` cost_method (acct-8gg) |
-| `wac_periodic` | always **P0006** (acct-qfj; depends on period-close machinery) | always **P0006** |
+| `wac_periodic` | use pool average; flagged in `transfers_provisional` for re-cost at close (`acct-qfj`, migration 0029); P0006 if pool empty on depletion | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
 | `wac_retroactive` | use pool average; flagged in `transfers_provisional` for chronological replay at close (`acct-9tw`, migration 0031) | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
 | `fifo` / `lot` | always **P0006** (acct-8gg) | always **P0006** |
 
