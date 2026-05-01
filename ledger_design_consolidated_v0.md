@@ -1109,6 +1109,33 @@ events:
     amount: spread_amount
 ```
 
+### 3.11 Inventory adjustment (general — not cycle-count-specific)
+
+Inventory adjustments bring inventory into or out of the system without an external counterparty (no PO, no SO, no WO). Use cases include physical-count corrections, write-downs, write-ins, post-receipt damage detected before a return, and rounding reconciliations.
+
+The document layer is the `inventory_adjustments` table (migration 0022); the function `post_inventory_adjustment` wraps the `cycle_count_adj` ledger primitive. Caller passes a signed `qty_delta` (positive = in, negative = out) and a `unit_cost`. The function generates the 2-event batch:
+
+```
+qty_delta > 0 (in):
+  - reason='cycle_count_adj'
+    debit:  accounts(stock_available, sku, loc).id
+    credit: accounts(creation_void, qty).id
+    amount: |qty_delta|
+  - reason='cycle_count_adj'
+    debit:  accounts(inv_value_{class}, sku, loc, ccy).id   -- class ∈ {'raw','fg'}
+    credit: accounts(creation_void, value, ccy).id
+    amount: |qty_delta| * unit_cost
+
+qty_delta < 0 (out): debit and credit roles flip on both legs.
+```
+
+Notes:
+- `inventory_class` is `'raw'` or `'fg'` (MVP); WIP adjustments require routing_op resolution and are deferred.
+- `unit_cost = 0` is legal (qty-only adjustment); the value leg is omitted.
+- Idempotent on `idempotency_key` at the document-table level — replay returns the existing document id without re-posting.
+- Counterpart is `creation_void` on both qty and value sides (matches existing conformance pattern). P&L counterpart (`inv_adj_expense`) is a future revisit when income-statement-shaped reporting is in scope.
+- The ledger reason is `cycle_count_adj` because that is the existing primitive — the name is historical. The document's `subtype`/intent (count, damage, write-down, write-in) lives on the `inventory_adjustments` row, not on the ledger reason. Future work may rename the underlying reason; until then, treat `cycle_count_adj` as the generic adjustment primitive.
+
 ## §4. WIP model
 
 ### 4.1 Account grain

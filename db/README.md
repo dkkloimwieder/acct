@@ -140,6 +140,38 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 
+## Document-layer wrappers
+
+Phase 1 introduces document-layer functions that wrap `post_transfers` for common workflows. Callers use these instead of constructing event JSONB by hand.
+
+### `post_inventory_adjustment` (migration 0022, acct-sb6)
+
+Pure inventory adjustment in or out at a given (qty, unit_cost). Insert + post-transfers in one call, idempotent at the document level.
+
+Signature:
+```
+post_inventory_adjustment(
+  p_sku_id          UUID,
+  p_location_id     UUID,
+  p_qty_delta       BIGINT,   -- signed; >0 = in, <0 = out
+  p_unit_cost       BIGINT,   -- per-unit; 0 means qty-only (no value leg)
+  p_currency        TEXT,
+  p_inventory_class TEXT,     -- 'raw' or 'fg' (MVP; wip deferred)
+  p_business_date   DATE,
+  p_posted_by       UUID,
+  p_idempotency_key UUID,
+  p_notes           TEXT      DEFAULT NULL
+) RETURNS UUID                -- inventory_adjustments.id
+```
+
+Behavior:
+- Inserts an `inventory_adjustments` row (UNIQUE on `idempotency_key`); a replay with the same key returns the existing id without re-posting.
+- Resolves `stock_available(sku, location)`, `inv_value_{class}(sku, location, currency)`, and `creation_void` counterparts; raises `P0010` if any account is missing.
+- Builds a 2-event batch with reason `cycle_count_adj` (qty leg + value leg), sign-flipped on negative `qty_delta`. Skips the value leg when `unit_cost = 0`.
+- Calls `post_transfers(batch, FALSE)` — closed-period override is not exposed here yet.
+
+See consolidated doc §3.11 for the full design notes.
+
 ## Schema integrity check (`scripts/ci-check.sh`)
 
 Pre-push guard for schema changes. There is no remote CI; this script is the check. Runs entirely against an ephemeral `acct_ci` DB inside the existing dev Postgres instance — the dev `acct` DB is untouched.
