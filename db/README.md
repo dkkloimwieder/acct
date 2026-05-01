@@ -139,6 +139,9 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 | `P0006` | `cost_method_not_implemented` / `wac_zero_qty_pool` | `reason ∈ {op_move, scrap, wo_complete, so_ship}` AND any of: (a) sku not resolvable from either account, (b) sku's `cost_method ∈ {'lot','fifo'}` on a qty-side event (the qty-side gate relaxes for `'standard'` and `'wac'`), (c) value-side event missing `qty`, (d) value-side event with sku's `cost_method ∈ {'lot','fifo'}` (raised inside the dispatcher), (e) value-side event with sku's `cost_method = 'wac'` and the qty pool is zero. Also raised by `post_inventory_adjustment` when called against a `'fifo'` or `'lot'` SKU. |
 | `P0010` | `caller_bug_account_missing` | A required account does not exist for the (sku, location, currency) tuple. Raised by `reserve_inventory()` (no open `stock_available` for the sku/location pair) and by `post_inventory_adjustment` (no open `stock_available`, no open `inv_value_{class}`, no `creation_void(qty)`, or no `inv_adj_expense(currency)`). Indicates accounts must be pre-created. |
 | `P0011` | `cost_assertion_invalid` | Caller's `p_unit_cost` violates the contract for the SKU's `cost_method`. Raised by `post_inventory_adjustment` when: (a) the SKU is `'standard'` and caller passed any non-NULL `p_unit_cost` (standard SKUs have a fixed cost; do not pass one), (b) the SKU is `'wac'` IN with `p_unit_cost = NULL` and the pool is empty (must seed at known cost), (c) `cost_method` is otherwise unrecognized. |
+| `P0014` | `period_close_invalid` | `close_period(p_period_id, ...)` called against a missing period or one whose `closed_at IS NOT NULL`. Raised by `close_period`. Two concurrent calls on the same period both raise this — the loser re-reads `closed_at` after the `FOR UPDATE` lock is released and finds it stamped. |
+| `P0015` | `period_close_provisional` | `close_period` refused: `transfers_provisional` has rows in this period with `finalized_at IS NULL`. Caller can pass `p_force_provisional := TRUE` to bypass; un-finalized rows are then left on the side table for forensics. |
+| `P0016` | `period_close_reconciliation` | `close_period` refused: `run_daily_reconciliation()` raised one or more new alerts. Caller can pass `p_force_recon := TRUE` to bypass; alerts are still recorded. |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 
@@ -230,6 +233,37 @@ The audit row (`inventory_cost_adjustments`) records `prior_unit_cost`, `target_
 The `cost_adjustment` transfer_reason is distinct from `cost_restate` (which is reserved for §10 commodity provisional-to-actual settlement).
 
 See consolidated doc §3.12 for the full design notes.
+
+### `close_period` (migration 0026, acct-s6n)
+
+Period close is an orchestrated operation, not a manual `UPDATE periods SET closed_at`. Migration 0025 (`acct-4mt`) lays the schema (`transfers_provisional` + three new variance `account_kind`s); migration 0026 (`acct-v51`) wires `close_period()` and the three close-hook stubs.
+
+Signature:
+```
+close_period(
+  p_period_id         BIGINT,
+  p_actor             UUID,
+  p_force_provisional BOOLEAN DEFAULT FALSE,
+  p_force_recon       BOOLEAN DEFAULT FALSE
+) RETURNS JSONB
+```
+
+Steps inside `close_period`:
+
+1. `SELECT ... FROM periods WHERE id = $1 FOR UPDATE` — serializes concurrent close calls; raises **P0014** if the period is missing or already closed.
+2. Calls `wac_periodic_close_hook`, `wac_retroactive_close_hook`, `cost_adjust_retroactive_hook` in that order. All three are stubs that return 0 in `acct-s6n`; Epics B (`acct-qfj`), C (`acct-9tw`), E (`acct-og1`) replace the bodies. Hook variance transfers post **before** `closed_at` is stamped so they don't trip P0005.
+3. **Provisional gate**: counts `transfers_provisional` rows in this period with `finalized_at IS NULL`. Raises **P0015** unless `p_force_provisional = TRUE`.
+4. **Reconciliation gate**: calls `run_daily_reconciliation()`. Raises **P0016** unless `p_force_recon = TRUE`. Force still records the alerts.
+5. Stamps `closed_at = clock_timestamp()`, `closed_by = p_actor`.
+6. Returns a JSONB summary: `{ period_id, period_code, closed_at, closed_by, finalized_count, hook_results, unfinalized_remaining, alerts, forced }` — caller persists or logs as audit.
+
+Force flags are independent — `p_force_provisional` does NOT bypass recon, `p_force_recon` does NOT bypass provisional. Operators can force one gate while keeping the other in effect.
+
+Hook contract: `<name>(p_period_id BIGINT) RETURNS BIGINT` (count finalized). Epics B/C/E may extend the signature when they replace the body — the change is additive (call sites in `close_period` updated in the same migration).
+
+**Known limitation.** `p_actor` is unvalidated — `close_period` accepts any UUID and stores it as `closed_by`. RBAC is Part VII Q6, still open.
+
+See consolidated doc §6 for the full design notes.
 
 ## Schema integrity check (`scripts/ci-check.sh`)
 

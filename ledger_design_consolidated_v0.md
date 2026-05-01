@@ -1260,18 +1260,92 @@ The "Currency Exchange recipe" carries forward in shape; the implementation drop
 
 ## §6. Period close
 
+Period close is an orchestrated operation, not a manual `UPDATE periods SET closed_at`. The orchestration ships in migration 0026 (`acct-s6n` / Phase 1) and lives behind one function:
+
 ```sql
--- One transaction:
-INSERT INTO period_snapshots (period_id, account_id, debits_total, credits_total)
-SELECT $period_id, id, debits_total, credits_total FROM accounts;
-
-UPDATE periods SET closed_at = clock_timestamp(), closed_by = $user
-WHERE id = $period_id;
-
--- Adjusting entries (accruals, deferrals, revaluations) are normal transfers
--- with reason in the adjustment range, posted into the now-closed period
--- only via post_transfers(..., p_override_closed_period := TRUE).
+close_period(
+  p_period_id         BIGINT,
+  p_actor             UUID,
+  p_force_provisional BOOLEAN DEFAULT FALSE,  -- bypass un-finalized provisional rows
+  p_force_recon       BOOLEAN DEFAULT FALSE   -- bypass reconciliation alerts
+) RETURNS JSONB                               -- audit summary
 ```
+
+Sequence inside `close_period`:
+
+1. **Validate** — `SELECT ... FROM periods WHERE id = p_period_id FOR UPDATE`. Raises **P0014** (`period_close_invalid`) if the period is missing or already closed. The row-level lock serializes concurrent close attempts on the same period — the loser re-reads `closed_at` after the winner commits and surfaces P0014.
+
+2. **Run hooks** in a fixed order:
+   - `wac_periodic_close_hook(period_id)` — Epic B (`acct-qfj`) replaces this body.
+   - `wac_retroactive_close_hook(period_id)` — Epic C (`acct-9tw`) replaces this body.
+   - `cost_adjust_retroactive_hook(period_id)` — Epic E (`acct-og1`) replaces this body.
+
+   Each hook returns `BIGINT` — the count of rows it finalized. In `acct-s6n` all three are stubs that return 0 and touch nothing; the contract is in place so the dependent epics can replace bodies without modifying `close_period` itself. Hooks run **before** step 5 stamps `closed_at` so any variance transfers they post don't trip `post_transfers`' P0005 gate on the period being closed.
+
+3. **Provisional gate** — count `transfers_provisional` rows in this period with `finalized_at IS NULL`. If > 0 and `p_force_provisional = FALSE`, raise **P0015** (`period_close_provisional`). Forced close leaves un-finalized rows on the side table as-is for forensics — it does not auto-finalize them.
+
+4. **Reconciliation gate** — call `run_daily_reconciliation()`. If new alerts > 0 and `p_force_recon = FALSE`, raise **P0016** (`period_close_reconciliation`). Forced close still records the alerts; the gate just doesn't block.
+
+5. **Stamp** — `UPDATE periods SET closed_at = clock_timestamp(), closed_by = p_actor`.
+
+6. **Return** a JSONB audit summary the caller persists or logs:
+
+   ```json
+   {
+     "period_id": 1,
+     "period_code": "2026-04",
+     "closed_at": "2026-05-01T12:00:00Z",
+     "closed_by": "uuid",
+     "finalized_count": 0,
+     "hook_results": {
+       "wac_periodic": 0,
+       "wac_retroactive": 0,
+       "cost_adjust_retroactive": 0
+     },
+     "unfinalized_remaining": 0,
+     "alerts": 0,
+     "forced": { "provisional": false, "recon": false }
+   }
+   ```
+
+The two force flags are **independent** by design — provisional and reconciliation gates protect against very different failure modes (incomplete workflow vs corrupt ledger), and an operator might reasonably need to bypass one without bypassing the other.
+
+**`transfers_provisional` side table** (migration 0025, `acct-4mt`):
+
+```sql
+CREATE TABLE transfers_provisional (
+  transfer_id          BIGINT PRIMARY KEY REFERENCES transfers(id),
+  period_id            BIGINT NOT NULL REFERENCES periods(id),
+  cost_method          cost_method NOT NULL,
+  finalized_at         TIMESTAMPTZ,
+  variance_amount      BIGINT,
+  variance_transfer_id BIGINT REFERENCES transfers(id)
+);
+```
+
+Three lifecycle states enforced by CHECK:
+
+| `finalized_at` | `variance_amount` | `variance_transfer_id` | Meaning |
+|---|---|---|---|
+| `NULL` | `NULL` | `NULL` | un-finalized (writer just inserted) |
+| `NOT NULL` | `0` | `NULL` | finalized, no variance to post |
+| `NOT NULL` | `<> 0` | `NOT NULL` | finalized, variance posted (transfer FK) |
+
+A side table is required because the append-only trigger on `transfers` (§1.9) blocks `UPDATE`/`DELETE`, so `finalized_at` can't live as a column on the transfer itself.
+
+**Variance account kinds** (added in migration 0025, seeded in `db/fixtures/small/seed.sql` for USD + EUR):
+
+| `account_kind` | Posted by | Income-statement story |
+|---|---|---|
+| `variance_wac_period`         | `wac_periodic_close_hook`         | wac_periodic re-pricing close adjustment |
+| `variance_wac_retroactive`    | `wac_retroactive_close_hook`      | wac_retroactive late-data correction |
+| `variance_cost_adjust_retro`  | `cost_adjust_retroactive_hook`    | retroactive cost_adjustment correction |
+
+All three are bidirectional (`normal_side='unrestricted'`); write-ups credit them, write-downs debit them — same convention as `inv_adj_expense` and `variance_cost_adjustment`. Three separate kinds rather than one shared `variance_close` so the income statement reports the three close-time correction stories distinctly.
+
+Adjusting entries posted **after** close use `post_transfers(..., p_override_closed_period := TRUE)` with the `reversal` reason or one of the variance reasons.
+
+**Known limitation.** `p_actor` is unvalidated — `close_period` accepts any UUID and stores it. RBAC is Part VII Q6, still open.
 
 **§△-10 closed.** Period locking is a database invariant, not API discipline.
 
