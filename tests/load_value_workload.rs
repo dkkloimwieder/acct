@@ -93,7 +93,7 @@ async fn setup_qty_fixture(pool: &sqlx::PgPool, n_skus: usize) -> Vec<(i64, i64)
     for i in 1..=n_skus {
         let code = format!("BENCH-{:03}", i);
         sqlx::query(
-            "INSERT INTO skus (code, uom, standard_cost) VALUES ($1, 'EA', 1)
+            "INSERT INTO skus (code, uom) VALUES ($1, 'EA')
              ON CONFLICT (code) DO NOTHING",
         )
         .bind(&code)
@@ -101,6 +101,18 @@ async fn setup_qty_fixture(pool: &sqlx::PgPool, n_skus: usize) -> Vec<(i64, i64)
         .await
         .expect("insert BENCH sku");
     }
+
+    sqlx::raw_sql(
+        "INSERT INTO standard_costs (sku_id, cost, effective_at, posted_by, idempotency_key)
+         SELECT s.id, 1, '1970-01-01'::DATE,
+                '00000000-0000-0000-0000-000000000000'::UUID, gen_random_uuid()
+           FROM skus s
+          WHERE s.code LIKE 'BENCH-%'
+            AND NOT EXISTS (SELECT 1 FROM standard_costs sc WHERE sc.sku_id = s.id)",
+    )
+    .execute(pool)
+    .await
+    .expect("backfill BENCH standard_costs");
 
     sqlx::query(
         "INSERT INTO accounts (kind, ledger_kind, sku_id, location_id, normal_side)

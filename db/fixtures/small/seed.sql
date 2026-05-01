@@ -4,18 +4,34 @@
 
 -- ============================================================
 -- SKUs (10): 8 standard, 1 wac, 1 fifo
+-- After acct-x4t (migration 0027), standard cost is no longer a
+-- column on skus. Standard SKUs need a row in standard_costs (below)
+-- to be usable; non-standard SKUs (WAC, fifo) don't.
 -- ============================================================
-INSERT INTO skus (code, uom, standard_cost, cost_method) VALUES
-  ('SKU-A',  'EA',  100, 'standard'),
-  ('SKU-B',  'EA',  200, 'standard'),
-  ('SKU-C',  'EA',   50, 'standard'),
-  ('SKU-D',  'EA',  150, 'standard'),
-  ('SKU-E',  'EA',   75, 'standard'),
-  ('SKU-F',  'EA',  300, 'standard'),
-  ('SKU-G',  'EA',   25, 'standard'),
-  ('SKU-H',  'EA',  500, 'standard'),
-  ('SKU-WAC','EA',  100, 'wac_perpetual'),
-  ('SKU-FIF','EA',  100, 'fifo');
+INSERT INTO skus (code, uom, cost_method) VALUES
+  ('SKU-A',  'EA', 'standard'),
+  ('SKU-B',  'EA', 'standard'),
+  ('SKU-C',  'EA', 'standard'),
+  ('SKU-D',  'EA', 'standard'),
+  ('SKU-E',  'EA', 'standard'),
+  ('SKU-F',  'EA', 'standard'),
+  ('SKU-G',  'EA', 'standard'),
+  ('SKU-H',  'EA', 'standard'),
+  ('SKU-WAC','EA', 'wac_perpetual'),
+  ('SKU-FIF','EA', 'fifo');
+
+-- Standard costs for the 8 standard SKUs, effective from epoch so
+-- every test's business_date resolves. Posted by the system-bootstrap
+-- UUID — RBAC is Q6, still open.
+INSERT INTO standard_costs (sku_id, cost, effective_at, posted_by, idempotency_key)
+SELECT s.id, v.cost, '1970-01-01'::DATE,
+       '00000000-0000-0000-0000-000000000000'::UUID, gen_random_uuid()
+  FROM (VALUES
+          ('SKU-A', 100), ('SKU-B', 200), ('SKU-C', 50),
+          ('SKU-D', 150), ('SKU-E',  75), ('SKU-F', 300),
+          ('SKU-G',  25), ('SKU-H', 500)
+       ) AS v(code, cost)
+  JOIN skus s ON s.code = v.code;
 
 -- ============================================================
 -- Locations (3)

@@ -114,6 +114,25 @@ pub async fn call_post_transfers(
         .await
 }
 
+/// Insert a standard_costs row directly (bypasses post_standard_cost_roll,
+/// which doesn't exist until acct-8rv lands). Use this in tests that
+/// create a SKU mid-run and need it usable immediately. The fixture
+/// already seeds standard_costs for SKU-A through SKU-H at
+/// effective_at='1970-01-01'; this helper is for ad-hoc SKUs.
+pub async fn seed_standard_cost(pool: &PgPool, sku_code: &str, cost: i64) {
+    sqlx::query(
+        "INSERT INTO standard_costs (sku_id, cost, effective_at, posted_by, idempotency_key)
+         SELECT id, $2, '1970-01-01'::DATE,
+                '00000000-0000-0000-0000-000000000000'::UUID, gen_random_uuid()
+           FROM skus WHERE code = $1",
+    )
+    .bind(sku_code)
+    .bind(cost)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("seed_standard_cost {sku_code}={cost}: {e}"));
+}
+
 /// Generate a UUID server-side (avoids needing the `uuid` crate as a
 /// dev-dependency). Returned as the canonical hex string form.
 pub async fn fresh_uuid(pool: &PgPool) -> String {
