@@ -79,6 +79,14 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('inv_adj_expense', 'value', 'USD', 'unrestricted'),
   ('inv_adj_expense', 'value', 'EUR', 'unrestricted');
 
+-- Cost adjustment variance (USD + EUR). Bidirectional P&L line for
+-- explicit per-unit cost revaluations of WAC pools (acct-14m). Distinct
+-- from inv_adj_expense — qty-driven adjustments and value-only
+-- revaluations land on different income-statement lines.
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('variance_cost_adjustment', 'value', 'USD', 'unrestricted'),
+  ('variance_cost_adjustment', 'value', 'EUR', 'unrestricted');
+
 -- SKU-A value accounts (USD).
 -- After acct-nfr (migration 0020), value accounts partition by the
 -- same dimensions as their qty-side counterparts:

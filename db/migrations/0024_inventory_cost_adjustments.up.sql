@@ -1,0 +1,291 @@
+-- acct-14m / acct-sb6 — Phase 1 Epic D: cost_adjustment workflow.
+--
+-- Document-layer workflow for adjusting the current per-unit average
+-- cost of inventory without moving qty. Distinct from
+-- inventory_adjustment (which moves qty + value together) — this is a
+-- value-only revaluation.
+--
+-- Use cases:
+--   - Lower-of-cost-or-market write-down on existing inventory
+--   - Quality issue revealed after the fact: pool's cost was overstated
+--   - Late vendor credit applied retroactively to current inventory
+--   - Cost basis correction after audit
+--
+-- Design:
+--
+--   * NEW transfer_reason 'cost_adjustment'. Distinct from cost_restate
+--     (which is for §10 commodity provisional-to-actual settlement
+--     reversal — a different conceptual workflow).
+--
+--   * NEW account_kind 'variance_cost_adjustment'. Bidirectional P&L
+--     (normal_side='unrestricted'). Distinct from inv_adj_expense
+--     (which is for qty-driven adjustments — finding/losing inventory)
+--     so the income statement can separately report revaluation events
+--     from cycle-count gain/loss.
+--
+--   * Function signature:
+--       post_cost_adjustment(
+--         p_sku_id, p_location_id, p_currency, p_inventory_class,
+--         p_target_unit_cost,    -- the new avg the user wants
+--         p_business_date, p_posted_by, p_idempotency_key, p_notes
+--       ) RETURNS UUID
+--
+--   * Behavior by cost_method:
+--       standard:        P0011 (standard SKUs have a fixed cost; to
+--                        change it, update skus.standard_cost via a
+--                        separate workflow — not yet implemented)
+--       wac_perpetual:   read pool under FOR UPDATE; compute delta =
+--                        target * pool_qty - pool_value; post a single
+--                        value-only transfer. Direction depends on sign
+--                        of delta (write-up vs write-down).
+--       wac_periodic:    P0006 (depends on period-close machinery; acct-s6n)
+--       wac_retroactive: P0006 (depends on period-close machinery; acct-s6n)
+--       lot / fifo:      P0006 (acct-8gg)
+--
+--   * P&L direction:
+--       delta > 0 (write-up): debit inv_value_*, credit
+--                             variance_cost_adjustment (revaluation gain)
+--       delta < 0 (write-down): debit variance_cost_adjustment, credit
+--                               inv_value_* (revaluation loss)
+--       delta = 0: audit row recorded; no transfer posted (no-op)
+--
+--   * Pool reads happen under FOR UPDATE on qty + value accounts in
+--     ascending id order to match post_transfers' lock-order invariant.
+--     The qty account is locked even though no qty leg is posted —
+--     this prevents a concurrent inventory_adjustment from changing
+--     pool_qty between read and apply.
+--
+--   * Idempotent at the document-table level: replay returns the
+--     existing id without re-posting. The audit row records the
+--     PRIOR avg, the TARGET, the resulting DELTA, and the pool qty
+--     at adjustment time so the operation is self-explanatory in
+--     reports.
+--
+--   * Empty pool (qty <= 0): P0010. Cost adjustment is meaningful
+--     only on a populated pool — there's no avg to adjust on an
+--     empty one.
+
+ALTER TYPE transfer_reason ADD VALUE IF NOT EXISTS 'cost_adjustment';
+ALTER TYPE account_kind   ADD VALUE IF NOT EXISTS 'variance_cost_adjustment';
+
+CREATE TABLE inventory_cost_adjustments (
+  id               UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
+  sku_id           UUID NOT NULL REFERENCES skus(id),
+  location_id      UUID NOT NULL REFERENCES locations(id),
+  currency         TEXT NOT NULL,
+  inventory_class  TEXT NOT NULL CHECK (inventory_class IN ('raw','fg')),
+  prior_unit_cost  BIGINT NOT NULL,
+  target_unit_cost BIGINT NOT NULL CHECK (target_unit_cost >= 0),
+  delta_value      BIGINT NOT NULL,
+  pool_qty         BIGINT NOT NULL CHECK (pool_qty > 0),
+  business_date    DATE   NOT NULL,
+  posted_by        UUID   NOT NULL,
+  posted_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  idempotency_key  UUID   NOT NULL UNIQUE,
+  notes            TEXT
+);
+
+CREATE INDEX inv_cost_adj_sku_loc ON inventory_cost_adjustments (sku_id, location_id);
+CREATE INDEX inv_cost_adj_posted_at ON inventory_cost_adjustments (posted_at);
+
+CREATE OR REPLACE FUNCTION post_cost_adjustment(
+  p_sku_id           UUID,
+  p_location_id      UUID,
+  p_currency         TEXT,
+  p_inventory_class  TEXT,
+  p_target_unit_cost BIGINT,
+  p_business_date    DATE,
+  p_posted_by        UUID,
+  p_idempotency_key  UUID,
+  p_notes            TEXT DEFAULT NULL
+) RETURNS UUID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_existing_id  UUID;
+  v_doc_id       UUID;
+  v_cost_method  cost_method;
+  v_qty_acct     BIGINT;
+  v_val_acct     BIGINT;
+  v_var_acct     BIGINT;
+  v_value_kind   TEXT;
+  v_lock_first   BIGINT;
+  v_lock_second  BIGINT;
+  v_pool_qty     BIGINT;
+  v_pool_value   BIGINT;
+  v_prior_unit   BIGINT;
+  v_new_value    BIGINT;
+  v_delta        BIGINT;
+  v_amount       BIGINT;
+  v_debit        BIGINT;
+  v_credit       BIGINT;
+  v_batch        JSONB;
+BEGIN
+  -- Fast-path replay check.
+  SELECT id INTO v_existing_id
+    FROM inventory_cost_adjustments
+   WHERE idempotency_key = p_idempotency_key;
+  IF v_existing_id IS NOT NULL THEN
+    RETURN v_existing_id;
+  END IF;
+
+  IF p_target_unit_cost < 0 THEN
+    RAISE EXCEPTION 'p_target_unit_cost must be >= 0 (got %)', p_target_unit_cost
+      USING ERRCODE = '23514';
+  END IF;
+
+  SELECT cost_method INTO v_cost_method FROM skus WHERE id = p_sku_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'sku % not found', p_sku_id USING ERRCODE = 'P0010';
+  END IF;
+
+  -- Cost-method dispatch (fail fast before resolving accounts).
+  CASE v_cost_method
+  WHEN 'standard' THEN
+    RAISE EXCEPTION
+      'cost_adjustment not applicable to standard SKU % — to change a '
+      'standard SKU''s cost, update skus.standard_cost via a separate '
+      'workflow (not yet implemented)',
+      p_sku_id USING ERRCODE = 'P0011';
+  WHEN 'wac_perpetual' THEN
+    NULL;  -- proceed below
+  WHEN 'wac_periodic' THEN
+    RAISE EXCEPTION
+      'cost_method_not_implemented: cost_adjustment on wac_periodic '
+      'requires period-close machinery (acct-s6n + acct-qfj); sku=%',
+      p_sku_id USING ERRCODE = 'P0006';
+  WHEN 'wac_retroactive' THEN
+    RAISE EXCEPTION
+      'cost_method_not_implemented: cost_adjustment on wac_retroactive '
+      'requires period-close machinery (acct-s6n + acct-9tw); sku=%',
+      p_sku_id USING ERRCODE = 'P0006';
+  WHEN 'fifo', 'lot' THEN
+    RAISE EXCEPTION
+      'cost_method_not_implemented: cost_adjustment on % SKU; see acct-8gg; sku=%',
+      v_cost_method, p_sku_id USING ERRCODE = 'P0006';
+  ELSE
+    RAISE EXCEPTION 'unknown cost_method % for sku=%', v_cost_method, p_sku_id
+      USING ERRCODE = 'P0011';
+  END CASE;
+
+  -- Resolve qty side: stock_available (we don't post against it but we
+  -- need to lock it to read pool_qty consistently).
+  SELECT id INTO v_qty_acct
+    FROM accounts
+   WHERE kind        = 'stock_available'
+     AND sku_id      = p_sku_id
+     AND location_id = p_location_id
+     AND NOT is_closed;
+  IF v_qty_acct IS NULL THEN
+    RAISE EXCEPTION 'no open stock_available account for sku=% loc=%',
+                    p_sku_id, p_location_id
+      USING ERRCODE = 'P0010';
+  END IF;
+
+  -- Resolve value side: inv_value_{class}.
+  v_value_kind := 'inv_value_' || p_inventory_class;
+  EXECUTE format(
+    'SELECT id FROM accounts
+      WHERE kind = %L AND sku_id = $1 AND location_id = $2
+        AND currency = $3 AND NOT is_closed',
+    v_value_kind
+  )
+  INTO v_val_acct
+  USING p_sku_id, p_location_id, p_currency;
+  IF v_val_acct IS NULL THEN
+    RAISE EXCEPTION 'no open % account for sku=% loc=% ccy=%',
+                    v_value_kind, p_sku_id, p_location_id, p_currency
+      USING ERRCODE = 'P0010';
+  END IF;
+
+  -- Resolve P&L counterpart: variance_cost_adjustment(currency).
+  SELECT id INTO v_var_acct
+    FROM accounts
+   WHERE kind = 'variance_cost_adjustment' AND ledger_kind = 'value'
+     AND currency = p_currency AND NOT is_closed;
+  IF v_var_acct IS NULL THEN
+    RAISE EXCEPTION 'no variance_cost_adjustment(value, ccy=%) account configured',
+                    p_currency
+      USING ERRCODE = 'P0010';
+  END IF;
+
+  -- Lock qty + value accounts in ascending id order. Same lock pattern
+  -- as post_inventory_adjustment so the two functions interleave safely.
+  v_lock_first  := LEAST(v_qty_acct, v_val_acct);
+  v_lock_second := GREATEST(v_qty_acct, v_val_acct);
+  PERFORM 1 FROM accounts WHERE id = v_lock_first  FOR UPDATE;
+  PERFORM 1 FROM accounts WHERE id = v_lock_second FOR UPDATE;
+
+  SELECT debits_total - credits_total INTO v_pool_qty
+    FROM accounts WHERE id = v_qty_acct;
+  SELECT debits_total - credits_total INTO v_pool_value
+    FROM accounts WHERE id = v_val_acct;
+
+  IF v_pool_qty <= 0 THEN
+    RAISE EXCEPTION
+      'cost_adjustment requires non-empty pool; sku=% loc=% has qty=%',
+      p_sku_id, p_location_id, v_pool_qty
+      USING ERRCODE = 'P0010';
+  END IF;
+
+  v_prior_unit := v_pool_value / v_pool_qty;             -- truncating BIGINT div
+  v_new_value  := p_target_unit_cost * v_pool_qty;
+  v_delta      := v_new_value - v_pool_value;
+
+  -- Insert the audit row before any transfer (fast-path replay
+  -- guard handled the duplicate case).
+  INSERT INTO inventory_cost_adjustments (
+    sku_id, location_id, currency, inventory_class,
+    prior_unit_cost, target_unit_cost, delta_value, pool_qty,
+    business_date, posted_by, idempotency_key, notes
+  ) VALUES (
+    p_sku_id, p_location_id, p_currency, p_inventory_class,
+    v_prior_unit, p_target_unit_cost, v_delta, v_pool_qty,
+    p_business_date, p_posted_by, p_idempotency_key, p_notes
+  )
+  ON CONFLICT (idempotency_key) DO NOTHING
+  RETURNING id INTO v_doc_id;
+
+  IF v_doc_id IS NULL THEN
+    SELECT id INTO v_doc_id
+      FROM inventory_cost_adjustments
+     WHERE idempotency_key = p_idempotency_key;
+    RETURN v_doc_id;
+  END IF;
+
+  -- delta = 0 → no-op; audit row is enough.
+  IF v_delta = 0 THEN
+    RETURN v_doc_id;
+  END IF;
+
+  -- Direction: write-up debits inventory and credits the P&L variance
+  -- (revaluation gain). Write-down does the reverse (revaluation loss).
+  IF v_delta > 0 THEN
+    v_debit  := v_val_acct;
+    v_credit := v_var_acct;
+    v_amount := v_delta;
+  ELSE
+    v_debit  := v_var_acct;
+    v_credit := v_val_acct;
+    v_amount := -v_delta;
+  END IF;
+
+  v_batch := jsonb_build_array(
+    jsonb_build_object(
+      'reason',            'cost_adjustment',
+      'document_kind',     'inventory_cost_adjustment',
+      'document_id',       v_doc_id,
+      'debit_account_id',  v_debit,
+      'credit_account_id', v_credit,
+      'amount',            v_amount,
+      'business_date',     p_business_date,
+      'idempotency_key',   gen_random_uuid(),
+      'posted_by',         p_posted_by
+    )
+  );
+
+  PERFORM post_transfers(v_batch, FALSE);
+
+  RETURN v_doc_id;
+END;
+$$;

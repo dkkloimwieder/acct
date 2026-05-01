@@ -1150,6 +1150,55 @@ Notes:
 
 WAC perpetual is one of three textbook WAC variants (per Oracle/PeopleSoft): perpetual (live average, recomputed every putaway), periodic (single average per period applied at close), and retroactive perpetual (perpetual chain with late-data corrections at close). Phase 1 ships only perpetual; the other two are filed as future epics. The audit row records the **effective** unit cost — what was actually applied — not the caller's input.
 
+### 3.12 Cost adjustment (value-only revaluation)
+
+Distinct from inventory adjustment (qty + value together) and from cost_restate (commodity provisional-to-actual settlement, §10). This is the workflow for explicitly revaluing the per-unit average cost of an existing inventory pool **without moving qty**.
+
+Use cases:
+- Lower-of-cost-or-market write-down on existing inventory.
+- Quality issue revealed: pool's recorded cost was overstated.
+- Late vendor credit applied retroactively to current inventory.
+- Cost basis correction after audit.
+
+Document layer: `inventory_cost_adjustments` table (migration 0024). Function: `post_cost_adjustment`. Underlying ledger reason: `cost_adjustment` (transfer_reason). P&L counterpart: `variance_cost_adjustment` — bidirectional account_kind, `normal_side='unrestricted'`. Distinct from `inv_adj_expense` (qty-driven adjustments) so the income statement reports revaluation events separately from cycle-count gain/loss.
+
+```
+post_cost_adjustment(sku, location, currency, inventory_class, target_unit_cost, ...)
+
+reads pool under FOR UPDATE → current_qty, current_value
+delta = (target_unit_cost * current_qty) - current_value
+
+delta > 0 (write-up):
+  - reason='cost_adjustment'
+    debit:  accounts(inv_value_{class}, sku, loc, ccy).id
+    credit: accounts(variance_cost_adjustment, ccy).id   -- revaluation gain
+    amount: delta
+
+delta < 0 (write-down):
+  - reason='cost_adjustment'
+    debit:  accounts(variance_cost_adjustment, ccy).id   -- revaluation loss
+    credit: accounts(inv_value_{class}, sku, loc, ccy).id
+    amount: -delta
+
+delta = 0: audit row recorded, no transfer posted.
+```
+
+Cost-method dispatch:
+
+| `cost_method` | Behavior |
+|---|---|
+| `standard` | **P0011** — to change a standard SKU's cost, update `skus.standard_cost` via a separate workflow (not yet implemented) |
+| `wac_perpetual` | computes delta against the live pool average; posts immediately |
+| `wac_periodic` | **P0006** — depends on period-close machinery (`acct-s6n`) and the `wac_periodic` epic (`acct-qfj`) |
+| `wac_retroactive` | **P0006** — same dependency chain, plus `acct-9tw` |
+| `fifo` / `lot` | **P0006** — `acct-8gg` |
+
+Empty pool (qty ≤ 0): **P0010** — there's no average to adjust on an empty pool.
+
+The audit row records the **prior** unit cost (pool avg before adjustment), the **target** unit cost, the resulting **delta_value**, and the **pool_qty** at adjustment time. This makes the operation self-explanatory in reports without needing to look elsewhere.
+
+Idempotent at the document-table level: replay returns the existing id without re-posting.
+
 ## §4. WIP model
 
 ### 4.1 Account grain

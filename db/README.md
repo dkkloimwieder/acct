@@ -190,6 +190,47 @@ The `inventory_adjustment` transfer_reason is added by migration 0022 alongside 
 
 See consolidated doc §3.11 for the full design notes.
 
+### `post_cost_adjustment` (migration 0024, acct-14m)
+
+Value-only revaluation of a WAC pool's per-unit average cost. Distinct from `post_inventory_adjustment` — that one moves qty + value together; this one moves only value. Use cases: lower-of-cost-or-market write-down, quality-revealed cost overstatement, late vendor credit, audit correction.
+
+Signature:
+```
+post_cost_adjustment(
+  p_sku_id           UUID,
+  p_location_id      UUID,
+  p_currency         TEXT,
+  p_inventory_class  TEXT,        -- 'raw' or 'fg'
+  p_target_unit_cost BIGINT,      -- the new pool avg the user wants
+  p_business_date    DATE,
+  p_posted_by        UUID,
+  p_idempotency_key  UUID,
+  p_notes            TEXT      DEFAULT NULL
+) RETURNS UUID                    -- inventory_cost_adjustments.id
+```
+
+Behavior:
+- Reads `current_qty`, `current_value` of the pool under `FOR UPDATE` (locks both stock_available and inv_value_* in ascending id order).
+- Computes `delta = target_unit_cost * current_qty - current_value`.
+- `delta > 0` (write-up): debit `inv_value_*`, credit `variance_cost_adjustment` (revaluation gain).
+- `delta < 0` (write-down): debit `variance_cost_adjustment`, credit `inv_value_*` (revaluation loss).
+- `delta = 0`: audit row recorded, no transfer posted (no-op).
+- Pool qty ≤ 0: **P0010** (cannot revalue an empty pool).
+- Cost-method dispatch:
+
+| `cost_method` | Behavior |
+|---|---|
+| `standard` | **P0011** — standard SKUs have a fixed cost; update `skus.standard_cost` separately |
+| `wac_perpetual` | computes delta against live pool avg; posts immediately |
+| `wac_periodic` / `wac_retroactive` | **P0006** (depends on period-close machinery, acct-s6n) |
+| `fifo` / `lot` | **P0006** (acct-8gg) |
+
+The audit row (`inventory_cost_adjustments`) records `prior_unit_cost`, `target_unit_cost`, `delta_value`, `pool_qty` for self-explanatory reporting. Idempotent on `idempotency_key`.
+
+The `cost_adjustment` transfer_reason is distinct from `cost_restate` (which is reserved for §10 commodity provisional-to-actual settlement).
+
+See consolidated doc §3.12 for the full design notes.
+
 ## Schema integrity check (`scripts/ci-check.sh`)
 
 Pre-push guard for schema changes. There is no remote CI; this script is the check. Runs entirely against an ephemeral `acct_ci` DB inside the existing dev Postgres instance — the dev `acct` DB is untouched.
