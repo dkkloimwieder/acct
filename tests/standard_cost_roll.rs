@@ -338,6 +338,406 @@ async fn wip_present_blocks_with_p0006_referencing_epic_g() {
 }
 
 #[tokio::test]
+async fn roll_down_revalues_existing_inventory() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = insert_standard_sku(&pool, "ROLL-DOWN").await;
+    let qty_acct = open_stock_available(&pool, &sku, "MAIN").await;
+    let val_acct = open_inv_value_fg(&pool, &sku, "MAIN").await;
+    seed_standard_cost(&pool, "ROLL-DOWN", 100).await;
+
+    let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
+    let _ = call_post_transfers(
+        &pool,
+        serde_json::json!([
+            make_event("inventory_adjustment", qty_acct, void_qty, 40, "2026-04-15", &fresh_uuid(&pool).await),
+            make_event("inventory_adjustment", val_acct, void_val, 4000, "2026-04-15", &fresh_uuid(&pool).await),
+        ]),
+        false,
+    )
+    .await
+    .expect("seed inventory");
+
+    // Roll 100 → 80; delta per unit = -20; 40 × -20 = -800.
+    let _ = call_roll(&pool, &sku, 80, "2026-04-20", "2026-04-20", Some(100))
+        .await
+        .expect("roll-down");
+
+    // inv_value_fg: 4000 - 800 = 3200.
+    let val_balance: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(val_acct)
+    .fetch_one(&pool)
+    .await
+    .expect("balance");
+    assert_eq!(val_balance, 3200);
+
+    // variance_std_cost_roll(USD): write-down debits the variance.
+    let var_acct =
+        account_id_by_kind_currency(&pool, "variance_std_cost_roll", Some("USD")).await;
+    let var_balance: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(var_acct)
+    .fetch_one(&pool)
+    .await
+    .expect("variance");
+    assert_eq!(var_balance, 800);
+}
+
+#[tokio::test]
+async fn post_roll_adjustment_uses_new_standard() {
+    // After a roll, post_inventory_adjustment with NULL p_unit_cost on
+    // the SKU must use the NEW standard, not the old. This verifies the
+    // standard_costs row is canonical and resolve_standard_cost_at picks
+    // it up.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = insert_standard_sku(&pool, "ROLL-AFTER").await;
+    let _ = open_stock_available(&pool, &sku, "MAIN").await;
+    let val_acct = open_inv_value_fg(&pool, &sku, "MAIN").await;
+    seed_standard_cost(&pool, "ROLL-AFTER", 50).await;
+
+    // Roll 50 → 75 (no inventory yet, so no revaluation; just changes
+    // the active standard).
+    let _ = call_roll(&pool, &sku, 75, "2026-04-15", "2026-04-15", Some(50))
+        .await
+        .expect("roll");
+
+    // Now an adjustment IN with NULL p_unit_cost: 10 units → value = 750.
+    let loc_id: String = sqlx::query_scalar("SELECT id::text FROM locations WHERE code = 'MAIN'")
+        .fetch_one(&pool)
+        .await
+        .expect("loc");
+    let posted_by = fresh_uuid(&pool).await;
+    let idem = fresh_uuid(&pool).await;
+
+    let _: String = sqlx::query_scalar(
+        "SELECT post_inventory_adjustment(
+            $1::UUID, $2::UUID, 10, NULL::BIGINT, 'USD',
+            'fg', '2026-04-16'::DATE, $3::UUID, $4::UUID, NULL
+         )::text",
+    )
+    .bind(&sku)
+    .bind(&loc_id)
+    .bind(&posted_by)
+    .bind(&idem)
+    .fetch_one(&pool)
+    .await
+    .expect("adjustment after roll");
+
+    let val_balance: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(val_acct)
+    .fetch_one(&pool)
+    .await
+    .expect("balance");
+    assert_eq!(val_balance, 750, "10 × new standard 75 = 750");
+}
+
+#[tokio::test]
+async fn multi_location_roll_revalues_each_pool() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = insert_standard_sku(&pool, "ROLL-MULTI-LOC").await;
+    let qty_main = open_stock_available(&pool, &sku, "MAIN").await;
+    let val_main = open_inv_value_fg(&pool, &sku, "MAIN").await;
+    let qty_alt = open_stock_available(&pool, &sku, "ALT").await;
+    let val_alt = open_inv_value_fg(&pool, &sku, "ALT").await;
+    seed_standard_cost(&pool, "ROLL-MULTI-LOC", 100).await;
+
+    let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
+
+    // 30 units at MAIN, 20 at ALT; both at standard 100.
+    for (q, v, qty) in [(qty_main, val_main, 30i64), (qty_alt, val_alt, 20i64)] {
+        let _ = call_post_transfers(
+            &pool,
+            serde_json::json!([
+                make_event("inventory_adjustment", q, void_qty, qty, "2026-04-15", &fresh_uuid(&pool).await),
+                make_event("inventory_adjustment", v, void_val, qty * 100, "2026-04-15", &fresh_uuid(&pool).await),
+            ]),
+            false,
+        )
+        .await
+        .expect("seed");
+    }
+
+    // Roll 100 → 130; delta = 30/unit; MAIN: 30×30=900; ALT: 20×30=600.
+    let _ = call_roll(&pool, &sku, 130, "2026-04-20", "2026-04-20", Some(100))
+        .await
+        .expect("multi-loc roll");
+
+    let main_balance: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(val_main)
+    .fetch_one(&pool)
+    .await
+    .expect("main");
+    let alt_balance: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(val_alt)
+    .fetch_one(&pool)
+    .await
+    .expect("alt");
+    assert_eq!(main_balance, 3000 + 900, "MAIN: 3000 + 900");
+    assert_eq!(alt_balance, 2000 + 600, "ALT: 2000 + 600");
+
+    // Audit row aggregates both pools.
+    let (delta, qty): (i64, i64) = sqlx::query_as(
+        "SELECT total_delta_value, pool_qty
+           FROM inventory_standard_cost_rolls
+          WHERE sku_id = $1::UUID
+          ORDER BY posted_at DESC LIMIT 1",
+    )
+    .bind(&sku)
+    .fetch_one(&pool)
+    .await
+    .expect("audit row");
+    assert_eq!(delta, 1500, "900 + 600");
+    assert_eq!(qty, 50, "30 + 20");
+}
+
+#[tokio::test]
+async fn no_op_same_cost_records_audit_no_transfer() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = insert_standard_sku(&pool, "ROLL-NOOP").await;
+    let qty_acct = open_stock_available(&pool, &sku, "MAIN").await;
+    let val_acct = open_inv_value_fg(&pool, &sku, "MAIN").await;
+    seed_standard_cost(&pool, "ROLL-NOOP", 100).await;
+
+    let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
+    let _ = call_post_transfers(
+        &pool,
+        serde_json::json!([
+            make_event("inventory_adjustment", qty_acct, void_qty, 25, "2026-04-15", &fresh_uuid(&pool).await),
+            make_event("inventory_adjustment", val_acct, void_val, 2500, "2026-04-15", &fresh_uuid(&pool).await),
+        ]),
+        false,
+    )
+    .await
+    .expect("seed");
+
+    let val_before: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(val_acct)
+    .fetch_one(&pool)
+    .await
+    .expect("val before");
+
+    // No-op: target == prior == 100.
+    let doc_id = call_roll(&pool, &sku, 100, "2026-04-20", "2026-04-20", Some(100))
+        .await
+        .expect("no-op roll");
+
+    // Inventory unchanged.
+    let val_after: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(val_acct)
+    .fetch_one(&pool)
+    .await
+    .expect("val after");
+    assert_eq!(val_before, val_after);
+
+    // Audit row recorded with delta=0 and pool_qty=0 (no pools touched).
+    let (prior, target, delta, qty): (Option<i64>, i64, i64, i64) = sqlx::query_as(
+        "SELECT prior_standard_cost, target_standard_cost,
+                total_delta_value, pool_qty
+           FROM inventory_standard_cost_rolls WHERE id = $1::UUID",
+    )
+    .bind(&doc_id)
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(prior, Some(100));
+    assert_eq!(target, 100);
+    assert_eq!(delta, 0);
+    assert_eq!(qty, 0);
+
+    // No standard_cost_roll transfers posted.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM transfers WHERE reason = 'standard_cost_roll'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn audit_row_records_prior_target_delta_qty_after_revaluation() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = insert_standard_sku(&pool, "ROLL-AUDIT").await;
+    let qty_acct = open_stock_available(&pool, &sku, "MAIN").await;
+    let val_acct = open_inv_value_fg(&pool, &sku, "MAIN").await;
+    seed_standard_cost(&pool, "ROLL-AUDIT", 60).await;
+
+    let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
+    let _ = call_post_transfers(
+        &pool,
+        serde_json::json!([
+            make_event("inventory_adjustment", qty_acct, void_qty, 15, "2026-04-15", &fresh_uuid(&pool).await),
+            make_event("inventory_adjustment", val_acct, void_val, 900, "2026-04-15", &fresh_uuid(&pool).await),
+        ]),
+        false,
+    )
+    .await
+    .expect("seed");
+
+    let doc_id = call_roll(&pool, &sku, 90, "2026-04-20", "2026-04-20", Some(60))
+        .await
+        .expect("roll");
+
+    let (prior, target, delta, qty, eff): (Option<i64>, i64, i64, i64, String) = sqlx::query_as(
+        "SELECT prior_standard_cost, target_standard_cost,
+                total_delta_value, pool_qty, effective_at::text
+           FROM inventory_standard_cost_rolls WHERE id = $1::UUID",
+    )
+    .bind(&doc_id)
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(prior, Some(60));
+    assert_eq!(target, 90);
+    assert_eq!(delta, 450, "15 × (90 - 60)");
+    assert_eq!(qty, 15);
+    assert_eq!(eff, "2026-04-20");
+}
+
+#[tokio::test]
+async fn wac_periodic_raises_p0011_redirect() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku: String = sqlx::query_scalar(
+        "INSERT INTO skus (code, uom, cost_method)
+         VALUES ('ROLL-WACPER', 'EA', 'wac_periodic')
+         RETURNING id::text",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert wac_periodic sku");
+
+    let err = call_roll(&pool, &sku, 100, "2026-04-15", "2026-04-15", None)
+        .await
+        .err()
+        .expect("P0011");
+    let db_err = err.as_database_error().unwrap();
+    assert_eq!(db_err.code().unwrap().as_ref(), "P0011");
+    assert!(db_err.message().contains("post_cost_adjustment"));
+}
+
+#[tokio::test]
+async fn wac_retroactive_raises_p0011_redirect() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku: String = sqlx::query_scalar(
+        "INSERT INTO skus (code, uom, cost_method)
+         VALUES ('ROLL-WACRET', 'EA', 'wac_retroactive')
+         RETURNING id::text",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert wac_retroactive sku");
+
+    let err = call_roll(&pool, &sku, 100, "2026-04-15", "2026-04-15", None)
+        .await
+        .err()
+        .expect("P0011");
+    let db_err = err.as_database_error().unwrap();
+    assert_eq!(db_err.code().unwrap().as_ref(), "P0011");
+}
+
+#[tokio::test]
+async fn fifo_raises_p0006() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku: String = sqlx::query_scalar(
+        "INSERT INTO skus (code, uom, cost_method)
+         VALUES ('ROLL-FIFO', 'EA', 'fifo')
+         RETURNING id::text",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert fifo sku");
+
+    expect_sqlstate("P0006", || async {
+        call_roll(&pool, &sku, 100, "2026-04-15", "2026-04-15", None)
+            .await
+            .map(|_| ())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn lot_raises_p0006() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku: String = sqlx::query_scalar(
+        "INSERT INTO skus (code, uom, cost_method)
+         VALUES ('ROLL-LOT', 'EA', 'lot')
+         RETURNING id::text",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert lot sku");
+
+    expect_sqlstate("P0006", || async {
+        call_roll(&pool, &sku, 100, "2026-04-15", "2026-04-15", None)
+            .await
+            .map(|_| ())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn unknown_sku_raises_p0010() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let bogus = fresh_uuid(&pool).await;
+    expect_sqlstate("P0010", || async {
+        call_roll(&pool, &bogus, 100, "2026-04-15", "2026-04-15", None)
+            .await
+            .map(|_| ())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn negative_new_cost_raises_23514() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = insert_standard_sku(&pool, "ROLL-NEG").await;
+    expect_sqlstate("23514", || async {
+        call_roll(&pool, &sku, -1, "2026-04-15", "2026-04-15", None)
+            .await
+            .map(|_| ())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn wac_perpetual_raises_p0011_redirect() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;

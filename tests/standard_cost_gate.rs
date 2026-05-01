@@ -229,6 +229,35 @@ async fn post_transfers_value_event_blocks_unestablished_standard_sku_p0018() {
 }
 
 #[tokio::test]
+async fn business_date_at_effective_succeeds_boundary_inclusive() {
+    // resolve_standard_cost_at uses `effective_at <= business_date`,
+    // so a business_date exactly equal to the earliest effective row
+    // resolves successfully (no P0018).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku_id = insert_standard_sku(&pool, "STD-BOUNDARY").await;
+    sqlx::query(
+        "INSERT INTO standard_costs (sku_id, cost, effective_at, posted_by, idempotency_key)
+         VALUES ($1::UUID, 88, '2026-04-01'::DATE,
+                 '00000000-0000-0000-0000-000000000000'::UUID, gen_random_uuid())",
+    )
+    .bind(&sku_id)
+    .execute(&pool)
+    .await
+    .expect("seed boundary-effective standard");
+
+    let cost: i64 = sqlx::query_scalar(
+        "SELECT resolve_standard_cost_at($1::UUID, '2026-04-01'::DATE)",
+    )
+    .bind(&sku_id)
+    .fetch_one(&pool)
+    .await
+    .expect("resolve at boundary");
+    assert_eq!(cost, 88);
+}
+
+#[tokio::test]
 async fn fixture_skus_resolve_via_migrated_standards() {
     // Sanity: the fixture data migration in 0027 + the seed.sql rewrite
     // means SKU-A through SKU-H still have their standard cost. SKU-A=100.
