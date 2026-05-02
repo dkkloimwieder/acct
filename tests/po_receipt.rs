@@ -152,10 +152,9 @@ async fn scaffold_skua(
         pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
     )
     .await;
-    let var_ppv = open_account(
-        pool, "variance_ppv", "value", Some("USD"), None, None, None, "unrestricted",
-    )
-    .await;
+    // variance_ppv USD is in the fixture; reuse to avoid creating a
+    // duplicate that would make post_po_receipt's lookup non-deterministic.
+    let var_ppv = account_id_by_kind_currency(pool, "variance_ppv", Some("USD")).await;
 
     Scaffold {
         supplier_id: supplier,
@@ -531,21 +530,9 @@ async fn scaffold_skua_with_code(
         pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
     )
     .await;
-    let var_ppv = match sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM accounts WHERE kind='variance_ppv' AND currency='USD' AND NOT is_closed",
-    )
-    .fetch_optional(pool)
-    .await
-    .unwrap()
-    {
-        Some(id) => id,
-        None => {
-            open_account(
-                pool, "variance_ppv", "value", Some("USD"), None, None, None, "unrestricted",
-            )
-            .await
-        }
-    };
+    // variance_ppv USD is in the fixture; reuse to keep the function's
+    // lookup deterministic.
+    let var_ppv = account_id_by_kind_currency(pool, "variance_ppv", Some("USD")).await;
 
     Scaffold {
         supplier_id: supplier,
