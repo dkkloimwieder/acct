@@ -153,6 +153,10 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 | `P0023` | `po_line_overreceived` | `post_po_receipt` would push cumulative `SUM(po_receipt_lines.qty_received)` for a `po_line` past its `qty_ordered`. Strict for Phase 1 (no over-receipt tolerance); over/under-receipt with tolerance windows is Phase 2. |
 | `P0024` | `ap_bill_three_way_mismatch` | `post_ap_bill` `po_match` line failed strict three-way match: `qty` exceeds the received-not-billed remainder for the referenced `po_line`, OR `unit_cost` differs from `po_line.unit_cost`, OR `amount` ≠ `qty × unit_cost`. Caller resolves by issuing a `cost_adjustment` (§3.12) for cost discrepancies, or reversal+rebook for qty discrepancies. |
 | `P0025` | `ap_bill_invalid_line` | `post_ap_bill` semantic line violation: unknown vendor, empty bill, unknown line `kind`, `po_match` line whose `po_line_id` belongs to a different vendor than the bill, currency mismatch between `po_line` and bill, `service` line missing or pointing at a closed expense account, or expense account on the wrong ledger / wrong currency. CHECK at the table layer catches table-level shape violations (NULL where required, etc.); this code surfaces what the function pre-empts. |
+| `P0026` | `wo_invalid` | `post_wo_start` / `post_op_move` / `post_wo_complete` / `post_scrap` rejected the call: WO id not found, status not draft (for `post_wo_start`) or not released (for the others), `parent_sku.cost_method ≠ 'standard'` (Slice B MVP gate; lifted under `acct-p7v`), empty `wo_routings` for the WO, qty ≤ 0, scrap qty exceeds `stock_wip` pool balance at the op, or a `wo_routing_burdens.applied_account_kind` that has no `_wo_apply_reason_for` mapping (e.g. caller seeded `cogs` as a burden kind). |
+| `P0027` | `wo_qty_overflow` | `post_wo_complete` or `post_scrap` would push `qty_completed + qty_scrapped + this_qty` past `qty_target`. Strict for Slice B MVP (no over-completion / over-scrap tolerance). |
+| `P0028` | `routing_op_invalid` | `post_op_move` got `from_op = to_op`, or `from_op` / `to_op` (or `post_scrap`'s `routing_op`) is not in this WO's `wo_routings`. |
+| `P0029` | `bom_missing` | `post_wo_start` found zero `boms` rows for `parent_sku_id`. WO parents must declare at least one component. |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 
@@ -410,6 +414,34 @@ Two line modes co-existable in one bill:
 Inflow cycle pieces fit together as: `post_po_receipt` accrues to `ap_unsettled`, `post_ap_bill` (po_match) clears `ap_unsettled → ap`, `post_transfers(reason='ap_payment')` (per consolidated doc §3.7) settles `ap → cash`. Each step is its own ledger event with its own document trail — no implicit linkage beyond the `po_line_id` and `vendor_bill_lines.po_line_id` columns used by the three-way match query.
 
 Standard ERP convention; Slice A's choice (D1) over the simpler "post directly to ap at receipt" pattern. The three-way match is **strict** for Phase 1: tolerance windows, over-receipt, and partial-line matching with weighted-cost averaging are all Phase 2 concerns.
+
+### `post_wo_start` / `post_op_move` / `post_wo_complete` / `post_scrap` (migrations 0037 + 0038 + 0039, acct-b82)
+
+Slice B conversion cycle. Document-layer wrappers for the work-order lifecycle.
+
+**Schema (migration 0037)**:
+- `work_orders(id, wo_no, parent_sku_id, fg_location_id, qty_target, qty_completed, qty_scrapped, status, currency, posted_by, posted_at)` — header. status ∈ {`draft`, `released`, `closed`}.
+- `wo_routings(wo_id, routing_op, op_name)` — per-WO operation list (no shared template table at MVP). PK `(wo_id, routing_op)`.
+- `wo_routing_burdens(wo_id, routing_op, applied_account_kind, std_amount)` — per-op standard absorption rates. PK `(wo_id, routing_op, applied_account_kind)`. FK to `wo_routings`. The open extension point: adding a new burden type (`outside_processing_applied`, `setup_applied`, `tooling_applied`, energy, …) is `ALTER TYPE account_kind ADD VALUE` + `ALTER TYPE transfer_reason ADD VALUE` + extending `_wo_apply_reason_for(account_kind)` + scaffolding the per-currency account. Schema is unchanged.
+- `boms(parent_sku_id, component_sku_id, component_loc_id, qty_per_parent)` — formal BOM reference data. Single-level; sub-assembly composition is a separate WO chained by parent consumption.
+- `wo_events(id, wo_id, event_kind, routing_op_from, routing_op_to, qty, business_date, posted_by, idempotency_key, notes)` — lifecycle audit log. event_kind ∈ {`start`, `op_move`, `wo_complete`, `scrap`}. Composite CHECK ensures the (event_kind, routing_op_*, qty) combination is internally consistent.
+
+**Cost rollup model.** `parent_std_cost = Σ (bom.qty_per_parent × component_std_cost) + Σ_op Σ_kind wo_routing_burdens.std_amount`. BOM components and per-op burdens are the same idea — per-unit costs that apply as a unit moves through the routing — differing only in *what* (RM substance vs absorption: labor / OH / outside-proc / …) and *when* (RM at WO start; burdens at the op they're declared on).
+
+**Functions (migration 0038, idempotency-fix 0039)**:
+
+- `post_wo_start(p_wo_id, p_business_date, p_posted_by, p_idempotency_key, p_notes)` — releases a draft WO. Charges WIP@first_op with RM (per BOM component, valued at component standard cost via `resolve_standard_cost_at`) plus first-op burdens. Emits `wo_start` qty leg + N × `rm_issue_to_wo` (qty + value) + M × burden-apply (e.g. `labor_apply`, `oh_apply`). Flips status `draft → released`.
+- `post_op_move(p_wo_id, p_from_op, p_to_op, p_qty, …)` — moves qty units between ops, then applies destination-op burdens. Value-leg amount = `qty × std_cum_at_from_op` (RM + burdens for ops ≤ from_op), passed through reason `op_move_v` (NOT in the dispatcher's cost-event list, so caller-supplied amount stands — the dispatcher's standard branch returns parent's full std cost which would be wrong at intermediate ops). Rework moves (to_op < from_op) re-apply destination burdens — realistic ERP semantics for rework labor.
+- `post_wo_complete(p_wo_id, p_qty, …)` — completes qty units from the highest routing_op into FG. Value-leg uses reason `wo_complete` and rides the dispatcher's standard branch (correct at last op because `std_cum_at_last_op = parent_std_cost`). On final completion (qty_completed + qty_scrapped reaches qty_target), reads `inv_value_wip@last_op` residual under `FOR UPDATE` and emits a `wo_close_v` leg for any nonzero balance, then sets status='closed'.
+- `post_scrap(p_wo_id, p_routing_op, p_qty, …)` — reads `inv_value_wip` + `stock_wip@op` pools `FOR UPDATE` to compute accumulated unit cost. Emits `scrap` qty leg (`stock_scrap DR / stock_wip CR`) + `scrap_v` value leg (`variance_scrap DR / inv_value_wip CR`).
+
+**MVP gate.** WO `parent_sku.cost_method = 'standard'` (P0006 otherwise; lifted under acct-p7v which adds wac to WIP). Components may use any cost method but **must** have a `standard_costs` row in effect at `business_date` (resolve_standard_cost_at raises P0018 otherwise) — the MVP values RM at standard regardless of comp.cost_method to keep BOM expansion deterministic.
+
+**Idempotency.** Each function checks `wo_events.idempotency_key` on entry (fast path) and again after the `FOR UPDATE` on `work_orders` (race-safe — fixes the wo_start / wo_complete status-transition window described in the migration 0039 header). Replays return `p_wo_id` without re-emitting events.
+
+**WIP locking + read-then-write.** `post_op_move` does not lock — it reads BOM and `wo_routing_burdens` snapshots and trusts that those are stable for the WO's lifetime. `post_scrap` and the wo_complete residual path acquire `FOR UPDATE` on `inv_value_wip` (and the matching `stock_wip` for scrap) before reading `(debits_total - credits_total)` — the read-then-write under lock pattern, allowed in v0.2 (CLAUDE.md "Load-bearing design decisions"). Since these locks are acquired in the same transaction as the subsequent `post_transfers` call (which itself acquires `FOR UPDATE` on the same accounts in id order), there is no cross-transaction deadlock window — same-tx FOR UPDATE re-acquisition is a no-op upgrade.
+
+**Errors.** P0026 (wo_invalid: not found, wrong status, parent ≠ standard, no routing, scrap > pool); P0027 (qty_overflow on wo_complete / scrap); P0028 (routing_op_invalid: from=to, op not in routing); P0029 (bom_missing); P0010 if any required account isn't open; P0018 if a component lacks a standard cost row; P0001–P0005 inherit from `post_transfers`.
 
 ## Schema integrity check (`scripts/ci-check.sh`)
 

@@ -1057,17 +1057,21 @@ Per-op MUV/LV/OHV (operation-level variance grain) is deferred — the residual 
 
 ### 3.5 Scrap at operation
 
+`post_scrap(p_wo_id, p_routing_op, p_qty, ...)` (Slice B, acct-b82) reads `inv_value_wip(parent, op, currency)` + `stock_wip(parent, op)` pools `FOR UPDATE` to compute accumulated unit cost (= `std_cum_at_op` for that WO under MVP, since pools are loaded at standard). Updates `work_orders.qty_scrapped`. P0026 if scrap qty exceeds pool balance.
+
 ```
-events:
+events (post_scrap):
   - reason='scrap', routing_op=NN
     debit:  accounts(stock_scrap, parent_sku).id
     credit: accounts(stock_wip, parent_sku, NN).id
     amount: qty
   - reason='scrap_v', routing_op=NN
     debit:  accounts(variance_scrap, currency).id
-    credit: accounts(inv_value_wip, parent_sku, currency).id
-    amount: accumulated_cost  (computed read-then-write under lock)
+    credit: accounts(inv_value_wip, parent_sku, NN, currency).id
+    amount: accumulated_unit_cost × qty  (computed read-then-write under lock)
 ```
+
+`scrap` is in the dispatcher cost-event list but its qty-side leg has `ledger_kind='qty'` — dispatcher skips. `scrap_v` is NOT in the cost-event list — caller-supplied amount stands.
 
 ### 3.6 Quarantine and release
 
