@@ -1,0 +1,11 @@
+-- acct-b82 / Slice B.1 — function rollback.
+
+DROP FUNCTION IF EXISTS post_scrap(UUID, INT, BIGINT, DATE, UUID, UUID, TEXT);
+DROP FUNCTION IF EXISTS post_wo_complete(UUID, BIGINT, DATE, UUID, UUID, TEXT);
+DROP FUNCTION IF EXISTS post_op_move(UUID, INT, INT, BIGINT, DATE, UUID, UUID, TEXT);
+DROP FUNCTION IF EXISTS post_wo_start(UUID, DATE, UUID, UUID, TEXT);
+
+DROP FUNCTION IF EXISTS _wo_burden_events_for_op(UUID, INT, BIGINT, BIGINT, CHAR, DATE, UUID, UUID);
+DROP FUNCTION IF EXISTS _wo_apply_reason_for(account_kind);
+
+DROP TABLE IF EXISTS wo_events;

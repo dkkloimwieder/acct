@@ -954,82 +954,106 @@ The same Postgres transaction also marks the reservation as allocated (or shippe
 
 ### 3.4 Work order lifecycle
 
-**WO start at Op 10** (issue-by-issue RM, standard cost):
+**Slice B (acct-b82, 2026-05-02)** introduces the document layer for WOs. Schema: `work_orders` (header), `wo_routings` (per-WO ops, no shared template table at MVP), `wo_routing_burdens(wo_id, routing_op, applied_account_kind, std_amount)` (per-op standard absorption rates by burden type), `boms(parent_sku_id, component_sku_id, qty_per_parent, component_loc_id)`. The four document-layer functions are `post_wo_start`, `post_op_move`, `post_wo_complete`, `post_scrap`. MVP restriction: WO parent_sku.cost_method = `standard` (P0006 otherwise; lifted under acct-p7v).
+
+**Cost rollup model.** A WO's standard cost is:
 
 ```
-events:
-  - reason='rm_issue_to_wo', routing_op=10
-    debit:  accounts(stock_consumed, comp_sku).id
-    credit: accounts(stock_available, comp_sku, comp_loc).id
-    amount: qty_A
-  - reason='wo_start', routing_op=10
-    debit:  accounts(stock_wip, parent_sku, 10).id
+parent_std_cost = Σ (bom.qty_per_parent × component_std_cost)        (RM)
+                + Σ_op Σ_kind wo_routing_burdens.std_amount          (per-op burdens)
+```
+
+**BOM components and per-op burdens are the same idea** — both are per-unit costs that apply to a unit as it moves through the routing. They differ only in *what* they substantively are (RM vs absorption: labor / OH / outside-processing / setup / tooling / energy / ...) and *when* they apply (RM at WO start; burdens at the op they're declared on). Burden rows credit `<applied_account_kind>(currency)` accounts (which are absorption accounts, e.g. `labor_applied`, `oh_applied`); reconciliation between absorbed and actual (vendor bill, payroll, allocation) is separate variance work.
+
+**Open extension via `applied_account_kind`.** MVP supports `labor_applied` and `oh_applied`. New burden types (`outside_processing_applied`, `setup_applied`, `tooling_applied`, energy, …) are added by:
+1. `ALTER TYPE account_kind ADD VALUE '<X>_applied'`
+2. `ALTER TYPE transfer_reason ADD VALUE '<X>_apply'`
+3. Extending the `_wo_apply_reason_for(account_kind)` mapping in the WO functions
+4. Scaffolding the per-currency `<X>_applied` account
+
+The `wo_routing_burdens` table itself does not change.
+
+**WO start (releases the WO; charges WIP@first_op):**
+
+```
+events (post_wo_start):
+  - reason='wo_start', routing_op=first_op
+    debit:  accounts(stock_wip, parent_sku, first_op).id
     credit: accounts(creation_void).id
-    amount: 1
-  - reason='rm_issue_to_wo', routing_op=10
-    debit:  accounts(inv_value_wip, parent_sku, currency).id
-    credit: accounts(inv_value_raw, comp_sku, currency).id
-    amount: comp_A_cost
-  - reason='labor_apply', routing_op=10
-    debit:  accounts(inv_value_wip, parent_sku, currency).id
-    credit: accounts(labor_applied, currency).id
-    amount: op10_std_labor
-  - reason='oh_apply', routing_op=10
-    debit:  accounts(inv_value_wip, parent_sku, currency).id
-    credit: accounts(oh_applied, currency).id
-    amount: op10_std_oh
+    amount: qty_target
+
+  for each (component_sku, qty_per_parent, component_loc) in boms(parent_sku):
+    - reason='rm_issue_to_wo'
+      debit:  accounts(stock_consumed, component_sku).id
+      credit: accounts(stock_available, component_sku, component_loc).id
+      amount: qty_target * qty_per_parent
+    - reason='rm_issue_to_wo'
+      debit:  accounts(inv_value_wip, parent_sku, first_op, currency).id
+      credit: accounts(inv_value_raw, component_sku, component_loc, currency).id
+      amount: qty_target * qty_per_parent * resolve_standard_cost_at(component_sku, business_date)
+
+  for each (applied_account_kind, std_amount) in wo_routing_burdens(wo_id, first_op):
+    - reason=_wo_apply_reason_for(applied_account_kind)  -- e.g. labor_apply, oh_apply
+      debit:  accounts(inv_value_wip, parent_sku, first_op, currency).id
+      credit: accounts(applied_account_kind, currency).id
+      amount: qty_target * std_amount
 ```
 
-**Op move (Op 10 → Op 20)** — read-then-write under lock is fine:
+After `post_wo_start`, `WIP@first_op = qty_target × std_cum_at_first_op` (RM + first-op burdens).
 
-The write function, when reason='op_move', computes accumulated unit cost from the locked WIP balance:
+**Op move (from_op → to_op):**
 
-```sql
--- inside post_transfers, when reason='op_move' (special path)
-SELECT
-  (vd.debits_total - vd.credits_total) AS accum_value,
-  (qd.debits_total - qd.credits_total) AS qty_in_wip
-INTO v_accum_value, v_qty_in_wip
-FROM accounts vd, accounts qd
-WHERE vd.id = $value_acct_op10 AND qd.id = $qty_acct_op10;
+The value-leg amount equals `qty × std_cum_at_from_op` (RM + sum of burdens for ops ≤ from_op) — i.e. all the cost a unit accumulated by the time it arrived at `from_op`. After the move, the destination op's burdens are applied against the moved qty.
 
-v_unit_cost := v_accum_value / NULLIF(v_qty_in_wip, 0);
-v_amount    := v_unit_cost * (v_event->>'qty')::BIGINT;
-
--- then post the qty and value transfers normally
-```
+The dispatcher's standard branch returns `qty × parent_std_cost` (resolved at SKU level), which is correct only at the last op. For intermediate ops `post_op_move` computes the value externally and passes it via reason `op_move_v` (NOT in the dispatcher's cost-event list). Mirrors the `scrap` / `scrap_v` qty-leg / value-leg split.
 
 ```
-events:
-  - reason='op_move', routing_op=20
-    debit:  accounts(stock_wip, parent_sku, 20).id
-    credit: accounts(stock_wip, parent_sku, 10).id
+events (post_op_move(wo_id, from_op, to_op, qty)):
+  - reason='op_move'
+    debit:  accounts(stock_wip, parent_sku, to_op).id
+    credit: accounts(stock_wip, parent_sku, from_op).id
     amount: qty
-  - reason='op_move', routing_op=20
-    debit:  accounts(inv_value_wip, parent_sku, currency).id  -- (op 20)
-    credit: accounts(inv_value_wip, parent_sku, currency).id  -- (op 10)
-    amount: v_amount  (computed above)
+  - reason='op_move_v'                                        -- value leg
+    debit:  accounts(inv_value_wip, parent_sku, to_op, currency).id
+    credit: accounts(inv_value_wip, parent_sku, from_op, currency).id
+    amount: qty * std_cum_at_from_op
+                where std_cum_at_from_op
+                  = Σ (bom.qty_per_parent × resolve_standard_cost_at(comp, business_date))
+                  + Σ wo_routing_burdens.std_amount  for ops ≤ from_op
+
+  for each (applied_account_kind, std_amount) in wo_routing_burdens(wo_id, to_op):
+    - reason=_wo_apply_reason_for(applied_account_kind)
+      debit:  accounts(inv_value_wip, parent_sku, to_op, currency).id
+      credit: accounts(applied_account_kind, currency).id
+      amount: qty * std_amount
 ```
 
-(If per-op value accounts are kept distinct, debit/credit are different `inv_value_wip` rows scoped by routing_op — see §1.1 unique index.)
+After `post_op_move`, `WIP@to_op` grew by `qty × std_cum_at_to_op`. Rework moves (to_op < from_op) are allowed and re-apply the destination op's burdens — realistic ERP rework semantics.
 
-**WO complete (last op → FG, standard-cost variance):**
+**WO complete (last op → FG; residual variance at close):**
+
+At the last op, `std_cum_at_last_op == parent_std_cost`, so the dispatcher's standard branch returns the right number for the value-leg. Reason stays `wo_complete` (in the dispatcher cost-event list).
 
 ```
-events:
+events (post_wo_complete(wo_id, qty)):
   - reason='wo_complete'
     debit:  accounts(stock_available, parent_sku, fg_loc).id
     credit: accounts(stock_wip, parent_sku, last_op).id
     amount: qty
-  - reason='wo_complete'
-    debit:  accounts(inv_value_fg, parent_sku, currency).id
-    credit: accounts(inv_value_wip, parent_sku, currency).id
-    amount: qty * std_cost
+  - reason='wo_complete'                                       -- dispatcher-priced
+    debit:  accounts(inv_value_fg, parent_sku, fg_loc, currency).id
+    credit: accounts(inv_value_wip, parent_sku, last_op, currency).id
+    amount: qty * resolve_standard_cost_at(parent_sku, business_date)
+
+  -- only on final completion (qty_completed + qty_scrapped reaches qty_target),
+  -- if WIP@last_op holds nonzero residual (read FOR UPDATE):
   - reason='wo_close_v'
-    debit:  accounts(variance_wo_close, currency).id  (or flip if favorable)
-    credit: accounts(inv_value_wip, parent_sku, currency).id
-    amount: residual  (computed read-then-write under lock)
+    debit:  accounts(variance_wo_close, currency).id  (or flip when favorable)
+    credit: accounts(inv_value_wip, parent_sku, last_op, currency).id
+    amount: |residual|
 ```
+
+Per-op MUV/LV/OHV (operation-level variance grain) is deferred — the residual at WO close is the only variance the MVP surfaces. (Slice B Q3 lean.)
 
 ### 3.5 Scrap at operation
 
