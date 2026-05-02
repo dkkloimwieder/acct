@@ -94,6 +94,14 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('cogs',                 'value', 'USD', 'debit'),
   ('variance_wo_close',    'value', 'USD', 'unrestricted');
 
+-- Slice B (acct-wl1) absorption + scrap-variance accounts (USD).
+-- Currency-only kinds; not partitioned by SKU/location. Per-SKU
+-- stock_scrap is scaffolded per-test (sku-specific qty kind).
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('labor_applied',  'value', 'USD', 'credit'),
+  ('oh_applied',     'value', 'USD', 'credit'),
+  ('variance_scrap', 'value', 'USD', 'unrestricted');
+
 -- Inventory adjustment account (USD + EUR). Bidirectional P&L line:
 -- credit balance = net adjustment income (we found inventory),
 -- debit  balance = net adjustment expense (we lost inventory).
@@ -169,6 +177,8 @@ INSERT INTO accounts (kind, ledger_kind, sku_id, routing_op, normal_side)
   SELECT 'stock_wip', 'qty', s.id, 20, 'debit' FROM skus s WHERE s.code='SKU-A';
 INSERT INTO accounts (kind, ledger_kind, sku_id, normal_side)
   SELECT 'stock_consumed', 'qty', s.id, 'debit' FROM skus s WHERE s.code='SKU-A';
+INSERT INTO accounts (kind, ledger_kind, sku_id, normal_side)
+  SELECT 'stock_scrap', 'qty', s.id, 'debit' FROM skus s WHERE s.code='SKU-A';
 
 -- SKU-WAC accounts (used by acct-uxu WAC tests + acct-93b.15 P0006 dispatch).
 -- Qty side: stock_available (MAIN), stock_wip (op10, op20).

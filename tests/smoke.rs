@@ -1,13 +1,16 @@
 mod common;
 
-use common::connect_test_db;
+use common::{connect_test_db, reset_to_fixture};
 
 /// Smoke test: verify the harness can reach the test DB, that migrations
 /// and the fixture have been applied (run-tests.sh seeds before invoking
-/// cargo test), and that a basic SELECT round-trips. Read-only.
+/// cargo test), and that a basic SELECT round-trips. Resets to the
+/// fixture first so residue from tests in earlier-alphabetical binaries
+/// (e.g. slice_b_tables_t1) doesn't trip the row-count assertions.
 #[tokio::test]
 async fn fixture_is_loaded() {
     let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
 
     let sku_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM skus")
         .fetch_one(&pool)
