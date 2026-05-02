@@ -149,6 +149,10 @@ For all other reasons (anything not in the cost-relevant set): caller sends `amo
 | `P0019` | `retroactive_std_cost_roll_blocked` | `post_standard_cost_roll` caller passed `p_effective_at` that is not strictly greater than every existing `standard_costs.effective_at` for the SKU. Phase 1 does not support retroactive corrections to past standard costs. |
 | `P0020` | `wac_periodic_close_no_receipts` | `wac_periodic_close_hook` (composed through `close_period`) found a pool with un-finalized `wac_periodic` provisional rows but zero in-period receipts; cannot compute the period's `final_avg = Σ(receipts value) / Σ(receipts qty)`. Operator either (a) posts a receipt for the period and retries close, or (b) calls `close_period(..., p_force_provisional := TRUE)` which skips the un-processable rows and leaves them on the side table for forensics. |
 | `P0021` | `target_period_closed` | `post_cost_adjustment_retroactive` caller passed `p_target_period_id` for a period whose `closed_at IS NOT NULL`. The retroactive cost-adjustment workflow only operates on currently-open periods (the queue is the period's audit trail and must be visible to `close_period`). To fix a closed period, reopen it first; reopen workflow is tracked as `acct-7h4` (Phase 2 Epic K). |
+| `P0022` | `po_receipt_invalid` | `post_po_receipt` caller passed an unknown PO id, a PO with no `supplier_id`, an unknown `po_line_id`, a `po_line` belonging to a different PO, an empty lines array, or `qty_received <= 0`. Document-layer caller bug; the function rejects before posting any transfers. |
+| `P0023` | `po_line_overreceived` | `post_po_receipt` would push cumulative `SUM(po_receipt_lines.qty_received)` for a `po_line` past its `qty_ordered`. Strict for Phase 1 (no over-receipt tolerance); over/under-receipt with tolerance windows is Phase 2. |
+| `P0024` | `ap_bill_three_way_mismatch` | `post_ap_bill` `po_match` line failed strict three-way match: `qty` exceeds the received-not-billed remainder for the referenced `po_line`, OR `unit_cost` differs from `po_line.unit_cost`, OR `amount` ≠ `qty × unit_cost`. Caller resolves by issuing a `cost_adjustment` (§3.12) for cost discrepancies, or reversal+rebook for qty discrepancies. |
+| `P0025` | `ap_bill_invalid_line` | `post_ap_bill` semantic line violation: unknown supplier, empty bill, unknown line `kind`, `po_match` line whose `po_line_id` belongs to a different supplier than the bill, currency mismatch between `po_line` and bill, `service` line missing or pointing at a closed expense account, or expense account on the wrong ledger / wrong currency. CHECK at the table layer catches table-level shape violations (NULL where required, etc.); this code surfaces what the function pre-empts. |
 
 The L3 append-only trigger (`P9999`) and the L2 balance-respects-normal-side CHECK (`23514`) are defenses in depth; neither should fire from inside `post_transfers` under normal use.
 
@@ -348,6 +352,64 @@ Behavior:
 **Known limitation.** `p_posted_by` is unvalidated — same convention as the other document-layer functions. RBAC is Part VII Q6, still open.
 
 See consolidated doc §3.13 for the full design notes.
+
+### `post_po_receipt` (migration 0035, acct-7mg)
+
+Slice A inflow workflow. Receives goods against an open PO; emits the qty + value (+ optional PPV) event batch documented in consolidated doc §3.1.
+
+Signature:
+```
+post_po_receipt(
+  p_po_id           UUID,
+  p_lines           JSONB,   -- [{po_line_id: UUID, qty_received: BIGINT}, ...]
+  p_business_date   DATE,
+  p_posted_by       UUID,
+  p_idempotency_key UUID,
+  p_notes           TEXT     DEFAULT NULL
+) RETURNS UUID                -- po_receipts.id
+```
+
+Per line, looks up `purchase_order_lines` for SKU/location/unit_cost/currency, validates the PO/line ownership and over-receipt gate (P0023 if cumulative `qty_received` would exceed `qty_ordered`), resolves accounts (qty: stock_available + supplier_pool; value: inv_value_raw + ap_unsettled), and emits 2 events (qty leg + value leg). For standard SKUs with `po_unit_cost ≠ resolve_standard_cost_at(sku, business_date)`, emits a third PPV event routing the variance through `variance_ppv` — `inv_value_raw` lands at standard cost regardless. WAC SKUs (perpetual / periodic / retroactive) post `inv_value_raw` at `po_unit_cost`; the pool re-averages organically.
+
+**GRNI semantics (D1, 2026-05-01).** Credits `ap_unsettled` (goods received not invoiced), not `ap`. Clearance happens when `post_ap_bill` is called against the PO line (see below). Earlier draft of the design (§3.1 pre-Slice-A) credited `ap` directly at receipt — revised when Slice A landed; see consolidated doc §3.1 for rationale.
+
+**Errors.** P0022 on PO/line/empty/qty validation; P0023 on over-receipt; P0006 for fifo/lot SKUs; P0010 if any required account isn't open; standard P0001-P0005 inherit from `post_transfers`.
+
+**Idempotency.** Replay on `p_idempotency_key` returns the existing `po_receipts.id` without re-posting.
+
+### `post_ap_bill` (migration 0035, acct-7mg)
+
+Slice A inflow workflow companion. Vendor bill — clears GRNI accruals from PO receipts and/or posts standalone service expenses.
+
+Signature:
+```
+post_ap_bill(
+  p_supplier_id     UUID,
+  p_currency        CHAR(3),
+  p_lines           JSONB,
+    -- [{kind:'po_match', po_line_id, qty, unit_cost, amount}]
+    -- [{kind:'service',  expense_account_id, amount}]
+  p_business_date   DATE,
+  p_posted_by       UUID,
+  p_idempotency_key UUID,
+  p_notes           TEXT     DEFAULT NULL
+) RETURNS UUID                -- vendor_bills.id
+```
+
+Two line modes co-existable in one bill:
+
+- **`po_match`** — strict three-way match (D3, 2026-05-01) against the referenced `po_line`. Validates `qty ≤ received_not_billed_remainder` (cumulative across receipts and prior bills, where `remainder = SUM(po_receipt_lines.qty_received) − SUM(prior vendor_bill_lines.qty WHERE kind='po_match')`), `unit_cost = po_line.unit_cost`, `amount = qty × unit_cost`. Posts `ap_unsettled DR / ap CR`. Cumulative billed is recomputed per line within the same batch (later lines see earlier inserts via `READ COMMITTED`).
+- **`service`** — caller supplies an arbitrary value-side `expense_account_id`. Function validates the account is open, `ledger_kind='value'`, currency = bill currency. Posts `expense_account DR / ap CR`. No PO reference; covers utilities, professional services, etc. Stable expense taxonomy (operating_expense kinds) is filed as `acct-063` follow-up.
+
+**Errors.** P0024 for any three-way mismatch; P0025 for invalid line kind, supplier mismatch, currency mismatch on po_line, missing/closed expense account; P0010 if no open `ap` for `(supplier, currency)`; P0001-P0005 inherit from `post_transfers`.
+
+**Idempotency.** Replay on `p_idempotency_key` returns the existing `vendor_bills.id` without re-posting.
+
+### Three-way match and GRNI flow
+
+Inflow cycle pieces fit together as: `post_po_receipt` accrues to `ap_unsettled`, `post_ap_bill` (po_match) clears `ap_unsettled → ap`, `post_transfers(reason='ap_payment')` (per consolidated doc §3.7) settles `ap → cash`. Each step is its own ledger event with its own document trail — no implicit linkage beyond the `po_line_id` and `vendor_bill_lines.po_line_id` columns used by the three-way match query.
+
+Standard ERP convention; Slice A's choice (D1) over the simpler "post directly to ap at receipt" pattern. The three-way match is **strict** for Phase 1: tolerance windows, over-receipt, and partial-line matching with weighted-cost averaging are all Phase 2 concerns.
 
 ## Schema integrity check (`scripts/ci-check.sh`)
 

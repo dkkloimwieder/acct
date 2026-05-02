@@ -801,23 +801,37 @@ All patterns are a single `post_transfers` call with one or more events in the J
 
 ### 3.1 PO receipt (firm-priced)
 
+Slice A inflow workflow (acct-7mg, migrations 0034/0035). The document layer is `purchase_orders` (header) + `purchase_order_lines` (per-line) + `po_receipts` (header) + `po_receipt_lines` (per-line). The function `post_po_receipt(p_po_id, p_lines, ...)` validates over-receipt, resolves accounts per SKU's cost method, and emits the event batch below per received line.
+
+**GRNI semantics (D1, 2026-05-01).** Receipts credit `ap_unsettled` (goods received not invoiced), not `ap` directly. The vendor bill (`post_ap_bill`, §3.x below) clears the GRNI accrual to `ap` once the bill arrives. This matches mainstream ERP convention (SAP/Oracle/D365) and prevents AP from being credited before invoice approval. Earlier draft of this section credited `ap` directly at receipt; revised when Slice A landed.
+
 ```
-events:
+events (per po_line received):
   - reason='po_receipt'
     debit:  accounts(stock_available, sku, recv_loc).id
     credit: accounts(supplier_pool, supplier_id).id
     amount: qty
+    qty:    qty
   - reason='po_receipt'
-    debit:  accounts(inv_value_raw, sku, currency).id
-    credit: accounts(ap, supplier_id, currency).id
-    amount: qty * unit_cost
-  - (if standard cost with PPV)
+    debit:  accounts(inv_value_raw, sku, recv_loc, currency).id
+    credit: accounts(ap_unsettled, supplier_id, currency).id
+    amount: qty * std_cost   -- standard SKU; std at business_date
+            qty * po_unit_cost  -- WAC SKU (perpetual / periodic / retroactive)
+    qty:    qty
+  - (standard SKU only, when po_unit_cost ≠ std_cost)
     reason='ppv'
-    debit:  accounts(inv_value_raw, sku, currency).id
-            (or accounts(variance_ppv, currency) if delta unfavorable; flip otherwise)
-    credit: accounts(ap, supplier_id, currency).id
-    amount: qty * (actual_cost - std_cost)
+    -- unfavorable (po > std):
+    debit:  accounts(variance_ppv, currency).id
+    credit: accounts(ap_unsettled, supplier_id, currency).id
+    amount: qty * (po_unit_cost - std_cost)
+    -- favorable (po < std): debit and credit roles flip; amount = |delta|
 ```
+
+Net effect at the supplier-side: `ap_unsettled` = `qty * po_unit_cost` regardless of cost method (it's what we owe); `inv_value_raw` lands at `qty * std` for standard SKUs (PPV absorbs the variance) and at `qty * po_unit_cost` for WAC SKUs (the pool re-averages organically).
+
+Strict over-receipt rejection (D3): cumulative `qty_received` per `po_line` cannot exceed `qty_ordered` (`P0023`). Tolerance / over-receipt is Phase 2.
+
+`fifo` / `lot` cost methods raise `P0006` at receipt time (acct-8gg).
 
 ### 3.2 Inter-location transfer
 
@@ -1323,6 +1337,38 @@ close-time (cost_adjust_retroactive_hook):
 **Idempotency.** `idempotency_key UUID NOT NULL UNIQUE` on the queue table. Replay returns the existing queue row's id without re-inserting; the hook's `FOR UPDATE` walk also tolerates concurrent close attempts.
 
 The audit row records `target_avg`, `business_date`, `posted_by`, `posted_at`, `finalized_at`, `finalized_count` (depletions processed at close), `total_variance` (signed sum of variance_amount across all 2-transfer batches), and free-form `notes`. The full lifecycle is reconstructable from this row plus the variance transfers (joined via `document_id = queue_row.id`, `document_kind = 'cost_adjust_retroactive_close'`).
+
+### 3.15 AP bill (vendor invoice)
+
+Slice A inflow workflow companion to §3.1 (acct-7mg, migration 0035). The document layer is `vendor_bills` (header) + `vendor_bill_lines` (per-line). The function `post_ap_bill(p_supplier_id, p_currency, p_lines, ...)` validates each line per its `kind` and emits the event below.
+
+Two line modes coexist in one bill:
+
+**`po_match` — clears the GRNI accrual from §3.1.** Strict three-way match (D3, 2026-05-01): per `po_line`, the bill's `qty` cannot exceed the received-not-yet-billed remainder (`SUM(po_receipt_lines.qty_received) − SUM(prior vendor_bill_lines.qty WHERE kind='po_match')`); `unit_cost` must equal `po_line.unit_cost`; `amount` must equal `qty × unit_cost`. Cumulative across the bill batch (later lines see earlier inserts via `READ COMMITTED`).
+
+```
+event (per po_match line):
+  - reason='ap_bill'
+    debit:  accounts(ap_unsettled, supplier_id, currency).id
+    credit: accounts(ap, supplier_id, currency).id
+    amount: qty * unit_cost
+```
+
+Net effect: `ap_unsettled` (GRNI accrual from §3.1's receipt event) clears to `ap` (real liability). The flow now reads §3.1 → §3.15 → §3.7 (`ap_payment`).
+
+**`service` — caller-supplied expense (no PO reference).** Covers utilities, professional services, rent, software, etc. The caller passes `expense_account_id` per line; the function validates that the account is open, value-side, and matches the bill currency. Taxonomy (operating-expense account_kind enum) deferred to acct-063 (D2, 2026-05-01).
+
+```
+event (per service line):
+  - reason='ap_bill'
+    debit:  accounts(<caller-supplied expense_account>).id
+    credit: accounts(ap, supplier_id, currency).id
+    amount: line.amount
+```
+
+Both modes can be mixed in one document (one `vendor_bill`, one `post_ap_bill` call). Replays on `idempotency_key` short-circuit before any post.
+
+Error codes (all new in Slice A): **P0022** po_receipt_invalid (deferred from §3.1), **P0023** po_line_overreceived, **P0024** ap_bill_three_way_mismatch (qty over remainder, unit_cost mismatch, or amount ≠ qty × unit_cost), **P0025** ap_bill_invalid_line (wrong supplier on po_line, currency mismatch, missing or closed expense account, unknown line kind).
 
 ## §4. WIP model
 
