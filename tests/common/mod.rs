@@ -62,7 +62,8 @@ pub async fn reset_to_fixture(pool: &PgPool) {
             skus,
             locations,
             sales_orders,
-            purchase_orders
+            purchase_orders,
+            suppliers
          RESTART IDENTITY CASCADE",
     )
     .execute(pool)
