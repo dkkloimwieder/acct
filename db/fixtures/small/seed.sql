@@ -77,12 +77,12 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
 
 -- Slice A (acct-7mg) inflow accounts. Un-partitioned (no
 -- counterparty_id) — shared by conformance harness cases that don't
--- model per-supplier liability. Per-supplier partitioned versions are
--- created inline by Slice A matrix tests via the supplier scaffold.
+-- model per-vendor liability. Per-vendor partitioned versions are
+-- created inline by Slice A matrix tests via the vendor scaffold.
 INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
-  ('ap_unsettled',  'value', 'USD', 'credit'),  -- GRNI accrual
-  ('supplier_pool', 'qty',   NULL,  'credit'),  -- per-vendor qty pool
-  ('variance_ppv',  'value', 'USD', 'unrestricted');
+  ('ap_unsettled', 'value', 'USD', 'credit'),  -- GRNI accrual
+  ('vendor_pool',  'qty',   NULL,  'credit'),  -- per-vendor qty pool
+  ('variance_ppv', 'value', 'USD', 'unrestricted');
 
 -- Cash + revenue (EUR) — for currency-mismatch tests
 INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES

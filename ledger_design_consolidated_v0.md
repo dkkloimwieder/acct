@@ -373,7 +373,7 @@ CREATE TYPE account_kind AS ENUM (
   'stock_available', 'stock_reserved', 'stock_quarantine', 'stock_scrap',
   'stock_in_transit', 'stock_consumed', 'stock_wip',
   -- Counterparty (qty side, optional)
-  'supplier_pool', 'customer_pool',
+  'vendor_pool', 'customer_pool',
   -- Value
   'inv_value_raw', 'inv_value_wip', 'inv_value_fg', 'cogs',
   'ap', 'ap_unsettled', 'ar', 'cash',
@@ -809,12 +809,12 @@ Slice A inflow workflow (acct-7mg, migrations 0034/0035). The document layer is 
 events (per po_line received):
   - reason='po_receipt'
     debit:  accounts(stock_available, sku, recv_loc).id
-    credit: accounts(supplier_pool, supplier_id).id
+    credit: accounts(vendor_pool, vendor_id).id
     amount: qty
     qty:    qty
   - reason='po_receipt'
     debit:  accounts(inv_value_raw, sku, recv_loc, currency).id
-    credit: accounts(ap_unsettled, supplier_id, currency).id
+    credit: accounts(ap_unsettled, vendor_id, currency).id
     amount: qty * std_cost   -- standard SKU; std at business_date
             qty * po_unit_cost  -- WAC SKU (perpetual / periodic / retroactive)
     qty:    qty
@@ -822,12 +822,12 @@ events (per po_line received):
     reason='ppv'
     -- unfavorable (po > std):
     debit:  accounts(variance_ppv, currency).id
-    credit: accounts(ap_unsettled, supplier_id, currency).id
+    credit: accounts(ap_unsettled, vendor_id, currency).id
     amount: qty * (po_unit_cost - std_cost)
     -- favorable (po < std): debit and credit roles flip; amount = |delta|
 ```
 
-Net effect at the supplier-side: `ap_unsettled` = `qty * po_unit_cost` regardless of cost method (it's what we owe); `inv_value_raw` lands at `qty * std` for standard SKUs (PPV absorbs the variance) and at `qty * po_unit_cost` for WAC SKUs (the pool re-averages organically).
+Net effect at the vendor-side: `ap_unsettled` = `qty * po_unit_cost` regardless of cost method (it's what we owe); `inv_value_raw` lands at `qty * std` for standard SKUs (PPV absorbs the variance) and at `qty * po_unit_cost` for WAC SKUs (the pool re-averages organically).
 
 Strict over-receipt rejection (D3): cumulative `qty_received` per `po_line` cannot exceed `qty_ordered` (`P0023`). Tolerance / over-receipt is Phase 2.
 
@@ -1080,7 +1080,7 @@ events:
 ```
 events:
   - reason='ap_payment'
-    debit:  accounts(ap, supplier_id, currency).id
+    debit:  accounts(ap, vendor_id, currency).id
     credit: accounts(cash, currency).id
     amount: payment_amount
 ```
@@ -1340,7 +1340,7 @@ The audit row records `target_avg`, `business_date`, `posted_by`, `posted_at`, `
 
 ### 3.15 AP bill (vendor invoice)
 
-Slice A inflow workflow companion to §3.1 (acct-7mg, migration 0035). The document layer is `vendor_bills` (header) + `vendor_bill_lines` (per-line). The function `post_ap_bill(p_supplier_id, p_currency, p_lines, ...)` validates each line per its `kind` and emits the event below.
+Slice A inflow workflow companion to §3.1 (acct-7mg, migration 0035). The document layer is `vendor_bills` (header) + `vendor_bill_lines` (per-line). The function `post_ap_bill(p_vendor_id, p_currency, p_lines, ...)` validates each line per its `kind` and emits the event below.
 
 Two line modes coexist in one bill:
 
@@ -1349,8 +1349,8 @@ Two line modes coexist in one bill:
 ```
 event (per po_match line):
   - reason='ap_bill'
-    debit:  accounts(ap_unsettled, supplier_id, currency).id
-    credit: accounts(ap, supplier_id, currency).id
+    debit:  accounts(ap_unsettled, vendor_id, currency).id
+    credit: accounts(ap, vendor_id, currency).id
     amount: qty * unit_cost
 ```
 
@@ -1362,13 +1362,13 @@ Net effect: `ap_unsettled` (GRNI accrual from §3.1's receipt event) clears to `
 event (per service line):
   - reason='ap_bill'
     debit:  accounts(<caller-supplied expense_account>).id
-    credit: accounts(ap, supplier_id, currency).id
+    credit: accounts(ap, vendor_id, currency).id
     amount: line.amount
 ```
 
 Both modes can be mixed in one document (one `vendor_bill`, one `post_ap_bill` call). Replays on `idempotency_key` short-circuit before any post.
 
-Error codes (all new in Slice A): **P0022** po_receipt_invalid (deferred from §3.1), **P0023** po_line_overreceived, **P0024** ap_bill_three_way_mismatch (qty over remainder, unit_cost mismatch, or amount ≠ qty × unit_cost), **P0025** ap_bill_invalid_line (wrong supplier on po_line, currency mismatch, missing or closed expense account, unknown line kind).
+Error codes (all new in Slice A): **P0022** po_receipt_invalid (deferred from §3.1), **P0023** po_line_overreceived, **P0024** ap_bill_three_way_mismatch (qty over remainder, unit_cost mismatch, or amount ≠ qty × unit_cost), **P0025** ap_bill_invalid_line (wrong vendor on po_line, currency mismatch, missing or closed expense account, unknown line kind).
 
 ## §4. WIP model
 
@@ -1620,11 +1620,11 @@ The §17 patterns from `ledger_inventory_design_spec_v0.md` carry forward; only 
 events:
   - reason='po_receipt_provisional'
     debit:  accounts(stock_available, sku, recv_loc).id
-    credit: accounts(supplier_pool, supplier_id).id
+    credit: accounts(vendor_pool, vendor_id).id
     amount: qty
   - reason='po_receipt_provisional'
     debit:  accounts(inv_value_raw, sku, currency).id
-    credit: accounts(ap_unsettled, supplier_id, currency).id
+    credit: accounts(ap_unsettled, vendor_id, currency).id
     amount: qty * provisional_price
 ```
 
@@ -1655,23 +1655,23 @@ For the settling receipt, derive `Δ_onhand`, `Δ_consumed`, `Δ_wip` such that 
 ```
 events (signs shown for Δ > 0):
   - reason='po_settlement'
-    debit:  accounts(ap_unsettled, supplier_id, currency).id
-    credit: accounts(ap, supplier_id, currency).id
+    debit:  accounts(ap_unsettled, vendor_id, currency).id
+    credit: accounts(ap, vendor_id, currency).id
     amount: qty * provisional_price
 
   - reason='price_trueup_inventory'
     debit:  accounts(inv_value_raw, sku, currency).id
-    credit: accounts(ap, supplier_id, currency).id
+    credit: accounts(ap, vendor_id, currency).id
     amount: Δ_onhand
 
   - reason='price_trueup_cogs'
     debit:  accounts(cogs, sku, currency).id
-    credit: accounts(ap, supplier_id, currency).id
+    credit: accounts(ap, vendor_id, currency).id
     amount: Δ_consumed
 
   - reason='price_trueup_wip', routing_op=NN
     debit:  accounts(inv_value_wip, parent_sku, currency).id
-    credit: accounts(ap, supplier_id, currency).id
+    credit: accounts(ap, vendor_id, currency).id
     amount: Δ_wip_for_op_NN
     (one event per affected op)
 ```

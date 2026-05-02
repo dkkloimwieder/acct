@@ -18,15 +18,15 @@ use sqlx::PgPool;
 
 #[allow(dead_code)]
 struct Setup {
-    supplier_id: String,
+    vendor_id: String,
     po_id: String,
     po_line_id: String,
     sku_id: String,
     loc_id: String,
     qty_acct: i64,
     val_acct: i64,
-    sup_qty: i64,
-    sup_unsettled: i64,
+    ven_qty: i64,
+    ven_unsettled: i64,
     ap: i64,
     var_ppv: i64,
 }
@@ -39,23 +39,23 @@ async fn id_text(pool: &PgPool, q: &str, bind: &str) -> String {
         .unwrap_or_else(|e| panic!("{q} for {bind}: {e}"))
 }
 
-async fn fresh_supplier(pool: &PgPool, code: &str, currency: &str) -> String {
+async fn fresh_vendor(pool: &PgPool, code: &str, currency: &str) -> String {
     sqlx::query_scalar(
-        "INSERT INTO suppliers (code, name, currency) VALUES ($1, $2, $3) RETURNING id::text",
+        "INSERT INTO vendors (code, name, currency) VALUES ($1, $2, $3) RETURNING id::text",
     )
     .bind(code)
-    .bind(format!("Supplier {code}"))
+    .bind(format!("Vendor {code}"))
     .bind(currency)
     .fetch_one(pool)
     .await
     .unwrap()
 }
 
-async fn fresh_po(pool: &PgPool, supplier_id: &str) -> String {
+async fn fresh_po(pool: &PgPool, vendor_id: &str) -> String {
     sqlx::query_scalar(
-        "INSERT INTO purchase_orders (supplier_id, status) VALUES ($1::UUID, 'open') RETURNING id::text",
+        "INSERT INTO purchase_orders (vendor_id, status) VALUES ($1::UUID, 'open') RETURNING id::text",
     )
-    .bind(supplier_id)
+    .bind(vendor_id)
     .fetch_one(pool)
     .await
     .unwrap()
@@ -116,13 +116,13 @@ async fn open_account(
     .unwrap_or_else(|e| panic!("open {kind}/{ledger_kind}: {e}"))
 }
 
-/// Build the supplier + PO + PO-line + accounts scaffold; standard SKU-A
+/// Build the vendor + PO + PO-line + accounts scaffold; standard SKU-A
 /// at MAIN. po and std equal (no PPV) to keep arithmetic simple.
-async fn build_setup(pool: &PgPool, supplier_code: &str) -> Setup {
+async fn build_setup(pool: &PgPool, vendor_code: &str) -> Setup {
     let sku = id_text(pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-A").await;
     let loc = id_text(pool, "SELECT id::text FROM locations WHERE code = $1", "MAIN").await;
-    let supplier = fresh_supplier(pool, supplier_code, "USD").await;
-    let po = fresh_po(pool, &supplier).await;
+    let vendor = fresh_vendor(pool, vendor_code, "USD").await;
+    let po = fresh_po(pool, &vendor).await;
     let po_line = fresh_po_line(pool, &po, 1, &sku, &loc, 100, 100, "USD").await;
 
     let qty_acct = account_id_stock_available(pool, "SKU-A", "MAIN").await;
@@ -131,15 +131,15 @@ async fn build_setup(pool: &PgPool, supplier_code: &str) -> Setup {
     )
     .await;
 
-    let sup_qty =
-        open_account(pool, "supplier_pool", "qty", None, None, None, Some(&supplier), "credit")
+    let ven_qty =
+        open_account(pool, "vendor_pool", "qty", None, None, None, Some(&vendor), "credit")
             .await;
-    let sup_unsettled = open_account(
-        pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&supplier), "credit",
+    let ven_unsettled = open_account(
+        pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     let ap = open_account(
-        pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     let var_ppv = open_account(
@@ -148,15 +148,15 @@ async fn build_setup(pool: &PgPool, supplier_code: &str) -> Setup {
     .await;
 
     Setup {
-        supplier_id: supplier,
+        vendor_id: vendor,
         po_id: po,
         po_line_id: po_line,
         sku_id: sku,
         loc_id: loc,
         qty_acct,
         val_acct,
-        sup_qty,
-        sup_unsettled,
+        ven_qty,
+        ven_unsettled,
         ap,
         var_ppv,
     }
@@ -192,7 +192,7 @@ async fn call_receipt(
 
 async fn call_bill(
     pool: &PgPool,
-    supplier_id: &str,
+    vendor_id: &str,
     currency: &str,
     lines: serde_json::Value,
     business_date: &str,
@@ -202,7 +202,7 @@ async fn call_bill(
     sqlx::query_scalar(
         "SELECT post_ap_bill($1::UUID, $2, $3, $4::DATE, $5::UUID, $6::UUID, NULL)::text",
     )
-    .bind(supplier_id)
+    .bind(vendor_id)
     .bind(currency)
     .bind(lines)
     .bind(business_date)
@@ -233,7 +233,7 @@ async fn po_match_full_clearance() {
     receive_10(&pool, &sx).await;
 
     // After receipt: ap_unsettled CR 1000, ap untouched.
-    assert_eq!(balance(&pool, sx.sup_unsettled).await, -1000);
+    assert_eq!(balance(&pool, sx.ven_unsettled).await, -1000);
     assert_eq!(balance(&pool, sx.ap).await, 0);
 
     let key = fresh_uuid(&pool).await;
@@ -241,12 +241,12 @@ async fn po_match_full_clearance() {
         "kind": "po_match", "po_line_id": sx.po_line_id,
         "qty": 10, "unit_cost": 100, "amount": 1000
     }]);
-    call_bill(&pool, &sx.supplier_id, "USD", lines, "2026-04-16", &key)
+    call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-16", &key)
         .await
         .expect("bill");
 
     // ap_unsettled cleared → ap.
-    assert_eq!(balance(&pool, sx.sup_unsettled).await, 0);
+    assert_eq!(balance(&pool, sx.ven_unsettled).await, 0);
     assert_eq!(balance(&pool, sx.ap).await, -1000);
 }
 
@@ -261,7 +261,7 @@ async fn po_match_partial_then_remainder() {
     // Bill 4 of 10.
     let k1 = fresh_uuid(&pool).await;
     call_bill(
-        &pool, &sx.supplier_id, "USD",
+        &pool, &sx.vendor_id, "USD",
         serde_json::json!([{
             "kind": "po_match", "po_line_id": sx.po_line_id,
             "qty": 4, "unit_cost": 100, "amount": 400
@@ -270,13 +270,13 @@ async fn po_match_partial_then_remainder() {
     )
     .await
     .expect("bill 1");
-    assert_eq!(balance(&pool, sx.sup_unsettled).await, -600);
+    assert_eq!(balance(&pool, sx.ven_unsettled).await, -600);
     assert_eq!(balance(&pool, sx.ap).await, -400);
 
     // Bill remaining 6.
     let k2 = fresh_uuid(&pool).await;
     call_bill(
-        &pool, &sx.supplier_id, "USD",
+        &pool, &sx.vendor_id, "USD",
         serde_json::json!([{
             "kind": "po_match", "po_line_id": sx.po_line_id,
             "qty": 6, "unit_cost": 100, "amount": 600
@@ -285,7 +285,7 @@ async fn po_match_partial_then_remainder() {
     )
     .await
     .expect("bill 2");
-    assert_eq!(balance(&pool, sx.sup_unsettled).await, 0);
+    assert_eq!(balance(&pool, sx.ven_unsettled).await, 0);
     assert_eq!(balance(&pool, sx.ap).await, -1000);
 }
 
@@ -304,7 +304,7 @@ async fn po_match_over_received_not_billed_p0024() {
         "qty": 11, "unit_cost": 100, "amount": 1100
     }]);
     expect_sqlstate("P0024", || async {
-        call_bill(&pool, &sx.supplier_id, "USD", lines, "2026-04-16", &key).await.map(|_| ())
+        call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-16", &key).await.map(|_| ())
     })
     .await;
 }
@@ -324,7 +324,7 @@ async fn po_match_unit_cost_mismatch_p0024() {
         "qty": 10, "unit_cost": 99, "amount": 990
     }]);
     expect_sqlstate("P0024", || async {
-        call_bill(&pool, &sx.supplier_id, "USD", lines, "2026-04-16", &key).await.map(|_| ())
+        call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-16", &key).await.map(|_| ())
     })
     .await;
 }
@@ -344,7 +344,7 @@ async fn po_match_amount_mismatch_p0024() {
         "qty": 10, "unit_cost": 100, "amount": 999
     }]);
     expect_sqlstate("P0024", || async {
-        call_bill(&pool, &sx.supplier_id, "USD", lines, "2026-04-16", &key).await.map(|_| ())
+        call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-16", &key).await.map(|_| ())
     })
     .await;
 }
@@ -360,7 +360,7 @@ async fn po_match_double_bill_same_line_p0024() {
     // Bill all 10 first.
     let k1 = fresh_uuid(&pool).await;
     call_bill(
-        &pool, &sx.supplier_id, "USD",
+        &pool, &sx.vendor_id, "USD",
         serde_json::json!([{
             "kind": "po_match", "po_line_id": sx.po_line_id,
             "qty": 10, "unit_cost": 100, "amount": 1000
@@ -377,37 +377,37 @@ async fn po_match_double_bill_same_line_p0024() {
         "qty": 1, "unit_cost": 100, "amount": 100
     }]);
     expect_sqlstate("P0024", || async {
-        call_bill(&pool, &sx.supplier_id, "USD", lines, "2026-04-17", &k2).await.map(|_| ())
+        call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-17", &k2).await.map(|_| ())
     })
     .await;
 }
 
 #[tokio::test]
-async fn po_match_wrong_supplier_p0025() {
+async fn po_match_wrong_vendor_p0025() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
     let sx_a = build_setup(&pool, "S-A").await;
     receive_10(&pool, &sx_a).await;
-    // Supplier B exists too.
-    let sup_b = fresh_supplier(&pool, "S-B", "USD").await;
+    // Vendor B exists too.
+    let ven_b = fresh_vendor(&pool, "S-B", "USD").await;
     let _ = open_account(
-        &pool, "ap", "value", Some("USD"), None, None, Some(&sup_b), "credit",
+        &pool, "ap", "value", Some("USD"), None, None, Some(&ven_b), "credit",
     )
     .await;
     let _ = open_account(
-        &pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&sup_b), "credit",
+        &pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&ven_b), "credit",
     )
     .await;
 
-    // Try to bill A's po_line under supplier B.
+    // Try to bill A's po_line under vendor B.
     let key = fresh_uuid(&pool).await;
     let lines = serde_json::json!([{
         "kind": "po_match", "po_line_id": sx_a.po_line_id,
         "qty": 10, "unit_cost": 100, "amount": 1000
     }]);
     expect_sqlstate("P0025", || async {
-        call_bill(&pool, &sup_b, "USD", lines, "2026-04-16", &key).await.map(|_| ())
+        call_bill(&pool, &ven_b, "USD", lines, "2026-04-16", &key).await.map(|_| ())
     })
     .await;
 }
@@ -420,9 +420,9 @@ async fn po_match_currency_mismatch_p0025() {
     let sx = build_setup(&pool, "S1").await;
     receive_10(&pool, &sx).await;
 
-    // Open EUR ap for the supplier so we get past the ap-lookup.
+    // Open EUR ap for the vendor so we get past the ap-lookup.
     let _ = open_account(
-        &pool, "ap", "value", Some("EUR"), None, None, Some(&sx.supplier_id), "credit",
+        &pool, "ap", "value", Some("EUR"), None, None, Some(&sx.vendor_id), "credit",
     )
     .await;
 
@@ -433,7 +433,7 @@ async fn po_match_currency_mismatch_p0025() {
         "qty": 10, "unit_cost": 100, "amount": 1000
     }]);
     expect_sqlstate("P0025", || async {
-        call_bill(&pool, &sx.supplier_id, "EUR", lines, "2026-04-16", &key).await.map(|_| ())
+        call_bill(&pool, &sx.vendor_id, "EUR", lines, "2026-04-16", &key).await.map(|_| ())
     })
     .await;
 }
@@ -447,9 +447,9 @@ async fn service_single_line_clears_to_ap() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    let supplier = fresh_supplier(&pool, "SVC-1", "USD").await;
+    let vendor = fresh_vendor(&pool, "SVC-1", "USD").await;
     let ap = open_account(
-        &pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        &pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     // Service expense goes to a labor_expense USD account (existing
@@ -463,7 +463,7 @@ async fn service_single_line_clears_to_ap() {
     let lines = serde_json::json!([{
         "kind": "service", "expense_account_id": expense, "amount": 750
     }]);
-    call_bill(&pool, &supplier, "USD", lines, "2026-04-15", &key)
+    call_bill(&pool, &vendor, "USD", lines, "2026-04-15", &key)
         .await
         .expect("bill");
 
@@ -476,9 +476,9 @@ async fn service_multi_line_two_expense_accounts() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    let supplier = fresh_supplier(&pool, "SVC-2", "USD").await;
+    let vendor = fresh_vendor(&pool, "SVC-2", "USD").await;
     let ap = open_account(
-        &pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        &pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     // Use two distinct expense-style accounts: labor_expense (debit-normal)
@@ -496,7 +496,7 @@ async fn service_multi_line_two_expense_accounts() {
         { "kind": "service", "expense_account_id": exp_labor, "amount": 300 },
         { "kind": "service", "expense_account_id": exp_adj,   "amount": 200 },
     ]);
-    call_bill(&pool, &supplier, "USD", lines, "2026-04-15", &key)
+    call_bill(&pool, &vendor, "USD", lines, "2026-04-15", &key)
         .await
         .expect("bill");
 
@@ -510,9 +510,9 @@ async fn service_closed_expense_account_p0025() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    let supplier = fresh_supplier(&pool, "SVC-3", "USD").await;
+    let vendor = fresh_vendor(&pool, "SVC-3", "USD").await;
     let _ = open_account(
-        &pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        &pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     let expense = open_account(
@@ -530,7 +530,7 @@ async fn service_closed_expense_account_p0025() {
         "kind": "service", "expense_account_id": expense, "amount": 100
     }]);
     expect_sqlstate("P0025", || async {
-        call_bill(&pool, &supplier, "USD", lines, "2026-04-15", &key).await.map(|_| ())
+        call_bill(&pool, &vendor, "USD", lines, "2026-04-15", &key).await.map(|_| ())
     })
     .await;
 }
@@ -540,9 +540,9 @@ async fn service_currency_mismatch_p0025() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    let supplier = fresh_supplier(&pool, "SVC-4", "USD").await;
+    let vendor = fresh_vendor(&pool, "SVC-4", "USD").await;
     let _ = open_account(
-        &pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        &pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     // EUR expense account; bill is USD.
@@ -556,7 +556,7 @@ async fn service_currency_mismatch_p0025() {
         "kind": "service", "expense_account_id": exp_eur, "amount": 100
     }]);
     expect_sqlstate("P0025", || async {
-        call_bill(&pool, &supplier, "USD", lines, "2026-04-15", &key).await.map(|_| ())
+        call_bill(&pool, &vendor, "USD", lines, "2026-04-15", &key).await.map(|_| ())
     })
     .await;
 }
@@ -583,11 +583,11 @@ async fn mixed_bill_po_match_plus_service() {
           "qty": 10, "unit_cost": 100, "amount": 1000 },
         { "kind": "service", "expense_account_id": exp, "amount": 50 },
     ]);
-    call_bill(&pool, &sx.supplier_id, "USD", lines, "2026-04-16", &key)
+    call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-16", &key)
         .await
         .expect("bill");
 
-    assert_eq!(balance(&pool, sx.sup_unsettled).await, 0);
+    assert_eq!(balance(&pool, sx.ven_unsettled).await, 0);
     assert_eq!(balance(&pool, exp).await, 50);
     assert_eq!(balance(&pool, sx.ap).await, -1050);
 }
@@ -609,15 +609,15 @@ async fn idempotency_replay_returns_same_doc_id() {
         "kind": "po_match", "po_line_id": sx.po_line_id,
         "qty": 10, "unit_cost": 100, "amount": 1000
     }]);
-    let id1 = call_bill(&pool, &sx.supplier_id, "USD", lines.clone(), "2026-04-16", &key)
+    let id1 = call_bill(&pool, &sx.vendor_id, "USD", lines.clone(), "2026-04-16", &key)
         .await
         .expect("first");
-    let id2 = call_bill(&pool, &sx.supplier_id, "USD", lines, "2026-04-16", &key)
+    let id2 = call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-16", &key)
         .await
         .expect("replay");
     assert_eq!(id1, id2);
     // Balances unchanged after replay (still cleared once).
-    assert_eq!(balance(&pool, sx.sup_unsettled).await, 0);
+    assert_eq!(balance(&pool, sx.ven_unsettled).await, 0);
     assert_eq!(balance(&pool, sx.ap).await, -1000);
 }
 
@@ -636,13 +636,13 @@ async fn closed_period_raises_p0005() {
     }]);
     // 2026-03 is closed in the fixture.
     expect_sqlstate("P0005", || async {
-        call_bill(&pool, &sx.supplier_id, "USD", lines, "2026-03-15", &key).await.map(|_| ())
+        call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-03-15", &key).await.map(|_| ())
     })
     .await;
 }
 
 #[tokio::test]
-async fn unknown_supplier_p0025() {
+async fn unknown_vendor_p0025() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
@@ -663,7 +663,7 @@ async fn no_ap_account_raises_p0010() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    let supplier = fresh_supplier(&pool, "NOAP", "USD").await;
+    let vendor = fresh_vendor(&pool, "NOAP", "USD").await;
     // Don't open an ap account.
     let expense = open_account(
         &pool, "labor_expense", "value", Some("USD"), None, None, None, "debit",
@@ -675,7 +675,7 @@ async fn no_ap_account_raises_p0010() {
         "kind": "service", "expense_account_id": expense, "amount": 100
     }]);
     expect_sqlstate("P0010", || async {
-        call_bill(&pool, &supplier, "USD", lines, "2026-04-15", &key).await.map(|_| ())
+        call_bill(&pool, &vendor, "USD", lines, "2026-04-15", &key).await.map(|_| ())
     })
     .await;
 }
@@ -685,15 +685,15 @@ async fn empty_lines_p0025() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    let supplier = fresh_supplier(&pool, "EMPTY", "USD").await;
+    let vendor = fresh_vendor(&pool, "EMPTY", "USD").await;
     let _ = open_account(
-        &pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        &pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     let key = fresh_uuid(&pool).await;
     let lines = serde_json::json!([]);
     expect_sqlstate("P0025", || async {
-        call_bill(&pool, &supplier, "USD", lines, "2026-04-15", &key).await.map(|_| ())
+        call_bill(&pool, &vendor, "USD", lines, "2026-04-15", &key).await.map(|_| ())
     })
     .await;
 }
@@ -703,9 +703,9 @@ async fn unknown_line_kind_p0025() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    let supplier = fresh_supplier(&pool, "BADKIND", "USD").await;
+    let vendor = fresh_vendor(&pool, "BADKIND", "USD").await;
     let _ = open_account(
-        &pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        &pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
 
@@ -716,7 +716,7 @@ async fn unknown_line_kind_p0025() {
     // Table CHECK fires at INSERT time inside the function with code 23514.
     // Or function may pre-empt with P0025 — either is acceptable; test
     // accepts the function-layer code.
-    let result = call_bill(&pool, &supplier, "USD", lines, "2026-04-15", &key).await;
+    let result = call_bill(&pool, &vendor, "USD", lines, "2026-04-15", &key).await;
     assert!(result.is_err(), "expected error for unknown kind");
     let err = result.unwrap_err();
     let db = err.as_database_error().expect("db error");

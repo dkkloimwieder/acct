@@ -21,15 +21,15 @@ use sqlx::PgPool;
 
 #[allow(dead_code)]
 struct Scaffold {
-    supplier_id: String,
+    vendor_id: String,
     po_id: String,
     po_line_id: String,
     sku_id: String,
     loc_id: String,
     qty_acct: i64,
     val_acct: i64,
-    sup_qty: i64,    // supplier_pool (qty)
-    sup_unsettled: i64, // ap_unsettled (value)
+    ven_qty: i64,    // vendor_pool (qty)
+    ven_unsettled: i64, // ap_unsettled (value)
     ap: i64,         // ap (value, for bill tests)
     var_ppv: i64,    // variance_ppv (value)
 }
@@ -42,23 +42,23 @@ async fn id_text(pool: &PgPool, q: &str, bind: &str) -> String {
         .unwrap_or_else(|e| panic!("{q} for {bind}: {e}"))
 }
 
-async fn fresh_supplier(pool: &PgPool, code: &str, currency: &str) -> String {
+async fn fresh_vendor(pool: &PgPool, code: &str, currency: &str) -> String {
     sqlx::query_scalar(
-        "INSERT INTO suppliers (code, name, currency) VALUES ($1, $2, $3) RETURNING id::text",
+        "INSERT INTO vendors (code, name, currency) VALUES ($1, $2, $3) RETURNING id::text",
     )
     .bind(code)
-    .bind(format!("Supplier {code}"))
+    .bind(format!("Vendor {code}"))
     .bind(currency)
     .fetch_one(pool)
     .await
-    .unwrap_or_else(|e| panic!("insert supplier {code}: {e}"))
+    .unwrap_or_else(|e| panic!("insert vendor {code}: {e}"))
 }
 
-async fn fresh_po(pool: &PgPool, supplier_id: &str) -> String {
+async fn fresh_po(pool: &PgPool, vendor_id: &str) -> String {
     sqlx::query_scalar(
-        "INSERT INTO purchase_orders (supplier_id, status) VALUES ($1::UUID, 'open') RETURNING id::text",
+        "INSERT INTO purchase_orders (vendor_id, status) VALUES ($1::UUID, 'open') RETURNING id::text",
     )
-    .bind(supplier_id)
+    .bind(vendor_id)
     .fetch_one(pool)
     .await
     .unwrap_or_else(|e| panic!("insert PO: {e}"))
@@ -121,7 +121,7 @@ async fn open_account(
 
 /// Build a scaffold for SKU-A/MAIN/USD with one PO line. SKU-A is standard,
 /// std_cost=100 from the fixture. inv_value_raw + stock_available accounts
-/// for SKU-A/MAIN exist in the fixture; we add the supplier-side accounts
+/// for SKU-A/MAIN exist in the fixture; we add the vendor-side accounts
 /// + variance_ppv.
 async fn scaffold_skua(
     pool: &PgPool,
@@ -130,8 +130,8 @@ async fn scaffold_skua(
 ) -> Scaffold {
     let sku = id_text(pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-A").await;
     let loc = id_text(pool, "SELECT id::text FROM locations WHERE code = $1", "MAIN").await;
-    let supplier = fresh_supplier(pool, "SUPP-1", "USD").await;
-    let po = fresh_po(pool, &supplier).await;
+    let vendor = fresh_vendor(pool, "SUPP-1", "USD").await;
+    let po = fresh_po(pool, &vendor).await;
     let po_line = fresh_po_line(pool, &po, 1, &sku, &loc, qty_ordered, po_unit_cost, "USD").await;
 
     let qty_acct = account_id_stock_available(pool, "SKU-A", "MAIN").await;
@@ -141,15 +141,15 @@ async fn scaffold_skua(
     )
     .await;
 
-    let sup_qty =
-        open_account(pool, "supplier_pool", "qty", None, None, None, Some(&supplier), "credit")
+    let ven_qty =
+        open_account(pool, "vendor_pool", "qty", None, None, None, Some(&vendor), "credit")
             .await;
-    let sup_unsettled = open_account(
-        pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&supplier), "credit",
+    let ven_unsettled = open_account(
+        pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     let ap = open_account(
-        pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     // variance_ppv USD is in the fixture; reuse to avoid creating a
@@ -157,15 +157,15 @@ async fn scaffold_skua(
     let var_ppv = account_id_by_kind_currency(pool, "variance_ppv", Some("USD")).await;
 
     Scaffold {
-        supplier_id: supplier,
+        vendor_id: vendor,
         po_id: po,
         po_line_id: po_line,
         sku_id: sku,
         loc_id: loc,
         qty_acct,
         val_acct,
-        sup_qty,
-        sup_unsettled,
+        ven_qty,
+        ven_unsettled,
         ap,
         var_ppv,
     }
@@ -215,12 +215,12 @@ async fn standard_sku_full_receipt_no_ppv() {
     let lines = serde_json::json!([{ "po_line_id": sf.po_line_id, "qty_received": 10 }]);
     call_receipt(&pool, &sf.po_id, lines, "2026-04-15", &key).await.expect("receipt");
 
-    // qty leg: stock_available DR 10, supplier_pool CR 10
+    // qty leg: stock_available DR 10, vendor_pool CR 10
     assert_eq!(balance(&pool, sf.qty_acct).await, 10);
-    assert_eq!(balance(&pool, sf.sup_qty).await, -10);
+    assert_eq!(balance(&pool, sf.ven_qty).await, -10);
     // value leg: inv_value_raw DR 1000, ap_unsettled CR 1000 (qty * std)
     assert_eq!(balance(&pool, sf.val_acct).await, 1000);
-    assert_eq!(balance(&pool, sf.sup_unsettled).await, -1000);
+    assert_eq!(balance(&pool, sf.ven_unsettled).await, -1000);
     // No PPV.
     assert_eq!(balance(&pool, sf.var_ppv).await, 0);
     // ap untouched (GRNI: only ap_unsettled credited at receipt).
@@ -244,7 +244,7 @@ async fn standard_sku_unfavorable_ppv() {
     // variance_ppv DR 200 (unfavorable: po > std).
     assert_eq!(balance(&pool, sf.var_ppv).await, 200);
     // ap_unsettled CR total = std×qty + ppv = 1000 + 200 = 1200 = po×qty.
-    assert_eq!(balance(&pool, sf.sup_unsettled).await, -1200);
+    assert_eq!(balance(&pool, sf.ven_unsettled).await, -1200);
 }
 
 #[tokio::test]
@@ -264,7 +264,7 @@ async fn standard_sku_favorable_ppv() {
     // variance_ppv CR 200 (favorable: po < std). credit balance = -200.
     assert_eq!(balance(&pool, sf.var_ppv).await, -200);
     // ap_unsettled CR total = std×qty − |ppv| = 1000 − 200 = 800 = po×qty.
-    assert_eq!(balance(&pool, sf.sup_unsettled).await, -800);
+    assert_eq!(balance(&pool, sf.ven_unsettled).await, -800);
 }
 
 // ============================================================
@@ -277,21 +277,21 @@ async fn wac_perpetual_receipt_pool_re_averages() {
     reset_to_fixture(&pool).await;
 
     // SKU-WAC at MAIN; fixture has stock_available + inv_value_raw open
-    // for SKU-WAC/MAIN. Need supplier-side accounts.
+    // for SKU-WAC/MAIN. Need vendor-side accounts.
     let sku = id_text(&pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-WAC").await;
     let loc = id_text(&pool, "SELECT id::text FROM locations WHERE code = $1", "MAIN").await;
-    let supplier = fresh_supplier(&pool, "SUPP-WAC", "USD").await;
-    let po = fresh_po(&pool, &supplier).await;
+    let vendor = fresh_vendor(&pool, "SUPP-WAC", "USD").await;
+    let po = fresh_po(&pool, &vendor).await;
     let qty_acct = account_id_stock_available(&pool, "SKU-WAC", "MAIN").await;
     let val_acct = account_id_for_selector(
         &pool, "inv_value_raw", Some("SKU-WAC"), Some("MAIN"), Some("USD"), None,
     )
     .await;
-    let sup_qty =
-        open_account(&pool, "supplier_pool", "qty", None, None, None, Some(&supplier), "credit")
+    let ven_qty =
+        open_account(&pool, "vendor_pool", "qty", None, None, None, Some(&vendor), "credit")
             .await;
-    let sup_unsettled = open_account(
-        &pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&supplier), "credit",
+    let ven_unsettled = open_account(
+        &pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
 
@@ -306,8 +306,8 @@ async fn wac_perpetual_receipt_pool_re_averages() {
 
     assert_eq!(balance(&pool, qty_acct).await, 10);
     assert_eq!(balance(&pool, val_acct).await, 500);
-    assert_eq!(balance(&pool, sup_qty).await, -10);
-    assert_eq!(balance(&pool, sup_unsettled).await, -500);
+    assert_eq!(balance(&pool, ven_qty).await, -10);
+    assert_eq!(balance(&pool, ven_unsettled).await, -500);
 
     // Second receipt: 10 units @ $70 → pool 20 / $1200, avg $60.
     let line2 = fresh_po_line(&pool, &po, 2, &sku, &loc, 10, 70, "USD").await;
@@ -402,8 +402,8 @@ async fn unknown_po_raises_p0022() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    // Need at least one supplier so accounts exist.
-    let _ = fresh_supplier(&pool, "S", "USD").await;
+    // Need at least one vendor so accounts exist.
+    let _ = fresh_vendor(&pool, "S", "USD").await;
     let bogus_po = fresh_uuid(&pool).await;
     let key = fresh_uuid(&pool).await;
     let bogus_line = fresh_uuid(&pool).await;
@@ -437,8 +437,8 @@ async fn po_line_from_different_po_raises_p0022() {
     reset_to_fixture(&pool).await;
 
     let sf1 = scaffold_skua(&pool, 10, 100).await;
-    // A second PO on the same supplier with its own line.
-    let po2 = fresh_po(&pool, &sf1.supplier_id).await;
+    // A second PO on the same vendor with its own line.
+    let po2 = fresh_po(&pool, &sf1.vendor_id).await;
     let line_on_po2 =
         fresh_po_line(&pool, &po2, 1, &sf1.sku_id, &sf1.loc_id, 10, 100, "USD").await;
 
@@ -484,18 +484,18 @@ async fn over_receipt_raises_p0023() {
     .await;
 }
 
-/// Variant of scaffold_skua with caller-supplied supplier code so we can
+/// Variant of scaffold_skua with caller-supplied vendor code so we can
 /// have multiple scaffolds in one test.
 async fn scaffold_skua_with_code(
     pool: &PgPool,
-    supplier_code: &str,
+    vendor_code: &str,
     qty_ordered: i64,
     po_unit_cost: i64,
 ) -> Scaffold {
     let sku = id_text(pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-A").await;
     let loc = id_text(pool, "SELECT id::text FROM locations WHERE code = $1", "MAIN").await;
-    let supplier = fresh_supplier(pool, supplier_code, "USD").await;
-    let po = fresh_po(pool, &supplier).await;
+    let vendor = fresh_vendor(pool, vendor_code, "USD").await;
+    let po = fresh_po(pool, &vendor).await;
     let po_line = fresh_po_line(pool, &po, 1, &sku, &loc, qty_ordered, po_unit_cost, "USD").await;
 
     let qty_acct = account_id_stock_available(pool, "SKU-A", "MAIN").await;
@@ -519,15 +519,15 @@ async fn scaffold_skua_with_code(
         }
     };
 
-    let sup_qty =
-        open_account(pool, "supplier_pool", "qty", None, None, None, Some(&supplier), "credit")
+    let ven_qty =
+        open_account(pool, "vendor_pool", "qty", None, None, None, Some(&vendor), "credit")
             .await;
-    let sup_unsettled = open_account(
-        pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&supplier), "credit",
+    let ven_unsettled = open_account(
+        pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     let ap = open_account(
-        pool, "ap", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
     // variance_ppv USD is in the fixture; reuse to keep the function's
@@ -535,15 +535,15 @@ async fn scaffold_skua_with_code(
     let var_ppv = account_id_by_kind_currency(pool, "variance_ppv", Some("USD")).await;
 
     Scaffold {
-        supplier_id: supplier,
+        vendor_id: vendor,
         po_id: po,
         po_line_id: po_line,
         sku_id: sku,
         loc_id: loc,
         qty_acct,
         val_acct,
-        sup_qty,
-        sup_unsettled,
+        ven_qty,
+        ven_unsettled,
         ap,
         var_ppv,
     }
@@ -555,21 +555,21 @@ async fn fifo_sku_raises_p0006() {
     reset_to_fixture(&pool).await;
 
     // SKU-FIF (fifo cost_method) is in the fixture but has no value account.
-    // Make one + supplier scaffold so the function gets to the cost_method
+    // Make one + vendor scaffold so the function gets to the cost_method
     // dispatch, which raises P0006.
     let sku = id_text(&pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-FIF").await;
     let loc = id_text(&pool, "SELECT id::text FROM locations WHERE code = $1", "MAIN").await;
-    let supplier = fresh_supplier(&pool, "SUPP-FIF", "USD").await;
-    let po = fresh_po(&pool, &supplier).await;
+    let vendor = fresh_vendor(&pool, "SUPP-FIF", "USD").await;
+    let po = fresh_po(&pool, &vendor).await;
     let line = fresh_po_line(&pool, &po, 1, &sku, &loc, 10, 100, "USD").await;
     let _ = open_account(
         &pool, "inv_value_raw", "value", Some("USD"), Some(&sku), Some(&loc), None, "debit",
     )
     .await;
-    let _ = open_account(&pool, "supplier_pool", "qty", None, None, None, Some(&supplier), "credit")
+    let _ = open_account(&pool, "vendor_pool", "qty", None, None, None, Some(&vendor), "credit")
         .await;
     let _ = open_account(
-        &pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&supplier), "credit",
+        &pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&vendor), "credit",
     )
     .await;
 
