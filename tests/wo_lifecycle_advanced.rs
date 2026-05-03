@@ -1475,3 +1475,212 @@ async fn bom_id_pin_overrides_default_picks_draft_bom() {
         "pinned draft BOM emitted its lines"
     );
 }
+
+// ============================================================
+// C5g — ECO approval workflow
+// ============================================================
+//
+// post_eco_approve(eco_id, effective_at, approved_by) transitions a
+// draft ECO to 'approved' and walks bom_headers WHERE eco_id = ?:
+//   - new draft rows: status='active', effective_at = ECO.effective_at
+//   - prior active rows for the same (parent, alternate_no): status=
+//     'obsolete', obsolete_at = ECO.effective_at
+//
+// The obsolete-old-then-activate-new ordering inside the function
+// avoids a transient bom_headers_primary partial UNIQUE conflict when
+// both rows are is_primary=true.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eco_approval_happy_path_no_predecessor() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    fresh_location(&pool, "PHX-ECO1-RAW").await;
+    scaffold_component(&pool, "PHX-ECO1-CMP", "PHX-ECO1-RAW", 50, 500).await;
+
+    // Draft ECO with one attached draft bom_header. No prior active rev
+    // exists (so the "obsolete predecessor" branch is a no-op here —
+    // covered in the next test).
+    let requested_by = fresh_uuid(&pool).await;
+    let eco_id: i64 = sqlx::query_scalar(
+        "INSERT INTO engineering_change_orders (code, description, requested_by)
+         VALUES ('ECO-001', 'Initial BOM for SKU-A', $1::UUID) RETURNING id",
+    )
+    .bind(&requested_by)
+    .fetch_one(&pool)
+    .await
+    .expect("create ECO");
+
+    let bom_id =
+        create_bom_header_full(&pool, "SKU-A", 1, "A", true, "draft", Some(eco_id)).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-ECO1-CMP", "PHX-ECO1-RAW", 1, 0.0).await;
+
+    // Approve at effective_at='2026-04-01' (covered by the open
+    // 2026-04 period).
+    let approved_by = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_eco_approve($1, '2026-04-01 00:00:00+00'::TIMESTAMPTZ, $2::UUID)",
+    )
+    .bind(eco_id)
+    .bind(&approved_by)
+    .execute(&pool)
+    .await
+    .expect("post_eco_approve");
+
+    // Compare timestamps server-side to avoid pulling chrono into deps.
+    let (eco_status, eco_eff_match, eco_approved_match, eco_approved_set): (
+        String,
+        bool,
+        bool,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT status,
+                effective_at = '2026-04-01 00:00:00+00'::TIMESTAMPTZ,
+                approved_by  = $2::UUID,
+                approved_at  IS NOT NULL
+           FROM engineering_change_orders WHERE id = $1",
+    )
+    .bind(eco_id)
+    .bind(&approved_by)
+    .fetch_one(&pool)
+    .await
+    .expect("ECO row");
+    assert_eq!(eco_status, "approved");
+    assert!(eco_eff_match, "ECO.effective_at = 2026-04-01");
+    assert!(eco_approved_match, "ECO.approved_by = approver");
+    assert!(eco_approved_set, "ECO.approved_at populated");
+
+    // bom_header now active with effective_at = ECO.effective_at.
+    let (bom_status, bom_eff_match): (String, bool) = sqlx::query_as(
+        "SELECT status, effective_at = '2026-04-01 00:00:00+00'::TIMESTAMPTZ
+           FROM bom_headers WHERE id = $1",
+    )
+    .bind(bom_id)
+    .fetch_one(&pool)
+    .await
+    .expect("bom_header row");
+    assert_eq!(bom_status, "active", "bom_header activated");
+    assert!(bom_eff_match, "bom_header.effective_at = ECO.effective_at");
+
+    // Round-trip: WO at 2026-04-15 picks the now-active rev A and drains
+    // its component (sanity check that the lifecycle ended in a usable
+    // state).
+    let wo_id = create_test_wo(&pool, "PHX-ECO1-001", "SKU-A", "MAIN", 5).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    wo_start(&pool, &wo_id).await;
+    let cmp_consumed = stock_consumed_for(&pool, "PHX-ECO1-CMP").await;
+    assert_eq!(rm_issued_qty(&pool, cmp_consumed).await, 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eco_obsoletes_prior_revision_then_new_rev_takes_over() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    fresh_location(&pool, "PHX-ECO2-RAW").await;
+    scaffold_component(&pool, "PHX-ECO2-CA", "PHX-ECO2-RAW", 50, 1000).await;
+    scaffold_component(&pool, "PHX-ECO2-CB", "PHX-ECO2-RAW", 50, 1000).await;
+
+    // Existing primary active rev A for SKU-A alt 1.
+    let bom_a = create_bom_header(&pool, "SKU-A").await;
+    sqlx::query(
+        "UPDATE bom_headers SET effective_at='2026-01-01'::TIMESTAMPTZ WHERE id=$1",
+    )
+    .bind(bom_a)
+    .execute(&pool)
+    .await
+    .expect("set rev A effective_at");
+    add_bom_item(&pool, bom_a, 1, 10, "PHX-ECO2-CA", "PHX-ECO2-RAW", 1, 0.0).await;
+
+    // Pre-ECO WO at 2026-04-15 picks rev A.
+    let wo_pre = create_test_wo(&pool, "PHX-ECO2-PRE", "SKU-A", "MAIN", 7).await;
+    add_test_routing(&pool, &wo_pre, 10, "MILL").await;
+    wo_start(&pool, &wo_pre).await;
+    let ca_consumed = stock_consumed_for(&pool, "PHX-ECO2-CA").await;
+    assert_eq!(
+        rm_issued_qty(&pool, ca_consumed).await,
+        7,
+        "pre-ECO WO drained rev A's component"
+    );
+
+    // Draft ECO + draft rev B (alternate=1, revision='B', is_primary=true,
+    // status='draft'). is_primary=true is allowed at draft because the
+    // bom_headers_primary partial UNIQUE ignores non-active rows.
+    let requested_by = fresh_uuid(&pool).await;
+    let eco_id: i64 = sqlx::query_scalar(
+        "INSERT INTO engineering_change_orders (code, description, requested_by)
+         VALUES ('ECO-002', 'Replace SKU-A rev A with rev B', $1::UUID) RETURNING id",
+    )
+    .bind(&requested_by)
+    .fetch_one(&pool)
+    .await
+    .expect("create ECO");
+
+    let bom_b =
+        create_bom_header_full(&pool, "SKU-A", 1, "B", true, "draft", Some(eco_id))
+            .await;
+    add_bom_item(&pool, bom_b, 1, 10, "PHX-ECO2-CB", "PHX-ECO2-RAW", 1, 0.0).await;
+
+    // Approve at T='2026-05-01' (covered by 2026-05 period).
+    let approved_by = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_eco_approve($1, '2026-05-01 00:00:00+00'::TIMESTAMPTZ, $2::UUID)",
+    )
+    .bind(eco_id)
+    .bind(&approved_by)
+    .execute(&pool)
+    .await
+    .expect("post_eco_approve");
+
+    // rev A: status='obsolete', obsolete_at = T.
+    let (a_status, a_obs_match): (String, bool) = sqlx::query_as(
+        "SELECT status, obsolete_at = '2026-05-01 00:00:00+00'::TIMESTAMPTZ
+           FROM bom_headers WHERE id = $1",
+    )
+    .bind(bom_a)
+    .fetch_one(&pool)
+    .await
+    .expect("rev A row");
+    assert_eq!(a_status, "obsolete", "rev A obsoleted by ECO");
+    assert!(a_obs_match, "rev A.obsolete_at = ECO.effective_at");
+
+    // rev B: status='active', effective_at = T.
+    let (b_status, b_eff_match): (String, bool) = sqlx::query_as(
+        "SELECT status, effective_at = '2026-05-01 00:00:00+00'::TIMESTAMPTZ
+           FROM bom_headers WHERE id = $1",
+    )
+    .bind(bom_b)
+    .fetch_one(&pool)
+    .await
+    .expect("rev B row");
+    assert_eq!(b_status, "active", "rev B activated");
+    assert!(b_eff_match, "rev B.effective_at = ECO.effective_at");
+
+    // Post-ECO WO at 2026-05-15 picks rev B.
+    let wo_post = create_test_wo(&pool, "PHX-ECO2-POST", "SKU-A", "MAIN", 9).await;
+    add_test_routing(&pool, &wo_post, 10, "MILL").await;
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_wo_start($1::UUID, '2026-05-15'::DATE, $2::UUID, $3::UUID, NULL)",
+    )
+    .bind(&wo_post)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("post_wo_start post-ECO");
+
+    let cb_consumed = stock_consumed_for(&pool, "PHX-ECO2-CB").await;
+    assert_eq!(
+        rm_issued_qty(&pool, cb_consumed).await,
+        9,
+        "post-ECO WO drained rev B's component"
+    );
+    // Cumulative on CA stays at 7 — rev A is obsolete and not pickable.
+    assert_eq!(
+        rm_issued_qty(&pool, ca_consumed).await,
+        7,
+        "rev A no longer used after ECO"
+    );
+}
