@@ -1,0 +1,4 @@
+-- acct-2yu — rollback of B11.
+
+DROP FUNCTION IF EXISTS post_osp_receive(UUID, INT, BIGINT, UUID, DATE, UUID, UUID, TEXT);
+DROP FUNCTION IF EXISTS post_osp_ship(UUID, INT, BIGINT, UUID, DATE, UUID, UUID, TEXT);
