@@ -858,6 +858,246 @@ async fn full_scrap_then_post_wo_close_unproduced() {
 }
 
 // ============================================================
+// C5e — co-products
+// ============================================================
+//
+// Co-products are joint-production outputs where each output takes a
+// share of total WIP value via wo_outputs.allocation_pct (Σ = 100).
+// Each output also has its own qty (output.qty), proportionally drained
+// per call as output.qty × p_qty / qty_target.
+//
+// By-products (NRV credit-back / negligible / disposal-cost) are
+// deferred — see acct-7t4. The wo_outputs table here represents
+// co-products only.
+
+/// Scaffold an additional output SKU's FG-side accounts (stock_available
+/// + inv_value_fg) at a location. Used when a WO has co-products where
+/// the secondary output_sku ≠ parent_sku.
+async fn scaffold_output_sku(pool: &PgPool, code: &str, fg_loc_code: &str) {
+    let sku_id = fresh_sku(pool, code).await;
+    let fg_loc = loc_id(pool, fg_loc_code).await;
+    open_account(
+        pool,
+        "stock_available",
+        "qty",
+        None,
+        Some(&sku_id),
+        Some(&fg_loc),
+        None,
+        "debit",
+    )
+    .await;
+    open_account(
+        pool,
+        "inv_value_fg",
+        "value",
+        Some("USD"),
+        Some(&sku_id),
+        Some(&fg_loc),
+        None,
+        "debit",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn coproduct_two_outputs_60_40_sales_value_split() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    // Component setup. Parent's std cost is fixture-seeded SKU-A=100,
+    // so total_drain at qty_target=100 = 10,000 — clean splits below.
+    fresh_location(&pool, "PHX-CP1-RAW").await;
+    scaffold_component(&pool, "PHX-CP1-CMP", "PHX-CP1-RAW", 50, 1000).await;
+
+    // Co-product B (the secondary co-product). Parent SKU-A doubles as
+    // co-product A; its FG-side accounts are already in fixture.
+    scaffold_output_sku(&pool, "PHX-CP1-B", "MAIN").await;
+
+    // BOM: 2 units of component per parent at op10. value at op10 = 2×50 = 100/unit.
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-CP1-CMP", "PHX-CP1-RAW", 2, 0.0).await;
+
+    // WO + 2 routings.
+    let wo_id = create_test_wo(&pool, "PHX-CP1-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    // Pre-populate wo_outputs (so post_wo_start doesn't auto-init the
+    // single-output default). Co-product A=SKU-A 60 units / 60% value;
+    // Co-product B=PHX-CP1-B 40 units / 40% value.
+    add_wo_output(&pool, &wo_id, 1, "SKU-A",     "MAIN", 60, "sales_value", 60.0).await;
+    add_wo_output(&pool, &wo_id, 2, "PHX-CP1-B", "MAIN", 40, "sales_value", 40.0).await;
+
+    wo_start(&pool, &wo_id).await;
+    op_move(&pool, &wo_id, 10, 20, 100).await;
+
+    // Final completion.
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_wo_complete($1::UUID, 100, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+    )
+    .bind(&wo_id)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("post_wo_complete");
+
+    // Assert each output got its qty + value share.
+    let a_qty = account_id_stock_available(&pool, "SKU-A", "MAIN").await;
+    let b_qty = account_id_stock_available(&pool, "PHX-CP1-B", "MAIN").await;
+    let a_val = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM accounts WHERE kind='inv_value_fg' AND sku_id=(SELECT id FROM skus WHERE code='SKU-A') AND location_id=(SELECT id FROM locations WHERE code='MAIN')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("a_val lookup");
+    let b_val = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM accounts WHERE kind='inv_value_fg' AND sku_id=(SELECT id FROM skus WHERE code='PHX-CP1-B') AND location_id=(SELECT id FROM locations WHERE code='MAIN')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("b_val lookup");
+
+    assert_eq!(balance(&pool, a_qty).await, 60, "co-product A: 60 units");
+    assert_eq!(balance(&pool, b_qty).await, 40, "co-product B: 40 units");
+    assert_eq!(balance(&pool, a_val).await, 6000, "co-product A: 60% of 10000");
+    assert_eq!(balance(&pool, b_val).await, 4000, "co-product B: 40% of 10000");
+
+    // WIP@op20 should drain to ~0; any tiny residue lands in
+    // variance_wo_close via wo_close_v at final close.
+    let wip_val_op20 = account_id_for_selector(
+        &pool,
+        "inv_value_wip",
+        Some("SKU-A"),
+        None,
+        Some("USD"),
+        Some(20),
+    )
+    .await;
+    assert_eq!(balance(&pool, wip_val_op20).await, 0, "WIP@op20 fully drained");
+
+    // Status = closed (final close was triggered).
+    let status: String = sqlx::query_scalar("SELECT status FROM work_orders WHERE id = $1::UUID")
+        .bind(&wo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn coproduct_two_outputs_70_30_fixed_ratio_partial_completion() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    fresh_location(&pool, "PHX-CP2-RAW").await;
+    scaffold_component(&pool, "PHX-CP2-CMP", "PHX-CP2-RAW", 50, 1000).await;
+    scaffold_output_sku(&pool, "PHX-CP2-B", "MAIN").await;
+
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-CP2-CMP", "PHX-CP2-RAW", 2, 0.0).await;
+
+    let wo_id = create_test_wo(&pool, "PHX-CP2-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    add_wo_output(&pool, &wo_id, 1, "SKU-A",     "MAIN", 70, "fixed_ratio", 70.0).await;
+    add_wo_output(&pool, &wo_id, 2, "PHX-CP2-B", "MAIN", 30, "fixed_ratio", 30.0).await;
+
+    wo_start(&pool, &wo_id).await;
+    op_move(&pool, &wo_id, 10, 20, 100).await;
+
+    // First partial completion: p_qty=50.
+    let posted_by = fresh_uuid(&pool).await;
+    let key1 = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_wo_complete($1::UUID, 50, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+    )
+    .bind(&wo_id)
+    .bind(&posted_by)
+    .bind(&key1)
+    .execute(&pool)
+    .await
+    .expect("partial wo_complete");
+
+    let a_qty = account_id_stock_available(&pool, "SKU-A", "MAIN").await;
+    let b_qty = account_id_stock_available(&pool, "PHX-CP2-B", "MAIN").await;
+
+    // First call: A.q = floor(70 * 50 / 100) = 35; B.q = 50 - 35 = 15 (last absorbs).
+    assert_eq!(balance(&pool, a_qty).await, 35, "first partial: A=35");
+    assert_eq!(balance(&pool, b_qty).await, 15, "first partial: B=15 (last absorbs residual)");
+
+    // Status still 'released' — not at qty_target yet.
+    let status: String = sqlx::query_scalar("SELECT status FROM work_orders WHERE id = $1::UUID")
+        .bind(&wo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "released");
+
+    // Second completion finishes the WO.
+    let key2 = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_wo_complete($1::UUID, 50, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+    )
+    .bind(&wo_id)
+    .bind(&posted_by)
+    .bind(&key2)
+    .execute(&pool)
+    .await
+    .expect("final wo_complete");
+
+    // Cumulative: A=70, B=30. Sum=100=qty_target.
+    assert_eq!(balance(&pool, a_qty).await, 70, "cumulative A=70");
+    assert_eq!(balance(&pool, b_qty).await, 30, "cumulative B=30");
+
+    let status: String = sqlx::query_scalar("SELECT status FROM work_orders WHERE id = $1::UUID")
+        .bind(&wo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn coproduct_allocation_pct_mismatch_raises_p0033() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    fresh_location(&pool, "PHX-CP3-RAW").await;
+    scaffold_component(&pool, "PHX-CP3-CMP", "PHX-CP3-RAW", 50, 1000).await;
+    scaffold_output_sku(&pool, "PHX-CP3-B", "MAIN").await;
+
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-CP3-CMP", "PHX-CP3-RAW", 1, 0.0).await;
+
+    let wo_id = create_test_wo(&pool, "PHX-CP3-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+
+    // Mis-configured: 60 + 50 = 110%, not 100.
+    add_wo_output(&pool, &wo_id, 1, "SKU-A",     "MAIN", 60, "fixed_ratio", 60.0).await;
+    add_wo_output(&pool, &wo_id, 2, "PHX-CP3-B", "MAIN", 40, "fixed_ratio", 50.0).await;
+
+    expect_sqlstate("P0033", || async {
+        let posted_by = fresh_uuid(&pool).await;
+        let key = fresh_uuid(&pool).await;
+        sqlx::query(
+            "SELECT post_wo_start($1::UUID, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+        )
+        .bind(&wo_id)
+        .bind(&posted_by)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .map(|_| ())
+    })
+    .await;
+}
+
+// ============================================================
 // C5a.3 — recursion limit: 17-level chain raises P0032
 // ============================================================
 //
