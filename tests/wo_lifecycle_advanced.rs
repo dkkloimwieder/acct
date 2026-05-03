@@ -379,122 +379,175 @@ async fn explode_one_level_phantom_flattens_into_parent() {
 }
 
 // ============================================================
-// C5b — yield gross-up via scrap_pct on item lines
+// C5b — yield: scrap_pct is planning metadata, not build cost
 // ============================================================
 //
-// scrap_pct is "planned material loss during assembly" — cutting waste,
-// evaporation, breakage. _wo_emit_bom_lines grosses up the rm_issue
-// qty so the survivors equal qty_per_parent × p_qty:
-//   adj_qty = CEIL(p_qty × qty_per_parent / (1 - scrap_pct/100))
-// The grossed-up extra units physically leave raw inventory; the WIP
-// pool is charged adj_qty × component_std_cost.
+// bom_lines.scrap_pct records *planned* material loss for MRP/scheduling
+// (e.g. "this component routinely loses 5% during assembly"). Build cost
+// in WIP comes from ACTUAL usage — emission and per-op flow are LITERAL
+// (qty_per × p_qty × comp_std). If the floor consumes more than the
+// BOM's literal qty, the excess is a separate post_transfers call
+// (an inventory adjustment or follow-up rm_issue_to_wo).
+//
+// skus.yield_mode picks how the parent's standard cost rollup treats
+// scrap_pct (acct-6jq):
+//   plan_only  (default): rollup = literal sum. variance_wo_close shows
+//                          the full scrap-driven gap as unfavorable.
+//   absorbed:             rollup factors in scrap (caller-set today;
+//                          future tooling reads yield_mode and inflates).
+//                          variance_wo_close captures the actual-vs-
+//                          planned gap (favorable if no actual scrap).
+//
+// In BOTH modes pool flow is literal; only the parent_std × qty drain
+// at wo_complete differs because the caller-set parent_std embodies
+// the rollup decision.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn yield_grossup_five_percent_scrap_grosses_to_211() {
+async fn yield_plan_only_emits_literal_qty_no_yield_variance() {
+    // Mode B (plan_only, default): parent_std = literal qty_per × comp_std.
+    // scrap_pct present but ignored at emission → drain matches pool;
+    // variance_wo_close = 0 from yield (zero actual scrap).
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    // Component scaffold: PHX-Y-C @ std=10, raw at PHX-Y-RAW.
-    fresh_location(&pool, "PHX-Y-RAW").await;
-    scaffold_component(&pool, "PHX-Y-C", "PHX-Y-RAW", 10, 10_000).await;
-    let comp_id = sku_id(&pool, "PHX-Y-C").await;
+    fresh_location(&pool, "PHX-YPO-RAW").await;
+    scaffold_component(&pool, "PHX-YPO-C", "PHX-YPO-RAW", 10, 1000).await;
 
-    // SKU-A is the parent; its accounts are seeded by the fixture.
-    // Build a bom_header for SKU-A pointing at PHX-Y-C with scrap_pct=5,
-    // qty_per_parent=2, applies_at_op=10.
+    // BOM with scrap_pct=5% — recorded as planning hint.
     let bom_id = create_bom_header(&pool, "SKU-A").await;
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-Y-C", "PHX-Y-RAW", 2, 5.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-YPO-C", "PHX-YPO-RAW", 2, 5.0).await;
 
-    // WO at qty_target=100 with routing op10 only.
-    let wo_id = create_test_wo(&pool, "PHX-Y-001", "SKU-A", "MAIN", 100).await;
+    // SKU-A's fixture-seeded std_cost=100. Parent_std for plan_only mode
+    // would be `2 × 10 = 20` (literal) — fixture's 100 doesn't match,
+    // so override for this test.
+    let posted_by = fresh_uuid(&pool).await;
+    let std_key = fresh_uuid(&pool).await;
+    sqlx::query(
+        "INSERT INTO standard_costs (sku_id, cost, effective_at, posted_by, idempotency_key)
+         SELECT id, 20, '2026-04-01'::DATE, $1::UUID, $2::UUID FROM skus WHERE code='SKU-A'",
+    )
+    .bind(&posted_by)
+    .bind(&std_key)
+    .execute(&pool)
+    .await
+    .expect("override SKU-A std cost to 20 (plan_only literal)");
+
+    let wo_id = create_test_wo(&pool, "PHX-YPO-001", "SKU-A", "MAIN", 100).await;
     add_test_routing(&pool, &wo_id, 10, "MILL").await;
 
-    // Run post_wo_start.
-    let posted_by = fresh_uuid(&pool).await;
+    wo_start(&pool, &wo_id).await;
+
+    // Emission is LITERAL: qty_per × p_qty = 2 × 100 = 200 (NOT 211).
+    let consumed = stock_consumed_for(&pool, "PHX-YPO-C").await;
+    assert_eq!(
+        rm_issued_qty(&pool, consumed).await,
+        200,
+        "scrap_pct=5 does NOT gross up emission: literal 2×100=200"
+    );
+
+    // Pool@op10 = 200 × 10 = 2000.
+    let wip_op10 = account_id_for_selector(
+        &pool, "inv_value_wip", Some("SKU-A"), None, Some("USD"), Some(10),
+    )
+    .await;
+    assert_eq!(balance(&pool, wip_op10).await, 2000);
+
+    // Single-op WO: complete at qty=100, parent_std=20, drain = 2000.
+    // Pool drains cleanly to 0; no variance from yield.
     let key = fresh_uuid(&pool).await;
     sqlx::query(
-        "SELECT post_wo_start($1::UUID, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+        "SELECT post_wo_complete($1::UUID, 100, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
     )
     .bind(&wo_id)
     .bind(&posted_by)
     .bind(&key)
     .execute(&pool)
     .await
-    .expect("post_wo_start");
+    .expect("post_wo_complete");
 
-    // adj_qty = CEIL(100 × 2 / (1 - 0.05)) = CEIL(200 / 0.95) = CEIL(210.526) = 211.
-    let consumed = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM accounts WHERE kind='stock_consumed' AND sku_id = $1::UUID",
-    )
-    .bind(&comp_id)
-    .fetch_one(&pool)
-    .await
-    .expect("stock_consumed lookup");
-
-    let issued = rm_issued_qty(&pool, consumed).await;
+    let var_close = account_id_by_kind_currency(&pool, "variance_wo_close", Some("USD")).await;
     assert_eq!(
-        issued, 211,
-        "scrap_pct=5 grosses up qty: CEIL(100 × 2 / 0.95) = 211 (got {issued})"
+        balance(&pool, var_close).await,
+        0,
+        "plan_only with literal parent_std: no yield variance"
     );
-
-    // The grossed-up qty went out of raw inventory.
-    let raw_qty = account_id_stock_available(&pool, "PHX-Y-C", "PHX-Y-RAW").await;
-    let raw_balance = balance(&pool, raw_qty).await;
-    assert_eq!(raw_balance, 10_000 - 211, "raw drained by 211 units");
+    assert_eq!(balance(&pool, wip_op10).await, 0, "WIP fully drained");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn yield_grossup_multi_component_with_different_scrap_pcts() {
+async fn yield_absorbed_via_scrap_aware_parent_std_surfaces_favorable_variance() {
+    // Mode A (absorbed): caller marks parent yield_mode='absorbed' and
+    // pre-sets parent_std to the rolled-up scrap-aware value. Pool flow
+    // is still LITERAL (acct-6jq). At wo_complete, the larger drain
+    // (parent_std × qty) over-drains the actually-literal pool, and the
+    // residual sweep captures the gap as a favorable variance — meaning
+    // we ran the WO without consuming the planned scrap allowance.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    // Two components with different scrap_pcts.
-    fresh_location(&pool, "PHX-YM-RAW").await;
-    scaffold_component(&pool, "PHX-YM-C1", "PHX-YM-RAW", 5, 10_000).await;
-    scaffold_component(&pool, "PHX-YM-C2", "PHX-YM-RAW", 8, 10_000).await;
-    let c1_id = sku_id(&pool, "PHX-YM-C1").await;
-    let c2_id = sku_id(&pool, "PHX-YM-C2").await;
+    sqlx::query("UPDATE skus SET yield_mode='absorbed' WHERE code='SKU-A'")
+        .execute(&pool)
+        .await
+        .expect("set absorbed mode");
+
+    fresh_location(&pool, "PHX-YAB-RAW").await;
+    scaffold_component(&pool, "PHX-YAB-C", "PHX-YAB-RAW", 10, 1000).await;
 
     let bom_id = create_bom_header(&pool, "SKU-A").await;
-    // C1: scrap=10%, qty=1 per parent. CEIL(100 × 1 / 0.90) = 112.
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-YM-C1", "PHX-YM-RAW", 1, 10.0).await;
-    // C2: scrap=0%, qty=3 per parent. 100 × 3 = 300 (no gross-up).
-    add_bom_item(&pool, bom_id, 2, 10, "PHX-YM-C2", "PHX-YM-RAW", 3, 0.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-YAB-C", "PHX-YAB-RAW", 2, 5.0).await;
 
-    let wo_id = create_test_wo(&pool, "PHX-YM-001", "SKU-A", "MAIN", 100).await;
+    // Scrap-aware rollup: 2 / (1 - 0.05) × 10 = 21.05 → caller stores 21.
+    let posted_by = fresh_uuid(&pool).await;
+    let std_key = fresh_uuid(&pool).await;
+    sqlx::query(
+        "INSERT INTO standard_costs (sku_id, cost, effective_at, posted_by, idempotency_key)
+         SELECT id, 21, '2026-04-01'::DATE, $1::UUID, $2::UUID FROM skus WHERE code='SKU-A'",
+    )
+    .bind(&posted_by)
+    .bind(&std_key)
+    .execute(&pool)
+    .await
+    .expect("override SKU-A std cost to 21 (absorbed scrap-aware)");
+
+    let wo_id = create_test_wo(&pool, "PHX-YAB-001", "SKU-A", "MAIN", 100).await;
     add_test_routing(&pool, &wo_id, 10, "MILL").await;
 
-    let posted_by = fresh_uuid(&pool).await;
+    wo_start(&pool, &wo_id).await;
+
+    // Emission LITERAL (same as plan_only): 200 components, pool=2000.
+    let consumed = stock_consumed_for(&pool, "PHX-YAB-C").await;
+    assert_eq!(rm_issued_qty(&pool, consumed).await, 200,
+        "absorbed mode also emits literal at WO_start");
+
+    let wip_op10 = account_id_for_selector(
+        &pool, "inv_value_wip", Some("SKU-A"), None, Some("USD"), Some(10),
+    )
+    .await;
+    assert_eq!(balance(&pool, wip_op10).await, 2000);
+
+    // Complete: parent_std=21 × qty=100 = 2100 drain. Pool has 2000.
+    // Walk-all sweep absorbs the −100 residual into variance_wo_close.
     let key = fresh_uuid(&pool).await;
     sqlx::query(
-        "SELECT post_wo_start($1::UUID, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+        "SELECT post_wo_complete($1::UUID, 100, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
     )
     .bind(&wo_id)
     .bind(&posted_by)
     .bind(&key)
     .execute(&pool)
     .await
-    .expect("post_wo_start");
+    .expect("post_wo_complete");
 
-    let c1_consumed = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM accounts WHERE kind='stock_consumed' AND sku_id = $1::UUID",
-    )
-    .bind(&c1_id)
-    .fetch_one(&pool)
-    .await
-    .expect("c1 stock_consumed lookup");
-    let c2_consumed = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM accounts WHERE kind='stock_consumed' AND sku_id = $1::UUID",
-    )
-    .bind(&c2_id)
-    .fetch_one(&pool)
-    .await
-    .expect("c2 stock_consumed lookup");
-
-    assert_eq!(rm_issued_qty(&pool, c1_consumed).await, 112,
-        "C1 with scrap=10% grosses up to CEIL(100/0.9)=112");
-    assert_eq!(rm_issued_qty(&pool, c2_consumed).await, 300,
-        "C2 with scrap=0% has no gross-up: 100 × 3 = 300");
+    // variance_wo_close: residual = 2000 (pool) − 2100 (drain) = −100.
+    // The residual sweep credits variance_wo_close 100 (favorable),
+    // surfacing as balance = −100 on the debit-normal account.
+    let var_close = account_id_by_kind_currency(&pool, "variance_wo_close", Some("USD")).await;
+    assert_eq!(
+        balance(&pool, var_close).await,
+        -100,
+        "absorbed mode: 5% scrap allowance unspent → favorable variance −100"
+    );
+    assert_eq!(balance(&pool, wip_op10).await, 0, "WIP fully resolved");
 }
 
 // ============================================================
