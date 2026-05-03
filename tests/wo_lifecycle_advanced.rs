@@ -1684,3 +1684,194 @@ async fn eco_obsoletes_prior_revision_then_new_rev_takes_over() {
         "rev A no longer used after ECO"
     );
 }
+
+// ============================================================
+// C5i — misc edge cases
+// ============================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wo_close_v_absorbs_intermediate_op_residual() {
+    // The new wo_complete path walks ALL inv_value_wip(parent, op_*, ccy)
+    // accounts for the WO and absorbs any non-zero balance via wo_close_v
+    // at final close — extending the legacy path's last-op-only sweep.
+    // This catches lot-amortization residue at non-last ops.
+    //
+    // Setup math (qty_target=100, default_lot_size=100, parent_std=3):
+    //   per_lot wo_start charge std=349
+    //   per_lot_cum at op10 = (349::numeric / 100)::bigint = 3
+    //                         (PG rounds 3.49 → 3)
+    //   std_cum_at_op10     = 0 + 3 = 3
+    //   pool@op10 actual    = 349 (charge fires once at wo_start)
+    //   op_move_v amount    = 100 × 3 = 300
+    //   pool@op10 residual  = 349 − 300 = 49  ←
+    //   pool@op20 after move = 300
+    //   wo_complete value-leg = 100 × 3 = 300 → drains op20 to zero
+    //   walk-all sweep absorbs op10 +49 into variance_wo_close.
+    //
+    // Why std=349 (not 350): PG's ::BIGINT cast rounds half AWAY from
+    // zero, so 350/100 = 3.5 → 4, which would over-drain op_move_v
+    // (100×4=400 > 349 pool) and trip the inv_value_wip CHECK.
+
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    // Force amortization truncation by setting default_lot_size > 1
+    // and overriding SKU-A's std_cost to match std_cum_at_last_op so
+    // the only post-close residue is the op10 truncation residual
+    // (otherwise parent_std=100 from the fixture would over-drain
+    // op20 into a huge negative variance that swamps the test signal).
+    sqlx::query("UPDATE skus SET default_lot_size=100 WHERE code='SKU-A'")
+        .execute(&pool)
+        .await
+        .expect("set default_lot_size");
+    let posted_by_seed = fresh_uuid(&pool).await;
+    let std_key = fresh_uuid(&pool).await;
+    sqlx::query(
+        "INSERT INTO standard_costs (sku_id, cost, effective_at, posted_by, idempotency_key)
+         SELECT id, 3, '2026-04-01'::DATE, $1::UUID, $2::UUID FROM skus WHERE code='SKU-A'",
+    )
+    .bind(&posted_by_seed)
+    .bind(&std_key)
+    .execute(&pool)
+    .await
+    .expect("override SKU-A std cost to 3");
+
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    // PG's ::BIGINT cast rounds-half-away-from-zero, NOT integer truncation:
+    //   350/100 = 3.5 → 4 (over-drains: op_move_v 400 > pool 350 → CHECK violation).
+    // Pick std_amount=349 instead: 349/100 = 3.49 → 3, op_move_v 100×3=300,
+    // pool@op10 actual = 349, residual = 349 − 300 = 49.
+    add_bom_charge(&pool, bom_id, 1, 10, "oh_std", 349, "wo_start").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-RES-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    let var_close = account_id_by_kind_currency(&pool, "variance_wo_close", Some("USD")).await;
+    let wip_op10 = account_id_for_selector(
+        &pool,
+        "inv_value_wip",
+        Some("SKU-A"),
+        None,
+        Some("USD"),
+        Some(10),
+    )
+    .await;
+    let wip_op20 = account_id_for_selector(
+        &pool,
+        "inv_value_wip",
+        Some("SKU-A"),
+        None,
+        Some("USD"),
+        Some(20),
+    )
+    .await;
+
+    wo_start(&pool, &wo_id).await;
+    assert_eq!(
+        balance(&pool, wip_op10).await,
+        349,
+        "after wo_start: pool@op10 = 349 (wo_start charge)"
+    );
+
+    op_move(&pool, &wo_id, 10, 20, 100).await;
+    assert_eq!(
+        balance(&pool, wip_op10).await,
+        49,
+        "after op_move: pool@op10 = 349 − 300 = 49 (lot-amortization residual)"
+    );
+    assert_eq!(balance(&pool, wip_op20).await, 300, "after op_move: pool@op20 = 300");
+
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_wo_complete($1::UUID, 100, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+    )
+    .bind(&wo_id)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("post_wo_complete");
+
+    assert_eq!(
+        balance(&pool, wip_op10).await,
+        0,
+        "wo_close residual sweep drained op10 to zero"
+    );
+    assert_eq!(balance(&pool, wip_op20).await, 0, "op20 fully drained at wo_complete");
+    assert_eq!(
+        balance(&pool, var_close).await,
+        49,
+        "variance_wo_close absorbed the 49 op10 residual"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn consumption_policy_backflush_at_complete_raises_p0035() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    // Flip SKU-A's consumption_policy off the default 'forward'.
+    sqlx::query("UPDATE skus SET consumption_policy='backflush_at_complete' WHERE code='SKU-A'")
+        .execute(&pool)
+        .await
+        .expect("set consumption_policy");
+
+    // Minimal valid BOM so the gate is reached (not short-circuited
+    // by an earlier P0029 / P0026 / etc.).
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_charge(&pool, bom_id, 1, 10, "oh_std", 100, "wo_start").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-CP-BF1", "SKU-A", "MAIN", 10).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+
+    expect_sqlstate("P0035", || async {
+        let posted_by = fresh_uuid(&pool).await;
+        let key = fresh_uuid(&pool).await;
+        sqlx::query(
+            "SELECT post_wo_start($1::UUID, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+        )
+        .bind(&wo_id)
+        .bind(&posted_by)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .map(|_| ())
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn phantom_cycle_a_to_b_to_a_raises_p0032() {
+    // A direct self-reference (A's BOM line points at A as a phantom)
+    // is blocked by the bom_line_self_reference_check trigger (P0034).
+    // A two-step cycle (A points at phantom B; B's BOM points back at A
+    // as a phantom) is allowed at INSERT time but the recursive CTE in
+    // _wo_explode_bom keeps incrementing depth until the depth<16 cap
+    // fires, raising P0032 phantom_recursion_limit.
+
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    fresh_location(&pool, "PHX-CYC-RAW").await;
+    let _a = fresh_phantom_sku(&pool, "PHX-CYC-A").await;
+    let _b = fresh_phantom_sku(&pool, "PHX-CYC-B").await;
+    fresh_sku(&pool, "PHX-CYC-LEAF").await; // unused but available if expander needs leaf
+
+    // A's BOM points at B (phantom). B's BOM points back at A (phantom).
+    let bom_a = create_bom_header(&pool, "PHX-CYC-A").await;
+    add_bom_item(&pool, bom_a, 1, 10, "PHX-CYC-B", "PHX-CYC-RAW", 1, 0.0).await;
+
+    let bom_b = create_bom_header(&pool, "PHX-CYC-B").await;
+    add_bom_item(&pool, bom_b, 1, 10, "PHX-CYC-A", "PHX-CYC-RAW", 1, 0.0).await;
+
+    expect_sqlstate("P0032", || async {
+        sqlx::query("SELECT _wo_explode_bom($1, '2026-04-15'::DATE)")
+            .bind(bom_a)
+            .execute(&pool)
+            .await
+            .map(|_| ())
+    })
+    .await;
+}
