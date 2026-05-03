@@ -677,6 +677,187 @@ async fn fire_at_per_unit_service_scales_per_arrival() {
 }
 
 // ============================================================
+// C5d — scrap-aware safety + partial-scrap with per-lot charges
+// ============================================================
+//
+// Plan §2 worked example. Three sub-cases:
+//   (a) Per-lot charge already fired before partial scrap → charge
+//       stays in WIP pool; scrapped portion absorbs its share at the
+//       accumulated unit cost; no refund or pro-ration.
+//   (b) Per-lot charge with fire_at='op_arrival' for an op the WO
+//       never reaches → charge NEVER fires. Real-world correct: don't
+//       pay for OSP freight if you never shipped to OSP.
+//   (c) WO fully scrapped → post_wo_close_unproduced closes the WO.
+
+async fn scrap(pool: &PgPool, wo_id: &str, routing_op: i32, qty: i64) {
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    sqlx::query(
+        "SELECT post_scrap($1::UUID, $2, $3, '2026-04-15'::DATE, $4::UUID, $5::UUID, NULL)",
+    )
+    .bind(wo_id)
+    .bind(routing_op)
+    .bind(qty)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("post_scrap op={routing_op} qty={qty}: {e}"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scrap_aware_safety_unfired_op_arrival_charge_never_incurred() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    // BOM with charge at op20 fire_at='op_arrival'.
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_charge(&pool, bom_id, 1, 20, "oh_std", 200, "op_arrival").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-SD1-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    let oh = account_id_by_kind_currency(&pool, "oh_applied", Some("USD")).await;
+
+    wo_start(&pool, &wo_id).await;
+    assert_eq!(balance(&pool, oh).await, 0, "charge has not fired (op20 not reached)");
+
+    // Scrap all 100 units at op10 — never reach op20.
+    scrap(&pool, &wo_id, 10, 100).await;
+
+    // The op20 op_arrival charge NEVER fires: scrap-aware safety.
+    assert_eq!(
+        balance(&pool, oh).await,
+        0,
+        "charge with fire_at=op_arrival at op20 never fires when WO scrapped at op10"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scrap_aware_safety_wo_start_charge_is_sunk_even_on_full_scrap() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    // Charge fires at WO_start.
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_charge(&pool, bom_id, 1, 10, "oh_std", 150, "wo_start").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-SD2-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    let oh = account_id_by_kind_currency(&pool, "oh_applied", Some("USD")).await;
+
+    wo_start(&pool, &wo_id).await;
+    assert_eq!(balance(&pool, oh).await, -150, "wo_start charge fires upfront");
+
+    // Scrap everything at op10. The wo_start charge is in the WIP pool;
+    // it gets absorbed by variance_scrap (since the entire pool drains).
+    scrap(&pool, &wo_id, 10, 100).await;
+
+    // oh_applied still holds the -150: that fee is incurred. The
+    // scrap_v leg moved its share into variance_scrap on the value side
+    // but did NOT reverse the absorption.
+    assert_eq!(
+        balance(&pool, oh).await,
+        -150,
+        "wo_start charge is sunk regardless of scrap"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_scrap_with_fired_per_lot_charge_absorbs_proportional_share() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    // BOM has a per_lot charge that fires at op_arrival of op20.
+    // Plus a per_unit service so the pool isn't dominated by the lot
+    // charge alone — makes the absorbed share assertion meaningful.
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_service(&pool, bom_id, 1, 20, "labor_std", 5, "per_unit", "op_arrival").await;
+    add_bom_charge(&pool, bom_id, 2, 20, "oh_std", 200, "op_arrival").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-SD3-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    wo_start(&pool, &wo_id).await;
+    op_move(&pool, &wo_id, 10, 20, 100).await;
+
+    // After op_move 100 to op20:
+    //   inv_value_wip(SKU-A, op20) holds:
+    //     op_move_v amount = 100 × std_cum_at_op10
+    //     std_cum_at_op10 = parent SKU-A's std=100 BUT bom-driven cum
+    //     is 0 (no per_unit at op10, no fired per_lot). Actually the
+    //     resolve_standard_cost_at(SKU-A) returns 100 (fixture seed)
+    //     but our bom_lines compute has only op20 lines. std_cum_at_op10
+    //     under new path = sum of per_unit at op<=10 = 0; sum of fired
+    //     per_lot at op<=10 = 0 (none with fire_at=wo_start in this BOM).
+    //     So std_cum_at_op10 = 0, op_move_v amount = 0.
+    //   On first arrival at op20: per_unit labor fires 100×5 = 500;
+    //   per_lot oh fires 200. WIP@op20 = 0 + 500 + 200 = 700, qty=100.
+    //   accumulated_unit_cost = 700 / 100 = 7.
+
+    let var_scrap = account_id_by_kind_currency(&pool, "variance_scrap", Some("USD")).await;
+    let pre_var = balance(&pool, var_scrap).await;
+    assert_eq!(pre_var, 0, "variance_scrap=0 before scrap");
+
+    // Scrap 5 of 100 at op20 → unit_cost=7, value taken to scrap = 5 × 7 = 35.
+    scrap(&pool, &wo_id, 20, 5).await;
+
+    let post_var = balance(&pool, var_scrap).await;
+    assert_eq!(
+        post_var, 35,
+        "scrap 5 at unit_cost=7 → variance_scrap=35 (proportional share of fired per-lot charge included)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_scrap_then_post_wo_close_unproduced() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    // Minimal BOM: just a wo_start charge so the pool isn't empty.
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_charge(&pool, bom_id, 1, 10, "oh_std", 150, "wo_start").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-SD4-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+
+    wo_start(&pool, &wo_id).await;
+    scrap(&pool, &wo_id, 10, 100).await;
+
+    // qty_completed=0, qty_scrapped=100=qty_target. Status still 'released'.
+    let status: String = sqlx::query_scalar("SELECT status FROM work_orders WHERE id = $1::UUID")
+        .bind(&wo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "released", "WO still released after full scrap");
+
+    // post_wo_close_unproduced should close it cleanly.
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_wo_close_unproduced($1::UUID, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+    )
+    .bind(&wo_id)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("post_wo_close_unproduced");
+
+    let status: String = sqlx::query_scalar("SELECT status FROM work_orders WHERE id = $1::UUID")
+        .bind(&wo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "closed", "WO closed after post_wo_close_unproduced");
+}
+
+// ============================================================
 // C5a.3 — recursion limit: 17-level chain raises P0032
 // ============================================================
 //
