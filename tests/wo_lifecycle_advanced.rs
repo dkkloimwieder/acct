@@ -1162,3 +1162,316 @@ async fn explode_phantom_recursion_limit_raises_p0032() {
     })
     .await;
 }
+
+// ============================================================
+// C5f — alternate BOMs + revisions
+// ============================================================
+//
+// _wo_resolve_bom_for picks:
+//   - work_orders.bom_id if set (caller pin — bypasses effectivity/primary)
+//   - else bom_header_at(parent, alt=1, business_date) — the primary path,
+//     filtered by status='active' AND effective_at < business_date < obsolete_at
+//
+// post_wo_start's dispatch-by-existence check additionally requires a
+// primary active BOM to exist for the parent at business_date when bom_id
+// is NULL — so revision tests that flip primary across business_dates need
+// to model that lifecycle (UPDATE is_primary as ECOs supersede each other).
+
+async fn stock_consumed_for(pool: &PgPool, sku_code: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT id FROM accounts
+          WHERE kind='stock_consumed' AND sku_id=(SELECT id FROM skus WHERE code=$1)",
+    )
+    .bind(sku_code)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("stock_consumed lookup {sku_code}: {e}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alternates_bom_id_null_picks_primary_set_picks_alternate() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    fresh_location(&pool, "PHX-ALT-RAW").await;
+    scaffold_component(&pool, "PHX-ALT-CA1", "PHX-ALT-RAW", 50, 1000).await;
+    scaffold_component(&pool, "PHX-ALT-CA2", "PHX-ALT-RAW", 50, 1000).await;
+
+    // alt 1 (primary, default helper): consumes CA1.
+    let bom_alt1 = create_bom_header(&pool, "SKU-A").await;
+    add_bom_item(&pool, bom_alt1, 1, 10, "PHX-ALT-CA1", "PHX-ALT-RAW", 1, 0.0).await;
+
+    // alt 2 (substitute, is_primary=false): consumes CA2. Different
+    // alternate_no → no conflict with the bom_headers_primary partial
+    // unique index even though it covers alt 1.
+    let bom_alt2 =
+        create_bom_header_full(&pool, "SKU-A", 2, "A", false, "active", None).await;
+    add_bom_item(&pool, bom_alt2, 1, 10, "PHX-ALT-CA2", "PHX-ALT-RAW", 1, 0.0).await;
+
+    // WO 1: bom_id NULL → resolver falls back to primary alt 1.
+    let wo1 = create_test_wo(&pool, "PHX-ALT-001", "SKU-A", "MAIN", 50).await;
+    add_test_routing(&pool, &wo1, 10, "MILL").await;
+    wo_start(&pool, &wo1).await;
+
+    let ca1_consumed = stock_consumed_for(&pool, "PHX-ALT-CA1").await;
+    let ca2_consumed = stock_consumed_for(&pool, "PHX-ALT-CA2").await;
+
+    assert_eq!(
+        rm_issued_qty(&pool, ca1_consumed).await,
+        50,
+        "WO1 (bom_id NULL) drained alt 1 component (CA1)"
+    );
+    assert_eq!(
+        rm_issued_qty(&pool, ca2_consumed).await,
+        0,
+        "WO1 did not drain alt 2 component (CA2)"
+    );
+
+    // WO 2: bom_id pinned to alt 2.
+    let wo2 = create_test_wo(&pool, "PHX-ALT-002", "SKU-A", "MAIN", 50).await;
+    add_test_routing(&pool, &wo2, 10, "MILL").await;
+    set_wo_bom_id(&pool, &wo2, bom_alt2).await;
+    wo_start(&pool, &wo2).await;
+
+    assert_eq!(
+        rm_issued_qty(&pool, ca2_consumed).await,
+        50,
+        "WO2 (bom_id=alt 2) drained alt 2 component (CA2)"
+    );
+    assert_eq!(
+        rm_issued_qty(&pool, ca1_consumed).await,
+        50,
+        "WO2 did not double-drain alt 1 (cumulative still 50 from WO1)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn primary_bom_resolution_via_resolver_function() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    fresh_location(&pool, "PHX-RES-RAW").await;
+    scaffold_component(&pool, "PHX-RES-CMP", "PHX-RES-RAW", 50, 500).await;
+
+    // Single primary active BOM (default helper).
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-RES-CMP", "PHX-RES-RAW", 1, 0.0).await;
+
+    let wo_id = create_test_wo(&pool, "PHX-RES-001", "SKU-A", "MAIN", 25).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+
+    // Direct resolver-call assertion: _wo_resolve_bom_for returns our bom_id.
+    let resolved: i64 = sqlx::query_scalar(
+        "SELECT (_wo_resolve_bom_for($1::UUID, '2026-04-15'::DATE)).id",
+    )
+    .bind(&wo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("resolver");
+    assert_eq!(resolved, bom_id, "resolver picks the only active primary BOM");
+
+    // Round-trip: post_wo_start emits the line.
+    wo_start(&pool, &wo_id).await;
+    let consumed = stock_consumed_for(&pool, "PHX-RES-CMP").await;
+    assert_eq!(
+        rm_issued_qty(&pool, consumed).await,
+        25,
+        "primary BOM emitted its rm_issue line"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revisions_effective_date_picks_active_revision() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    fresh_location(&pool, "PHX-REV-RAW").await;
+    scaffold_component(&pool, "PHX-REV-CA", "PHX-REV-RAW", 50, 1000).await;
+    scaffold_component(&pool, "PHX-REV-CB", "PHX-REV-RAW", 50, 1000).await;
+
+    // rev A (alt=1, is_primary=true initially): window [2026-01-01, 2026-06-01).
+    let bom_a = create_bom_header(&pool, "SKU-A").await;
+    sqlx::query(
+        "UPDATE bom_headers
+            SET effective_at='2026-01-01'::TIMESTAMPTZ,
+                obsolete_at='2026-06-01'::TIMESTAMPTZ
+          WHERE id=$1",
+    )
+    .bind(bom_a)
+    .execute(&pool)
+    .await
+    .expect("set rev A window");
+    add_bom_item(&pool, bom_a, 1, 10, "PHX-REV-CA", "PHX-REV-RAW", 1, 0.0).await;
+
+    // rev B (alt=1 rev='B', is_primary=false initially): window [2026-06-01, infinity).
+    // is_primary stays false until the ECO transition below — the
+    // bom_headers_primary partial unique index forbids two rows being
+    // is_primary=true AND status='active' for the same (parent, alt).
+    let bom_b =
+        create_bom_header_full(&pool, "SKU-A", 1, "B", false, "active", None).await;
+    sqlx::query(
+        "UPDATE bom_headers SET effective_at='2026-06-01'::TIMESTAMPTZ WHERE id=$1",
+    )
+    .bind(bom_b)
+    .execute(&pool)
+    .await
+    .expect("set rev B effective_at");
+    add_bom_item(&pool, bom_b, 1, 10, "PHX-REV-CB", "PHX-REV-RAW", 1, 0.0).await;
+
+    // Direct resolver assertions: bom_header_at filters status='active'
+    // and the effectivity window — does NOT filter is_primary, so both
+    // revs are eligible per their own window.
+    let parent_sku_a: String = sqlx::query_scalar("SELECT id::text FROM skus WHERE code='SKU-A'")
+        .fetch_one(&pool)
+        .await
+        .expect("SKU-A id");
+    let resolved_a: i64 =
+        sqlx::query_scalar("SELECT (bom_header_at($1::UUID, 1, '2026-04-15'::DATE)).id")
+            .bind(&parent_sku_a)
+            .fetch_one(&pool)
+            .await
+            .expect("resolver A");
+    assert_eq!(resolved_a, bom_a, "2026-04-15 picks rev A by effective_at filter");
+
+    let resolved_b: i64 =
+        sqlx::query_scalar("SELECT (bom_header_at($1::UUID, 1, '2026-07-15'::DATE)).id")
+            .bind(&parent_sku_a)
+            .fetch_one(&pool)
+            .await
+            .expect("resolver B");
+    assert_eq!(resolved_b, bom_b, "2026-07-15 picks rev B by effective_at filter");
+
+    // April WO: rev A is primary in April → dispatch activates new path,
+    // resolver returns rev A, post_wo_start drains CA.
+    let wo_april = create_test_wo(&pool, "PHX-REV-APR", "SKU-A", "MAIN", 10).await;
+    add_test_routing(&pool, &wo_april, 10, "MILL").await;
+    let posted_by = fresh_uuid(&pool).await;
+    let key1 = fresh_uuid(&pool).await;
+    sqlx::query("SELECT post_wo_start($1::UUID, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)")
+        .bind(&wo_april)
+        .bind(&posted_by)
+        .bind(&key1)
+        .execute(&pool)
+        .await
+        .expect("post_wo_start april");
+
+    // Simulate ECO transition: rev B becomes primary, rev A loses
+    // primary status. (Real lifecycle is acct-yqt post_eco_approve;
+    // we model it inline here.) Order matters: drop A's primary first,
+    // then set B's, otherwise both rows are primary mid-transaction
+    // and the partial unique index conflicts.
+    sqlx::query("UPDATE bom_headers SET is_primary=FALSE WHERE id=$1")
+        .bind(bom_a)
+        .execute(&pool)
+        .await
+        .expect("rev A drop primary");
+    sqlx::query("UPDATE bom_headers SET is_primary=TRUE WHERE id=$1")
+        .bind(bom_b)
+        .execute(&pool)
+        .await
+        .expect("rev B set primary");
+
+    // June WO: rev A's window ends 2026-06-01, so a 2026-06-15 business
+    // date falls into rev B's window. (Fixture only seeds periods through
+    // 2026-06; using 2026-06-15 keeps us inside an open period.) Rev B
+    // is primary now → dispatch activates new path, resolver returns
+    // rev B, post_wo_start drains CB.
+    let wo_july = create_test_wo(&pool, "PHX-REV-JUN", "SKU-A", "MAIN", 10).await;
+    add_test_routing(&pool, &wo_july, 10, "MILL").await;
+    let key2 = fresh_uuid(&pool).await;
+    sqlx::query("SELECT post_wo_start($1::UUID, '2026-06-15'::DATE, $2::UUID, $3::UUID, NULL)")
+        .bind(&wo_july)
+        .bind(&posted_by)
+        .bind(&key2)
+        .execute(&pool)
+        .await
+        .expect("post_wo_start june");
+
+    let ca_consumed = stock_consumed_for(&pool, "PHX-REV-CA").await;
+    let cb_consumed = stock_consumed_for(&pool, "PHX-REV-CB").await;
+    assert_eq!(
+        rm_issued_qty(&pool, ca_consumed).await,
+        10,
+        "April WO drained rev A's component (CA)"
+    );
+    assert_eq!(
+        rm_issued_qty(&pool, cb_consumed).await,
+        10,
+        "July WO drained rev B's component (CB)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bom_id_pin_overrides_default_picks_draft_bom() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    fresh_location(&pool, "PHX-PIN-RAW").await;
+    scaffold_component(&pool, "PHX-PIN-CDFL", "PHX-PIN-RAW", 50, 500).await;
+    scaffold_component(&pool, "PHX-PIN-CDRF", "PHX-PIN-RAW", 50, 500).await;
+
+    // Default active primary BOM (alt=1, rev='A', is_primary=true, status='active').
+    let bom_default = create_bom_header(&pool, "SKU-A").await;
+    add_bom_item(
+        &pool,
+        bom_default,
+        1,
+        10,
+        "PHX-PIN-CDFL",
+        "PHX-PIN-RAW",
+        1,
+        0.0,
+    )
+    .await;
+
+    // Draft BOM (status='draft', is_primary=false). bom_header_at would
+    // skip this since it filters status='active'; but caller pins it
+    // explicitly via work_orders.bom_id. _wo_resolve_bom_for honors
+    // the pin without re-checking status — caller may legitimately
+    // want to test a future-effective draft.
+    let bom_draft =
+        create_bom_header_full(&pool, "SKU-A", 1, "DRAFT", false, "draft", None).await;
+    add_bom_item(
+        &pool,
+        bom_draft,
+        1,
+        10,
+        "PHX-PIN-CDRF",
+        "PHX-PIN-RAW",
+        1,
+        0.0,
+    )
+    .await;
+
+    let wo_id = create_test_wo(&pool, "PHX-PIN-001", "SKU-A", "MAIN", 20).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    set_wo_bom_id(&pool, &wo_id, bom_draft).await;
+
+    // _wo_resolve_bom_for honors the pin even for status='draft'.
+    let resolved: i64 = sqlx::query_scalar(
+        "SELECT (_wo_resolve_bom_for($1::UUID, '2026-04-15'::DATE)).id",
+    )
+    .bind(&wo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("resolver");
+    assert_eq!(
+        resolved, bom_draft,
+        "bom_id pin bypasses effectivity/status filter"
+    );
+
+    wo_start(&pool, &wo_id).await;
+
+    let dfl_consumed = stock_consumed_for(&pool, "PHX-PIN-CDFL").await;
+    let drf_consumed = stock_consumed_for(&pool, "PHX-PIN-CDRF").await;
+    assert_eq!(
+        rm_issued_qty(&pool, dfl_consumed).await,
+        0,
+        "default BOM was NOT used (pin overrides)"
+    );
+    assert_eq!(
+        rm_issued_qty(&pool, drf_consumed).await,
+        20,
+        "pinned draft BOM emitted its lines"
+    );
+}
