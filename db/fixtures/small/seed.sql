@@ -102,6 +102,28 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('oh_applied',     'value', 'USD', 'credit'),
   ('variance_scrap', 'value', 'USD', 'unrestricted');
 
+-- BOM2 (acct-jg2) labor_expense USD — companion to labor_applied for the
+-- eventual period-close burden-netting hook (acct-BURDENCLOSE Phase 2).
+-- Debit-normal: P&L expense line. labor_std absorption_class points at
+-- this kind via expense_account_kind so close-hook netting can resolve
+-- the account by (kind, currency).
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('labor_expense', 'value', 'USD', 'debit');
+
+-- BOM2 (acct-jg2) absorption_classes seed rows. Migration 0042 inserts
+-- these on first apply, but TRUNCATE during reset_to_fixture wipes them;
+-- re-seed here so each test starts with a known baseline.
+-- Plus a generic absorption_pool USD account so charge/service bom_lines
+-- referencing absorption_pool can resolve without per-class scaffolding.
+INSERT INTO absorption_classes (code, display_name, applied_account_kind, expense_account_kind)
+VALUES
+  ('labor_std', 'Standard Labor',    'labor_applied', 'labor_expense'),
+  ('oh_std',    'Standard Overhead', 'oh_applied',    NULL)
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('absorption_pool', 'value', 'USD', 'credit');
+
 -- Inventory adjustment account (USD + EUR). Bidirectional P&L line:
 -- credit balance = net adjustment income (we found inventory),
 -- debit  balance = net adjustment expense (we lost inventory).

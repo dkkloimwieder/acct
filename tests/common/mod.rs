@@ -57,9 +57,16 @@ pub async fn reset_to_fixture(pool: &PgPool) {
             commodity_receipts,
             ledger_outbox,
             wo_events,
+            wo_routings,
+            wo_routing_burdens,
+            wo_outputs,
             work_orders,
             boms,
+            bom_headers,
+            engineering_change_orders,
+            absorption_classes,
             accounts,
+            standard_costs,
             periods,
             fx_rates,
             skus,
@@ -326,6 +333,230 @@ pub async fn seed_stock(pool: &PgPool, sku_code: &str, loc_code: &str, qty: i64)
         .await
         .expect("seed_stock post_transfers");
     assert_eq!(result[0]["result"], "ok", "seed_stock: {result}");
+}
+
+// ============================================================
+// BOM2 helpers (acct-jg2)
+//
+// Test-side scaffolding for the new BOM model. These build up
+// bom_headers + bom_lines + wo_outputs + absorption_classes rows
+// the way C5 advanced tests need. Existing wo_lifecycle.rs tests
+// stay on the old `boms` model; the dispatch-by-existence in
+// post_wo_start / post_op_move / post_wo_complete picks the new
+// path only when bom_headers exists for the parent.
+// ============================================================
+
+/// Register an absorption_class. Returns the id. The seed already
+/// inserts labor_std + oh_std; use this for ad-hoc per-test classes
+/// (e.g. osp_plating, production_setup).
+pub async fn register_absorption_class(
+    pool: &PgPool,
+    code: &str,
+    applied_account_kind: &str,
+    expense_account_kind: Option<&str>,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO absorption_classes
+            (code, display_name, applied_account_kind, expense_account_kind)
+         VALUES ($1, $1, $2::account_kind, $3::account_kind)
+         RETURNING id",
+    )
+    .bind(code)
+    .bind(applied_account_kind)
+    .bind(expense_account_kind)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("register_absorption_class {code}: {e}"))
+}
+
+/// Create a bom_header row. Returns the id. Defaults: alternate_no=1,
+/// revision_no='A', is_primary=true, status='active', no eco_id.
+pub async fn create_bom_header(pool: &PgPool, parent_sku_code: &str) -> i64 {
+    create_bom_header_full(pool, parent_sku_code, 1, "A", true, "active", None).await
+}
+
+/// Full-control bom_header creation. Use when alternate / revision /
+/// is_primary / status / eco_id need to deviate from the default.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_bom_header_full(
+    pool: &PgPool,
+    parent_sku_code: &str,
+    alternate_no: i32,
+    revision_no: &str,
+    is_primary: bool,
+    status: &str,
+    eco_id: Option<i64>,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO bom_headers
+            (parent_sku_id, alternate_no, revision_no, is_primary, status, eco_id)
+         SELECT s.id, $2, $3, $4, $5, $6
+           FROM skus s WHERE s.code = $1
+         RETURNING id",
+    )
+    .bind(parent_sku_code)
+    .bind(alternate_no)
+    .bind(revision_no)
+    .bind(is_primary)
+    .bind(status)
+    .bind(eco_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("create_bom_header parent={parent_sku_code} alt={alternate_no} rev={revision_no}: {e}"))
+}
+
+/// Add an item line to a bom_header. component sku/location resolved
+/// by code. Defaults: scrap_pct=0, fire_at='op_arrival' (item lines
+/// can only be per_unit + op_arrival per the bom_lines CHECKs).
+#[allow(clippy::too_many_arguments)]
+pub async fn add_bom_item(
+    pool: &PgPool,
+    bom_id: i64,
+    line_no: i32,
+    applies_at_op: i32,
+    component_sku_code: &str,
+    component_loc_code: &str,
+    qty_per_parent: i64,
+    scrap_pct: f64,
+) {
+    sqlx::query(
+        "INSERT INTO bom_lines
+            (bom_id, line_no, kind, basis, applies_at_op, fire_at, scrap_pct,
+             component_sku_id, component_loc_id, qty_per_parent)
+         SELECT $1, $2, 'item', 'per_unit', $3, 'op_arrival', $4,
+                s.id, l.id, $7
+           FROM skus s, locations l WHERE s.code = $5 AND l.code = $6",
+    )
+    .bind(bom_id)
+    .bind(line_no)
+    .bind(applies_at_op)
+    .bind(scrap_pct)
+    .bind(component_sku_code)
+    .bind(component_loc_code)
+    .bind(qty_per_parent)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "add_bom_item bom={bom_id} line={line_no} comp={component_sku_code}/{component_loc_code}: {e}"
+        )
+    });
+}
+
+/// Add a service line to a bom_header. class lookup by code in
+/// absorption_classes. basis defaults to 'per_unit'; fire_at defaults
+/// to 'op_arrival'. Set fire_at='wo_start' for charges that fire
+/// upfront (only valid with basis='per_lot').
+#[allow(clippy::too_many_arguments)]
+pub async fn add_bom_service(
+    pool: &PgPool,
+    bom_id: i64,
+    line_no: i32,
+    applies_at_op: i32,
+    class_code: &str,
+    std_amount: i64,
+    basis: &str,
+    fire_at: &str,
+) {
+    sqlx::query(
+        "INSERT INTO bom_lines
+            (bom_id, line_no, kind, basis, applies_at_op, fire_at,
+             absorption_class_id, std_amount)
+         SELECT $1, $2, 'service', $5, $3, $6, ac.id, $7
+           FROM absorption_classes ac WHERE ac.code = $4",
+    )
+    .bind(bom_id)
+    .bind(line_no)
+    .bind(applies_at_op)
+    .bind(class_code)
+    .bind(basis)
+    .bind(fire_at)
+    .bind(std_amount)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("add_bom_service bom={bom_id} line={line_no} class={class_code}: {e}"));
+}
+
+/// Add a charge line to a bom_header. Charges are always per_lot
+/// (CHECK constraint). fire_at defaults to 'op_arrival' but
+/// 'wo_start' is the common case for setup/freight charges.
+#[allow(clippy::too_many_arguments)]
+pub async fn add_bom_charge(
+    pool: &PgPool,
+    bom_id: i64,
+    line_no: i32,
+    applies_at_op: i32,
+    class_code: &str,
+    std_amount: i64,
+    fire_at: &str,
+) {
+    sqlx::query(
+        "INSERT INTO bom_lines
+            (bom_id, line_no, kind, basis, applies_at_op, fire_at,
+             absorption_class_id, std_amount)
+         SELECT $1, $2, 'charge', 'per_lot', $3, $5, ac.id, $6
+           FROM absorption_classes ac WHERE ac.code = $4",
+    )
+    .bind(bom_id)
+    .bind(line_no)
+    .bind(applies_at_op)
+    .bind(class_code)
+    .bind(fire_at)
+    .bind(std_amount)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("add_bom_charge bom={bom_id} line={line_no} class={class_code}: {e}"));
+}
+
+/// Add a wo_outputs row. Used by tests that exercise multi-output WOs
+/// (co-products, by-products). For single-output, post_wo_start
+/// auto-initializes a default wo_outputs row when the new path is
+/// active and none exists.
+#[allow(clippy::too_many_arguments)]
+pub async fn add_wo_output(
+    pool: &PgPool,
+    wo_id: &str,
+    output_no: i32,
+    output_sku_code: &str,
+    fg_loc_code: &str,
+    qty: i64,
+    allocation_method: &str,
+    allocation_pct: f64,
+) {
+    sqlx::query(
+        "INSERT INTO wo_outputs
+            (wo_id, output_no, output_sku_id, fg_location_id, qty,
+             allocation_method, allocation_pct)
+         SELECT $1::UUID, $2, s.id, l.id, $5, $6, $7
+           FROM skus s, locations l WHERE s.code = $3 AND l.code = $4",
+    )
+    .bind(wo_id)
+    .bind(output_no)
+    .bind(output_sku_code)
+    .bind(fg_loc_code)
+    .bind(qty)
+    .bind(allocation_method)
+    .bind(allocation_pct)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "add_wo_output wo={wo_id} #{output_no} sku={output_sku_code}/{fg_loc_code}: {e}"
+        )
+    });
+}
+
+/// Set work_orders.bom_id to pin a specific BOM (alternate or future-
+/// effective draft) on the WO. NULL means "use primary active at
+/// business_date" (the default — post_wo_start picks via
+/// _wo_resolve_bom_for).
+pub async fn set_wo_bom_id(pool: &PgPool, wo_id: &str, bom_id: i64) {
+    sqlx::query("UPDATE work_orders SET bom_id = $2 WHERE id = $1::UUID")
+        .bind(wo_id)
+        .bind(bom_id)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("set_wo_bom_id wo={wo_id} bom={bom_id}: {e}"));
 }
 
 /// Invoke the `reserve_inventory()` PL/pgSQL function (migration 0014).
