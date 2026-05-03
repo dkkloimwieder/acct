@@ -498,6 +498,185 @@ async fn yield_grossup_multi_component_with_different_scrap_pcts() {
 }
 
 // ============================================================
+// C5c — fire_at semantics
+// ============================================================
+//
+// fire_at controls *when* a bom_line fires:
+//   wo_start    — fires at post_wo_start regardless of applies_at_op
+//   op_arrival  — fires when qty first arrives at applies_at_op
+// per_unit lines must be op_arrival (CHECK constraint).
+// per_lot lines can be either; the wo_start variant pays setup-style
+// charges upfront (e.g. production_setup), the op_arrival variant
+// gates the charge on whether the op is actually reached
+// (scrap-aware safety — see C5d).
+
+/// Helper: post a single-batch op_move from from_op to to_op.
+async fn op_move(pool: &PgPool, wo_id: &str, from_op: i32, to_op: i32, qty: i64) {
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    sqlx::query(
+        "SELECT post_op_move($1::UUID, $2, $3, $4, '2026-04-15'::DATE, $5::UUID, $6::UUID, NULL)",
+    )
+    .bind(wo_id)
+    .bind(from_op)
+    .bind(to_op)
+    .bind(qty)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("post_op_move {from_op}->{to_op} qty={qty}: {e}"));
+}
+
+async fn wo_start(pool: &PgPool, wo_id: &str) {
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    sqlx::query(
+        "SELECT post_wo_start($1::UUID, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+    )
+    .bind(wo_id)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("post_wo_start: {e}"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fire_at_wo_start_per_lot_fires_immediately() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    // SKU-A parent. Charge applies_at_op=20 but fire_at='wo_start'
+    // (e.g. production setup that's paid upfront regardless of op).
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_charge(&pool, bom_id, 1, 20, "oh_std", 150, "wo_start").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-FA1-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    // Before WO_start: oh_applied has zero balance.
+    let oh = account_id_by_kind_currency(&pool, "oh_applied", Some("USD")).await;
+    assert_eq!(balance(&pool, oh).await, 0, "oh_applied starts at 0");
+
+    wo_start(&pool, &wo_id).await;
+
+    // After WO_start: the per_lot charge already fired even though
+    // applies_at_op=20 hasn't been reached yet. Balance is -150
+    // (credit-side increment).
+    let bal = balance(&pool, oh).await;
+    assert_eq!(bal, -150, "fire_at=wo_start charge fires upfront: oh_applied bal={bal}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fire_at_op_arrival_per_lot_fires_only_when_op_reached() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    // Same charge but fire_at='op_arrival'.
+    add_bom_charge(&pool, bom_id, 1, 20, "oh_std", 150, "op_arrival").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-FA2-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    let oh = account_id_by_kind_currency(&pool, "oh_applied", Some("USD")).await;
+
+    wo_start(&pool, &wo_id).await;
+    assert_eq!(
+        balance(&pool, oh).await,
+        0,
+        "fire_at=op_arrival applies_at_op=20: did NOT fire at WO_start"
+    );
+
+    op_move(&pool, &wo_id, 10, 20, 100).await;
+    assert_eq!(
+        balance(&pool, oh).await,
+        -150,
+        "fire_at=op_arrival fires on first arrival at op=20"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fire_at_op_arrival_per_lot_fires_only_on_first_arrival() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    // Per-lot charge at op20.
+    add_bom_charge(&pool, bom_id, 1, 20, "oh_std", 200, "op_arrival").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-FA3-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    let oh = account_id_by_kind_currency(&pool, "oh_applied", Some("USD")).await;
+
+    wo_start(&pool, &wo_id).await;
+    assert_eq!(balance(&pool, oh).await, 0);
+
+    // First batch arrives at op20 → per_lot charge fires.
+    op_move(&pool, &wo_id, 10, 20, 60).await;
+    assert_eq!(
+        balance(&pool, oh).await,
+        -200,
+        "first arrival at op20 fires the per_lot charge"
+    );
+
+    // Second batch arrives at op20 → per_lot must NOT re-fire.
+    op_move(&pool, &wo_id, 10, 20, 40).await;
+    assert_eq!(
+        balance(&pool, oh).await,
+        -200,
+        "subsequent arrival at op20 does NOT re-fire per_lot (still -200, not -400)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fire_at_per_unit_service_scales_per_arrival() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    // Per-unit labor at op20: std_amount=5 per unit → fires every arrival
+    // proportional to incoming qty.
+    add_bom_service(&pool, bom_id, 1, 20, "labor_std", 5, "per_unit", "op_arrival").await;
+    // Per-lot charge at op20: fires once.
+    add_bom_charge(&pool, bom_id, 2, 20, "oh_std", 100, "op_arrival").await;
+
+    let wo_id = create_test_wo(&pool, "PHX-FA4-001", "SKU-A", "MAIN", 100).await;
+    add_test_routing(&pool, &wo_id, 10, "MILL").await;
+    add_test_routing(&pool, &wo_id, 20, "FINISH").await;
+
+    let labor = account_id_by_kind_currency(&pool, "labor_applied", Some("USD")).await;
+    let oh = account_id_by_kind_currency(&pool, "oh_applied", Some("USD")).await;
+
+    wo_start(&pool, &wo_id).await;
+
+    // First batch: 60 units arrive. Per_unit labor fires for 60 × 5 = 300.
+    // Per-lot charge fires once at 100.
+    op_move(&pool, &wo_id, 10, 20, 60).await;
+    assert_eq!(balance(&pool, labor).await, -300, "per_unit fires 60 × 5 = 300");
+    assert_eq!(balance(&pool, oh).await, -100, "per_lot fires once at 100");
+
+    // Second batch: 40 units arrive. Per_unit fires for 40 × 5 = 200 more
+    // (cumulative -500). Per-lot does NOT re-fire.
+    op_move(&pool, &wo_id, 10, 20, 40).await;
+    assert_eq!(
+        balance(&pool, labor).await,
+        -500,
+        "per_unit cumulative: 300 + 200 = 500"
+    );
+    assert_eq!(
+        balance(&pool, oh).await,
+        -100,
+        "per_lot stays at -100 (no re-fire)"
+    );
+}
+
+// ============================================================
 // C5a.3 — recursion limit: 17-level chain raises P0032
 // ============================================================
 //
