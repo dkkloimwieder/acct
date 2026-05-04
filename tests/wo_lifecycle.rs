@@ -864,43 +864,6 @@ async fn wo_already_started_raises_p0026() {
 }
 
 #[tokio::test]
-async fn parent_wac_periodic_multi_op_raises_p0026() {
-    // wac_periodic / wac_retroactive parents accept single-op routings
-    // (acct-bol tier 1); multi-op routings raise P0026 pending the
-    // topological per-pool close hook recompute (acct-smn tier 2 /
-    // acct-rso tier 3).
-    let pool = connect_test_db().await;
-    reset_to_fixture(&pool).await;
-    let parent = fresh_sku(&pool, "WO-WACP", "wac_periodic").await;
-    set_std_cost(&pool, &parent, 67).await;
-    let fg_loc = fresh_location(&pool, "WO-FG").await;
-    open_account(
-        &pool, "stock_wip", "qty", None, Some(&parent), None, Some(10), "debit",
-    )
-    .await;
-    open_account(
-        &pool, "stock_wip", "qty", None, Some(&parent), None, Some(20), "debit",
-    )
-    .await;
-    open_account(
-        &pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(10), "debit",
-    )
-    .await;
-    open_account(
-        &pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(20), "debit",
-    )
-    .await;
-    let wo_id = create_wo(&pool, "WO-WACP1", &parent, &fg_loc, 10, "USD").await;
-    add_routing(&pool, &wo_id, 10, "MILL").await;
-    add_routing(&pool, &wo_id, 20, "FINISH").await;
-    expect_sqlstate(
-        "P0026",
-        || async { call_wo_start(&pool, &wo_id, &fresh_uuid(&pool).await).await.map(|_| ()) },
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn missing_routing_raises_p0026() {
     // routing-empty check fires before BOM resolution; no bom_header
     // needed.

@@ -206,29 +206,32 @@ async fn check_rejects_zero_variance_with_transfer_id() {
 }
 
 #[tokio::test]
-async fn check_rejects_nonzero_variance_without_transfer_id() {
+async fn finalized_nonzero_variance_without_transfer_id_is_allowed() {
+    // Tier 2 (acct-smn, mig 0065): the close hook's internal-chain
+    // op_move_v finalization records a non-zero variance_amount with
+    // variance_transfer_id NULL — the cost shift propagates via the
+    // topological cache, no audit transfer is posted. The CHECK was
+    // relaxed to permit this. Zero-variance + non-NULL transfer_id and
+    // finalized + NULL variance are still rejected (verified by
+    // siblings above).
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
     let pid = period_id(&pool, "2026-04").await;
     let tid = post_one_transfer(&pool, 5).await;
 
-    // A non-zero variance must point at the transfer that posted it.
-    expect_sqlstate("23514", || async {
-        sqlx::query(
-            "INSERT INTO transfers_provisional
-                (transfer_id, period_id, cost_method,
-                 finalized_at, variance_amount, variance_transfer_id)
-             VALUES ($1, $2, 'wac_periodic',
-                     clock_timestamp(), 500, NULL)",
-        )
-        .bind(tid)
-        .bind(pid)
-        .execute(&pool)
-        .await
-        .map(|_| ())
-    })
-    .await;
+    sqlx::query(
+        "INSERT INTO transfers_provisional
+            (transfer_id, period_id, cost_method,
+             finalized_at, variance_amount, variance_transfer_id)
+         VALUES ($1, $2, 'wac_periodic',
+                 clock_timestamp(), 500, NULL)",
+    )
+    .bind(tid)
+    .bind(pid)
+    .execute(&pool)
+    .await
+    .expect("non-zero variance with NULL transfer_id is allowed post-tier-2");
 }
 
 #[tokio::test]

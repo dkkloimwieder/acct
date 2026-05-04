@@ -232,6 +232,7 @@ struct SingleOpWo {
     wip_qty_op10: i64,
     wip_val_op10: i64,
     fg_val_acct: i64,
+    #[allow(dead_code)]
     parent_id: String,
 }
 
@@ -517,29 +518,6 @@ async fn wac_periodic_scrap_finalized() {
     .await
     .expect("variances");
     assert_eq!(variances, vec![0, 0], "no drift");
-}
-
-/// Multi-op routing on wac_periodic parent must raise P0026 with hint to acct-smn.
-#[tokio::test(flavor = "multi_thread")]
-async fn wac_periodic_multi_op_routing_raises_p0026() {
-    let pool = connect_test_db().await;
-    reset_to_fixture(&pool).await;
-
-    let parent = fresh_sku(&pool, "WACPER-MO", "wac_periodic").await;
-    let fg_loc = fresh_location(&pool, "WACPER-MO-FG").await;
-    let _w1 = open_account(&pool, "stock_wip", "qty", None, Some(&parent), None, Some(10), "debit").await;
-    let _w2 = open_account(&pool, "stock_wip", "qty", None, Some(&parent), None, Some(20), "debit").await;
-    let _v1 = open_account(&pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(10), "debit").await;
-    let _v2 = open_account(&pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(20), "debit").await;
-    let wo_id = create_wo(&pool, "WACPER-MO-WO", &parent, &fg_loc, 10).await;
-    add_routing(&pool, &wo_id, 10, "MILL").await;
-    add_routing(&pool, &wo_id, 20, "FINISH").await;
-
-    expect_sqlstate(
-        "P0026",
-        || async { call_wo_start(&pool, &wo_id, &fresh_uuid(&pool).await).await.map(|_| ()) },
-    )
-    .await;
 }
 
 /// Partial wo_complete on wac_periodic: two wo_complete_v events flagged,
