@@ -864,12 +864,12 @@ async fn wo_already_started_raises_p0026() {
 }
 
 #[tokio::test]
-async fn parent_not_standard_raises_p0026() {
-    // cost_method check fires before BOM resolution; no bom_header
-    // needed for this gate to trip.
+async fn parent_wac_periodic_raises_p0026() {
+    // wac_perpetual is now accepted (acct-wig); wac_periodic /
+    // wac_retroactive still gate at P0026 pending acct-8in.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
-    let parent = fresh_sku(&pool, "WO-WAC", "wac_perpetual").await;
+    let parent = fresh_sku(&pool, "WO-WACP", "wac_periodic").await;
     set_std_cost(&pool, &parent, 67).await;
     let fg_loc = fresh_location(&pool, "WO-FG").await;
     open_account(
@@ -880,7 +880,7 @@ async fn parent_not_standard_raises_p0026() {
         &pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(10), "debit",
     )
     .await;
-    let wo_id = create_wo(&pool, "WO-WAC1", &parent, &fg_loc, 10, "USD").await;
+    let wo_id = create_wo(&pool, "WO-WACP1", &parent, &fg_loc, 10, "USD").await;
     add_routing(&pool, &wo_id, 10, "MILL").await;
     expect_sqlstate(
         "P0026",
