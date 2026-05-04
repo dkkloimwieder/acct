@@ -954,106 +954,187 @@ The same Postgres transaction also marks the reservation as allocated (or shippe
 
 ### 3.4 Work order lifecycle
 
-**Slice B (acct-b82, 2026-05-02)** introduces the document layer for WOs. Schema: `work_orders` (header), `wo_routings` (per-WO ops, no shared template table at MVP), `wo_routing_burdens(wo_id, routing_op, applied_account_kind, std_amount)` (per-op standard absorption rates by burden type), `boms(parent_sku_id, component_sku_id, qty_per_parent, component_loc_id)`. The four document-layer functions are `post_wo_start`, `post_op_move`, `post_wo_complete`, `post_scrap`. MVP restriction: WO parent_sku.cost_method = `standard` (P0006 otherwise; lifted under acct-p7v).
+**Slice B (acct-b82, 2026-05-02)** introduced the document layer for WOs. The **BOM2 refactor** (acct-jg2, 2026-05-03, migrations 0040–0062) replaced Slice B's flat `boms` + `wo_routing_burdens` schema with a header/lines model, runtime-configurable absorption taxonomy, alternates, time-phased revisions, phantom expansion, fire_at scrap-aware semantics, co-product output distribution, and dual-mode yield. The five document-layer functions are `post_wo_start`, `post_op_move`, `post_wo_complete`, `post_scrap`, `post_wo_close_unproduced`, plus the workflow function `post_eco_approve`. MVP restriction stays: WO parent_sku.cost_method = `standard` (P0006 otherwise; lifted under acct-p7v).
 
-**Cost rollup model.** A WO's standard cost is:
+**BOM2 schema (replaces flat `boms` + `wo_routing_burdens`):**
+
+- `bom_headers(id, parent_sku_id, alternate_no, revision_no, code, description, status, is_primary, effective_at, obsolete_at, eco_id, created_at)` — the BOM-as-a-thing. status ∈ {draft, active, obsolete}. UNIQUE on `(parent_sku_id, alternate_no, revision_no)`. Partial UNIQUE INDEX `bom_headers_primary` enforces "one primary per (parent_sku, alternate_no) at any time" while status='active'. CHECK on `effective_at < obsolete_at`. Time-phased revisions selected via `effective_at`/`obsolete_at` window.
+- `bom_lines(bom_id, line_no, kind, basis, applies_at_op, fire_at, scrap_pct, component_sku_id, component_loc_id, qty_per_parent, absorption_class_id, std_amount)` — BOM contents. `kind` ∈ {`item`, `service`, `charge`}; `basis` ∈ {`per_unit`, `per_lot`}; `fire_at` ∈ {`wo_start`, `op_arrival`}. Items have component refs; services and charges have absorption_class + std_amount. Cross-table self-reference (component = parent) is caught by a row-level trigger raising **P0034** `bom_line_self_reference`.
+- `absorption_classes(id, code, display_name, applied_account_kind, expense_account_kind, ...)` — runtime burden taxonomy. Seed declares `labor_std → labor_applied` and `oh_std → oh_applied`. New classes (`osp_plating`, `production_setup`, `energy_hv`, …) are plain `INSERT`s — **no `ALTER TYPE` needed**. Classes targeting `applied_account_kind='absorption_pool'` ride generic reasons `burden_apply` (per_unit) / `lot_charge_apply` (per_lot); canonical `labor_applied` / `oh_applied` keep their canonical reasons regardless of basis.
+- `engineering_change_orders(id, code, status, requested_by, requested_at, approved_by, approved_at, effective_at, rejected_reason)` — ECO workflow. Composite CHECK enforces `approved` requires `approved_by + approved_at + effective_at`; `rejected` requires `rejected_reason`.
+- `wo_outputs(wo_id, output_no, output_sku_id, fg_location_id, qty, allocation_method, allocation_pct)` — co-product / by-product table. `allocation_method` ∈ {`primary`, `sales_value`, `fixed_ratio`, `market_price`}.
+- `work_orders.bom_id BIGINT REFERENCES bom_headers(id)` — optional pin. NULL falls back to primary active at business_date via `_wo_resolve_bom_for`.
+- `skus.yield_mode TEXT NOT NULL DEFAULT 'plan_only'` ∈ {`plan_only`, `absorbed`} — caller intent for the future BOM rollup tool. Pool flow is **literal** in both modes; `yield_mode` only affects rollup output (whether scrap_pct inflates parent_std).
+- `skus.default_lot_size BIGINT NOT NULL DEFAULT 1` — divisor for amortizing per-lot charges into per-unit standard cost.
+- `skus.is_phantom BOOLEAN NOT NULL DEFAULT FALSE` — phantom assemblies expand recursively at WO_start (16-level cap; **P0032** on cycle/depth).
+- `skus.consumption_policy TEXT NOT NULL DEFAULT 'forward'` ∈ {`forward`, `backflush_at_op`, `backflush_at_complete`} — only `forward` is dispatched today; the others raise **P0035** at WO start (BEFORE INSERT trigger on `wo_events`).
+
+**Cost rollup model (BOM2).**
 
 ```
-parent_std_cost = Σ (bom.qty_per_parent × component_std_cost)        (RM)
-                + Σ_op Σ_kind wo_routing_burdens.std_amount          (per-op burdens)
+parent_std_cost = Σ (item lines: qty_per_parent × component_std_cost)
+                + Σ (per_unit service lines: std_amount)
+                + Σ (per_lot lines: std_amount / parent.default_lot_size)
 ```
 
-**BOM components and per-op burdens are the same idea** — both are per-unit costs that apply to a unit as it moves through the routing. They differ only in *what* they substantively are (RM vs absorption: labor / OH / outside-processing / setup / tooling / energy / ...) and *when* they apply (RM at WO start; burdens at the op they're declared on). Burden rows credit `<applied_account_kind>(currency)` accounts (which are absorption accounts, e.g. `labor_applied`, `oh_applied`); reconciliation between absorbed and actual (vendor bill, payroll, allocation) is separate variance work.
+The rollup is a future tool; today the standard is set caller-side via `post_standard_cost_roll`. With `skus.yield_mode='absorbed'` the rollup tool inflates per-line item contributions by `1/(1 − scrap_pct/100)`. With `plan_only` (default) `scrap_pct` is ignored at rollup; actual scrap surfaces as variance at `wo_close_v`.
 
-**Open extension via `applied_account_kind`.** MVP supports `labor_applied` and `oh_applied`. New burden types (`outside_processing_applied`, `setup_applied`, `tooling_applied`, energy, …) are added by:
-1. `ALTER TYPE account_kind ADD VALUE '<X>_applied'`
-2. `ALTER TYPE transfer_reason ADD VALUE '<X>_apply'`
-3. Extending the `_wo_apply_reason_for(account_kind)` mapping in the WO functions
-4. Scaffolding the per-currency `<X>_applied` account
+**Item lines vs services vs charges.** All three are "per-unit costs that apply as a unit moves through the routing." They differ only in *what* they substantively are and *when* they apply:
+- **items**: physical BOM components. `kind='item', basis='per_unit', fire_at='op_arrival'` (CHECK-enforced — items can only be per_unit op_arrival). Fire **once per lifecycle** at the first arrival of `applies_at_op` (which is `wo_start` if applies_at_op = first_op).
+- **services**: per-unit absorption (labor, machine-hours). `basis ∈ {per_unit, per_lot}`. Per-unit services fire on **every arrival** of their `applies_at_op` — per-pass labor model. Per-lot services fire once on first arrival.
+- **charges**: per-lot fixed amounts (setup, freight). CHECK enforces `kind='charge' AND basis='per_lot'`. fire_at='wo_start' fires upfront; fire_at='op_arrival' fires once on first arrival of applies_at_op.
 
-The `wo_routing_burdens` table itself does not change.
+**Resolver and helpers.**
+
+- `bom_header_at(parent_sku_id, alternate_no, business_date) → bom_headers` — single-row resolver. **P0033** (`bom_header_resolution_invalid`) on zero or multiple matches.
+- `_wo_resolve_bom_for(wo_id, business_date) → bom_headers` — uses `work_orders.bom_id` if set; else `bom_header_at(parent, 1, business_date)`.
+- `_wo_explode_bom(bom_id, business_date) → TABLE(...)` — recursive phantom expansion. Cap 16; **P0032** on cycle or depth.
+- `_wo_emit_bom_lines(wo_id, bom_id, routing_op, qty, filter JSONB, event_id, business_date, posted_by) → JSONB` — generic event-batch builder. `filter` selects by `{kind, basis, fire_at, applies_at_op}` subset. Emission is **literal** — `bom_lines.scrap_pct` is planning metadata only.
+- `_wo_apply_reason_for(class_id, basis) → transfer_reason` — `labor_applied → labor_apply`, `oh_applied → oh_apply`, `absorption_pool + per_unit → burden_apply`, `absorption_pool + per_lot → lot_charge_apply`. Anything else raises **P0026**.
 
 **WO start (releases the WO; charges WIP@first_op):**
 
+`post_wo_start` resolves the BOM via `_wo_resolve_bom_for`, validates every `bom_lines.applies_at_op` (post phantom explosion) appears in `wo_routings` (**P0028** otherwise), auto-initializes a default `wo_outputs` row when empty (single primary, qty=qty_target, fg_location=work_orders.fg_location_id, allocation_pct=100), then emits two filtered batches via `_wo_emit_bom_lines`.
+
 ```
 events (post_wo_start):
-  - reason='wo_start', routing_op=first_op
+  -- qty leg
+  - reason='wo_start'
     debit:  accounts(stock_wip, parent_sku, first_op).id
     credit: accounts(creation_void).id
     amount: qty_target
 
-  for each (component_sku, qty_per_parent, component_loc) in boms(parent_sku):
-    - reason='rm_issue_to_wo'
-      debit:  accounts(stock_consumed, component_sku).id
-      credit: accounts(stock_available, component_sku, component_loc).id
-      amount: qty_target * qty_per_parent
-    - reason='rm_issue_to_wo'
-      debit:  accounts(inv_value_wip, parent_sku, first_op, currency).id
-      credit: accounts(inv_value_raw, component_sku, component_loc, currency).id
-      amount: qty_target * qty_per_parent * resolve_standard_cost_at(component_sku, business_date)
+  -- All fire_at='wo_start' lines (any applies_at_op), charging WIP@first_op:
+  filter = { fire_at: 'wo_start' }
 
-  for each (applied_account_kind, std_amount) in wo_routing_burdens(wo_id, first_op):
-    - reason=_wo_apply_reason_for(applied_account_kind)  -- e.g. labor_apply, oh_apply
-      debit:  accounts(inv_value_wip, parent_sku, first_op, currency).id
-      credit: accounts(applied_account_kind, currency).id
-      amount: qty_target * std_amount
+    item line: rm_issue_to_wo qty + value pair (component → WIP@first_op)
+    service per_unit: amount = qty_target × std_amount, charging WIP@first_op
+    service per_lot:  amount =          std_amount, charging WIP@first_op
+    charge  per_lot:  amount =          std_amount, charging WIP@first_op
+                      (applied_account → WIP@first_op via _wo_apply_reason_for)
+
+  -- fire_at='op_arrival' lines at first_op (item lines at applies_at_op=first_op
+  -- fire here for the first time):
+  filter = { fire_at: 'op_arrival', applies_at_op: first_op }
+    same emission rules
 ```
 
-After `post_wo_start`, `WIP@first_op = qty_target × std_cum_at_first_op` (RM + first-op burdens).
+After `post_wo_start`, `WIP@first_op = qty_target × std_cum_at_first_op`.
 
 **Op move (from_op → to_op):**
 
-The value-leg amount equals `qty × std_cum_at_from_op` (RM + sum of burdens for ops ≤ from_op) — i.e. all the cost a unit accumulated by the time it arrived at `from_op`. After the move, the destination op's burdens are applied against the moved qty.
+`post_op_move` computes `std_cum_at_from_op` from `bom_lines` (LITERAL — scrap_pct is planning metadata only):
 
-The dispatcher's standard branch returns `qty × parent_std_cost` (resolved at SKU level), which is correct only at the last op. For intermediate ops `post_op_move` computes the value externally and passes it via reason `op_move_v` (NOT in the dispatcher's cost-event list). Mirrors the `scrap` / `scrap_v` qty-leg / value-leg split.
+```
+v_per_unit_cum = Σ (item.qty_per_parent × comp_std)
+               + Σ (service.std_amount where basis='per_unit')
+                 for applies_at_op ≤ from_op
+
+v_per_lot_cum = Σ (line.std_amount) / default_lot_size
+                for per_lot lines that have fired by now
+                (fire_at='wo_start' OR (fire_at='op_arrival' AND applies_at_op ≤ from_op))
+
+std_cum_at_from = v_per_unit_cum + v_per_lot_cum
+value_amount    = qty × std_cum_at_from
+```
+
+Reason `op_move_v` (NOT in the dispatcher's cost-event list) ensures the caller-supplied value-leg amount stands. The dispatcher's standard branch would return `qty × parent_std` which is correct only at last_op.
 
 ```
 events (post_op_move(wo_id, from_op, to_op, qty)):
   - reason='op_move'
-    debit:  accounts(stock_wip, parent_sku, to_op).id
-    credit: accounts(stock_wip, parent_sku, from_op).id
+    debit:  stock_wip(parent, to_op)
+    credit: stock_wip(parent, from_op)
     amount: qty
-  - reason='op_move_v'                                        -- value leg
-    debit:  accounts(inv_value_wip, parent_sku, to_op, currency).id
-    credit: accounts(inv_value_wip, parent_sku, from_op, currency).id
-    amount: qty * std_cum_at_from_op
-                where std_cum_at_from_op
-                  = Σ (bom.qty_per_parent × resolve_standard_cost_at(comp, business_date))
-                  + Σ wo_routing_burdens.std_amount  for ops ≤ from_op
+  - reason='op_move_v'
+    debit:  inv_value_wip(parent, to_op, ccy)
+    credit: inv_value_wip(parent, from_op, ccy)
+    amount: qty × std_cum_at_from
 
-  for each (applied_account_kind, std_amount) in wo_routing_burdens(wo_id, to_op):
-    - reason=_wo_apply_reason_for(applied_account_kind)
-      debit:  accounts(inv_value_wip, parent_sku, to_op, currency).id
-      credit: accounts(applied_account_kind, currency).id
-      amount: qty * std_amount
+  -- to_op emit. First-arrival detection via wo_events history.
+  IF first_arrival (no prior event landed at to_op):
+    filter = { fire_at: 'op_arrival', applies_at_op: to_op }
+       — all per_unit + per_lot lines at to_op fire (item lines first time;
+         per_lot first time)
+  ELSE (subsequent arrival, e.g. rework op_to < op_from):
+    filter = { fire_at: 'op_arrival', applies_at_op: to_op,
+               basis: 'per_unit', kind: 'service' }
+       — per_unit *services only*. Items DO NOT re-fire (would double-issue raw
+         inventory on rework; acct-jtt fix in mig 0062). Per_lot already fired.
 ```
 
-After `post_op_move`, `WIP@to_op` grew by `qty × std_cum_at_to_op`. Rework moves (to_op < from_op) are allowed and re-apply the destination op's burdens — realistic ERP rework semantics.
+Rework moves (to_op < from_op) re-apply destination per_unit services — realistic ERP rework labor semantics.
 
-**WO complete (last op → FG; residual variance at close):**
+**WO complete (per-output drain; pre-balance + residual sweep at final close):**
 
-At the last op, `std_cum_at_last_op == parent_std_cost`, so the dispatcher's standard branch returns the right number for the value-leg. Reason stays `wo_complete` (in the dispatcher cost-event list).
+`post_wo_complete` validates `wo_outputs.allocation_pct` sums to 100 (**P0033** otherwise) and reads pool@last_op `FOR UPDATE`. Two structural moves were added vs Slice B:
+
+1. **Pre-balance step at v_will_close** (mig 0061, acct-6jq) — emits a `wo_close_v` BEFORE the per-output drain to align pool with `parent_std × qty`. Favorable case (pool < drain) is now reachable under standard cost-on-WIP without hitting the debit-normal CHECK; previously the drain over-credited `inv_value_wip` and 23514'd. Unfavorable case (pool > drain) is also unified here.
+2. **Per-output drain via `wo_complete_v`** — bypasses dispatcher pricing (which would return `qty × parent_std` for the parent SKU's `inv_value_fg`, wrong for co-product splits). Caller-computed share stands.
 
 ```
 events (post_wo_complete(wo_id, qty)):
-  - reason='wo_complete'
-    debit:  accounts(stock_available, parent_sku, fg_loc).id
-    credit: accounts(stock_wip, parent_sku, last_op).id
-    amount: qty
-  - reason='wo_complete'                                       -- dispatcher-priced
-    debit:  accounts(inv_value_fg, parent_sku, fg_loc, currency).id
-    credit: accounts(inv_value_wip, parent_sku, last_op, currency).id
-    amount: qty * resolve_standard_cost_at(parent_sku, business_date)
+  v_total_drain = qty × parent_std_cost
+  v_will_close  = (qty_completed + qty_scrapped + qty == qty_target)
 
-  -- only on final completion (qty_completed + qty_scrapped reaches qty_target),
-  -- if WIP@last_op holds nonzero residual (read FOR UPDATE):
-  - reason='wo_close_v'
-    debit:  accounts(variance_wo_close, currency).id  (or flip when favorable)
-    credit: accounts(inv_value_wip, parent_sku, last_op, currency).id
-    amount: |residual|
+  -- 1. Pre-balance at FINAL close
+  IF v_will_close THEN
+    v_prebalance = v_total_drain - pool_at_last_op
+    IF v_prebalance > 0:  -- favorable; inflate pool to drain target
+      reason='wo_close_v'
+      debit:  inv_value_wip(parent, last_op, ccy)
+      credit: variance_wo_close(ccy)
+      amount: v_prebalance
+    ELIF v_prebalance < 0:  -- unfavorable; deflate pool to drain target
+      reason='wo_close_v'
+      debit:  variance_wo_close(ccy)
+      credit: inv_value_wip(parent, last_op, ccy)
+      amount: |v_prebalance|
+
+  -- 2. Per-output drain (sum of v_q_share = qty; sum of v_v_share = v_total_drain)
+  FOR EACH wo_outputs ORDER BY output_no:
+    v_q_share = qty * (output.qty / wo.qty_target)  [last row absorbs rounding]
+    v_v_share = v_total_drain * (allocation_pct / 100)  [last row absorbs rounding]
+
+    reason='wo_complete'  (qty leg)
+      debit:  stock_available(output_sku, fg_loc)
+      credit: stock_wip(parent, last_op)
+      amount: v_q_share
+
+    reason='wo_complete_v'  (value leg; bypasses dispatcher)
+      debit:  inv_value_fg(output_sku, fg_loc, ccy)
+      credit: inv_value_wip(parent, last_op, ccy)
+      amount: v_v_share
+
+  -- 3. Final close residual sweep (catches non-last-op residue, e.g. op_move
+  --    integer truncation)
+  IF v_will_close THEN
+    FOR EACH inv_value_wip(parent, op, ccy) FOR UPDATE:
+      IF (debits - credits) ≠ 0:
+        wo_close_v event in the appropriate direction
+    UPDATE work_orders SET status='closed'
 ```
 
-Per-op MUV/LV/OHV (operation-level variance grain) is deferred — the residual at WO close is the only variance the MVP surfaces. (Slice B Q3 lean.)
+Per-op MUV/LV/OHV (operation-level variance grain) is still Phase 2; the pre-balance + residual sweep is the only variance grain MVP surfaces. `variance_muv` / `variance_lv` / `variance_ohv` enum values exist on `account_kind` for forward compatibility.
+
+**Co-products and by-products via `wo_outputs`.** A WO with no `wo_outputs` rows behaves as single-output (post_wo_start auto-init). With multiple rows, the FG drain distributes by `allocation_method`:
+- `primary` (default for auto-init): one output gets allocation_pct=100, others ride along at zero value (true by-products)
+- `sales_value`: caller-supplied split = relative selling-price share (sum to 100; **P0033** otherwise)
+- `fixed_ratio`: caller-declared split (sum to 100)
+- `market_price`: market_price table — Phase 2 (column reserved)
+
+NRV credit-back / negligible / disposal-cost treatments for by-products are Phase 2 (acct-7t4).
+
+**Partial-scrap-with-per-lot-charges semantics:**
+1. **Per-lot charge fired before partial scrap**: in the WIP pool at amortized rate; scrap takes its share at accumulated unit cost (which includes the charge); survivors carry forward at the same accumulated unit cost. Charge is fully expensed, no refund or pro-ration.
+2. **Per-lot charge with fire_at='op_arrival' for an op the WO never reaches**: never fires (scrap-aware safety).
+3. **Per-lot charge with fire_at='wo_start'**: already fired regardless of completion outcome (sunk; absorbs via scrap or wo_close_v).
+
+**Abandoned WO (fully scrapped, no completion):** `post_wo_close_unproduced(p_wo_id, ...)` validates `qty_completed = 0 AND qty_scrapped = qty_target` (**P0034** otherwise), absorbs all `inv_value_wip(parent, op)` residuals into `variance_wo_close`, sets status `closed`.
+
+**ECO workflow.** `post_eco_approve(p_eco_id, ...)` flips `engineering_change_orders.status` from draft → approved, populates the `bom_headers` tied to the ECO with `effective_at`, optionally obsoletes predecessor revisions. **P0031** on invalid state. Broader review/approval workflow is `acct-ECO-WORKFLOW` (acct-ir7).
+
+**Open extension.** New burden types (osp_plating, production_setup, energy_hv, …) are added at runtime via `INSERT INTO absorption_classes` + scaffolding the per-currency `absorption_pool` account. No `ALTER TYPE` needed — classes targeting `applied_account_kind='absorption_pool'` ride generic `burden_apply` / `lot_charge_apply` reasons.
 
 ### 3.5 Scrap at operation
 
