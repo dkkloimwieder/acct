@@ -409,23 +409,27 @@ async fn wac_retroactive_three_op_clean() {
     assert_eq!(balance(&pool, var_wacr).await, 0);
 }
 
-/// Mixed cost methods: standard parent + wac_retroactive component → P0026.
+/// Standard parent + wac_retroactive component (acct-7eo, mig 0077).
+/// rm_issue posts at running avg; close hook detects mixed shape and
+/// posts single-leg variance through variance_material_mixed against
+/// the component pool. Drift created by backdating a later receipt.
 #[tokio::test(flavor = "multi_thread")]
-async fn standard_parent_wac_retroactive_component_raises_p0026() {
+async fn standard_parent_wac_retroactive_component_routes_mixed_variance() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
     let parent = fresh_sku(&pool, "WACR-MIX-S", "standard").await;
-    set_std_cost(&pool, &parent, 100).await;
+    set_std_cost(&pool, &parent, 10).await;
     let fg_loc = fresh_location(&pool, "WACR-MIX-S-FG").await;
     let raw_loc = fresh_location(&pool, "WACR-MIX-S-RAW").await;
     let _q = open_account(&pool, "stock_wip", "qty", None, Some(&parent), None, Some(10), "debit").await;
-    let _v = open_account(&pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(10), "debit").await;
+    let wip10 = open_account(&pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(10), "debit").await;
     let _fq = open_account(&pool, "stock_available", "qty", None, Some(&parent), Some(&fg_loc), None, "debit").await;
-    let _fv = open_account(&pool, "inv_value_fg", "value", Some("USD"), Some(&parent), Some(&fg_loc), None, "debit").await;
+    let fg_v = open_account(&pool, "inv_value_fg", "value", Some("USD"), Some(&parent), Some(&fg_loc), None, "debit").await;
 
     let (comp, raw_qty, raw_val) = build_component(&pool, "WACR-MIX-S-C", "wac_retroactive", &raw_loc, 0).await;
-    pre_load_raw(&pool, raw_qty, raw_val, 100, 2000).await;
+    // First receipt 100 @ $5 (bd 2026-04-15 — the pre_load_raw default).
+    pre_load_raw(&pool, raw_qty, raw_val, 100, 500).await;
 
     let bom = create_bom_header(&pool, &parent).await;
     add_bom_item(&pool, bom, 1, 10, &comp, &raw_loc, 2).await;
@@ -433,15 +437,62 @@ async fn standard_parent_wac_retroactive_component_raises_p0026() {
     let wo = create_wo(&pool, "WACR-MIX-S-WO", &parent, &fg_loc, 10).await;
     add_routing(&pool, &wo, 10, "MILL").await;
 
-    expect_sqlstate(
-        "P0026",
-        || async { call_wo_start(&pool, &wo, &fresh_uuid(&pool).await, "2026-04-20").await.map(|_| ()) },
-    ).await;
+    // rm_issue at issue-time avg $5. WIP +$100, raw -$100 (qty 20).
+    call_wo_start(&pool, &wo, &fresh_uuid(&pool).await, "2026-04-20").await.unwrap();
+    assert_eq!(balance(&pool, wip10).await, 100);
+
+    // Backdated receipt @ bd 2026-04-10 (BEFORE issue bd). Posts now,
+    // but chronological replay puts it before the rm_issue. 100 @ $7.
+    let posted_by = fresh_uuid(&pool).await;
+    let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let void_val = account_id_by_kind_currency(&pool, "creation_void", Some("USD")).await;
+    let doc_id = fresh_uuid(&pool).await;
+    let events = json!([
+        { "reason": "cycle_count_adj", "document_kind": "seed", "document_id": doc_id,
+          "debit_account_id": raw_qty, "credit_account_id": void_qty,
+          "amount": 100, "qty": 100, "business_date": "2026-04-10",
+          "idempotency_key": fresh_uuid(&pool).await, "posted_by": posted_by },
+        { "reason": "cycle_count_adj", "document_kind": "seed", "document_id": doc_id,
+          "debit_account_id": raw_val, "credit_account_id": void_val,
+          "amount": 700, "qty": 100, "business_date": "2026-04-10",
+          "idempotency_key": fresh_uuid(&pool).await, "posted_by": posted_by },
+    ]);
+    sqlx::query("SELECT post_transfers($1, FALSE)")
+        .bind(events)
+        .execute(&pool).await.unwrap();
+
+    // wo_complete drains WIP at parent_std=$10 → FG +$100. WIP=0.
+    call_wo_complete(&pool, &wo, 10, &fresh_uuid(&pool).await, "2026-04-20").await.unwrap();
+    assert_eq!(balance(&pool, wip10).await, 0);
+    assert_eq!(balance(&pool, fg_v).await, 100);
+
+    // Close period. Chronological replay: receipt1 ($5, bd 04-15) +
+    // receipt2 ($7, bd 04-10) → at rm_issue's bd 04-20, running avg
+    // = (500+700)/200 = $6. Recomputed = $6 × 20 = $120. Variance = $20.
+    // Mixed-case routing: dr variance_material_mixed $20, cr raw_v $20.
+    let pid = period_id(&pool, "2026-04").await;
+    let var_mix = account_id_by_kind_currency(&pool, "variance_material_mixed", Some("USD")).await;
+    let var_wacr = account_id_by_kind_currency(&pool, "variance_wac_retroactive", Some("USD")).await;
+    let pre_var_mix = balance(&pool, var_mix).await;
+    let pre_var_wacr = balance(&pool, var_wacr).await;
+    let pre_wip = balance(&pool, wip10).await;
+
+    let _ = close_period(&pool, pid).await;
+
+    assert_eq!(balance(&pool, var_mix).await - pre_var_mix, 20,
+               "mixed-case wac_retroactive variance posted to variance_material_mixed");
+    assert_eq!(balance(&pool, var_wacr).await - pre_var_wacr, 0,
+               "variance_wac_retroactive untouched for mixed case");
+    assert_eq!(balance(&pool, wip10).await, pre_wip,
+               "destination WIP untouched");
+
+    common::assert_invariants_hold(&pool, "mixed_retroactive_std_parent").await;
 }
 
-/// Mixed cost methods: wac_perpetual parent + wac_retroactive component → P0026.
+/// wac_perpetual parent + wac_retroactive component (acct-7eo). Same
+/// routing: variance lands on variance_material_mixed at close.
 #[tokio::test(flavor = "multi_thread")]
-async fn wac_perpetual_parent_wac_retroactive_component_raises_p0026() {
+async fn wac_perpetual_parent_wac_retroactive_component_routes_mixed_variance() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
@@ -449,12 +500,12 @@ async fn wac_perpetual_parent_wac_retroactive_component_raises_p0026() {
     let fg_loc = fresh_location(&pool, "WACR-MIX-P-FG").await;
     let raw_loc = fresh_location(&pool, "WACR-MIX-P-RAW").await;
     let _q = open_account(&pool, "stock_wip", "qty", None, Some(&parent), None, Some(10), "debit").await;
-    let _v = open_account(&pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(10), "debit").await;
+    let wip10 = open_account(&pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(10), "debit").await;
     let _fq = open_account(&pool, "stock_available", "qty", None, Some(&parent), Some(&fg_loc), None, "debit").await;
-    let _fv = open_account(&pool, "inv_value_fg", "value", Some("USD"), Some(&parent), Some(&fg_loc), None, "debit").await;
+    let fg_v = open_account(&pool, "inv_value_fg", "value", Some("USD"), Some(&parent), Some(&fg_loc), None, "debit").await;
 
     let (comp, raw_qty, raw_val) = build_component(&pool, "WACR-MIX-P-C", "wac_retroactive", &raw_loc, 0).await;
-    pre_load_raw(&pool, raw_qty, raw_val, 100, 2000).await;
+    pre_load_raw(&pool, raw_qty, raw_val, 100, 500).await;
 
     let bom = create_bom_header(&pool, &parent).await;
     add_bom_item(&pool, bom, 1, 10, &comp, &raw_loc, 2).await;
@@ -462,10 +513,43 @@ async fn wac_perpetual_parent_wac_retroactive_component_raises_p0026() {
     let wo = create_wo(&pool, "WACR-MIX-P-WO", &parent, &fg_loc, 10).await;
     add_routing(&pool, &wo, 10, "MILL").await;
 
-    expect_sqlstate(
-        "P0026",
-        || async { call_wo_start(&pool, &wo, &fresh_uuid(&pool).await, "2026-04-20").await.map(|_| ()) },
-    ).await;
+    call_wo_start(&pool, &wo, &fresh_uuid(&pool).await, "2026-04-20").await.unwrap();
+    assert_eq!(balance(&pool, wip10).await, 100);
+
+    // Backdated drift receipt.
+    let posted_by = fresh_uuid(&pool).await;
+    let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let void_val = account_id_by_kind_currency(&pool, "creation_void", Some("USD")).await;
+    let doc_id = fresh_uuid(&pool).await;
+    let events = json!([
+        { "reason": "cycle_count_adj", "document_kind": "seed", "document_id": doc_id,
+          "debit_account_id": raw_qty, "credit_account_id": void_qty,
+          "amount": 100, "qty": 100, "business_date": "2026-04-10",
+          "idempotency_key": fresh_uuid(&pool).await, "posted_by": posted_by },
+        { "reason": "cycle_count_adj", "document_kind": "seed", "document_id": doc_id,
+          "debit_account_id": raw_val, "credit_account_id": void_val,
+          "amount": 700, "qty": 100, "business_date": "2026-04-10",
+          "idempotency_key": fresh_uuid(&pool).await, "posted_by": posted_by },
+    ]);
+    sqlx::query("SELECT post_transfers($1, FALSE)")
+        .bind(events)
+        .execute(&pool).await.unwrap();
+
+    // wac_perpetual parent: wo_complete drains WIP at running avg = $100/10 = $10.
+    call_wo_complete(&pool, &wo, 10, &fresh_uuid(&pool).await, "2026-04-20").await.unwrap();
+    assert_eq!(balance(&pool, wip10).await, 0);
+    assert_eq!(balance(&pool, fg_v).await, 100);
+
+    let pid = period_id(&pool, "2026-04").await;
+    let var_mix = account_id_by_kind_currency(&pool, "variance_material_mixed", Some("USD")).await;
+    let pre_var_mix = balance(&pool, var_mix).await;
+
+    let _ = close_period(&pool, pid).await;
+
+    assert_eq!(balance(&pool, var_mix).await - pre_var_mix, 20);
+    assert_eq!(balance(&pool, wip10).await, 0);
+
+    common::assert_invariants_hold(&pool, "mixed_retroactive_wac_perpetual_parent").await;
 }
 
 /// Rework cycle on wac_retroactive parent: op_move(20→10) creates a cycle

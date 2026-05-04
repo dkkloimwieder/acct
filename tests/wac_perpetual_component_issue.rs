@@ -468,9 +468,12 @@ async fn wac_perpetual_empty_component_pool_raises_p0010() {
     .await;
 }
 
-/// wac_periodic component → P0026 deferred to acct-7py (tier 2).
+/// wac_periodic component on a standard parent (acct-7eo, mig 0077).
+/// Smoke test that the formerly-deferred mixed case now succeeds at
+/// rm_issue time. Full mixed-case variance routing is verified by
+/// tests/wac_periodic_component_issue.rs::standard_parent_with_wac_periodic_component_routes_mixed_variance.
 #[tokio::test]
-async fn wac_periodic_component_raises_p0026() {
+async fn wac_periodic_component_on_standard_parent_succeeds() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
@@ -483,9 +486,6 @@ async fn wac_periodic_component_raises_p0026() {
     let (_, _comp_raw_val) = open_component_raw(&pool, &comp, &raw_loc).await;
     open_parent_wip_fg(&pool, &parent, &fg_loc).await;
 
-    // Seed via direct post_transfers (post_inventory_adjustment for
-    // wac_periodic depletions/seeds works but isn't needed here — we
-    // just need pool to be non-empty so we hit the cost_method dispatch).
     let posted_by = fresh_uuid(&pool).await;
     let key = fresh_uuid(&pool).await;
     let _ = sqlx::query_scalar::<_, String>(
@@ -507,11 +507,8 @@ async fn wac_periodic_component_raises_p0026() {
     let bom_id = create_bom(&pool, &parent).await;
     add_bom_item(&pool, bom_id, 1, 10, &comp, &raw_loc, 2).await;
 
-    expect_sqlstate(
-        "P0026",
-        || async { call_wo_start(&pool, &wo_id).await.map(|_| ()) },
-    )
-    .await;
+    call_wo_start(&pool, &wo_id).await
+        .expect("acct-7eo: mixed wac_periodic component on standard parent now succeeds");
 }
 
 // Suppress unused warning on json import (helper for future extension).

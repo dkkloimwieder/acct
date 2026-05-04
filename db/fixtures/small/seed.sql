@@ -170,6 +170,16 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('variance_cost_adjust_retro',  'value', 'USD', 'unrestricted'),
   ('variance_cost_adjust_retro',  'value', 'EUR', 'unrestricted');
 
+-- Mixed-method material variance (USD + EUR; acct-7eo / mig 0077).
+-- Bidirectional P&L for rm_issue_to_wo where component is wac_periodic
+-- or wac_retroactive but parent is not; close hook posts single-leg
+-- variance through this account at period close. Distinct from
+-- variance_wac_period / variance_wac_retroactive (which carry the
+-- close-time recompute variance for HOMOGENEOUS shapes).
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('variance_material_mixed',     'value', 'USD', 'unrestricted'),
+  ('variance_material_mixed',     'value', 'EUR', 'unrestricted');
+
 -- SKU-A value accounts (USD).
 -- After acct-nfr (migration 0020), value accounts partition by the
 -- same dimensions as their qty-side counterparts:

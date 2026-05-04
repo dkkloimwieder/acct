@@ -606,43 +606,100 @@ async fn three_tier_chain_raw_to_wip10_to_wip20_to_fg() {
     assert_eq!(wc_post, 1, "wo_complete_v posted leaf variance");
 }
 
-/// Mixed parent/component cost methods raise P0026 (deferred to acct-7eo).
-/// Standard parent + wac_periodic component: rm_issue cannot land variance
-/// cleanly on a non-wac-periodic destination WIP. Verify gate fires.
+/// Standard parent + wac_periodic component (acct-7eo, mig 0077). The
+/// rm_issue posts at the component's running avg; close hook detects
+/// the mixed shape (destination WIP's parent is standard, not
+/// wac_periodic) and posts single-leg variance through
+/// variance_material_mixed against the component pool. Destination WIP
+/// is NOT touched — keeps the provisional cost.
 #[tokio::test(flavor = "multi_thread")]
-async fn standard_parent_with_wac_periodic_component_raises_p0026() {
+async fn standard_parent_with_wac_periodic_component_routes_mixed_variance() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
     let parent = fresh_sku(&pool, "P5", "standard").await;
-    set_std_cost(&pool, &parent, 100).await;
+    // parent_std must cover the rm_issue value plus any FG drain.
+    // Component qty/p=2 at $5 avg = $10/parent unit. Set parent_std=$10.
+    set_std_cost(&pool, &parent, 10).await;
     let comp = fresh_sku(&pool, "P5-C", "wac_periodic").await;
     let raw_loc = fresh_location(&pool, "P5-RAW").await;
     let fg_loc = fresh_location(&pool, "P5-FG").await;
 
     let (raw_q, raw_v) = open_component_raw(&pool, &comp, &raw_loc).await;
-    let (_wip_vals, _fg_v) = open_parent_wip_fg(&pool, &parent, &fg_loc, &[10]).await;
-    seed_pool(&pool, raw_q, raw_v, 100, 1000, "2026-04-10").await;
+    let (wip_vals, fg_v) = open_parent_wip_fg(&pool, &parent, &fg_loc, &[10]).await;
+    let wip10 = wip_vals[0];
+    // First receipt: 100 @ $5. Then drift will push final_avg.
+    seed_pool(&pool, raw_q, raw_v, 100, 500, "2026-04-05").await;
 
     let wo = create_wo(&pool, "WO5", &parent, &fg_loc, 10).await;
     add_routing(&pool, &wo, 10, "MILL").await;
     let bom = create_bom_header(&pool, &parent, 1, true).await;
     add_bom_item(&pool, bom, 1, 10, &comp, &raw_loc, 2).await;
 
-    let err = call_wo_start(&pool, &wo, &fresh_uuid(&pool).await).await
-        .expect_err("expected P0026 mixed cost methods");
-    let sqlstate = err.as_database_error().and_then(|e| e.code().map(|c| c.to_string()));
-    assert_eq!(sqlstate, Some("P0026".to_string()),
-               "mixed parent/component cost methods raise P0026, got {err:?}");
-    assert!(format!("{err}").contains("rm_issue_mixed_cost_method"),
-            "error message mentions mixed cost methods: {err}");
+    // rm_issue at running avg $5: dr WIP $100, cr raw $100 (qty=20).
+    // WIP qty=10 (parent units), value=$100.
+    call_wo_start(&pool, &wo, &fresh_uuid(&pool).await).await.unwrap();
+    assert_eq!(balance(&pool, wip10).await, 100, "rm_issue at provisional $5 → WIP $100");
+
+    // Drift the raw pool: another receipt 100 @ $7. Period avg = (500+700)/200 = $6.
+    seed_pool(&pool, raw_q, raw_v, 100, 700, "2026-04-15").await;
+
+    // Complete the WO at parent_std=$10. Drains WIP $100 → FG $100.
+    call_wo_complete(&pool, &wo, 10, &fresh_uuid(&pool).await).await.unwrap();
+    assert_eq!(balance(&pool, wip10).await, 0, "WIP drained at standard parent_std");
+    assert_eq!(balance(&pool, fg_v).await, 100);
+
+    // Close the period. Mixed-case rm_issue: variance = ($6-$5)×20 = $20.
+    // Posted single-leg: dr variance_material_mixed $20, cr raw_v $20.
+    // Destination WIP NOT touched.
+    let pid = period_id(&pool, "2026-04").await;
+    let var_mix = account_id_by_kind_currency(&pool, "variance_material_mixed", Some("USD")).await;
+    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    let pre_var_mix = balance(&pool, var_mix).await;
+    let pre_var_wac = balance(&pool, var_wac).await;
+    let pre_raw_v = balance(&pool, raw_v).await;
+    let pre_wip = balance(&pool, wip10).await;
+
+    let summary = close_period_force(&pool, pid, false).await.expect("close_period");
+    assert_eq!(summary["hook_results"]["wac_periodic"].as_i64(), Some(1));
+
+    // Mixed-case variance lands on variance_material_mixed (single-leg).
+    assert_eq!(balance(&pool, var_mix).await - pre_var_mix, 20,
+               "mixed-case variance posted to variance_material_mixed");
+    // Homogeneous variance_wac_period unchanged.
+    assert_eq!(balance(&pool, var_wac).await - pre_var_wac, 0,
+               "variance_wac_period not touched for mixed case");
+    // Raw component pool credited by variance — depleted to reflect $6 avg.
+    assert_eq!(balance(&pool, raw_v).await - pre_raw_v, -20,
+               "component pool credited by variance");
+    // Destination WIP untouched.
+    assert_eq!(balance(&pool, wip10).await, pre_wip,
+               "destination WIP untouched in mixed-case variance routing");
+
+    // Provisional row finalized with variance_transfer_id NOT NULL (leaf).
+    let (finalized_at, var_amount, var_xfer): (Option<String>, Option<i64>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT finalized_at::text, variance_amount, variance_transfer_id
+               FROM transfers_provisional p
+               JOIN transfers t ON t.id = p.transfer_id
+              WHERE p.cost_method='wac_periodic' AND t.reason='rm_issue_to_wo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(finalized_at.is_some());
+    assert_eq!(var_amount, Some(20));
+    assert!(var_xfer.is_some(), "mixed-case rm_issue posted a leaf variance transfer");
+
+    common::assert_invariants_hold(&pool, "mixed_period_std_parent").await;
 }
 
-/// wac_perpetual parent + wac_periodic component also raises P0026 (same
-/// reason: variance has no clean landing on a non-wac-periodic destination
-/// WIP for retroactive correction).
+/// wac_perpetual parent + wac_periodic component (acct-7eo). Same
+/// mixed-case routing applies: variance lands on variance_material_mixed
+/// at close. wac_perpetual parent's WIP runs at WIP-pool running avg
+/// (not flagged), and the close hook's mixed branch keeps it untouched.
 #[tokio::test(flavor = "multi_thread")]
-async fn wac_perpetual_parent_with_wac_periodic_component_raises_p0026() {
+async fn wac_perpetual_parent_with_wac_periodic_component_routes_mixed_variance() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
@@ -652,18 +709,41 @@ async fn wac_perpetual_parent_with_wac_periodic_component_raises_p0026() {
     let fg_loc = fresh_location(&pool, "P6-FG").await;
 
     let (raw_q, raw_v) = open_component_raw(&pool, &comp, &raw_loc).await;
-    let (_wip_vals, _fg_v) = open_parent_wip_fg(&pool, &parent, &fg_loc, &[10]).await;
-    seed_pool(&pool, raw_q, raw_v, 100, 1000, "2026-04-10").await;
+    let (wip_vals, fg_v) = open_parent_wip_fg(&pool, &parent, &fg_loc, &[10]).await;
+    let wip10 = wip_vals[0];
+    seed_pool(&pool, raw_q, raw_v, 100, 500, "2026-04-05").await;
 
     let wo = create_wo(&pool, "WO6", &parent, &fg_loc, 10).await;
     add_routing(&pool, &wo, 10, "MILL").await;
     let bom = create_bom_header(&pool, &parent, 1, true).await;
     add_bom_item(&pool, bom, 1, 10, &comp, &raw_loc, 2).await;
 
-    let err = call_wo_start(&pool, &wo, &fresh_uuid(&pool).await).await
-        .expect_err("expected P0026 mixed cost methods");
-    let sqlstate = err.as_database_error().and_then(|e| e.code().map(|c| c.to_string()));
-    assert_eq!(sqlstate, Some("P0026".to_string()));
+    // rm_issue at running avg $5: WIP $100 / 10 parent units.
+    call_wo_start(&pool, &wo, &fresh_uuid(&pool).await).await.unwrap();
+    assert_eq!(balance(&pool, wip10).await, 100);
+
+    // Drift raw pool: 100 @ $7. final_avg = (500+700)/200 = $6.
+    seed_pool(&pool, raw_q, raw_v, 100, 700, "2026-04-15").await;
+
+    // wac_perpetual parent: wo_complete drains WIP at WIP-pool running avg
+    // = $100/10 = $10. Drains $100 to FG. WIP balance = 0.
+    call_wo_complete(&pool, &wo, 10, &fresh_uuid(&pool).await).await.unwrap();
+    assert_eq!(balance(&pool, wip10).await, 0);
+    assert_eq!(balance(&pool, fg_v).await, 100);
+
+    let pid = period_id(&pool, "2026-04").await;
+    let var_mix = account_id_by_kind_currency(&pool, "variance_material_mixed", Some("USD")).await;
+    let pre_var_mix = balance(&pool, var_mix).await;
+
+    let summary = close_period_force(&pool, pid, false).await.expect("close_period");
+    assert_eq!(summary["hook_results"]["wac_periodic"].as_i64(), Some(1));
+
+    // Mixed-case variance lands cleanly.
+    assert_eq!(balance(&pool, var_mix).await - pre_var_mix, 20);
+    assert_eq!(balance(&pool, wip10).await, 0,
+               "wac_perpetual parent WIP untouched by mixed-case routing");
+
+    common::assert_invariants_hold(&pool, "mixed_period_wac_perpetual_parent").await;
 }
 
 /// Single WO with NO drift: pool seeded once, rm_issue at running avg,
