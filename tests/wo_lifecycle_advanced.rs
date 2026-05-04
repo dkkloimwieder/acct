@@ -866,6 +866,106 @@ async fn partial_scrap_with_fired_per_lot_charge_absorbs_proportional_share() {
     );
 }
 
+// acct-du2.10 regression lock — post_wo_close_unproduced solo-at-pool gate.
+// Two WOs share parent_sku × routing_op. WO_A is fully scrapped and
+// closed via post_wo_close_unproduced. Pre-fix: the residual sweep
+// absorbed the WHOLE inv_value_wip(parent, op) balance into WO_A's
+// variance_wo_close, including WO_B's remaining WIP contribution. Post-
+// fix (mig 0072): the sweep skips pools where stock_wip(parent, op) qty
+// is non-zero (other WOs still active), deferring absorption to the
+// last sharing WO's close.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_unproduced_skips_residual_absorption_when_pool_shared() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    // Both WOs use the same minimal BOM: wo_start charge of 100/lot.
+    let bom_id = create_bom_header(&pool, "SKU-A").await;
+    add_bom_charge(&pool, bom_id, 1, 10, "oh_std", 100, "wo_start").await;
+
+    // WO_A: 10 units. WO_B: 10 units. Same parent SKU-A, same op 10.
+    let wo_a = create_test_wo(&pool, "PHX-DU2A-001", "SKU-A", "MAIN", 10).await;
+    add_test_routing(&pool, &wo_a, 10, "MILL").await;
+    let wo_b = create_test_wo(&pool, "PHX-DU2A-002", "SKU-A", "MAIN", 10).await;
+    add_test_routing(&pool, &wo_b, 10, "MILL").await;
+
+    wo_start(&pool, &wo_a).await;
+    wo_start(&pool, &wo_b).await;
+
+    // After both starts: stock_wip(SKU-A, op10) qty = 20.
+    // inv_value_wip(SKU-A, op10) value = 200 (each WO's wo_start charge
+    // emits 100 into the shared pool).
+    let wip_qty_acct = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM accounts
+          WHERE kind = 'stock_wip' AND sku_id = (SELECT id FROM skus WHERE code = 'SKU-A')
+            AND routing_op = 10 AND NOT is_closed",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("stock_wip");
+    let wip_val_acct = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM accounts
+          WHERE kind = 'inv_value_wip' AND sku_id = (SELECT id FROM skus WHERE code = 'SKU-A')
+            AND routing_op = 10 AND currency = 'USD' AND NOT is_closed",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inv_value_wip");
+    assert_eq!(balance(&pool, wip_qty_acct).await, 20, "shared qty pool = 20");
+    assert_eq!(balance(&pool, wip_val_acct).await, 200, "shared value pool = 200");
+
+    // WO_A scraps all 10 of its qty. Accumulated unit cost at scrap time
+    // is 200/20 = 10; 10 units × 10 = 100 to variance_scrap. After:
+    //   stock_wip qty = 10 (WO_B's)
+    //   inv_value_wip value = 100 (WO_B's contribution)
+    scrap(&pool, &wo_a, 10, 10).await;
+    assert_eq!(balance(&pool, wip_qty_acct).await, 10, "WO_B's qty remains");
+    assert_eq!(balance(&pool, wip_val_acct).await, 100, "WO_B's value remains");
+
+    let var_close = account_id_by_kind_currency(&pool, "variance_wo_close", Some("USD")).await;
+    let pre_var_close = balance(&pool, var_close).await;
+
+    // Close WO_A as unproduced. Gate must skip residual absorption
+    // because WO_B is still active at this op.
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_wo_close_unproduced($1::UUID, '2026-04-15'::DATE, $2::UUID, $3::UUID, NULL)",
+    )
+    .bind(&wo_a)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("post_wo_close_unproduced WO_A");
+
+    // WO_A status closed.
+    let status: String = sqlx::query_scalar("SELECT status FROM work_orders WHERE id = $1::UUID")
+        .bind(&wo_a)
+        .fetch_one(&pool)
+        .await
+        .expect("status");
+    assert_eq!(status, "closed", "WO_A closed");
+
+    // Critical assertion: variance_wo_close UNCHANGED. Pre-fix would
+    // have absorbed WO_B's 100 into WO_A's variance.
+    let post_var_close = balance(&pool, var_close).await;
+    assert_eq!(
+        post_var_close, pre_var_close,
+        "variance_wo_close must NOT absorb WO_B's WIP into WO_A's close \
+         (acct-du2.10 solo-at-pool gate)"
+    );
+
+    // inv_value_wip pool unchanged — still holds WO_B's 100.
+    assert_eq!(
+        balance(&pool, wip_val_acct).await,
+        100,
+        "inv_value_wip preserves WO_B's contribution"
+    );
+
+    common::assert_invariants_hold(&pool, "close_unproduced_shared_pool").await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn full_scrap_then_post_wo_close_unproduced() {
     let pool = connect_test_db().await;

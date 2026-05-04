@@ -645,22 +645,31 @@ pub async fn assert_invariants_hold(pool: &PgPool, label: &str) {
     );
 
     // I3: per-class signed qty SUM on inv_value_<class> via transfers.qty.
-    // For every value account that has at least one qty-bearing transfer,
-    // SUM(signed qty) must be >= 0. Asymmetric only across classes; same
-    // pool either grows on debit (receipt) or shrinks on credit (issue).
-    let bad_class_qty: Vec<(i64, String, i64)> = sqlx::query_as(
-        "SELECT a.id, a.kind::TEXT,
+    // For every wac_* SKU's value account that has at least one qty-
+    // bearing transfer, SUM(signed qty) must be >= 0.
+    //
+    // Standard-cost SKUs are EXCLUDED: their inv_value_wip pools receive
+    // wo_start / op_arrival charges (services + lot charges) that are
+    // amount-only (no qty), and qty-bearing depletions (op_move_v /
+    // scrap_v / wo_complete_v) reduce the signed qty SUM. This is by
+    // design — per-class qty SUM is not load-bearing for standard cost
+    // (pricing comes from std_cum). The invariant matters for wac_*
+    // SKUs where the qty SUM IS the divisor for running-avg pricing.
+    let bad_class_qty: Vec<(i64, String, String, i64)> = sqlx::query_as(
+        "SELECT a.id, a.kind::TEXT, COALESCE(s.cost_method::TEXT, 'unknown'),
                 COALESCE(SUM(CASE
                   WHEN t.debit_account_id  = a.id THEN  t.qty
                   WHEN t.credit_account_id = a.id THEN -t.qty
                 END), 0)::BIGINT AS net_qty
            FROM accounts a
+           JOIN skus s ON s.id = a.sku_id
            JOIN transfers t
              ON a.id IN (t.debit_account_id, t.credit_account_id)
             AND t.qty IS NOT NULL
           WHERE a.kind::TEXT IN ('inv_value_raw', 'inv_value_fg', 'inv_value_wip')
             AND NOT a.is_closed
-          GROUP BY a.id, a.kind
+            AND s.cost_method::TEXT IN ('wac_perpetual', 'wac_periodic', 'wac_retroactive')
+          GROUP BY a.id, a.kind, s.cost_method
          HAVING COALESCE(SUM(CASE
                   WHEN t.debit_account_id  = a.id THEN  t.qty
                   WHEN t.credit_account_id = a.id THEN -t.qty
@@ -671,7 +680,7 @@ pub async fn assert_invariants_hold(pool: &PgPool, label: &str) {
     .expect("invariants I3 query");
     assert!(
         bad_class_qty.is_empty(),
-        "[{label}] I3 violation — per-class signed qty SUM negative on inv_value_*: {bad_class_qty:?}",
+        "[{label}] I3 violation — per-class signed qty SUM negative on inv_value_* (wac_* SKUs only): {bad_class_qty:?}",
     );
 
     // I4: stock_wip qty >= 0 (subset of I1; explicit check for clarity).
@@ -708,11 +717,13 @@ pub async fn assert_invariants_hold(pool: &PgPool, label: &str) {
                      WHEN t.credit_account_id = a.id THEN -t.qty
                    END), 0)::BIGINT AS net_qty
               FROM accounts a
+              JOIN skus s ON s.id = a.sku_id
               LEFT JOIN transfers t
                      ON a.id IN (t.debit_account_id, t.credit_account_id)
                     AND t.qty IS NOT NULL
              WHERE a.kind::TEXT IN ('inv_value_raw','inv_value_fg','inv_value_wip')
                AND NOT a.is_closed
+               AND s.cost_method::TEXT IN ('wac_perpetual', 'wac_periodic', 'wac_retroactive')
              GROUP BY a.id, a.kind, a.debits_total, a.credits_total
          )
          SELECT id, k, balance, net_qty
@@ -724,7 +735,7 @@ pub async fn assert_invariants_hold(pool: &PgPool, label: &str) {
     .expect("invariants I5 query");
     assert!(
         bad_avg.is_empty(),
-        "[{label}] I5 violation — value-pool balance < 0 with positive qty SUM: {bad_avg:?}",
+        "[{label}] I5 violation — value-pool balance < 0 with positive qty SUM (wac_* only): {bad_avg:?}",
     );
 
     // I6: per-(ledger_kind, currency) double-entry.
