@@ -70,6 +70,20 @@ async fn open_inv_value_fg(pool: &sqlx::PgPool, sku_id: &str, loc_code: &str) ->
     .expect("open inv_value_fg")
 }
 
+async fn open_inv_value_raw(pool: &sqlx::PgPool, sku_id: &str, loc_code: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, location_id)
+         SELECT 'inv_value_raw', 'value', 'USD', 'debit', $1::UUID, l.id
+           FROM locations l WHERE l.code = $2
+         RETURNING id",
+    )
+    .bind(sku_id)
+    .bind(loc_code)
+    .fetch_one(pool)
+    .await
+    .expect("open inv_value_raw")
+}
+
 async fn open_inv_value_wip(pool: &sqlx::PgPool, sku_id: &str, op: i32) -> i64 {
     sqlx::query_scalar(
         "INSERT INTO accounts (kind, ledger_kind, currency, normal_side, sku_id, routing_op)
@@ -169,7 +183,7 @@ async fn second_roll_revalues_existing_inventory() {
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 50, "2026-04-15", &fresh_uuid(&pool).await),
-            make_event("inventory_adjustment", val_acct, void_val, 5000, "2026-04-15", &fresh_uuid(&pool).await),
+            make_event_with_qty("inventory_adjustment", val_acct, void_val, 5000, 50, "2026-04-15", &fresh_uuid(&pool).await),
         ]),
         false,
     )
@@ -221,7 +235,7 @@ async fn future_dated_roll_inserts_no_revaluation() {
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 30, "2026-04-15", &fresh_uuid(&pool).await),
-            make_event("inventory_adjustment", val_acct, void_val, 3000, "2026-04-15", &fresh_uuid(&pool).await),
+            make_event_with_qty("inventory_adjustment", val_acct, void_val, 3000, 30, "2026-04-15", &fresh_uuid(&pool).await),
         ]),
         false,
     )
@@ -353,7 +367,7 @@ async fn roll_down_revalues_existing_inventory() {
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 40, "2026-04-15", &fresh_uuid(&pool).await),
-            make_event("inventory_adjustment", val_acct, void_val, 4000, "2026-04-15", &fresh_uuid(&pool).await),
+            make_event_with_qty("inventory_adjustment", val_acct, void_val, 4000, 40, "2026-04-15", &fresh_uuid(&pool).await),
         ]),
         false,
     )
@@ -461,7 +475,7 @@ async fn multi_location_roll_revalues_each_pool() {
             &pool,
             serde_json::json!([
                 make_event("inventory_adjustment", q, void_qty, qty, "2026-04-15", &fresh_uuid(&pool).await),
-                make_event("inventory_adjustment", v, void_val, qty * 100, "2026-04-15", &fresh_uuid(&pool).await),
+                make_event_with_qty("inventory_adjustment", v, void_val, qty * 100, qty, "2026-04-15", &fresh_uuid(&pool).await),
             ]),
             false,
         )
@@ -522,7 +536,7 @@ async fn no_op_same_cost_records_audit_no_transfer() {
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 25, "2026-04-15", &fresh_uuid(&pool).await),
-            make_event("inventory_adjustment", val_acct, void_val, 2500, "2026-04-15", &fresh_uuid(&pool).await),
+            make_event_with_qty("inventory_adjustment", val_acct, void_val, 2500, 25, "2026-04-15", &fresh_uuid(&pool).await),
         ]),
         false,
     )
@@ -593,7 +607,7 @@ async fn audit_row_records_prior_target_delta_qty_after_revaluation() {
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 15, "2026-04-15", &fresh_uuid(&pool).await),
-            make_event("inventory_adjustment", val_acct, void_val, 900, "2026-04-15", &fresh_uuid(&pool).await),
+            make_event_with_qty("inventory_adjustment", val_acct, void_val, 900, 15, "2026-04-15", &fresh_uuid(&pool).await),
         ]),
         false,
     )
@@ -848,4 +862,139 @@ async fn first_roll_with_expected_old_nonnull_raises_p0017() {
             .map(|_| ())
     })
     .await;
+}
+
+// ---- acct-du2.11: multi-class same-location revaluation -----------
+//
+// Regression lock for the cross-class qty divisor bug fixed in mig
+// 0071. Pre-fix: post_standard_cost_roll's per-pool delta used the
+// stock_available cross-class qty, so each value pool was over-revalued
+// by the OTHER class's qty share. Post-fix: each pool's delta uses
+// per-class signed SUM on transfers.qty filtered to the value pool,
+// so raw and fg revalue independently with correct per-class qty.
+
+#[tokio::test]
+async fn multi_class_same_location_roll_uses_per_class_qty() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = insert_standard_sku(&pool, "ROLL-MULTICLASS").await;
+    let qty_main = open_stock_available(&pool, &sku, "MAIN").await;
+    let val_raw = open_inv_value_raw(&pool, &sku, "MAIN").await;
+    let val_fg = open_inv_value_fg(&pool, &sku, "MAIN").await;
+    seed_standard_cost(&pool, "ROLL-MULTICLASS", 100).await;
+
+    let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
+
+    // Seed 30 units to inv_value_raw and 20 units to inv_value_fg, all
+    // at MAIN. stock_available qty becomes 50 (raw + fg combined).
+    let _ = call_post_transfers(
+        &pool,
+        serde_json::json!([
+            // raw qty leg + value leg
+            make_event_with_qty(
+                "cycle_count_adj",
+                qty_main,
+                void_qty,
+                30,
+                30,
+                "2026-04-15",
+                &fresh_uuid(&pool).await,
+            ),
+            make_event_with_qty(
+                "cycle_count_adj",
+                val_raw,
+                void_val,
+                30 * 100,
+                30,
+                "2026-04-15",
+                &fresh_uuid(&pool).await,
+            ),
+            // fg qty leg + value leg
+            make_event_with_qty(
+                "cycle_count_adj",
+                qty_main,
+                void_qty,
+                20,
+                20,
+                "2026-04-15",
+                &fresh_uuid(&pool).await,
+            ),
+            make_event_with_qty(
+                "cycle_count_adj",
+                val_fg,
+                void_val,
+                20 * 100,
+                20,
+                "2026-04-15",
+                &fresh_uuid(&pool).await,
+            ),
+        ]),
+        false,
+    )
+    .await
+    .expect("seed multi-class");
+
+    // Sanity: stock_available qty = 50 cross-class, raw value = 3000,
+    // fg value = 2000.
+    let qty_total: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(qty_main)
+    .fetch_one(&pool)
+    .await
+    .expect("qty");
+    assert_eq!(qty_total, 50, "stock_available cross-class = 30 + 20");
+
+    // Roll 100 → 130 (delta = 30/unit). Per-class deltas:
+    //   raw: 30 × 30 =  900   (NOT 50 × 30 = 1500)
+    //   fg : 20 × 30 =  600   (NOT 50 × 30 = 1500)
+    let _ = call_roll(&pool, &sku, 130, "2026-04-20", "2026-04-20", Some(100))
+        .await
+        .expect("multi-class roll");
+
+    let raw_balance: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(val_raw)
+    .fetch_one(&pool)
+    .await
+    .expect("raw balance");
+    let fg_balance: i64 = sqlx::query_scalar(
+        "SELECT debits_total - credits_total FROM accounts WHERE id = $1",
+    )
+    .bind(val_fg)
+    .fetch_one(&pool)
+    .await
+    .expect("fg balance");
+
+    // Pre-fix expectation (BUG): both pools revalued by 1500 → raw=4500, fg=3500.
+    // Post-fix expectation (CORRECT): per-class deltas → raw=3900, fg=2600.
+    assert_eq!(
+        raw_balance, 3000 + 900,
+        "raw pool: per-class delta 30 × 30, NOT cross-class 50 × 30"
+    );
+    assert_eq!(
+        fg_balance, 2000 + 600,
+        "fg pool: per-class delta 20 × 30, NOT cross-class 50 × 30"
+    );
+
+    // Audit row: total_delta_value should aggregate per-class deltas
+    // (900 + 600 = 1500), pool_qty should be sum of per-class qtys (50).
+    let (delta, qty): (i64, i64) = sqlx::query_as(
+        "SELECT total_delta_value, pool_qty
+           FROM inventory_standard_cost_rolls
+          WHERE sku_id = $1::UUID
+          ORDER BY posted_at DESC LIMIT 1",
+    )
+    .bind(&sku)
+    .fetch_one(&pool)
+    .await
+    .expect("audit row");
+    assert_eq!(delta, 1500, "audit total_delta = raw 900 + fg 600");
+    assert_eq!(qty, 50, "audit pool_qty = raw 30 + fg 20");
+
+    // Invariants must still hold post-roll.
+    common::assert_invariants_hold(&pool, "multi_class_roll").await;
 }
