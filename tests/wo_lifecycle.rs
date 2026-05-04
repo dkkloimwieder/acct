@@ -977,15 +977,17 @@ async fn applied_account_kind_no_mapping_raises_p0026() {
 }
 
 #[tokio::test]
-async fn component_without_std_cost_raises_p0018() {
-    // BOM emission calls resolve_standard_cost_at(comp). If comp has no
-    // standard_costs row, P0018 surfaces.
+async fn standard_component_without_std_cost_raises_p0018() {
+    // Standard-cost component without a standard_costs row → P0018 from
+    // resolve_standard_cost_at. wac_perpetual components no longer go
+    // through resolve_standard_cost_at (acct-24b, mig 0066) — they hit
+    // P0010 'empty pool' instead, covered by a separate test below.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let parent = fresh_sku(&pool, "WO-P-NSC", "standard").await;
     set_std_cost(&pool, &parent, 50).await;
-    let comp = fresh_sku(&pool, "WO-C-NSC", "wac_perpetual").await;
-    // No standard_costs row for comp.
+    let comp = fresh_sku(&pool, "WO-C-NSC", "standard").await;
+    // No standard_costs row for comp — that's the P0018 trigger.
     let raw_loc = fresh_location(&pool, "WO-RAW-NSC").await;
     let fg_loc = fresh_location(&pool, "WO-FG-NSC").await;
     open_account(
