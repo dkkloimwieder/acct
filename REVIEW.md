@@ -353,3 +353,141 @@ Filing as **acct-du2.11** (a) and **acct-du2.12** (b).
 7. **Post-write invariants**: queue row inserted; idempotent on `idempotency_key`. Closed-target rejected with P0021.
 
 **Verdict**: clean.
+
+### `post_transfers` (mig 0033 body shape; mig 0067 / 0070 add reasons to flagging list)
+
+1. **Scope**: a batch of transfer events in one transaction. Atomic. Orchestrator: pre-scan → lock-pre-scan → per-event apply.
+2. **Value-pool reads**: doesn't read pools directly; delegates to `_post_transfers_compute_amount` which reads pre-locked pools.
+3. **Qty-divisor reads**: same — divisor work in the dispatcher.
+4. **cost_method dispatches**: cost-event reasons {op_move, scrap, wo_complete, so_ship} trigger lock-pre-scan WAC SKU collection. The pre-scan SKU resolution (mig 0031 lines 261–267) is **credit-first** (correct for depletion source). The apply-loop SKU resolution at 310 / 422 is **debit-first** (acct-du2.4) — drift risk; functionally equivalent today.
+5. **Document/WO-sharing**: lock-pre-scan acquires FOR UPDATE on every account referenced by the batch in ascending id order — deadlock-safe. ✓
+6. **Currency / period**: per-event validation in `_post_transfers_apply_event` (P0001/P0002/P0003/P0004/P0005). ✓
+7. **Post-write invariants**: every event in batch produces one transfer row + balance updates; cost-event events with wac_periodic / wac_retroactive cost_method also produce transfers_provisional rows. Returns JSONB array of `{index, result: 'ok' | 'exists'}`.
+
+**Verdict**: AP2 drift (acct-du2.4 already filed). Else clean.
+
+### `_post_transfers_lock_pre_scan` (mig 0033)
+
+Single helper that locks every account referenced by a batch (debit + credit + aux qty ids) in ascending id order. No pool/qty/dispatch/sharing/currency/period concerns. Pure correctness primitive.
+
+**Verdict**: clean.
+
+### `_post_transfers_lookup_qty_account` (mig 0021)
+
+Maps a value-side account (inv_value_raw/fg/wip) → matching qty-side account (stock_available or stock_wip). Read-only metadata.
+
+**Verdict**: clean **with a caveat**. Returns `stock_available` for both `inv_value_raw` AND `inv_value_fg`, since they share the same stock_available pool. **This is the genesis of the per-class qty issue** (acct-fii / acct-du2.8 / acct-du2.11): callers using the returned account's `debits_total - credits_total` as a per-class divisor get cross-class qty. The helper itself is correct; hazard is downstream usage. Recommend a code comment flagging that callers must use per-class signed SUM on `transfers.qty` for divisor work, not the returned account's balance — covered by **acct-du2.13** (filed below) doc-level.
+
+### `_wac_close_pool_qty_in` (mig 0064)
+
+For one value pool × one period, returns `Σ(qty)` of in-period qty inflows. For `inv_value_wip`: reads paired stock_wip account; for raw/fg: per-class signed SUM on the value account itself. Uses debit-side qty SUM (positive inflows only) — Oracle PAC convention. Asymmetric: receipts add, depletions don't subtract. Used by `wac_periodic_close_hook`. Tier 3 (`wac_retroactive_close_hook`) uses a different qty-stream merge approach (acct-rso).
+
+**Verdict**: clean.
+
+### `resolve_standard_cost_at` (mig 0027)
+
+`(sku, business_date) → standard cost`. STABLE — index-backed lookup. Raises P0018 if no standard exists at business_date.
+
+**Verdict**: clean. Single canonical lookup; P0018 gate composes cleanly through `_post_transfers_compute_amount` standard branch and every direct caller.
+
+### `bom_header_at` (mig 0048)
+
+`(parent_sku, alternate_no, business_date) → bom_header`. Enforces uniqueness via `bom_headers_active` partial index; raises P0033 on collision or no-active.
+
+**Verdict**: clean.
+
+### `_wo_resolve_bom_for` (mig 0049)
+
+`(wo_id, business_date) → bom_header`. Honors `work_orders.bom_id` if pinned; otherwise falls back to `bom_header_at(parent_sku, 1, business_date)` for primary alternate.
+
+**Verdict**: clean.
+
+### `_wo_explode_bom` (mig 0050)
+
+Recursively flattens phantom child BOMs into a parent BOM at the parent's `applies_at_op`. 16-level depth cap; cycle detection via depth + path tracking; raises P0032.
+
+**Verdict**: clean. Cycle detection is the recursive-explosion correctness primitive; no class/method/document confusion surface.
+
+### `_wo_apply_reason_for` (mig 0047)
+
+`(absorption_class_id, basis) → transfer_reason`. Maps absorption class + basis to the canonical generic reason (`burden_apply` / `lot_charge_apply`) or pinned reason (`labor_apply` / `oh_apply`). Raises P0026 on unmapped applied_account_kind.
+
+**Verdict**: clean. Pure metadata mapping.
+
+### `_wo_burden_events_for_op` (mig 0038)
+
+Returns burden rows for one (wo, op). Used by older pre-BOM2 paths; superseded by `_wo_emit_bom_lines` for BOM2-era WO lifecycle. Trivial helper.
+
+**Verdict**: clean (legacy; not on hot path post-BOM2).
+
+### `_wo_events_check_consumption_policy` (mig 0060)
+
+BEFORE INSERT trigger on `wo_events` (filtering for `event_kind='start'`). Reads `skus.consumption_policy` of the WO's parent SKU; raises **P0035** if non-`forward`. Backflush dispatchers tracked under `acct-BACKFLUSH` (acct-oi4).
+
+**Verdict**: clean. Single-purpose gate; correct enum handling.
+
+### `close_period` (mig 0032 — body covered inline above)
+
+Already audited as part of `cost_adjust_retroactive_hook` walk. Recap:
+
+1. Scope: one period × all three close hooks.
+2. Pool reads: none directly.
+3. Qty divisor reads: none.
+4. cost_method dispatches: none — orchestrator only.
+5. Document/WO-sharing: serializes via `FOR UPDATE` on `periods` row at line 389. Each hook called sequentially.
+6. Currency / period: gates on `closed_at` + `force_provisional` + `force_recon`. Two override flags pass through to hooks.
+7. Post-write invariants: periods.closed_at + closed_by stamped; un-finalized provisionals raise P0015 unless forced; recon alerts raise P0016 unless forced. Hook return counts aggregated.
+
+**Verdict**: clean. The period-row FOR UPDATE serializes concurrent close attempts (P0014 covers concurrent already-closed). p_actor unvalidated — RBAC tracked as Part VII Q6 (still open, design decision).
+
+### `run_daily_reconciliation` (mig 0016)
+
+Read-only alerter. Walks per-(ledger_kind, currency) double-entry sums; walks reservation over-promise; INSERTs reconciliation_alerts rows. No pool mutations. Called by close_period as the recon gate (and by pg_cron daily).
+
+**Verdict**: clean. Per-ledger double-entry SUM is the B3 fix from Part IV §7 — currency-partitioned, not single-global.
+
+### `reserve_inventory` (mig 0014)
+
+`(sku, location, qty, sales_order, sales_order_line) → inventory_reservation_id | NULL`. Reads `stock_available` qty under `FOR UPDATE` (line 46), checks `qty_promisable ≥ qty`, INSERTs reservation row.
+
+**Verdict**: clean. The FOR UPDATE serializes concurrent reservers; `qty_promisable` is computed inside the transaction's lock window; no race. P0010 if no open stock_available account.
+
+### `fn_block_transfer_modifications` (mig 0008)
+
+BEFORE UPDATE / DELETE trigger on `transfers`. Raises P0008 unconditionally. Implements append-only invariant.
+
+**Verdict**: clean.
+
+### `_bom_line_self_reference_guard` (mig 0044)
+
+CHECK constraint helper preventing a `bom_lines` row whose `component_sku_id` references a SKU that is itself a phantom whose primary BOM directly or indirectly references the parent. Walked at INSERT/UPDATE.
+
+**Verdict**: clean.
+
+## Phase 2 conclusion
+
+Walked 33 functions × 7-question structural checklist. Phase 2 surfaced **8 additional sub-issues** beyond Phase 1's grep pass:
+
+| ID | Severity | Function | AP | Summary |
+|----|----------|----------|----|---------|
+| acct-du2.1 | P2 | post_wo_complete | AP3 | solo-at-last gate read on stock_wip without FOR UPDATE (Phase 1) |
+| acct-du2.2 | P2 | post_wo_complete | AP3 | residual-sweep gate read on stock_wip without FOR UPDATE (Phase 1) |
+| acct-du2.3 | P2 | post_osp_ship / post_osp_receive | AP8 | idempotency replay race (acct-69p shape) (Phase 1) |
+| acct-du2.4 | P3 | _post_transfers_compute_amount | AP2 | debit-first COALESCE drift risk (Phase 1) |
+| acct-du2.5 | P3 | post_op_move / post_scrap | AP8 | dual-replay-check pattern missing (Phase 1) |
+| acct-du2.6 | P3 | post_wo_complete | AP3 | wac_* branch reads stock_wip qty without FOR UPDATE (Phase 2) |
+| acct-du2.7 | P3 | post_op_move | AP3 | wac_* branch reads stock_wip qty without FOR UPDATE (Phase 2) |
+| **acct-du2.8** | **P1** | **post_inventory_adjustment** | **AP1** | **wac_perpetual divisor uses stock_available cross-class qty (acct-fii sibling) (Phase 2)** |
+| acct-du2.9 | P3 | post_po_receipt / post_ap_bill | AP3 | cumulative-qty check not under FOR UPDATE on po_line (Phase 2) |
+| acct-du2.10 | P2 | post_wo_close_unproduced | AP5 | residual sweep missing solo-at-pool gate (acct-69e shape) (Phase 2) |
+| acct-du2.11 | P2 | post_standard_cost_roll | AP1 | revaluation uses stock_available cross-class qty (Phase 2) |
+| acct-du2.12 | P3 | post_standard_cost_roll | AP3 | stock_available read not under FOR UPDATE (Phase 2) |
+| acct-du2.13 | P3 | _post_transfers_lookup_qty_account | DOCS | function comment should warn callers about per-class divisor hazard (Phase 2) |
+
+**Severity totals**: 1 × P1, 5 × P2, 7 × P3.
+
+**Headline finding**: **acct-du2.8** is the same shape as the original acct-fii (P1) but in a different function. acct-fii fixed `post_cost_adjustment` in mig 0069; `post_inventory_adjustment` was overlooked at the time and never patched. Two sibling P2s (acct-du2.10, acct-du2.11) extend the bug-class to functions that nobody had looked at through the same lens.
+
+**Pattern across all findings**: every cross-class / cross-document / cross-method bug was reachable by asking the 7 questions deliberately. The Phase 1 grep found mechanical anti-patterns; Phase 2's structural walk caught semantic uses (a divisor that's "stock_available qty" passes any grep filter, but the question "is this divisor scoped to my class?" surfaces the bug regardless of how it's spelled in code).
+
+**Phase 2 verdict**: the meta-epic's premise is validated. Pattern-grep alone catches ~38% of class-confusion bugs (5/13 sub-issues from Phase 1); structural walk doubles that. Phase 3 (property-based testing with the 7 invariants) will catch any remaining shapes we haven't yet imagined.
