@@ -58,10 +58,8 @@ pub async fn reset_to_fixture(pool: &PgPool) {
             ledger_outbox,
             wo_events,
             wo_routings,
-            wo_routing_burdens,
             wo_outputs,
             work_orders,
-            boms,
             bom_headers,
             engineering_change_orders,
             absorption_classes,
@@ -338,12 +336,12 @@ pub async fn seed_stock(pool: &PgPool, sku_code: &str, loc_code: &str, qty: i64)
 // ============================================================
 // BOM2 helpers (acct-jg2)
 //
-// Test-side scaffolding for the new BOM model. These build up
-// bom_headers + bom_lines + wo_outputs + absorption_classes rows
-// the way C5 advanced tests need. Existing wo_lifecycle.rs tests
-// stay on the old `boms` model; the dispatch-by-existence in
-// post_wo_start / post_op_move / post_wo_complete picks the new
-// path only when bom_headers exists for the parent.
+// Test-side scaffolding for the BOM2 model. These build up
+// bom_headers + bom_lines + wo_outputs + absorption_classes rows.
+// As of acct-jtt (migration 0062) the legacy boms /
+// wo_routing_burdens path is gone — every WO must have a
+// bom_header. post_wo_start auto-initializes a default wo_outputs
+// row if none exists.
 // ============================================================
 
 /// Register an absorption_class. Returns the id. The seed already

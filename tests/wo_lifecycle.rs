@@ -1,23 +1,26 @@
 //! `acct-wl1` / Slice B.2 — work-order lifecycle matrix.
 //!
 //! Covers `post_wo_start`, `post_op_move`, `post_wo_complete`,
-//! `post_scrap`. Matrix shape mirrors `po_receipt.rs` / `ap_bill.rs`:
-//! per-test scaffold, then explicit assertions on account balances
-//! and on `transfers` / `wo_events` row counts.
+//! `post_scrap` against the **BOM2 model** (bom_headers + bom_lines +
+//! absorption_classes; acct-jg2). The pre-BOM2 `boms` /
+//! `wo_routing_burdens` setup was retired in C3 (acct-jtt) — this file
+//! now scaffolds via `create_bom_header` + `add_bom_item` +
+//! `add_bom_service`.
 //!
 //! Review memo (acct-69p) drives the priority edge cases:
 //!   - idempotency replay across all 4 functions (Item 9 / 0039 fix)
-//!   - rework op_move (to_op < from_op) re-applies destination burdens
+//!   - rework op_move (to_op < from_op) re-applies destination services
 //!   - multi-batch op_move into the same op
-//!   - empty wo_routing_burdens for an op
-//!   - wo_close_v residual sign (unfavorable + favorable)
+//!   - empty per-op service lines
+//!   - wo_close_v residual sign (unfavorable + favorable; pre-balance
+//!     step from migration 0061 makes the favorable case reachable)
 //!   - component without std cost → P0018
 //!   - cross-currency component → P0010
 //!   - applied_account_kind with no reason mapping → P0026
 //!
 //! Plus the validation errors: WO not found / not draft / not standard,
-//! empty routing, missing BOM, from_op = to_op, op not in routing,
-//! qty overflow, scrap qty > pool balance.
+//! empty routing, missing BOM (P0033 in BOM2), from_op = to_op, op not
+//! in routing, qty overflow, scrap qty > pool balance.
 
 mod common;
 
@@ -37,6 +40,7 @@ struct Wo {
     comp_a_id: String,
     comp_b_id: String,
     wo_id: String,
+    bom_id: i64,
     fg_qty_acct: i64,
     wip_qty_op10: i64,
     wip_qty_op20: i64,
@@ -160,44 +164,80 @@ async fn add_routing(pool: &PgPool, wo_id: &str, routing_op: i32, op_name: &str)
     .unwrap_or_else(|e| panic!("add_routing {routing_op}: {e}"));
 }
 
-async fn add_burden(
-    pool: &PgPool,
-    wo_id: &str,
-    routing_op: i32,
-    applied_kind: &str,
-    std_amount: i64,
-) {
-    sqlx::query(
-        "INSERT INTO wo_routing_burdens (wo_id, routing_op, applied_account_kind, std_amount)
-         VALUES ($1::UUID, $2, $3::account_kind, $4)",
+/// Create a bom_header for the parent SKU. Returns the bom_id. The
+/// header lands as primary, alternate=1, revision='A', status=active,
+/// effective from -infinity. Tests that need alternates/revisions go
+/// through the lower-level `create_bom_header_full` helper directly.
+async fn create_bom_header_for_sku(pool: &PgPool, parent_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO bom_headers
+            (parent_sku_id, alternate_no, revision_no, is_primary, status)
+         VALUES ($1::UUID, 1, 'A', TRUE, 'active')
+         RETURNING id",
     )
-    .bind(wo_id)
-    .bind(routing_op)
-    .bind(applied_kind)
-    .bind(std_amount)
-    .execute(pool)
+    .bind(parent_id)
+    .fetch_one(pool)
     .await
-    .unwrap_or_else(|e| panic!("add_burden op={routing_op} kind={applied_kind}: {e}"));
+    .unwrap_or_else(|e| panic!("create_bom_header parent={parent_id}: {e}"))
 }
 
-async fn add_bom(
+/// Add an item line to a bom_header by component IDs (not codes — the
+/// inline error tests create ad-hoc SKUs whose codes may collide across
+/// tests). Uses fire_at='op_arrival', basis='per_unit', scrap_pct=0.
+async fn add_bom_item_by_id(
     pool: &PgPool,
-    parent_id: &str,
+    bom_id: i64,
+    line_no: i32,
+    applies_at_op: i32,
     component_id: &str,
     component_loc_id: &str,
     qty_per_parent: i64,
 ) {
     sqlx::query(
-        "INSERT INTO boms (parent_sku_id, component_sku_id, component_loc_id, qty_per_parent)
-         VALUES ($1::UUID, $2::UUID, $3::UUID, $4)",
+        "INSERT INTO bom_lines
+            (bom_id, line_no, kind, basis, applies_at_op, fire_at, scrap_pct,
+             component_sku_id, component_loc_id, qty_per_parent)
+         VALUES ($1, $2, 'item', 'per_unit', $3, 'op_arrival', 0,
+                 $4::UUID, $5::UUID, $6)",
     )
-    .bind(parent_id)
+    .bind(bom_id)
+    .bind(line_no)
+    .bind(applies_at_op)
     .bind(component_id)
     .bind(component_loc_id)
     .bind(qty_per_parent)
     .execute(pool)
     .await
-    .unwrap_or_else(|e| panic!("add_bom parent={parent_id} comp={component_id}: {e}"));
+    .unwrap_or_else(|e| panic!("add_bom_item_by_id bom={bom_id} line={line_no}: {e}"));
+}
+
+/// Add a per-unit service line referencing an absorption_class by code.
+/// fire_at='op_arrival' (the only valid combo for per_unit per
+/// bom_lines CHECKs).
+async fn add_bom_service_per_unit(
+    pool: &PgPool,
+    bom_id: i64,
+    line_no: i32,
+    applies_at_op: i32,
+    class_code: &str,
+    std_amount: i64,
+) {
+    sqlx::query(
+        "INSERT INTO bom_lines
+            (bom_id, line_no, kind, basis, applies_at_op, fire_at,
+             absorption_class_id, std_amount)
+         SELECT $1, $2, 'service', 'per_unit', $3, 'op_arrival',
+                ac.id, $5
+           FROM absorption_classes ac WHERE ac.code = $4",
+    )
+    .bind(bom_id)
+    .bind(line_no)
+    .bind(applies_at_op)
+    .bind(class_code)
+    .bind(std_amount)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("add_bom_service line={line_no} class={class_code}: {e}"));
 }
 
 async fn balance(pool: &PgPool, id: i64) -> i64 {
@@ -210,26 +250,23 @@ async fn balance(pool: &PgPool, id: i64) -> i64 {
 
 /// Set up a 2-component, 2-op WO at qty_target with parent_std_cost
 /// rolled up correctly. comp_a × 2 (std=10) + comp_b × 1 (std=20)
-/// + op10 (labor 5, oh 3) + op20 (labor 7, oh 5) = 60 per unit.
-/// parent_std_cost = 60 (so wo_complete drains exactly, residual = 0).
+/// + op10 (labor 5, oh 3) + op20 (labor 7, oh 12) = 67 per unit.
+/// parent_std_cost = 67 (so wo_complete drains exactly, residual = 0).
 ///
-/// `with_burdens=true` adds the standard burden rows; tests that need
-/// the empty-burden case pass `false` and add their own selectively.
-async fn scaffold_wo(pool: &PgPool, qty_target: i64, with_burdens: bool) -> Wo {
+/// `with_services=true` adds the standard 4 service lines (labor+oh at
+/// each op); tests that need the empty-service case pass `false` and
+/// add their own selectively.
+async fn scaffold_wo(pool: &PgPool, qty_target: i64, with_services: bool) -> Wo {
     let parent = fresh_sku(pool, "WO-P", "standard").await;
     let comp_a = fresh_sku(pool, "WO-CA", "standard").await;
     let comp_b = fresh_sku(pool, "WO-CB", "standard").await;
     let raw_loc = fresh_location(pool, "WO-RAW").await;
     let fg_loc = fresh_location(pool, "WO-FG").await;
 
-    // 2 × comp_a (std=10) + 1 × comp_b (std=20) + ops (15 + 12)
-    // = 20 + 20 + 27 = 67? Let me recompute: comp_a=10, comp_b=20.
-    // 2×10 + 1×20 = 40 RM. burdens 15+12=27. Total 67.
     set_std_cost(pool, &parent, 67).await;
     set_std_cost(pool, &comp_a, 10).await;
     set_std_cost(pool, &comp_b, 20).await;
 
-    // Per-SKU qty + value accounts for parent.
     let wip_qty_op10 = open_account(
         pool, "stock_wip", "qty", None, Some(&parent), None, Some(10), "debit",
     )
@@ -259,7 +296,6 @@ async fn scaffold_wo(pool: &PgPool, qty_target: i64, with_burdens: bool) -> Wo {
     )
     .await;
 
-    // Component-side accounts: stock_consumed, stock_available@raw, inv_value_raw@raw.
     let consumed_a = open_account(
         pool, "stock_consumed", "qty", None, Some(&comp_a), None, None, "debit",
     )
@@ -285,8 +321,6 @@ async fn scaffold_wo(pool: &PgPool, qty_target: i64, with_burdens: bool) -> Wo {
     )
     .await;
 
-    // Currency-only accounts come from the fixture (labor_applied,
-    // oh_applied, variance_scrap, variance_wo_close). Look them up.
     let labor_applied = account_id_by_kind_currency(pool, "labor_applied", Some("USD")).await;
     let oh_applied = account_id_by_kind_currency(pool, "oh_applied", Some("USD")).await;
     let variance_wo_close =
@@ -298,15 +332,16 @@ async fn scaffold_wo(pool: &PgPool, qty_target: i64, with_burdens: bool) -> Wo {
     add_routing(pool, &wo_id, 10, "MILL").await;
     add_routing(pool, &wo_id, 20, "FINISH").await;
 
-    if with_burdens {
-        add_burden(pool, &wo_id, 10, "labor_applied", 5).await;
-        add_burden(pool, &wo_id, 10, "oh_applied", 3).await;
-        add_burden(pool, &wo_id, 20, "labor_applied", 7).await;
-        add_burden(pool, &wo_id, 20, "oh_applied", 12).await;
-    }
+    let bom_id = create_bom_header_for_sku(pool, &parent).await;
+    add_bom_item_by_id(pool, bom_id, 1, 10, &comp_a, &raw_loc, 2).await;
+    add_bom_item_by_id(pool, bom_id, 2, 10, &comp_b, &raw_loc, 1).await;
 
-    add_bom(pool, &parent, &comp_a, &raw_loc, 2).await;
-    add_bom(pool, &parent, &comp_b, &raw_loc, 1).await;
+    if with_services {
+        add_bom_service_per_unit(pool, bom_id, 3, 10, "labor_std", 5).await;
+        add_bom_service_per_unit(pool, bom_id, 4, 10, "oh_std", 3).await;
+        add_bom_service_per_unit(pool, bom_id, 5, 20, "labor_std", 7).await;
+        add_bom_service_per_unit(pool, bom_id, 6, 20, "oh_std", 12).await;
+    }
 
     Wo {
         parent_id: parent,
@@ -315,6 +350,7 @@ async fn scaffold_wo(pool: &PgPool, qty_target: i64, with_burdens: bool) -> Wo {
         comp_a_id: comp_a,
         comp_b_id: comp_b,
         wo_id,
+        bom_id,
         fg_qty_acct,
         wip_qty_op10,
         wip_qty_op20,
@@ -474,7 +510,7 @@ async fn happy_path_start_then_op_move_then_complete() {
         .expect("wo_start");
     assert_eq!(wo_status(&pool, &wo.wo_id).await, "released");
 
-    // After WO_start at qty_target=100:
+    // After WO_start at qty_target=100 (BOM2 path):
     //   WIP@op10 value = 100 × (40 RM + 5 labor + 3 oh) = 100 × 48 = 4800
     //   WIP@op10 qty   = 100
     //   raw_a value drained = 200 × 10 = 2000  (consumed)
@@ -489,7 +525,8 @@ async fn happy_path_start_then_op_move_then_complete() {
     assert_eq!(balance(&pool, wo.oh_applied).await, -300);
 
     // op_move 10→20 of all 100 units.
-    //   WIP@op20 += 100 × 48 (std_cum_at_op10) + 100 × 7 labor + 100 × 12 oh
+    //   WIP@op20 += 100 × 48 (per_unit_cum at applies_at_op<=10)
+    //            + 100 × 7 labor + 100 × 12 oh   (op20 services, first arrival)
     //            = 4800 + 700 + 1200 = 6700 = 100 × parent_std (67).
     //   WIP@op10 drains.
     call_op_move(&pool, &wo.wo_id, 10, 20, 100, &fresh_uuid(&pool).await)
@@ -515,7 +552,9 @@ async fn happy_path_start_then_op_move_then_complete() {
 
 #[tokio::test]
 async fn multi_batch_op_move_into_same_op() {
-    // Item 11: two op_moves arriving at op20, burdens apply per-batch.
+    // Item 11: two op_moves arriving at op20. In BOM2 the per_unit
+    // service lines re-fire on every arrival; per_lot lines (none here)
+    // would only fire on first arrival.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let wo = scaffold_wo(&pool, 100, true).await;
@@ -533,9 +572,13 @@ async fn multi_batch_op_move_into_same_op() {
 }
 
 #[tokio::test]
-async fn rework_op_move_reapplies_destination_burdens() {
-    // Item 2a: rework sends qty backwards (op20 → op10) and op10
-    // burdens apply again.
+async fn rework_op_move_reapplies_destination_services() {
+    // Item 2a: rework sends qty backwards (op20 → op10). In BOM2 the
+    // subsequent-arrival emit at op10 re-fires per_unit *services* only
+    // — the bom_lines item lines DO NOT re-fire (they fired once at
+    // wo_start; re-issuing components on rework would double-consume
+    // raw inventory). Subsequent-arrival service re-fire is the
+    // labor/OH-per-pass model from the Slice B spec.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let wo = scaffold_wo(&pool, 100, true).await;
@@ -547,37 +590,41 @@ async fn rework_op_move_reapplies_destination_burdens() {
     let oh_before = balance(&pool, wo.oh_applied).await;
     let wip10_before = balance(&pool, wo.wip_val_op10).await;
     let wip20_before = balance(&pool, wo.wip_val_op20).await;
+    let consumed_a_before = balance(&pool, wo.consumed_a).await;
+    let consumed_b_before = balance(&pool, wo.consumed_b).await;
 
     // Rework: 10 units back to op10.
     call_op_move(&pool, &wo.wo_id, 20, 10, 10, &fresh_uuid(&pool).await).await.unwrap();
 
-    // op10 burdens applied: 10 × (5 labor + 3 oh) = 50 + 30 = 80.
+    // op10 services re-applied: 10 × (5 labor + 3 oh) = 50 + 30 = 80.
     assert_eq!(balance(&pool, wo.labor_applied).await, labor_before - 50);
     assert_eq!(balance(&pool, wo.oh_applied).await, oh_before - 30);
-    // Value moved at std_cum_at_op20 (parent_std=67): 10 × 67 = 670.
-    // Plus op10 burdens added: 80. WIP@op10 grew by 670 + 80 = 750.
+    // op_move_v value-leg at std_cum_at_op20 = 67: 10 × 67 = 670.
+    // Plus op10 service re-fire: 80. WIP@op10 grew by 670 + 80 = 750.
     assert_eq!(balance(&pool, wo.wip_val_op10).await, wip10_before + 670 + 80);
     assert_eq!(balance(&pool, wo.wip_val_op20).await, wip20_before - 670);
+    // BOM items did NOT re-issue: stock_consumed unchanged.
+    assert_eq!(balance(&pool, wo.consumed_a).await, consumed_a_before);
+    assert_eq!(balance(&pool, wo.consumed_b).await, consumed_b_before);
 }
 
 #[tokio::test]
-async fn empty_burdens_op_succeeds() {
-    // Item 12: an op with no wo_routing_burdens just moves value forward
-    // (no apply events). Use scaffold(false) and add only op10 burdens.
+async fn empty_services_op_succeeds() {
+    // Item 12: an op with no per-unit service lines just moves value
+    // forward (no apply events). Use scaffold(false) and add only op10
+    // services. parent_std mismatch will pre-balance at wo_complete —
+    // see `wo_complete_unfavorable_residual_routes_through_variance`.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let wo = scaffold_wo(&pool, 100, false).await;
-    add_burden(&pool, &wo.wo_id, 10, "labor_applied", 5).await;
-    add_burden(&pool, &wo.wo_id, 10, "oh_applied", 3).await;
-    // op20 has zero burden rows. parent_std mismatch will land at
-    // wo_complete as residual — that's the next test. For now just
-    // verify start + op_move don't crash.
+    add_bom_service_per_unit(&pool, wo.bom_id, 3, 10, "labor_std", 5).await;
+    add_bom_service_per_unit(&pool, wo.bom_id, 4, 10, "oh_std", 3).await;
     set_std_cost_override(&pool, &wo.parent_id, 48).await; // RM 40 + op10 8
 
     pre_load_raw(&pool, &wo, 200, 100, 2000, 2000).await;
     call_wo_start(&pool, &wo.wo_id, &fresh_uuid(&pool).await).await.unwrap();
     call_op_move(&pool, &wo.wo_id, 10, 20, 100, &fresh_uuid(&pool).await).await.unwrap();
-    // WIP@op20 = 100 × 48 (std_cum_at_op10, no op20 burdens added).
+    // WIP@op20 = 100 × 48 (per_unit_cum at op10, no op20 services).
     assert_eq!(balance(&pool, wo.wip_val_op20).await, 4800);
 }
 
@@ -607,7 +654,7 @@ async fn wo_complete_unfavorable_residual_routes_through_variance() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let wo = scaffold_wo(&pool, 100, true).await;
-    // Parent std = 67 by scaffold; reset to 60 (10 less than WO_total).
+    // Parent std = 67 by scaffold; reset to 60 (7 less than per-unit accumulation).
     sqlx::query("DELETE FROM standard_costs WHERE sku_id = $1::UUID")
         .bind(&wo.parent_id)
         .execute(&pool)
@@ -620,8 +667,10 @@ async fn wo_complete_unfavorable_residual_routes_through_variance() {
     call_op_move(&pool, &wo.wo_id, 10, 20, 100, &fresh_uuid(&pool).await).await.unwrap();
     call_wo_complete(&pool, &wo.wo_id, 100, &fresh_uuid(&pool).await).await.unwrap();
 
-    // WIP@op20 held 100 × 67 = 6700. wo_complete drained 100 × 60 = 6000.
-    // Residual 700 → DR variance_wo_close / CR inv_value_wip.
+    // WIP@op20 held 100 × 67 = 6700. wo_complete drains 100 × 60 = 6000.
+    // BOM2 pre-balance step (mig 0061) emits an unfavorable wo_close_v
+    // for the 700 residual (DR variance / CR pool) BEFORE the per-output
+    // drain so the debit-normal CHECK on inv_value_wip stays satisfied.
     assert_eq!(balance(&pool, wo.wip_val_op20).await, 0);
     assert_eq!(balance(&pool, wo.fg_val_acct).await, 6000);
     assert_eq!(balance(&pool, wo.variance_wo_close).await, 700);
@@ -629,18 +678,15 @@ async fn wo_complete_unfavorable_residual_routes_through_variance() {
 }
 
 #[tokio::test]
-async fn wo_complete_favorable_drain_blocked_by_check() {
-    // Item 5 reverse: parent_std > WO_total. The dispatcher tries to
-    // drain qty × parent_std (7500) from a WIP pool holding only
-    // qty × WO_total (6700). inv_value_wip is debit-normal (CHECK
-    // accounts_check forbids negative balance), so the drain raises
-    // SQLSTATE 23514 instead of producing a favorable residual.
-    //
-    // This is a structural property of std-cost-on-WIP under MVP:
-    // favorable variance can't be reached because there's no
-    // mechanism to load WIP at less than parent_std. Acct-p7v
-    // (wac on WIP) lifts this — the pool unit cost would float and
-    // the favorable case becomes reachable.
+async fn wo_complete_favorable_residual_routes_through_variance() {
+    // Item 5 reverse: parent_std > per-unit accumulation. The dispatcher
+    // wants to drain qty × parent_std (7500) from a pool holding only
+    // qty × per-unit accumulation (6700). Pre-Slice-B this would have
+    // hit the debit-normal CHECK; under BOM2 (mig 0061) the
+    // post_wo_complete pre-balance step emits a FAVORABLE wo_close_v
+    // (DR pool / CR variance) BEFORE the per-output drain so the pool
+    // is topped up to the drain target. Variance lands negative
+    // (credit-side), reflecting the favorable position.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let wo = scaffold_wo(&pool, 100, true).await;
@@ -654,13 +700,15 @@ async fn wo_complete_favorable_drain_blocked_by_check() {
     pre_load_raw(&pool, &wo, 200, 100, 2000, 2000).await;
     call_wo_start(&pool, &wo.wo_id, &fresh_uuid(&pool).await).await.unwrap();
     call_op_move(&pool, &wo.wo_id, 10, 20, 100, &fresh_uuid(&pool).await).await.unwrap();
-    expect_sqlstate(
-        "23514",
-        || async {
-            call_wo_complete(&pool, &wo.wo_id, 100, &fresh_uuid(&pool).await).await.map(|_| ())
-        },
-    )
-    .await;
+    call_wo_complete(&pool, &wo.wo_id, 100, &fresh_uuid(&pool).await).await.unwrap();
+
+    // Pool@op20 was 6700 pre-complete. Drain target = 100 × 75 = 7500.
+    // Pre-balance: DR pool / CR variance 800 → pool = 7500, variance = -800.
+    // Per-output drain: 7500 → pool = 0, fg = 7500.
+    assert_eq!(balance(&pool, wo.wip_val_op20).await, 0);
+    assert_eq!(balance(&pool, wo.fg_val_acct).await, 7500);
+    assert_eq!(balance(&pool, wo.variance_wo_close).await, -800);
+    assert_eq!(wo_status(&pool, &wo.wo_id).await, "closed");
 }
 
 #[tokio::test]
@@ -817,15 +865,13 @@ async fn wo_already_started_raises_p0026() {
 
 #[tokio::test]
 async fn parent_not_standard_raises_p0026() {
+    // cost_method check fires before BOM resolution; no bom_header
+    // needed for this gate to trip.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let parent = fresh_sku(&pool, "WO-WAC", "wac_perpetual").await;
     set_std_cost(&pool, &parent, 67).await;
-    let raw_loc = fresh_location(&pool, "WO-RAW").await;
     let fg_loc = fresh_location(&pool, "WO-FG").await;
-    let comp = fresh_sku(&pool, "WO-CA", "standard").await;
-    set_std_cost(&pool, &comp, 10).await;
-    add_bom(&pool, &parent, &comp, &raw_loc, 1).await;
     open_account(
         &pool, "stock_wip", "qty", None, Some(&parent), None, Some(10), "debit",
     )
@@ -845,6 +891,8 @@ async fn parent_not_standard_raises_p0026() {
 
 #[tokio::test]
 async fn missing_routing_raises_p0026() {
+    // routing-empty check fires before BOM resolution; no bom_header
+    // needed.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let parent = fresh_sku(&pool, "WO-NO-ROUTE", "standard").await;
@@ -859,7 +907,11 @@ async fn missing_routing_raises_p0026() {
 }
 
 #[tokio::test]
-async fn missing_bom_raises_p0029() {
+async fn missing_bom_raises_p0033() {
+    // BOM2: no bom_header for parent → _wo_resolve_bom_for falls
+    // through bom_header_at, which raises P0033
+    // (bom_header_resolution_invalid). The pre-BOM2 P0029 path is
+    // gone; per-spec migration has no boms / wo_routing_burdens.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let parent = fresh_sku(&pool, "WO-NO-BOM", "standard").await;
@@ -876,7 +928,7 @@ async fn missing_bom_raises_p0029() {
     let wo_id = create_wo(&pool, "WO-Y", &parent, &fg_loc, 10, "USD").await;
     add_routing(&pool, &wo_id, 10, "OP1").await;
     expect_sqlstate(
-        "P0029",
+        "P0033",
         || async { call_wo_start(&pool, &wo_id, &fresh_uuid(&pool).await).await.map(|_| ()) },
     )
     .await;
@@ -933,13 +985,16 @@ async fn wo_complete_qty_overflow_raises_p0027() {
 
 #[tokio::test]
 async fn applied_account_kind_no_mapping_raises_p0026() {
-    // Item 6/7: applied_account_kind = 'cogs' has no _wo_apply_reason_for
-    // mapping → P0026 at WO start.
+    // BOM2: register an absorption_class whose applied_account_kind is
+    // not in the {labor_applied, oh_applied, absorption_pool} mapping
+    // set. The new _wo_apply_reason_for(class_id, basis) overload's
+    // ELSE branch raises P0026 when the bom_line fires.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let wo = scaffold_wo(&pool, 10, false).await;
     pre_load_raw(&pool, &wo, 20, 10, 200, 200).await;
-    add_burden(&pool, &wo.wo_id, 10, "cogs", 5).await;
+    register_absorption_class(&pool, "cogs_test", "cogs", None).await;
+    add_bom_service_per_unit(&pool, wo.bom_id, 3, 10, "cogs_test", 5).await;
     expect_sqlstate(
         "P0026",
         || async { call_wo_start(&pool, &wo.wo_id, &fresh_uuid(&pool).await).await.map(|_| ()) },
@@ -949,8 +1004,8 @@ async fn applied_account_kind_no_mapping_raises_p0026() {
 
 #[tokio::test]
 async fn component_without_std_cost_raises_p0018() {
-    // Item 3: BOM expansion calls resolve_standard_cost_at(comp). If
-    // comp has no standard_costs row, P0018 surfaces.
+    // BOM emission calls resolve_standard_cost_at(comp). If comp has no
+    // standard_costs row, P0018 surfaces.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let parent = fresh_sku(&pool, "WO-P-NSC", "standard").await;
@@ -959,7 +1014,6 @@ async fn component_without_std_cost_raises_p0018() {
     // No standard_costs row for comp.
     let raw_loc = fresh_location(&pool, "WO-RAW-NSC").await;
     let fg_loc = fresh_location(&pool, "WO-FG-NSC").await;
-    add_bom(&pool, &parent, &comp, &raw_loc, 1).await;
     open_account(
         &pool, "stock_wip", "qty", None, Some(&parent), None, Some(10), "debit",
     )
@@ -982,6 +1036,8 @@ async fn component_without_std_cost_raises_p0018() {
     .await;
     let wo_id = create_wo(&pool, "WO-NSC", &parent, &fg_loc, 5, "USD").await;
     add_routing(&pool, &wo_id, 10, "OP1").await;
+    let bom_id = create_bom_header_for_sku(&pool, &parent).await;
+    add_bom_item_by_id(&pool, bom_id, 1, 10, &comp, &raw_loc, 1).await;
     expect_sqlstate(
         "P0018",
         || async { call_wo_start(&pool, &wo_id, &fresh_uuid(&pool).await).await.map(|_| ()) },
@@ -1000,7 +1056,6 @@ async fn cross_currency_component_raises_p0010() {
     set_std_cost(&pool, &comp, 10).await;
     let raw_loc = fresh_location(&pool, "WO-RAW-CC").await;
     let fg_loc = fresh_location(&pool, "WO-FG-CC").await;
-    add_bom(&pool, &parent, &comp, &raw_loc, 1).await;
     open_account(
         &pool, "stock_wip", "qty", None, Some(&parent), None, Some(10), "debit",
     )
@@ -1024,6 +1079,8 @@ async fn cross_currency_component_raises_p0010() {
     .await;
     let wo_id = create_wo(&pool, "WO-CC", &parent, &fg_loc, 5, "USD").await;
     add_routing(&pool, &wo_id, 10, "OP1").await;
+    let bom_id = create_bom_header_for_sku(&pool, &parent).await;
+    add_bom_item_by_id(&pool, bom_id, 1, 10, &comp, &raw_loc, 1).await;
     expect_sqlstate(
         "P0010",
         || async { call_wo_start(&pool, &wo_id, &fresh_uuid(&pool).await).await.map(|_| ()) },
