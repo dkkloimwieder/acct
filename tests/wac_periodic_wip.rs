@@ -634,25 +634,6 @@ async fn wac_periodic_fully_scrapped_close_unproduced() {
     assert_eq!(variance, 0);
 }
 
-/// wac_retroactive on WIP raises P0026 in tier 1: its per-event chronological
-/// replay reads transfers.qty from value-pool events (rm_issue_to_wo carries
-/// component qty), giving wrong final_avg for inv_value_wip. The fix needs
-/// merging qty-side events into the replay walk — tier 3 (acct-rso).
-#[tokio::test(flavor = "multi_thread")]
-async fn wac_retroactive_raises_p0026_pending_tier3() {
-    let pool = connect_test_db().await;
-    reset_to_fixture(&pool).await;
-
-    let parent = fresh_sku(&pool, "WACRETRO", "wac_retroactive").await;
-    let fg_loc = fresh_location(&pool, "WACRETRO-FG").await;
-    let _w = open_account(&pool, "stock_wip", "qty", None, Some(&parent), None, Some(10), "debit").await;
-    let _v = open_account(&pool, "inv_value_wip", "value", Some("USD"), Some(&parent), None, Some(10), "debit").await;
-    let wo_id = create_wo(&pool, "WACRETRO-WO", &parent, &fg_loc, 10).await;
-    add_routing(&pool, &wo_id, 10, "MILL").await;
-
-    expect_sqlstate(
-        "P0026",
-        || async { call_wo_start(&pool, &wo_id, &fresh_uuid(&pool).await).await.map(|_| ()) },
-    )
-    .await;
-}
+// wac_retroactive on WIP support is shipped via tier 3 (acct-rso, mig 0070);
+// the single-op gate test that lived here is superseded by the comprehensive
+// tier-3 test suite in tests/wac_retroactive_wip.rs.
