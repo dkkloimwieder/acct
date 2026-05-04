@@ -41,10 +41,10 @@ drop_ci_db
 docker compose exec -T postgres psql -U "$PG_USER" -d "$ADMIN_DB" \
   -c "CREATE DATABASE ${CI_DB}" >/dev/null
 
-echo "==> Step 1/5: sqlx migrate run on fresh $CI_DB"
+echo "==> Step 1/6: sqlx migrate run on fresh $CI_DB"
 DATABASE_URL="$CI_URL" sqlx migrate run --source db/migrations
 
-echo "==> Step 2/5: sqlx migrate info — assert every migration installed"
+echo "==> Step 2/6: sqlx migrate info — assert every migration installed"
 INFO_OUTPUT=$(DATABASE_URL="$CI_URL" sqlx migrate info --source db/migrations)
 echo "$INFO_OUTPUT"
 if echo "$INFO_OUTPUT" | grep -qE 'pending'; then
@@ -52,7 +52,7 @@ if echo "$INFO_OUTPUT" | grep -qE 'pending'; then
   exit 1
 fi
 
-echo "==> Step 3/5: revert every migration in reverse order"
+echo "==> Step 3/6: revert every migration in reverse order"
 while true; do
   INSTALLED_COUNT=$(DATABASE_URL="$CI_URL" sqlx migrate info --source db/migrations \
     | grep -c 'installed' || true)
@@ -63,7 +63,7 @@ while true; do
   DATABASE_URL="$CI_URL" sqlx migrate revert --source db/migrations
 done
 
-echo "==> Step 4/5: redeploy on cleaned $CI_DB"
+echo "==> Step 4/6: redeploy on cleaned $CI_DB"
 DATABASE_URL="$CI_URL" sqlx migrate run --source db/migrations
 INFO_OUTPUT=$(DATABASE_URL="$CI_URL" sqlx migrate info --source db/migrations)
 if echo "$INFO_OUTPUT" | grep -qE 'pending'; then
@@ -72,7 +72,7 @@ if echo "$INFO_OUTPUT" | grep -qE 'pending'; then
   exit 1
 fi
 
-echo "==> Step 5/5: schema digest"
+echo "==> Step 5/6: schema digest"
 # PG 18 pg_dump emits a randomized `\restrict <key>` / `\unrestrict <key>`
 # header/footer pair on every invocation (security hardening; prevents
 # psql-restriction replay). Strip them before hashing so the digest is
@@ -81,6 +81,11 @@ SHA=$(docker compose exec -T postgres pg_dump -U "$PG_USER" -s "$CI_DB" \
         | grep -vE '^\\(restrict|unrestrict) ' \
         | sha256sum | awk '{print $1}')
 echo "schema SHA256 = $SHA"
+
+echo
+echo "==> Step 6/6: sql-lint anti-pattern scan (acct-du2 Phase 5)"
+echo "    Errors fail the build; warnings are advisory (review against REVIEW.md)."
+./scripts/sql-lint.sh
 
 echo
 echo "OK: schema integrity check passed."
