@@ -511,10 +511,10 @@ Walked 33 functions × 7-question structural checklist. Phase 2 surfaced **8 add
 | acct-du2.11 | P2 | ✓ closed | mig 0071 (post_standard_cost_roll per-class qty divisor) |
 | acct-du2.12 | P3 | ✓ closed | mig 0071 (stock_available read removed → AP3 dissolved) |
 | acct-du2.13 | P3 | ✓ closed | mig 0075 (lookup_qty_account COMMENT updated) |
-| acct-du2.14 | P3 | open | Phase 3 follow-up: tests/property_wo_lifecycle.rs |
-| acct-du2.15 | P2 | open | Phase 3 follow-up: tests/property_post_cost_adjustment.rs |
-| acct-du2.16 | P3 | open | Phase 3 follow-up: tests/property_period_close.rs |
+| acct-du2.14 | P3 | ✓ closed | tests/property_wo_lifecycle.rs (random multi-WO interleaving × 4 cost methods) |
+| acct-du2.15 | P2 | ✓ closed | tests/property_post_cost_adjustment.rs (multi-class same-location pool isolation) |
+| acct-du2.16 | P3 | ✓ closed | tests/property_period_close.rs (close_period × 3 hooks) |
 
-**Final tally**: 1 P1 false-alarm caught at fix-time (re-reading the latest migration body), 5 of 5 P2 bugs fixed, 7 of 7 P3 cleanups fixed, 3 deeper property-test binaries deferred. 6 fix migrations 0071–0076. ~5 regression tests added (multi-class roll, shared-pool unproduced close, A18 class-isolation, etc.). All 60 test binaries pass after every commit.
+**Final tally**: 1 P1 false-alarm caught at fix-time (re-reading the latest migration body), 5 of 5 P2 bugs fixed, 7 of 7 P3 cleanups fixed, 3 of 3 Phase 3 property-test binaries shipped. 6 fix migrations 0071–0076. ~5 regression tests added plus 3 new property-test binaries (each with 100 random scenarios by default, 200 also clean, via `PROPTEST_CASES`). All test binaries pass after every commit.
 
 **Methodology lesson**: the false alarm on acct-du2.8 surfaced a Phase 2 audit pitfall — when there are multiple `CREATE OR REPLACE FUNCTION` for the same function across migrations, only the LATEST one is the active version. Phase 2's structural walk caught this once (post_cost_adjustment latest = mig 0069) but missed it once (post_inventory_adjustment latest = mig 0031, not 0027). The right verification is `grep -nE 'CREATE OR REPLACE FUNCTION fname' db/migrations/*.up.sql | tail -1` before reading the body. The audit's verdict stays valid — even with one false alarm, 12/13 fixed bugs is a strong ROI on the structural walk.
