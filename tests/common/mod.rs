@@ -598,3 +598,172 @@ pub async fn try_reserve(
     .expect("reserve_inventory call");
     result
 }
+
+// ============================================================
+// acct-du2 Phase 3 — assert_invariants_hold.
+//
+// Seven invariants from the acct-du2 epic:
+//
+//   I1  No debit-normal account has negative balance.
+//   I2  No credit-normal account has positive balance.
+//   I3  Per-class signed qty SUM on inv_value_<class> via transfers.qty
+//       is ≥ 0 for every account that has any qty-bearing transfer.
+//   I4  stock_wip qty ≥ 0 for every parent_sku × routing_op.
+//   I5  Class avg ≈ inv_value.balance / per-class qty SUM (within
+//       BIGINT-truncation tolerance).
+//   I6  Per-(ledger_kind, currency) double-entry: SUM(debits) =
+//       SUM(credits).
+//   I7  No transfers_provisional row violates the existing CHECK
+//       (schema-enforced; we double-check post-write).
+//
+// I1 / I2 / I7 are also enforced by Postgres CHECK constraints — this
+// helper detects schema-violation paths that bypass post_transfers.
+// I3 / I5 / I6 are application-level and need queries.
+//
+// Use from property tests + targeted regression tests. Panics on
+// violation with a descriptive message including `label`.
+// ============================================================
+
+pub async fn assert_invariants_hold(pool: &PgPool, label: &str) {
+    // I1 + I2: balance signs vs normal_side.
+    let bad_balance: Vec<(i64, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, kind::TEXT, normal_side::TEXT, debits_total, credits_total
+           FROM accounts
+          WHERE NOT is_closed
+            AND CASE normal_side::TEXT
+                  WHEN 'debit'  THEN credits_total > debits_total
+                  WHEN 'credit' THEN debits_total  > credits_total
+                  ELSE FALSE
+                END",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("invariants I1/I2 query");
+    assert!(
+        bad_balance.is_empty(),
+        "[{label}] I1/I2 violation — debit/credit balance against normal_side: {bad_balance:?}",
+    );
+
+    // I3: per-class signed qty SUM on inv_value_<class> via transfers.qty.
+    // For every value account that has at least one qty-bearing transfer,
+    // SUM(signed qty) must be >= 0. Asymmetric only across classes; same
+    // pool either grows on debit (receipt) or shrinks on credit (issue).
+    let bad_class_qty: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT a.id, a.kind::TEXT,
+                COALESCE(SUM(CASE
+                  WHEN t.debit_account_id  = a.id THEN  t.qty
+                  WHEN t.credit_account_id = a.id THEN -t.qty
+                END), 0)::BIGINT AS net_qty
+           FROM accounts a
+           JOIN transfers t
+             ON a.id IN (t.debit_account_id, t.credit_account_id)
+            AND t.qty IS NOT NULL
+          WHERE a.kind::TEXT IN ('inv_value_raw', 'inv_value_fg', 'inv_value_wip')
+            AND NOT a.is_closed
+          GROUP BY a.id, a.kind
+         HAVING COALESCE(SUM(CASE
+                  WHEN t.debit_account_id  = a.id THEN  t.qty
+                  WHEN t.credit_account_id = a.id THEN -t.qty
+                END), 0) < 0",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("invariants I3 query");
+    assert!(
+        bad_class_qty.is_empty(),
+        "[{label}] I3 violation — per-class signed qty SUM negative on inv_value_*: {bad_class_qty:?}",
+    );
+
+    // I4: stock_wip qty >= 0 (subset of I1; explicit check for clarity).
+    let bad_wip_qty: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, debits_total, credits_total
+           FROM accounts
+          WHERE kind::TEXT = 'stock_wip' AND NOT is_closed
+            AND debits_total < credits_total",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("invariants I4 query");
+    assert!(
+        bad_wip_qty.is_empty(),
+        "[{label}] I4 violation — stock_wip qty negative: {bad_wip_qty:?}",
+    );
+
+    // I5: class avg consistency. For each value account with both non-
+    // zero balance AND non-zero per-class qty SUM, balance/qty must be
+    // consistent across the period (i.e. value/qty ratio sane).
+    // Tolerance: ±1 (BIGINT truncation); the check is value_balance >= 0
+    // when qty SUM > 0, and value_balance ≈ qty_SUM × avg_unit_cost.
+    // We can't recompute avg_unit_cost at this layer without replaying
+    // the chain, so the cheap check here is: value pool with positive
+    // qty SUM must have non-negative balance. (Negative balance would
+    // already be caught by I1; this is a redundant assertion for
+    // confidence.)
+    let bad_avg: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "WITH per_acct AS (
+            SELECT a.id, a.kind::TEXT AS k,
+                   (a.debits_total - a.credits_total) AS balance,
+                   COALESCE(SUM(CASE
+                     WHEN t.debit_account_id  = a.id THEN  t.qty
+                     WHEN t.credit_account_id = a.id THEN -t.qty
+                   END), 0)::BIGINT AS net_qty
+              FROM accounts a
+              LEFT JOIN transfers t
+                     ON a.id IN (t.debit_account_id, t.credit_account_id)
+                    AND t.qty IS NOT NULL
+             WHERE a.kind::TEXT IN ('inv_value_raw','inv_value_fg','inv_value_wip')
+               AND NOT a.is_closed
+             GROUP BY a.id, a.kind, a.debits_total, a.credits_total
+         )
+         SELECT id, k, balance, net_qty
+           FROM per_acct
+          WHERE net_qty > 0 AND balance < 0",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("invariants I5 query");
+    assert!(
+        bad_avg.is_empty(),
+        "[{label}] I5 violation — value-pool balance < 0 with positive qty SUM: {bad_avg:?}",
+    );
+
+    // I6: per-(ledger_kind, currency) double-entry.
+    // SUM(debits_total) - SUM(credits_total) must be 0 for every
+    // (ledger_kind, currency) partition. NULL currency (qty pools)
+    // grouped together.
+    let bad_de: Vec<(String, Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT ledger_kind, currency,
+                SUM(debits_total)::BIGINT AS d,
+                SUM(credits_total)::BIGINT AS c
+           FROM accounts
+          GROUP BY ledger_kind, currency
+         HAVING SUM(debits_total) <> SUM(credits_total)",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("invariants I6 query");
+    assert!(
+        bad_de.is_empty(),
+        "[{label}] I6 violation — per-(ledger_kind, currency) double-entry: {bad_de:?}",
+    );
+
+    // I7: transfers_provisional CHECK consistency.
+    // Schema-enforced; double-check post-write. The CHECK constraint
+    // (mig 0029 + 0065 relaxation) enforces:
+    //   - finalized_at NULL ↔ variance_amount NULL ↔ variance_transfer_id NULL
+    //   - finalized_at NOT NULL with variance_amount != 0 may have
+    //     variance_transfer_id NULL (internal-chain) OR NOT NULL (leaf).
+    let bad_prov: Vec<(i64,)> = sqlx::query_as(
+        "SELECT transfer_id
+           FROM transfers_provisional
+          WHERE (finalized_at IS NULL AND variance_amount IS NOT NULL)
+             OR (finalized_at IS NOT NULL AND variance_amount IS NULL)",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("invariants I7 query");
+    assert!(
+        bad_prov.is_empty(),
+        "[{label}] I7 violation — transfers_provisional finalized/variance mismatch: {bad_prov:?}",
+    );
+}
