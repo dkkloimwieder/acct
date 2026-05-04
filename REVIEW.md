@@ -491,3 +491,30 @@ Walked 33 functions × 7-question structural checklist. Phase 2 surfaced **8 add
 **Pattern across all findings**: every cross-class / cross-document / cross-method bug was reachable by asking the 7 questions deliberately. The Phase 1 grep found mechanical anti-patterns; Phase 2's structural walk caught semantic uses (a divisor that's "stock_available qty" passes any grep filter, but the question "is this divisor scoped to my class?" surfaces the bug regardless of how it's spelled in code).
 
 **Phase 2 verdict**: the meta-epic's premise is validated. Pattern-grep alone catches ~38% of class-confusion bugs (5/13 sub-issues from Phase 1); structural walk doubles that. Phase 3 (property-based testing with the 7 invariants) will catch any remaining shapes we haven't yet imagined.
+
+## Sub-issue closure summary
+
+13 of 16 sub-issues closed (12 fixed, 1 false alarm). 3 follow-up property-test binaries remain open as planned Phase 3 deeper work.
+
+| ID | Severity | Status | Closed via |
+|----|----------|--------|------------|
+| acct-du2.1 | P2 | ✓ closed | mig 0073 (lock-set extension in post_wo_complete) |
+| acct-du2.2 | P2 | ✓ closed | mig 0073 (lock-set extension, residual-sweep gate) |
+| acct-du2.3 | P2 | ✓ closed | mig 0074 (post_osp_*  dual replay-check) |
+| acct-du2.4 | P3 | ✓ closed | mig 0075 (compute_amount credit-first COALESCE) |
+| acct-du2.5 | P3 | ✓ closed | mig 0075 (post_op_move + post_scrap dual replay-check) |
+| acct-du2.6 | P3 | ✓ closed | mig 0073 (lock-set extension, post_wo_complete wac_*) |
+| acct-du2.7 | P3 | ✓ closed | mig 0073 (lock-set extension, post_op_move wac_*) |
+| **acct-du2.8** | P1 | ✓ closed | **FALSE ALARM** — Phase 2 audit read older mig 0027 body of post_inventory_adjustment; latest mig 0031 body uses per-class signed SUM correctly (acct-1vr fix landed in mig 0030 before acct-fii) |
+| acct-du2.9 | P3 | ✓ closed | mig 0076 (po_line FOR UPDATE before cumulative-qty SUM) |
+| acct-du2.10 | P2 | ✓ closed | mig 0072 (solo-at-pool gate for post_wo_close_unproduced) |
+| acct-du2.11 | P2 | ✓ closed | mig 0071 (post_standard_cost_roll per-class qty divisor) |
+| acct-du2.12 | P3 | ✓ closed | mig 0071 (stock_available read removed → AP3 dissolved) |
+| acct-du2.13 | P3 | ✓ closed | mig 0075 (lookup_qty_account COMMENT updated) |
+| acct-du2.14 | P3 | open | Phase 3 follow-up: tests/property_wo_lifecycle.rs |
+| acct-du2.15 | P2 | open | Phase 3 follow-up: tests/property_post_cost_adjustment.rs |
+| acct-du2.16 | P3 | open | Phase 3 follow-up: tests/property_period_close.rs |
+
+**Final tally**: 1 P1 false-alarm caught at fix-time (re-reading the latest migration body), 5 of 5 P2 bugs fixed, 7 of 7 P3 cleanups fixed, 3 deeper property-test binaries deferred. 6 fix migrations 0071–0076. ~5 regression tests added (multi-class roll, shared-pool unproduced close, A18 class-isolation, etc.). All 60 test binaries pass after every commit.
+
+**Methodology lesson**: the false alarm on acct-du2.8 surfaced a Phase 2 audit pitfall — when there are multiple `CREATE OR REPLACE FUNCTION` for the same function across migrations, only the LATEST one is the active version. Phase 2's structural walk caught this once (post_cost_adjustment latest = mig 0069) but missed it once (post_inventory_adjustment latest = mig 0031, not 0027). The right verification is `grep -nE 'CREATE OR REPLACE FUNCTION fname' db/migrations/*.up.sql | tail -1` before reading the body. The audit's verdict stays valid — even with one false alarm, 12/13 fixed bugs is a strong ROI on the structural walk.
