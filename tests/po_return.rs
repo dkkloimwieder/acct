@@ -828,3 +828,505 @@ async fn override_closed_period_allows_back_post() {
 
     assert_eq!(balance(&pool, s.qty_acct).await, 5);
 }
+
+// ============================================================
+// WAC cost-method coverage (acct-2j4)
+// ============================================================
+
+async fn fresh_sku(pool: &PgPool, code: &str, cost_method: &str) -> String {
+    sqlx::query_scalar(
+        "INSERT INTO skus (code, uom, cost_method)
+         VALUES ($1, 'EA', $2::cost_method) RETURNING id::text",
+    )
+    .bind(code)
+    .bind(cost_method)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("insert sku {code}: {e}"))
+}
+
+async fn fresh_location(pool: &PgPool, code: &str) -> String {
+    sqlx::query_scalar(
+        "INSERT INTO locations (code, name) VALUES ($1, $2) RETURNING id::text",
+    )
+    .bind(code)
+    .bind(format!("Loc {code}"))
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("insert loc {code}: {e}"))
+}
+
+#[allow(dead_code)]
+struct WacScaffold {
+    vendor_id: String,
+    po_id: String,
+    po_line_id: String,
+    sku_id: String,
+    loc_id: String,
+    qty_acct: i64,
+    val_acct: i64,
+    ven_qty: i64,
+    ven_unsettled: i64,
+    ven_ap: i64,
+    var_ppv: i64,
+}
+
+async fn scaffold_wac(
+    pool: &PgPool,
+    suffix: &str,
+    qty_ordered: i64,
+    po_unit_cost: i64,
+) -> WacScaffold {
+    let sku_id = fresh_sku(pool, &format!("SKU-WAC-{suffix}"), "wac_perpetual").await;
+    let loc_id = fresh_location(pool, &format!("WAC-{suffix}")).await;
+    let vendor = fresh_vendor(pool, &format!("VEN-WAC-{suffix}"), "USD").await;
+    let po = fresh_po(pool, &vendor).await;
+    let po_line = fresh_po_line(pool, &po, 1, &sku_id, &loc_id, qty_ordered, po_unit_cost, "USD").await;
+
+    let qty_acct = open_account(
+        pool, "stock_available", "qty", None, Some(&sku_id), Some(&loc_id), None, "debit",
+    )
+    .await;
+    let val_acct = open_account(
+        pool, "inv_value_raw", "value", Some("USD"), Some(&sku_id), Some(&loc_id), None, "debit",
+    )
+    .await;
+    let ven_qty = open_account(
+        pool, "vendor_pool", "qty", None, None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let ven_unsettled = open_account(
+        pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let ven_ap = open_account(
+        pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let var_ppv = account_id_by_kind_currency(pool, "variance_ppv", Some("USD")).await;
+
+    WacScaffold {
+        vendor_id: vendor,
+        po_id: po,
+        po_line_id: po_line,
+        sku_id,
+        loc_id,
+        qty_acct,
+        val_acct,
+        ven_qty,
+        ven_unsettled,
+        ven_ap,
+        var_ppv,
+    }
+}
+
+async fn receive_wac_no_bill(pool: &PgPool, w: &WacScaffold, qty: i64) -> String {
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    let lines = json!([{"po_line_id": w.po_line_id, "qty_received": qty}]);
+    sqlx::query(
+        "SELECT post_po_receipt($1::UUID, $2::JSONB, '2026-04-15'::DATE,
+                                 $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&w.po_id)
+    .bind(lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("post_po_receipt(wac): {e}"));
+
+    sqlx::query_scalar(
+        "SELECT prl.id::text FROM po_receipt_lines prl
+          WHERE prl.po_line_id = $1::UUID
+          ORDER BY prl.id DESC LIMIT 1",
+    )
+    .bind(&w.po_line_id)
+    .fetch_one(pool)
+    .await
+    .expect("recv_line lookup")
+}
+
+async fn bill_wac_qty(pool: &PgPool, w: &WacScaffold, qty: i64) {
+    let unit_cost: i64 = sqlx::query_scalar(
+        "SELECT unit_cost FROM purchase_order_lines WHERE id = $1::UUID",
+    )
+    .bind(&w.po_line_id)
+    .fetch_one(pool)
+    .await
+    .expect("po_line unit_cost");
+
+    let bill_lines = json!([{
+        "kind": "po_match",
+        "po_line_id": w.po_line_id,
+        "qty": qty,
+        "unit_cost": unit_cost,
+        "amount": qty * unit_cost
+    }]);
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    sqlx::query(
+        "SELECT post_ap_bill($1::UUID, 'USD', $2::JSONB, '2026-04-16'::DATE,
+                              $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&w.vendor_id)
+    .bind(bill_lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("post_ap_bill(wac): {e}"));
+}
+
+async fn call_wac_return(
+    pool: &PgPool,
+    w: &WacScaffold,
+    recv_line: &str,
+    qty: i64,
+) -> String {
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": qty}]);
+    sqlx::query_scalar(
+        "SELECT post_po_return($1::UUID, $2::JSONB, '2026-04-25'::DATE,
+                                $3::UUID, $4::UUID, NULL)::text",
+    )
+    .bind(&w.vendor_id)
+    .bind(lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .fetch_one(pool)
+    .await
+    .expect("wac return")
+}
+
+#[tokio::test]
+async fn wac_perpetual_post_bill_return_no_ppv() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let w = scaffold_wac(&pool, "POSTBILL", 10, 100).await;
+    let recv_line = receive_wac_no_bill(&pool, &w, 10).await;
+    bill_wac_qty(&pool, &w, 10).await;
+
+    assert_eq!(balance(&pool, w.qty_acct).await, 10);
+    assert_eq!(balance(&pool, w.val_acct).await, 1000);
+    assert_eq!(balance(&pool, w.ven_ap).await, -1000);
+    assert_eq!(balance(&pool, w.ven_unsettled).await, 0);
+    let var_before = balance(&pool, w.var_ppv).await;
+
+    call_wac_return(&pool, &w, &recv_line, 10).await;
+
+    assert_eq!(balance(&pool, w.qty_acct).await, 0);
+    assert_eq!(balance(&pool, w.val_acct).await, 0);
+    assert_eq!(balance(&pool, w.ven_ap).await, 0);
+    assert_eq!(balance(&pool, w.var_ppv).await, var_before);
+
+    assert_invariants_hold(&pool, "wac_perpetual_post_bill_return_no_ppv").await;
+}
+
+#[tokio::test]
+async fn wac_perpetual_pre_bill_return_routes_to_ap_unsettled() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let w = scaffold_wac(&pool, "PREBILL", 10, 100).await;
+    let recv_line = receive_wac_no_bill(&pool, &w, 10).await;
+
+    assert_eq!(balance(&pool, w.ven_unsettled).await, -1000);
+    assert_eq!(balance(&pool, w.ven_ap).await, 0);
+    let var_before = balance(&pool, w.var_ppv).await;
+
+    let return_id = call_wac_return(&pool, &w, &recv_line, 10).await;
+
+    assert_eq!(balance(&pool, w.ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, w.ven_ap).await, 0);
+    assert_eq!(balance(&pool, w.val_acct).await, 0);
+    assert_eq!(balance(&pool, w.var_ppv).await, var_before);
+
+    let (to_us, to_ap) = split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 10);
+    assert_eq!(to_ap, 0);
+}
+
+#[tokio::test]
+async fn wac_perpetual_partial_bill_split_no_ppv() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let w = scaffold_wac(&pool, "WACSPLIT", 10, 100).await;
+    let recv_line = receive_wac_no_bill(&pool, &w, 10).await;
+    bill_wac_qty(&pool, &w, 6).await;
+
+    assert_eq!(balance(&pool, w.ven_unsettled).await, -400);
+    assert_eq!(balance(&pool, w.ven_ap).await, -600);
+    let var_before = balance(&pool, w.var_ppv).await;
+
+    let return_id = call_wac_return(&pool, &w, &recv_line, 7).await;
+
+    assert_eq!(balance(&pool, w.ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, w.ven_ap).await, -300);
+    assert_eq!(balance(&pool, w.qty_acct).await, 3);
+    assert_eq!(balance(&pool, w.val_acct).await, 300);
+    assert_eq!(balance(&pool, w.var_ppv).await, var_before);
+
+    let (to_us, to_ap) = split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 4);
+    assert_eq!(to_ap, 3);
+}
+
+// ============================================================
+// Multi-line return doc spanning split states (acct-7nv)
+// ============================================================
+
+#[tokio::test]
+async fn multi_line_return_routes_each_line_independently() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = id_text(&pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-A").await;
+    let loc = id_text(&pool, "SELECT id::text FROM locations WHERE code = $1", "MAIN").await;
+    let vendor = fresh_vendor(&pool, "VEN-MULTI", "USD").await;
+    let po = fresh_po(&pool, &vendor).await;
+    let line_a = fresh_po_line(&pool, &po, 1, &sku, &loc, 10, 100, "USD").await;
+    let line_b = fresh_po_line(&pool, &po, 2, &sku, &loc, 10, 100, "USD").await;
+
+    let qty_acct = account_id_stock_available(&pool, "SKU-A", "MAIN").await;
+    let val_acct = account_id_for_selector(
+        &pool, "inv_value_raw", Some("SKU-A"), Some("MAIN"), Some("USD"), None,
+    )
+    .await;
+    let _ven_qty = open_account(
+        &pool, "vendor_pool", "qty", None, None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let ven_unsettled = open_account(
+        &pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let ven_ap = open_account(
+        &pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    let lines = json!([
+        {"po_line_id": line_a, "qty_received": 10},
+        {"po_line_id": line_b, "qty_received": 10}
+    ]);
+    sqlx::query(
+        "SELECT post_po_receipt($1::UUID, $2::JSONB, '2026-04-15'::DATE,
+                                 $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&po)
+    .bind(lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("receipt");
+
+    let recv_a: String = sqlx::query_scalar(
+        "SELECT id::text FROM po_receipt_lines WHERE po_line_id = $1::UUID",
+    )
+    .bind(&line_a)
+    .fetch_one(&pool)
+    .await
+    .expect("recv_a");
+    let recv_b: String = sqlx::query_scalar(
+        "SELECT id::text FROM po_receipt_lines WHERE po_line_id = $1::UUID",
+    )
+    .bind(&line_b)
+    .fetch_one(&pool)
+    .await
+    .expect("recv_b");
+
+    let bill_lines = json!([{
+        "kind": "po_match",
+        "po_line_id": line_a,
+        "qty": 10,
+        "unit_cost": 100,
+        "amount": 1000
+    }]);
+    let posted_by2 = fresh_uuid(&pool).await;
+    let key2 = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_ap_bill($1::UUID, 'USD', $2::JSONB, '2026-04-16'::DATE,
+                              $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&vendor)
+    .bind(bill_lines)
+    .bind(&posted_by2)
+    .bind(&key2)
+    .execute(&pool)
+    .await
+    .expect("bill A");
+
+    assert_eq!(balance(&pool, ven_ap).await, -1000);
+    assert_eq!(balance(&pool, ven_unsettled).await, -1000);
+
+    let return_lines = json!([
+        {"recv_line_id": recv_a, "qty_returned": 10},
+        {"recv_line_id": recv_b, "qty_returned": 10}
+    ]);
+    let return_id = call_return(&pool, &vendor, return_lines).await.expect("multi-line return");
+
+    assert_eq!(balance(&pool, ven_ap).await, 0);
+    assert_eq!(balance(&pool, ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, qty_acct).await, 0);
+    assert_eq!(balance(&pool, val_acct).await, 0);
+
+    let line_a_split: (i64, i64) = sqlx::query_as(
+        "SELECT qty_to_ap_unsettled::BIGINT, qty_to_ap::BIGINT
+         FROM po_return_lines WHERE return_id = $1::UUID AND recv_line_id = $2::UUID",
+    )
+    .bind(&return_id)
+    .bind(&recv_a)
+    .fetch_one(&pool)
+    .await
+    .expect("line_a split");
+    assert_eq!(line_a_split, (0, 10));
+
+    let line_b_split: (i64, i64) = sqlx::query_as(
+        "SELECT qty_to_ap_unsettled::BIGINT, qty_to_ap::BIGINT
+         FROM po_return_lines WHERE return_id = $1::UUID AND recv_line_id = $2::UUID",
+    )
+    .bind(&return_id)
+    .bind(&recv_b)
+    .fetch_one(&pool)
+    .await
+    .expect("line_b split");
+    assert_eq!(line_b_split, (10, 0));
+
+    assert_invariants_hold(&pool, "multi_line_return_routes_each_line_independently").await;
+}
+
+// ============================================================
+// Multi-currency state-aware routing (acct-bh0)
+// ============================================================
+
+#[tokio::test]
+async fn multi_currency_split_routes_per_currency_partition() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku_usd = id_text(&pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-A").await;
+    let sku_eur = id_text(&pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-B").await;
+    let loc = id_text(&pool, "SELECT id::text FROM locations WHERE code = $1", "MAIN").await;
+    let vendor = fresh_vendor(&pool, "VEN-FX", "USD").await;
+    let po = fresh_po(&pool, &vendor).await;
+    let line_usd = fresh_po_line(&pool, &po, 1, &sku_usd, &loc, 10, 100, "USD").await;
+    let line_eur = fresh_po_line(&pool, &po, 2, &sku_eur, &loc, 10, 80, "EUR").await;
+
+    let qty_usd = account_id_stock_available(&pool, "SKU-A", "MAIN").await;
+    let val_usd = account_id_for_selector(
+        &pool, "inv_value_raw", Some("SKU-A"), Some("MAIN"), Some("USD"), None,
+    )
+    .await;
+    let qty_eur = open_account(
+        &pool, "stock_available", "qty", None, Some(&sku_eur), Some(&loc), None, "debit",
+    )
+    .await;
+    let val_eur = open_account(
+        &pool, "inv_value_raw", "value", Some("EUR"), Some(&sku_eur), Some(&loc), None, "debit",
+    )
+    .await;
+    let _ven_qty = open_account(
+        &pool, "vendor_pool", "qty", None, None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let unsettled_usd = open_account(
+        &pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let unsettled_eur = open_account(
+        &pool, "ap_unsettled", "value", Some("EUR"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let ap_usd = open_account(
+        &pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let ap_eur = open_account(
+        &pool, "ap", "value", Some("EUR"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+    // EUR variance_ppv (SKU-B is standard cost=200; po=80 → PPV credit). Per
+    // fixture, variance_* accounts are unrestricted normal_side.
+    let _var_ppv_eur = open_account(
+        &pool, "variance_ppv", "value", Some("EUR"), None, None, None, "unrestricted",
+    )
+    .await;
+
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    let lines = json!([
+        {"po_line_id": line_usd, "qty_received": 10},
+        {"po_line_id": line_eur, "qty_received": 10}
+    ]);
+    sqlx::query(
+        "SELECT post_po_receipt($1::UUID, $2::JSONB, '2026-04-15'::DATE,
+                                 $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&po)
+    .bind(lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("multi-ccy receipt");
+
+    let recv_usd: String = sqlx::query_scalar(
+        "SELECT id::text FROM po_receipt_lines WHERE po_line_id = $1::UUID",
+    )
+    .bind(&line_usd)
+    .fetch_one(&pool)
+    .await
+    .expect("recv_usd");
+    let recv_eur: String = sqlx::query_scalar(
+        "SELECT id::text FROM po_receipt_lines WHERE po_line_id = $1::UUID",
+    )
+    .bind(&line_eur)
+    .fetch_one(&pool)
+    .await
+    .expect("recv_eur");
+
+    let bill_usd = json!([{
+        "kind": "po_match", "po_line_id": line_usd,
+        "qty": 10, "unit_cost": 100, "amount": 1000
+    }]);
+    let posted_by2 = fresh_uuid(&pool).await;
+    let key2 = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_ap_bill($1::UUID, 'USD', $2::JSONB, '2026-04-16'::DATE,
+                              $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&vendor)
+    .bind(bill_usd)
+    .bind(&posted_by2)
+    .bind(&key2)
+    .execute(&pool)
+    .await
+    .expect("bill USD");
+
+    assert_eq!(balance(&pool, ap_usd).await, -1000);
+    assert_eq!(balance(&pool, unsettled_usd).await, 0);
+    assert_eq!(balance(&pool, ap_eur).await, 0);
+    assert_eq!(balance(&pool, unsettled_eur).await, -800);
+
+    let return_lines = json!([
+        {"recv_line_id": recv_usd, "qty_returned": 10},
+        {"recv_line_id": recv_eur, "qty_returned": 10}
+    ]);
+    call_return(&pool, &vendor, return_lines).await.expect("multi-ccy return");
+
+    assert_eq!(balance(&pool, ap_usd).await, 0);
+    assert_eq!(balance(&pool, unsettled_usd).await, 0);
+    assert_eq!(balance(&pool, ap_eur).await, 0);
+    assert_eq!(balance(&pool, unsettled_eur).await, 0);
+
+    assert_eq!(balance(&pool, qty_usd).await, 0);
+    assert_eq!(balance(&pool, val_usd).await, 0);
+    assert_eq!(balance(&pool, qty_eur).await, 0);
+    assert_eq!(balance(&pool, val_eur).await, 0);
+
+    assert_invariants_hold(&pool, "multi_currency_split_routes_per_currency_partition").await;
+}

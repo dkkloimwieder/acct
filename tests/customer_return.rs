@@ -920,3 +920,506 @@ async fn override_closed_period_allows_back_post() {
 
     assert_eq!(balance(&pool, s.qty_acct).await, 5);
 }
+
+// ============================================================
+// Disposition × pre-invoice / partial-invoice combinations (acct-hik)
+// ============================================================
+
+#[tokio::test]
+async fn pre_invoice_return_disposition_scrap() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "PRE-INV-SCRAP", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_no_invoice(&pool, &s, 10).await;
+
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 1015);
+    let var_scrap_before = balance(&pool, s.var_scrap_acct).await;
+
+    let lines = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 10,
+        "disposition": "scrap"
+    }]);
+    let return_id = call_return(&pool, &s.customer_id, lines).await.expect("return");
+
+    // qty: stock_scrap; value: variance_scrap; revenue: ar_unsettled (pre-invoice).
+    assert_eq!(balance(&pool, s.qty_acct).await, 0);
+    assert_eq!(balance(&pool, s.stock_scrap_acct).await, 10);
+    assert_eq!(balance(&pool, s.val_acct).await, 0);
+    assert_eq!(balance(&pool, s.var_scrap_acct).await - var_scrap_before, 600);
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.cust_ar).await, 0);
+
+    let (to_us, to_ar) = ar_split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 10);
+    assert_eq!(to_ar, 0);
+
+    assert_invariants_hold(&pool, "pre_invoice_return_disposition_scrap").await;
+}
+
+#[tokio::test]
+async fn pre_invoice_return_disposition_repair() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "PRE-INV-REPAIR", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_no_invoice(&pool, &s, 10).await;
+
+    let lines = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 10,
+        "disposition": "repair"
+    }]);
+    let return_id = call_return(&pool, &s.customer_id, lines).await.expect("return");
+
+    // qty: stock_quarantine; value: inv_value_fg; revenue: ar_unsettled.
+    assert_eq!(balance(&pool, s.stock_quarantine_acct).await, 10);
+    assert_eq!(balance(&pool, s.val_acct).await, 600);
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.cust_ar).await, 0);
+
+    let (to_us, to_ar) = ar_split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 10);
+    assert_eq!(to_ar, 0);
+}
+
+#[tokio::test]
+async fn partial_invoice_split_disposition_scrap() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "SPLIT-SCRAP", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_no_invoice(&pool, &s, 10).await;
+    invoice_qty(&pool, &s, 6).await;
+
+    assert_eq!(balance(&pool, s.cust_ar).await, 600);
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 415);
+    let var_scrap_before = balance(&pool, s.var_scrap_acct).await;
+
+    let lines = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 7,
+        "disposition": "scrap"
+    }]);
+    let return_id = call_return(&pool, &s.customer_id, lines).await.expect("return");
+
+    // 4 → ar_unsettled (un-invoiced); 3 → ar (invoiced). Tax 7/10 of 15 = 10
+    // pro-rated, all to ar_unsettled. Cogs reversal goes to variance_scrap.
+    // Inventory qty: stock_scrap +7, stock_available untouched.
+    // Inv value untouched (still drained from ship); variance_scrap += 7*60=420.
+    assert_eq!(balance(&pool, s.qty_acct).await, 0);
+    assert_eq!(balance(&pool, s.stock_scrap_acct).await, 7);
+    assert_eq!(balance(&pool, s.val_acct).await, 0);
+    assert_eq!(balance(&pool, s.var_scrap_acct).await - var_scrap_before, 7 * 60);
+    assert_eq!(balance(&pool, s.cust_ar).await, 300);
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 5);
+
+    let (to_us, to_ar) = ar_split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 4);
+    assert_eq!(to_ar, 3);
+}
+
+#[tokio::test]
+async fn partial_invoice_split_disposition_repair() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "SPLIT-REPAIR", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_no_invoice(&pool, &s, 10).await;
+    invoice_qty(&pool, &s, 6).await;
+
+    let lines = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 7,
+        "disposition": "repair"
+    }]);
+    let return_id = call_return(&pool, &s.customer_id, lines).await.expect("return");
+
+    // qty → stock_quarantine; value → inv_value_fg; revenue split as before.
+    assert_eq!(balance(&pool, s.stock_quarantine_acct).await, 7);
+    assert_eq!(balance(&pool, s.val_acct).await, 7 * 60);
+    assert_eq!(balance(&pool, s.cust_ar).await, 300);
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 5);
+
+    let (to_us, to_ar) = ar_split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 4);
+    assert_eq!(to_ar, 3);
+}
+
+// ============================================================
+// Multi-line return doc spanning split states (acct-7nv, AR side)
+// ============================================================
+
+#[tokio::test]
+async fn ar_multi_line_return_routes_each_line_independently() {
+    // Customer has two so_lines (different SKUs / ship_locs). Ship both,
+    // invoice only line A. Return both in one doc → line A drains ar;
+    // line B drains ar_unsettled.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let customer_id = fresh_customer(&pool, "CUST-AR-MULTI", "USD").await;
+    let sku_a = fresh_sku(&pool, "SKU-AR-A", "standard").await;
+    let sku_b = fresh_sku(&pool, "SKU-AR-B", "standard").await;
+    let loc_a = fresh_location(&pool, "AR-A").await;
+    let loc_b = fresh_location(&pool, "AR-B").await;
+
+    set_std_cost(&pool, &sku_a, 60).await;
+    set_std_cost(&pool, &sku_b, 80).await;
+
+    let so_id = create_so(&pool, &customer_id).await;
+    let line_a = add_so_line(&pool, &so_id, 1, &sku_a, &loc_a, 10, 100, 0).await;
+    let line_b = add_so_line(&pool, &so_id, 2, &sku_b, &loc_b, 10, 120, 0).await;
+
+    // Open accounts for both lines.
+    let qty_a = open_account(
+        &pool, "stock_available", "qty", None, Some(&sku_a), Some(&loc_a), None, "debit",
+    )
+    .await;
+    let val_a = open_account(
+        &pool, "inv_value_fg", "value", Some("USD"), Some(&sku_a), Some(&loc_a), None, "debit",
+    )
+    .await;
+    let qty_b = open_account(
+        &pool, "stock_available", "qty", None, Some(&sku_b), Some(&loc_b), None, "debit",
+    )
+    .await;
+    let val_b = open_account(
+        &pool, "inv_value_fg", "value", Some("USD"), Some(&sku_b), Some(&loc_b), None, "debit",
+    )
+    .await;
+    let _cust_qty = open_account(
+        &pool, "customer_pool", "qty", None, None, None, Some(&customer_id), "debit",
+    )
+    .await;
+    let cust_unsettled = open_account(
+        &pool, "ar_unsettled", "value", Some("USD"), None, None, Some(&customer_id), "debit",
+    )
+    .await;
+    let cust_ar = open_account(
+        &pool, "ar", "value", Some("USD"), None, None, Some(&customer_id), "debit",
+    )
+    .await;
+
+    // Seed FG inventory for both SKUs.
+    let creation_void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let creation_void_val = account_id_by_kind_currency(&pool, "creation_void", Some("USD")).await;
+    let posted_by = fresh_uuid(&pool).await;
+    let doc_id = fresh_uuid(&pool).await;
+    let mint = json!([
+        {"reason":"cycle_count_adj","document_kind":"seed","document_id":doc_id,
+         "debit_account_id":qty_a,"credit_account_id":creation_void_qty,
+         "amount":10,"qty":10,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by},
+        {"reason":"cycle_count_adj","document_kind":"seed","document_id":doc_id,
+         "debit_account_id":val_a,"credit_account_id":creation_void_val,
+         "amount":600,"qty":10,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by},
+        {"reason":"cycle_count_adj","document_kind":"seed","document_id":doc_id,
+         "debit_account_id":qty_b,"credit_account_id":creation_void_qty,
+         "amount":10,"qty":10,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by},
+        {"reason":"cycle_count_adj","document_kind":"seed","document_id":doc_id,
+         "debit_account_id":val_b,"credit_account_id":creation_void_val,
+         "amount":800,"qty":10,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by}
+    ]);
+    sqlx::query("SELECT post_transfers($1, FALSE)")
+        .bind(mint)
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+    // Ship both lines.
+    let posted_by2 = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    let ship_lines = json!([
+        {"so_line_id": line_a, "qty_shipped": 10},
+        {"so_line_id": line_b, "qty_shipped": 10}
+    ]);
+    sqlx::query(
+        "SELECT post_so_ship($1::UUID, $2::JSONB, '2026-04-20'::DATE,
+                              $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&so_id)
+    .bind(ship_lines)
+    .bind(&posted_by2)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("ship both");
+
+    let ship_a: String = sqlx::query_scalar(
+        "SELECT id::text FROM so_shipment_lines WHERE so_line_id = $1::UUID",
+    )
+    .bind(&line_a)
+    .fetch_one(&pool)
+    .await
+    .expect("ship_a");
+    let ship_b: String = sqlx::query_scalar(
+        "SELECT id::text FROM so_shipment_lines WHERE so_line_id = $1::UUID",
+    )
+    .bind(&line_b)
+    .fetch_one(&pool)
+    .await
+    .expect("ship_b");
+
+    // Invoice ONLY line A.
+    let inv_lines = json!([{
+        "kind": "so_match", "so_line_id": line_a,
+        "qty": 10, "unit_price": 100, "amount": 1000
+    }]);
+    let posted_by3 = fresh_uuid(&pool).await;
+    let key2 = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_customer_invoice($1::UUID, 'USD', $2::JSONB,
+                                       '2026-04-21'::DATE, $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&customer_id)
+    .bind(inv_lines)
+    .bind(&posted_by3)
+    .bind(&key2)
+    .execute(&pool)
+    .await
+    .expect("invoice A");
+
+    // Pre-state: ar=1000 (line A invoiced); ar_unsettled = 0 (A) + 1200 (B) = 1200.
+    assert_eq!(balance(&pool, cust_ar).await, 1000);
+    assert_eq!(balance(&pool, cust_unsettled).await, 1200);
+
+    // Return both lines in ONE doc.
+    let return_lines = json!([
+        {"ship_line_id": ship_a, "qty_returned": 10, "disposition": "restock"},
+        {"ship_line_id": ship_b, "qty_returned": 10, "disposition": "restock"}
+    ]);
+    let return_id = call_return(&pool, &customer_id, return_lines).await.expect("multi-line ar return");
+
+    // ar drained (line A invoiced); ar_unsettled drained (line B not invoiced).
+    assert_eq!(balance(&pool, cust_ar).await, 0);
+    assert_eq!(balance(&pool, cust_unsettled).await, 0);
+
+    // Per-line splits.
+    let split_a: (i64, i64) = sqlx::query_as(
+        "SELECT qty_to_ar_unsettled::BIGINT, qty_to_ar::BIGINT
+         FROM customer_return_lines WHERE return_id = $1::UUID AND ship_line_id = $2::UUID",
+    )
+    .bind(&return_id)
+    .bind(&ship_a)
+    .fetch_one(&pool)
+    .await
+    .expect("split_a");
+    assert_eq!(split_a, (0, 10));
+
+    let split_b: (i64, i64) = sqlx::query_as(
+        "SELECT qty_to_ar_unsettled::BIGINT, qty_to_ar::BIGINT
+         FROM customer_return_lines WHERE return_id = $1::UUID AND ship_line_id = $2::UUID",
+    )
+    .bind(&return_id)
+    .bind(&ship_b)
+    .fetch_one(&pool)
+    .await
+    .expect("split_b");
+    assert_eq!(split_b, (10, 0));
+
+    assert_invariants_hold(&pool, "ar_multi_line_return_routes_each_line_independently").await;
+}
+
+// ============================================================
+// Multi-currency state-aware routing on AR side (acct-bh0)
+// ============================================================
+
+#[tokio::test]
+async fn ar_multi_currency_split_routes_per_currency_partition() {
+    // Customer with two so_lines: USD and EUR. Ship both. Invoice USD
+    // only. Return both — USD line drains ar (USD); EUR drains
+    // ar_unsettled (EUR).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let customer_id = fresh_customer(&pool, "CUST-AR-FX", "USD").await;
+    let sku_usd = fresh_sku(&pool, "SKU-AR-USD", "standard").await;
+    let sku_eur = fresh_sku(&pool, "SKU-AR-EUR", "standard").await;
+    let loc_usd = fresh_location(&pool, "AR-FX-USD").await;
+    let loc_eur = fresh_location(&pool, "AR-FX-EUR").await;
+
+    set_std_cost(&pool, &sku_usd, 60).await;
+    set_std_cost(&pool, &sku_eur, 80).await;
+
+    let so_id = create_so(&pool, &customer_id).await;
+    // sales_order_lines.currency is per-line.
+    let line_usd: String = sqlx::query_scalar(
+        "INSERT INTO sales_order_lines
+            (so_id, line_no, sku_id, ship_location_id, qty_ordered,
+             unit_price, currency, tax_amount)
+         VALUES ($1::UUID, 1, $2::UUID, $3::UUID, 10, 100, 'USD', 0)
+         RETURNING id::text",
+    )
+    .bind(&so_id)
+    .bind(&sku_usd)
+    .bind(&loc_usd)
+    .fetch_one(&pool)
+    .await
+    .expect("line_usd");
+    let line_eur: String = sqlx::query_scalar(
+        "INSERT INTO sales_order_lines
+            (so_id, line_no, sku_id, ship_location_id, qty_ordered,
+             unit_price, currency, tax_amount)
+         VALUES ($1::UUID, 2, $2::UUID, $3::UUID, 10, 120, 'EUR', 0)
+         RETURNING id::text",
+    )
+    .bind(&so_id)
+    .bind(&sku_eur)
+    .bind(&loc_eur)
+    .fetch_one(&pool)
+    .await
+    .expect("line_eur");
+
+    let qty_usd = open_account(
+        &pool, "stock_available", "qty", None, Some(&sku_usd), Some(&loc_usd), None, "debit",
+    )
+    .await;
+    let val_usd = open_account(
+        &pool, "inv_value_fg", "value", Some("USD"), Some(&sku_usd), Some(&loc_usd), None, "debit",
+    )
+    .await;
+    let qty_eur = open_account(
+        &pool, "stock_available", "qty", None, Some(&sku_eur), Some(&loc_eur), None, "debit",
+    )
+    .await;
+    let val_eur = open_account(
+        &pool, "inv_value_fg", "value", Some("EUR"), Some(&sku_eur), Some(&loc_eur), None, "debit",
+    )
+    .await;
+    let _cust_qty = open_account(
+        &pool, "customer_pool", "qty", None, None, None, Some(&customer_id), "debit",
+    )
+    .await;
+    let unsettled_usd = open_account(
+        &pool, "ar_unsettled", "value", Some("USD"), None, None, Some(&customer_id), "debit",
+    )
+    .await;
+    let unsettled_eur = open_account(
+        &pool, "ar_unsettled", "value", Some("EUR"), None, None, Some(&customer_id), "debit",
+    )
+    .await;
+    let ar_usd = open_account(
+        &pool, "ar", "value", Some("USD"), None, None, Some(&customer_id), "debit",
+    )
+    .await;
+    let ar_eur = open_account(
+        &pool, "ar", "value", Some("EUR"), None, None, Some(&customer_id), "debit",
+    )
+    .await;
+    // EUR cogs (revenue EUR is seeded; don't duplicate it).
+    let _cogs_eur = open_account(
+        &pool, "cogs", "value", Some("EUR"), None, None, None, "debit",
+    )
+    .await;
+
+    // Seed FG for both SKUs.
+    let creation_void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
+    let creation_void_usd = account_id_by_kind_currency(&pool, "creation_void", Some("USD")).await;
+    let creation_void_eur = open_account(
+        &pool, "creation_void", "value", Some("EUR"), None, None, None, "unrestricted",
+    )
+    .await;
+    let posted_by = fresh_uuid(&pool).await;
+    let doc_id = fresh_uuid(&pool).await;
+    let mint = json!([
+        {"reason":"cycle_count_adj","document_kind":"seed","document_id":doc_id,
+         "debit_account_id":qty_usd,"credit_account_id":creation_void_qty,
+         "amount":10,"qty":10,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by},
+        {"reason":"cycle_count_adj","document_kind":"seed","document_id":doc_id,
+         "debit_account_id":val_usd,"credit_account_id":creation_void_usd,
+         "amount":600,"qty":10,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by},
+        {"reason":"cycle_count_adj","document_kind":"seed","document_id":doc_id,
+         "debit_account_id":qty_eur,"credit_account_id":creation_void_qty,
+         "amount":10,"qty":10,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by},
+        {"reason":"cycle_count_adj","document_kind":"seed","document_id":doc_id,
+         "debit_account_id":val_eur,"credit_account_id":creation_void_eur,
+         "amount":800,"qty":10,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by}
+    ]);
+    sqlx::query("SELECT post_transfers($1, FALSE)")
+        .bind(mint)
+        .execute(&pool)
+        .await
+        .expect("seed multi-ccy");
+
+    // Ship both.
+    let posted_by2 = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    let ship_lines = json!([
+        {"so_line_id": line_usd, "qty_shipped": 10},
+        {"so_line_id": line_eur, "qty_shipped": 10}
+    ]);
+    sqlx::query(
+        "SELECT post_so_ship($1::UUID, $2::JSONB, '2026-04-20'::DATE,
+                              $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&so_id)
+    .bind(ship_lines)
+    .bind(&posted_by2)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("ship both ccy");
+
+    let ship_usd: String = sqlx::query_scalar(
+        "SELECT id::text FROM so_shipment_lines WHERE so_line_id = $1::UUID",
+    )
+    .bind(&line_usd)
+    .fetch_one(&pool)
+    .await
+    .expect("ship_usd");
+    let ship_eur: String = sqlx::query_scalar(
+        "SELECT id::text FROM so_shipment_lines WHERE so_line_id = $1::UUID",
+    )
+    .bind(&line_eur)
+    .fetch_one(&pool)
+    .await
+    .expect("ship_eur");
+
+    // Invoice USD only.
+    let inv_lines = json!([{
+        "kind": "so_match", "so_line_id": line_usd,
+        "qty": 10, "unit_price": 100, "amount": 1000
+    }]);
+    let posted_by3 = fresh_uuid(&pool).await;
+    let key2 = fresh_uuid(&pool).await;
+    sqlx::query(
+        "SELECT post_customer_invoice($1::UUID, 'USD', $2::JSONB,
+                                       '2026-04-21'::DATE, $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&customer_id)
+    .bind(inv_lines)
+    .bind(&posted_by3)
+    .bind(&key2)
+    .execute(&pool)
+    .await
+    .expect("invoice USD");
+
+    // Pre-state: USD ar=1000, USD ar_unsettled=0; EUR ar=0, EUR ar_unsettled=1200.
+    assert_eq!(balance(&pool, ar_usd).await, 1000);
+    assert_eq!(balance(&pool, unsettled_usd).await, 0);
+    assert_eq!(balance(&pool, ar_eur).await, 0);
+    assert_eq!(balance(&pool, unsettled_eur).await, 1200);
+
+    // Return both — single document.
+    let return_lines = json!([
+        {"ship_line_id": ship_usd, "qty_returned": 10, "disposition": "restock"},
+        {"ship_line_id": ship_eur, "qty_returned": 10, "disposition": "restock"}
+    ]);
+    call_return(&pool, &customer_id, return_lines).await.expect("multi-ccy return");
+
+    assert_eq!(balance(&pool, ar_usd).await, 0);
+    assert_eq!(balance(&pool, unsettled_usd).await, 0);
+    assert_eq!(balance(&pool, ar_eur).await, 0);
+    assert_eq!(balance(&pool, unsettled_eur).await, 0);
+
+    assert_invariants_hold(&pool, "ar_multi_currency_split_routes_per_currency_partition").await;
+}
