@@ -727,3 +727,141 @@ async fn unknown_line_kind_p0025() {
         db.message()
     );
 }
+
+// ============================================================
+// Three-way match tolerance windows (acct-7mc)
+// ============================================================
+
+async fn set_vendor_tolerance(pool: &PgPool, vendor_id: &str, pct: &str) {
+    sqlx::query(
+        "UPDATE vendors SET unit_cost_tolerance_pct = $1::NUMERIC WHERE id = $2::UUID",
+    )
+    .bind(pct)
+    .bind(vendor_id)
+    .execute(pool)
+    .await
+    .expect("set tolerance");
+}
+
+async fn match_tol_acct(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT id FROM accounts
+         WHERE kind='variance_match_tolerance' AND ledger_kind='value'
+           AND currency='USD' AND counterparty_id IS NULL AND NOT is_closed",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("match_tol")
+}
+
+#[tokio::test]
+async fn within_tolerance_unfavorable_absorbs_to_variance() {
+    // PO unit_cost=100, vendor tolerance=2%. Bill at unit_cost=102 (2%
+    // exactly). variance_match_tolerance debits 20 (loss); ap credits
+    // 1020 total (1000 base + 20 absorption).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let sx = build_setup(&pool, "VEN-TOL").await;
+    receive_10(&pool, &sx).await;
+    set_vendor_tolerance(&pool, &sx.vendor_id, "2.0").await;
+    let mt = match_tol_acct(&pool).await;
+    let mt_before = balance(&pool, mt).await;
+
+    let key = fresh_uuid(&pool).await;
+    let lines = serde_json::json!([{
+        "kind": "po_match", "po_line_id": sx.po_line_id,
+        "qty": 10, "unit_cost": 102, "amount": 1020
+    }]);
+    call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-16", &key).await
+        .expect("within tolerance");
+
+    assert_eq!(balance(&pool, sx.ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, sx.ap).await, -1020);
+    assert_eq!(balance(&pool, mt).await - mt_before, 20);
+
+    assert_invariants_hold(&pool, "within_tolerance_unfavorable_absorbs_to_variance").await;
+}
+
+#[tokio::test]
+async fn within_tolerance_favorable_absorbs_to_variance() {
+    // Bill at unit_cost=98 (2% below). Favorable: variance credits 20
+    // (gain); ap credits 980 (1000 base, then drain 20).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let sx = build_setup(&pool, "VEN-TOL-FAV").await;
+    receive_10(&pool, &sx).await;
+    set_vendor_tolerance(&pool, &sx.vendor_id, "2.0").await;
+    let mt = match_tol_acct(&pool).await;
+    let mt_before = balance(&pool, mt).await;
+
+    let key = fresh_uuid(&pool).await;
+    let lines = serde_json::json!([{
+        "kind": "po_match", "po_line_id": sx.po_line_id,
+        "qty": 10, "unit_cost": 98, "amount": 980
+    }]);
+    call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-16", &key).await
+        .expect("within tolerance fav");
+
+    assert_eq!(balance(&pool, sx.ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, sx.ap).await, -980);
+    assert_eq!(balance(&pool, mt).await - mt_before, -20);
+}
+
+#[tokio::test]
+async fn out_of_tolerance_still_raises_p0024() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let sx = build_setup(&pool, "VEN-OOT").await;
+    receive_10(&pool, &sx).await;
+    set_vendor_tolerance(&pool, &sx.vendor_id, "2.0").await;
+
+    let key = fresh_uuid(&pool).await;
+    // 5% over → 5 > 2 → reject.
+    let lines = serde_json::json!([{
+        "kind": "po_match", "po_line_id": sx.po_line_id,
+        "qty": 10, "unit_cost": 105, "amount": 1050
+    }]);
+    expect_sqlstate("P0024", || async {
+        call_bill(&pool, &sx.vendor_id, "USD", lines.clone(), "2026-04-16", &key).await.map(|_| ())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn zero_tolerance_default_is_strict() {
+    // Default vendor tolerance = 0; any unit_cost mismatch raises.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let sx = build_setup(&pool, "VEN-STRICT").await;
+    receive_10(&pool, &sx).await;
+
+    let key = fresh_uuid(&pool).await;
+    let lines = serde_json::json!([{
+        "kind": "po_match", "po_line_id": sx.po_line_id,
+        "qty": 10, "unit_cost": 101, "amount": 1010
+    }]);
+    expect_sqlstate("P0024", || async {
+        call_bill(&pool, &sx.vendor_id, "USD", lines.clone(), "2026-04-16", &key).await.map(|_| ())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn within_tolerance_exact_at_boundary_succeeds() {
+    // Tolerance = 5%; bill at exactly 5% over (not >).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let sx = build_setup(&pool, "VEN-BOUND").await;
+    receive_10(&pool, &sx).await;
+    set_vendor_tolerance(&pool, &sx.vendor_id, "5.0").await;
+
+    let key = fresh_uuid(&pool).await;
+    let lines = serde_json::json!([{
+        "kind": "po_match", "po_line_id": sx.po_line_id,
+        "qty": 10, "unit_cost": 105, "amount": 1050
+    }]);
+    call_bill(&pool, &sx.vendor_id, "USD", lines, "2026-04-16", &key).await
+        .expect("at-boundary succeeds");
+
+    assert_eq!(balance(&pool, sx.ap).await, -1050);
+}

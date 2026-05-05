@@ -178,6 +178,14 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('variance_ppv_prior_period_adj', 'value', 'USD', 'unrestricted'),
   ('variance_ppv_prior_period_adj', 'value', 'EUR', 'unrestricted');
 
+-- Three-way match tolerance variance (USD + EUR; acct-7mc, mig 0090).
+-- Bidirectional P&L for within-tolerance unit_cost / unit_price
+-- absorptions on bills / invoices. Vendors / customers configure
+-- their own tolerance_pct; default 0 = strict (existing behavior).
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('variance_match_tolerance', 'value', 'USD', 'unrestricted'),
+  ('variance_match_tolerance', 'value', 'EUR', 'unrestricted');
+
 -- Period-close variance lines (USD + EUR; acct-4mt / acct-s6n).
 -- All bidirectional — write-ups credit, write-downs debit. Three
 -- separate kinds (not one shared 'variance_close') so the income

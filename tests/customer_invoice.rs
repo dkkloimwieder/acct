@@ -556,3 +556,113 @@ async fn service_line_revenue_account_wrong_currency_raises_p0041() {
     })
     .await;
 }
+
+// ============================================================
+// Three-way match tolerance windows (acct-7mc, AR side)
+// ============================================================
+
+async fn set_customer_tolerance(pool: &PgPool, customer_id: &str, pct: &str) {
+    sqlx::query(
+        "UPDATE customers SET unit_price_tolerance_pct = $1::NUMERIC WHERE id = $2::UUID",
+    )
+    .bind(pct)
+    .bind(customer_id)
+    .execute(pool)
+    .await
+    .expect("set tolerance");
+}
+
+async fn ar_match_tol_acct(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT id FROM accounts
+         WHERE kind='variance_match_tolerance' AND ledger_kind='value'
+           AND currency='USD' AND counterparty_id IS NULL AND NOT is_closed",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("match_tol")
+}
+
+#[tokio::test]
+async fn ar_within_tolerance_unfavorable_absorbs_to_variance() {
+    // SO unit_price=100, customer tolerance=2%. Invoice at 102 (2%
+    // exactly). variance_match_tolerance credits 20 (gain on AR side
+    // — customer pays more than expected); ar gains 1020 total.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_post_ship(&pool, "AR-TOL", 50, 100, 10).await;
+    set_customer_tolerance(&pool, &s.customer_id, "2.0").await;
+    let mt = ar_match_tol_acct(&pool).await;
+    let mt_before = balance(&pool, mt).await;
+
+    let lines = json!([{
+        "kind": "so_match", "so_line_id": s.so_line_id,
+        "qty": 10, "unit_price": 102, "amount": 1020
+    }]);
+    call_invoice(&pool, &s.customer_id, "USD", lines).await
+        .expect("within tolerance ar");
+
+    // ar_unsettled drained by base 1000 (qty * so_line.unit_price).
+    // ar gained 1020 (1000 base from cleared accrual + 20 absorption).
+    // variance_match_tolerance credit = -20 (gain on credit-normal-eq
+    // unrestricted P&L).
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.cust_ar).await, 1020);
+    assert_eq!(balance(&pool, mt).await - mt_before, -20);
+
+    assert_invariants_hold(&pool, "ar_within_tolerance_unfavorable_absorbs_to_variance").await;
+}
+
+#[tokio::test]
+async fn ar_within_tolerance_favorable_absorbs_to_variance() {
+    // Invoice at 98 (2% below). Less ar; variance debits 20 (loss).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_post_ship(&pool, "AR-TOL-FAV", 50, 100, 10).await;
+    set_customer_tolerance(&pool, &s.customer_id, "2.0").await;
+    let mt = ar_match_tol_acct(&pool).await;
+    let mt_before = balance(&pool, mt).await;
+
+    let lines = json!([{
+        "kind": "so_match", "so_line_id": s.so_line_id,
+        "qty": 10, "unit_price": 98, "amount": 980
+    }]);
+    call_invoice(&pool, &s.customer_id, "USD", lines).await
+        .expect("within tolerance ar fav");
+
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.cust_ar).await, 980);
+    assert_eq!(balance(&pool, mt).await - mt_before, 20);
+}
+
+#[tokio::test]
+async fn ar_out_of_tolerance_still_raises_p0040() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_post_ship(&pool, "AR-OOT", 50, 100, 10).await;
+    set_customer_tolerance(&pool, &s.customer_id, "2.0").await;
+
+    let lines = json!([{
+        "kind": "so_match", "so_line_id": s.so_line_id,
+        "qty": 10, "unit_price": 105, "amount": 1050
+    }]);
+    expect_sqlstate("P0040", || async {
+        call_invoice(&pool, &s.customer_id, "USD", lines.clone()).await
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ar_zero_tolerance_default_is_strict() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_post_ship(&pool, "AR-STRICT", 50, 100, 10).await;
+    let lines = json!([{
+        "kind": "so_match", "so_line_id": s.so_line_id,
+        "qty": 10, "unit_price": 101, "amount": 1010
+    }]);
+    expect_sqlstate("P0040", || async {
+        call_invoice(&pool, &s.customer_id, "USD", lines.clone()).await
+    })
+    .await;
+}
