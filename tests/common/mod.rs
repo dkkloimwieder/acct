@@ -74,6 +74,7 @@ pub async fn reset_to_fixture(pool: &PgPool) {
             customer_invoices,
             so_shipment_lines,
             so_shipments,
+            so_allocations,
             sales_order_lines,
             sales_orders,
             customers,
