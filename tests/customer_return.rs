@@ -635,3 +635,288 @@ async fn qty_returned_zero_raises_p0044() {
     })
     .await;
 }
+
+// ============================================================
+// State-aware routing (acct-tk7)
+// ============================================================
+
+/// Ship `qty` units against the SO line WITHOUT invoicing them.
+async fn ship_no_invoice(pool: &PgPool, s: &ReturnScaffold, qty: i64) -> String {
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    let lines = json!([{"so_line_id": s.so_line_id, "qty_shipped": qty}]);
+    sqlx::query_scalar::<_, String>(
+        "SELECT post_so_ship($1::UUID, $2::JSONB, '2026-04-20'::DATE,
+                              $3::UUID, $4::UUID, NULL)::text",
+    )
+    .bind(&s.so_id)
+    .bind(lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("post_so_ship: {e}"));
+
+    sqlx::query_scalar(
+        "SELECT ssl.id::text FROM so_shipment_lines ssl
+          WHERE ssl.so_line_id = $1::UUID
+          ORDER BY ssl.id DESC LIMIT 1",
+    )
+    .bind(&s.so_line_id)
+    .fetch_one(pool)
+    .await
+    .expect("ship_line lookup")
+}
+
+async fn invoice_qty(pool: &PgPool, s: &ReturnScaffold, qty: i64) {
+    let inv_lines = json!([{
+        "kind": "so_match",
+        "so_line_id": s.so_line_id,
+        "qty": qty,
+        "unit_price": 100,
+        "amount": qty * 100
+    }]);
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    sqlx::query(
+        "SELECT post_customer_invoice($1::UUID, 'USD', $2::JSONB,
+                                       '2026-04-21'::DATE, $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&s.customer_id)
+    .bind(inv_lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("post_customer_invoice: {e}"));
+}
+
+async fn ar_split_columns(pool: &PgPool, return_id: &str) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT
+           COALESCE(SUM(qty_to_ar_unsettled), 0)::BIGINT,
+           COALESCE(SUM(qty_to_ar), 0)::BIGINT
+         FROM customer_return_lines WHERE return_id = $1::UUID",
+    )
+    .bind(return_id)
+    .fetch_one(pool)
+    .await
+    .expect("ar_split_columns")
+}
+
+#[tokio::test]
+async fn pre_invoice_return_routes_to_ar_unsettled() {
+    // Ship 10 (no invoice). Return 10 → revenue reverses against ar_unsettled
+    // (where it currently sits), not ar (which is 0).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "PRE-INV", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_no_invoice(&pool, &s, 10).await;
+
+    // After ship: ar_unsettled = 1000 (revenue) + 15 (tax) = 1015. ar = 0.
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 1015);
+    assert_eq!(balance(&pool, s.cust_ar).await, 0);
+
+    let lines = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 10,
+        "disposition": "restock"
+    }]);
+    let return_id = call_return(&pool, &s.customer_id, lines).await.expect("return");
+
+    // ar_unsettled drained to 0 (1000 revenue + 15 tax both reverse against it).
+    // ar untouched.
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.cust_ar).await, 0);
+    // Inventory back.
+    assert_eq!(balance(&pool, s.qty_acct).await, 10);
+    assert_eq!(balance(&pool, s.val_acct).await, 600);
+
+    let (to_us, to_ar) = ar_split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 10);
+    assert_eq!(to_ar, 0);
+
+    assert_invariants_hold(&pool, "pre_invoice_return_routes_to_ar_unsettled").await;
+}
+
+#[tokio::test]
+async fn partial_invoice_then_return_splits_routing() {
+    // Ship 10, invoice 6. Return 7.
+    // Routing: 4 to ar_unsettled (un-invoiced), 3 to ar (invoiced).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "AR-SPLIT", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_no_invoice(&pool, &s, 10).await;
+    invoice_qty(&pool, &s, 6).await;
+
+    // After ship+partial-invoice: ar = 600 (6*100); ar_unsettled = 415
+    // (4*100 unrevenued + 15 tax remaining).
+    assert_eq!(balance(&pool, s.cust_ar).await, 600);
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 415);
+
+    let lines = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 7,
+        "disposition": "restock"
+    }]);
+    let return_id = call_return(&pool, &s.customer_id, lines).await.expect("return");
+
+    // Routing: 4 units route to ar_unsettled (revenue 400), 3 units route
+    // to ar (revenue 300). Tax pro-rated 7/10 of 15 = 10 (integer trunc),
+    // routes to ar_unsettled.
+    //
+    // ar_unsettled: 415 - 400 (revenue reversal) - 10 (tax reversal) = 5.
+    // ar: 600 - 300 = 300.
+    assert_eq!(balance(&pool, s.cust_ar).await, 300);
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 5);
+
+    let (to_us, to_ar) = ar_split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 4);
+    assert_eq!(to_ar, 3);
+}
+
+#[tokio::test]
+async fn cumulative_ar_across_multiple_returns() {
+    // Ship 10 (no invoice). Return 4 (all to unsettled). Invoice 6. Return 4.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "AR-CUM", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_no_invoice(&pool, &s, 10).await;
+
+    let lines1 = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 4,
+        "disposition": "restock"
+    }]);
+    let r1 = call_return(&pool, &s.customer_id, lines1).await.expect("return-1");
+    let (a1, b1) = ar_split_columns(&pool, &r1).await;
+    assert_eq!(a1, 4);
+    assert_eq!(b1, 0);
+
+    // After return 1: ar_unsettled drained by 4*100 + tax_pro = 400 + 6 = 406.
+    // So ar_unsettled = 1015 - 406 = 609.
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 609);
+    assert_eq!(balance(&pool, s.cust_ar).await, 0);
+
+    // Invoice 6: avail = 10 - 0 - 4 = 6. Allowed.
+    invoice_qty(&pool, &s, 6).await;
+    // ar_unsettled drained by 600 (revenue clear). ar gets 600.
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 9);  // 609 - 600 = 9 (residual tax)
+    assert_eq!(balance(&pool, s.cust_ar).await, 600);
+
+    // Return 4 more (all on ar side; unsettled remainder = 10-6-4=0).
+    let lines2 = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 4,
+        "disposition": "restock"
+    }]);
+    let r2 = call_return(&pool, &s.customer_id, lines2).await.expect("return-2");
+    let (a2, b2) = ar_split_columns(&pool, &r2).await;
+    assert_eq!(a2, 0);
+    assert_eq!(b2, 4);
+
+    // ar drains by 400 → 200. Tax pro-rated 4/10 of 15 = 6, drains ar_unsettled.
+    assert_eq!(balance(&pool, s.cust_ar).await, 200);
+    assert_eq!(balance(&pool, s.cust_unsettled).await, 3);
+}
+
+#[tokio::test]
+async fn over_invoice_after_return_to_unsettled_rejected() {
+    // Ship 10, return 3 to ar_unsettled (no invoice yet). Invoice 10 should fail.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "OVER-INV", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_no_invoice(&pool, &s, 10).await;
+
+    let lines = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 3,
+        "disposition": "restock"
+    }]);
+    call_return(&pool, &s.customer_id, lines).await.expect("return");
+
+    // Try to invoice 10. avail = 10 - 0 - 3 = 7. Should fail with P0040.
+    let inv_lines = json!([{
+        "kind": "so_match",
+        "so_line_id": s.so_line_id,
+        "qty": 10,
+        "unit_price": 100,
+        "amount": 1000
+    }]);
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    expect_sqlstate("P0040", || async {
+        sqlx::query(
+            "SELECT post_customer_invoice($1::UUID, 'USD', $2::JSONB,
+                                           '2026-04-21'::DATE, $3::UUID, $4::UUID, NULL)",
+        )
+        .bind(&s.customer_id)
+        .bind(inv_lines.clone())
+        .bind(&posted_by)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .map(|_| String::new())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn override_closed_period_allows_back_post() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "AR-OVERRIDE", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_and_invoice(&pool, &s, 10).await;
+
+    sqlx::query(
+        "UPDATE periods SET closed_at = clock_timestamp()
+          WHERE opens_at <= '2026-04-25'::DATE AND closes_at >= '2026-04-25'::DATE",
+    )
+    .execute(&pool)
+    .await
+    .expect("close period");
+
+    let posted_by = fresh_uuid(&pool).await;
+    let key1 = fresh_uuid(&pool).await;
+    let lines = json!([{
+        "ship_line_id": ship_line,
+        "qty_returned": 5,
+        "disposition": "restock"
+    }]);
+
+    // Without override → P0005.
+    expect_sqlstate("P0005", || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT post_customer_return($1::UUID, $2::JSONB, '2026-04-25'::DATE,
+                                          $3::UUID, $4::UUID, NULL, FALSE)::text",
+        )
+        .bind(&s.customer_id)
+        .bind(lines.clone())
+        .bind(&posted_by)
+        .bind(&key1)
+        .fetch_one(&pool)
+        .await
+    })
+    .await;
+
+    // With override → succeeds.
+    let key2 = fresh_uuid(&pool).await;
+    sqlx::query_scalar::<_, String>(
+        "SELECT post_customer_return($1::UUID, $2::JSONB, '2026-04-25'::DATE,
+                                      $3::UUID, $4::UUID, NULL, TRUE)::text",
+    )
+    .bind(&s.customer_id)
+    .bind(lines)
+    .bind(&posted_by)
+    .bind(&key2)
+    .fetch_one(&pool)
+    .await
+    .expect("override return");
+
+    assert_eq!(balance(&pool, s.qty_acct).await, 5);
+}

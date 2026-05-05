@@ -517,3 +517,314 @@ async fn qty_returned_zero_raises_p0046() {
     })
     .await;
 }
+
+// ============================================================
+// State-aware routing (acct-tk7)
+// ============================================================
+
+/// Receive `qty` units against the PO line WITHOUT issuing a bill.
+/// Returns the po_receipt_lines.id of the receipt line.
+async fn receive_no_bill(pool: &PgPool, s: &ReturnScaffold, qty: i64) -> String {
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    let lines = json!([{"po_line_id": s.po_line_id, "qty_received": qty}]);
+    sqlx::query(
+        "SELECT post_po_receipt($1::UUID, $2::JSONB, '2026-04-15'::DATE,
+                                 $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&s.po_id)
+    .bind(lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("post_po_receipt: {e}"));
+
+    sqlx::query_scalar(
+        "SELECT prl.id::text FROM po_receipt_lines prl
+          WHERE prl.po_line_id = $1::UUID
+          ORDER BY prl.id DESC LIMIT 1",
+    )
+    .bind(&s.po_line_id)
+    .fetch_one(pool)
+    .await
+    .expect("recv_line lookup")
+}
+
+async fn bill_qty(pool: &PgPool, s: &ReturnScaffold, qty: i64) {
+    let unit_cost: i64 = sqlx::query_scalar(
+        "SELECT unit_cost FROM purchase_order_lines WHERE id = $1::UUID",
+    )
+    .bind(&s.po_line_id)
+    .fetch_one(pool)
+    .await
+    .expect("po_line unit_cost");
+
+    let bill_lines = json!([{
+        "kind": "po_match",
+        "po_line_id": s.po_line_id,
+        "qty": qty,
+        "unit_cost": unit_cost,
+        "amount": qty * unit_cost
+    }]);
+    let posted_by = fresh_uuid(pool).await;
+    let key = fresh_uuid(pool).await;
+    sqlx::query(
+        "SELECT post_ap_bill($1::UUID, 'USD', $2::JSONB, '2026-04-16'::DATE,
+                              $3::UUID, $4::UUID, NULL)",
+    )
+    .bind(&s.vendor_id)
+    .bind(bill_lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("post_ap_bill: {e}"));
+}
+
+async fn split_columns(pool: &PgPool, return_id: &str) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT
+           COALESCE(SUM(qty_to_ap_unsettled), 0)::BIGINT,
+           COALESCE(SUM(qty_to_ap), 0)::BIGINT
+         FROM po_return_lines WHERE return_id = $1::UUID",
+    )
+    .bind(return_id)
+    .fetch_one(pool)
+    .await
+    .expect("split_columns")
+}
+
+#[tokio::test]
+async fn pre_bill_return_routes_to_ap_unsettled() {
+    // Receive 10 (no bill). Return 10. Should drain ap_unsettled, not ap.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "PRE-BILL", 10, 100).await;
+    let recv_line = receive_no_bill(&pool, &s, 10).await;
+
+    // After receipt: ap_unsettled = -1000 (credit balance via debits-credits).
+    assert_eq!(balance(&pool, s.ven_unsettled).await, -1000);
+    assert_eq!(balance(&pool, s.ven_ap).await, 0);
+
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": 10}]);
+    let return_id = call_return(&pool, &s.vendor_id, lines).await.expect("return");
+
+    // ap_unsettled drained to 0; ap untouched; qty_to_ap_unsettled = 10.
+    assert_eq!(balance(&pool, s.ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.ven_ap).await, 0);
+    assert_eq!(balance(&pool, s.qty_acct).await, 0);
+    assert_eq!(balance(&pool, s.val_acct).await, 0);
+
+    let (to_us, to_ap) = split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 10);
+    assert_eq!(to_ap, 0);
+
+    assert_invariants_hold(&pool, "pre_bill_return_routes_to_ap_unsettled").await;
+}
+
+#[tokio::test]
+async fn pre_bill_return_with_ppv_drains_unsettled_and_ppv() {
+    // Receive 10 with po=120, std=100 → ap_unsettled credit = 1200, variance_ppv += 200.
+    // Return 10 pre-bill → ap_unsettled drains 1200; variance_ppv reverses 200.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "PRE-BILL-PPV", 10, 120).await;
+    let recv_line = receive_no_bill(&pool, &s, 10).await;
+
+    assert_eq!(balance(&pool, s.ven_unsettled).await, -1200);
+    assert_eq!(balance(&pool, s.ven_ap).await, 0);
+    let var_post_recv = balance(&pool, s.var_ppv).await;
+
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": 10}]);
+    let return_id = call_return(&pool, &s.vendor_id, lines).await.expect("return");
+
+    assert_eq!(balance(&pool, s.ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.ven_ap).await, 0);
+    assert_eq!(balance(&pool, s.val_acct).await, 0);
+    // Variance reverses by -200.
+    assert_eq!(balance(&pool, s.var_ppv).await - var_post_recv, -200);
+
+    let (to_us, to_ap) = split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 10);
+    assert_eq!(to_ap, 0);
+}
+
+#[tokio::test]
+async fn partial_bill_then_return_splits_routing() {
+    // Receive 10, bill 6. Return 7.
+    // Routing: 4 to ap_unsettled (un-billed remainder), 3 to ap.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "SPLIT", 10, 100).await;
+    let recv_line = receive_no_bill(&pool, &s, 10).await;
+    bill_qty(&pool, &s, 6).await;
+
+    // After receipt+partial-bill: ap_unsettled = -400 (10-6=4 unbilled);
+    // ap = -600 (6 billed).
+    assert_eq!(balance(&pool, s.ven_unsettled).await, -400);
+    assert_eq!(balance(&pool, s.ven_ap).await, -600);
+
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": 7}]);
+    let return_id = call_return(&pool, &s.vendor_id, lines).await.expect("return");
+
+    // ap_unsettled drains by 4*100=400 → 0;
+    // ap drains by 3*100=300 → -300.
+    assert_eq!(balance(&pool, s.ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.ven_ap).await, -300);
+    // Inventory drains by 7 (full qty regardless of route).
+    assert_eq!(balance(&pool, s.qty_acct).await, 3);
+    assert_eq!(balance(&pool, s.val_acct).await, 300);
+
+    let (to_us, to_ap) = split_columns(&pool, &return_id).await;
+    assert_eq!(to_us, 4);
+    assert_eq!(to_ap, 3);
+}
+
+#[tokio::test]
+async fn cumulative_across_multiple_returns() {
+    // Receive 10 (no bill). Return 4 (all to unsettled). Bill 6. Return 4 (all to ap).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "CUM", 10, 100).await;
+    let recv_line = receive_no_bill(&pool, &s, 10).await;
+
+    let lines1 = json!([{"recv_line_id": recv_line, "qty_returned": 4}]);
+    let r1 = call_return(&pool, &s.vendor_id, lines1).await.expect("return-1");
+    let (a1, b1) = split_columns(&pool, &r1).await;
+    assert_eq!(a1, 4);
+    assert_eq!(b1, 0);
+
+    // After return 1: ap_unsettled = -600 (10-4 received-unbilled-unreturned).
+    assert_eq!(balance(&pool, s.ven_unsettled).await, -600);
+
+    // Bill 6 (allowed: avail = 10-0-4 = 6).
+    bill_qty(&pool, &s, 6).await;
+    assert_eq!(balance(&pool, s.ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.ven_ap).await, -600);
+
+    // Now return 4 more (fully on ap side; unsettled remainder = 10-6-4 = 0).
+    let lines2 = json!([{"recv_line_id": recv_line, "qty_returned": 4}]);
+    let r2 = call_return(&pool, &s.vendor_id, lines2).await.expect("return-2");
+    let (a2, b2) = split_columns(&pool, &r2).await;
+    assert_eq!(a2, 0);
+    assert_eq!(b2, 4);
+
+    // ap drains by 400 → -200.
+    assert_eq!(balance(&pool, s.ven_ap).await, -200);
+}
+
+#[tokio::test]
+async fn over_bill_after_return_to_unsettled_rejected() {
+    // Receive 10, return 3 to ap_unsettled (no bill yet). Try billing 10 — rejected.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "OVER-BILL", 10, 100).await;
+    let recv_line = receive_no_bill(&pool, &s, 10).await;
+
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": 3}]);
+    call_return(&pool, &s.vendor_id, lines).await.expect("return");
+
+    // Try to bill 10 — should fail because available = 10-0-3 = 7.
+    let bill_lines = json!([{
+        "kind": "po_match",
+        "po_line_id": s.po_line_id,
+        "qty": 10,
+        "unit_cost": 100,
+        "amount": 1000
+    }]);
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    expect_sqlstate("P0024", || async {
+        sqlx::query(
+            "SELECT post_ap_bill($1::UUID, 'USD', $2::JSONB, '2026-04-16'::DATE,
+                                  $3::UUID, $4::UUID, NULL)",
+        )
+        .bind(&s.vendor_id)
+        .bind(bill_lines.clone())
+        .bind(&posted_by)
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .map(|_| String::new())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pre_bill_return_with_po_lt_std_drains_correctly() {
+    // po=80, std=100. Receive 10 → ap_unsettled CR 800; variance_ppv += -200
+    // (variance balance drops by 200 from baseline). Pre-bill return 10:
+    // event order PPV(reversal) BEFORE value-leg matters because ap_unsettled
+    // is credit-normal. Variance reverses, ap_unsettled drains.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "POLT-PRE", 10, 80).await;
+    let recv_line = receive_no_bill(&pool, &s, 10).await;
+
+    assert_eq!(balance(&pool, s.ven_unsettled).await, -800);
+    assert_eq!(balance(&pool, s.val_acct).await, 1000);
+    let var_post_recv = balance(&pool, s.var_ppv).await;
+
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": 10}]);
+    call_return(&pool, &s.vendor_id, lines).await.expect("return");
+
+    assert_eq!(balance(&pool, s.ven_unsettled).await, 0);
+    assert_eq!(balance(&pool, s.val_acct).await, 0);
+    // Variance increases by 200 (back to pre-receipt baseline).
+    assert_eq!(balance(&pool, s.var_ppv).await - var_post_recv, 200);
+}
+
+#[tokio::test]
+async fn override_closed_period_allows_back_post() {
+    // Lock a period in the past, then verify the return rejects without
+    // override and accepts with override.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "OVERRIDE", 10, 100).await;
+    let recv_line = receive_and_bill(&pool, &s, 10).await;
+
+    // Close the period covering the return business_date 2026-04-25.
+    sqlx::query(
+        "UPDATE periods SET closed_at = clock_timestamp()
+          WHERE opens_at <= '2026-04-25'::DATE AND closes_at >= '2026-04-25'::DATE",
+    )
+    .execute(&pool)
+    .await
+    .expect("close period");
+
+    let posted_by = fresh_uuid(&pool).await;
+    let key1 = fresh_uuid(&pool).await;
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": 5}]);
+
+    // Without override → P0005.
+    expect_sqlstate("P0005", || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT post_po_return($1::UUID, $2::JSONB, '2026-04-25'::DATE,
+                                    $3::UUID, $4::UUID, NULL, FALSE)::text",
+        )
+        .bind(&s.vendor_id)
+        .bind(lines.clone())
+        .bind(&posted_by)
+        .bind(&key1)
+        .fetch_one(&pool)
+        .await
+    })
+    .await;
+
+    // With override → succeeds.
+    let key2 = fresh_uuid(&pool).await;
+    sqlx::query_scalar::<_, String>(
+        "SELECT post_po_return($1::UUID, $2::JSONB, '2026-04-25'::DATE,
+                                $3::UUID, $4::UUID, NULL, TRUE)::text",
+    )
+    .bind(&s.vendor_id)
+    .bind(lines)
+    .bind(&posted_by)
+    .bind(&key2)
+    .fetch_one(&pool)
+    .await
+    .expect("override return");
+
+    assert_eq!(balance(&pool, s.qty_acct).await, 5);
+}
