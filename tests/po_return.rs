@@ -1422,6 +1422,112 @@ async fn wac_at_receipt_then_standard_change_uses_snapshot_no_fake_ppv() {
     assert_eq!(balance(&pool, w.ven_ap).await, 0);
 }
 
+// ============================================================
+// Cross-period PPV: prior-period adjustment routing (acct-b8n)
+// ============================================================
+
+async fn account_id_by_kind_currency_helper(pool: &PgPool, kind: &str, ccy: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT id FROM accounts
+         WHERE kind = $1::account_kind AND currency = $2 AND counterparty_id IS NULL
+           AND sku_id IS NULL AND location_id IS NULL AND NOT is_closed",
+    )
+    .bind(kind)
+    .bind(ccy)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("account {kind}/{ccy}: {e}"))
+}
+
+#[tokio::test]
+async fn cross_period_return_routes_ppv_to_prior_period_adj() {
+    // Receive 2026-04-15 with po=120, std=100 → variance_ppv +200 in
+    // period 2026-04. Bill 2026-04-16 (so post-bill route fires).
+    // CLOSE period 2026-04. Return 2026-05-15 → variance_ppv_prior_-
+    // period_adj receives the -200 reversal; variance_ppv stays put.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "PP-ADJ", 10, 120).await;
+    let recv_line = receive_and_bill(&pool, &s, 10).await;
+
+    let var_ppv_after_receipt = balance(&pool, s.var_ppv).await;
+    let var_pp_adj = account_id_by_kind_currency_helper(
+        &pool, "variance_ppv_prior_period_adj", "USD",
+    ).await;
+    let var_pp_adj_before = balance(&pool, var_pp_adj).await;
+
+    // Close the receipt's period (2026-04).
+    sqlx::query(
+        "UPDATE periods SET closed_at = clock_timestamp()
+          WHERE opens_at <= '2026-04-15'::DATE AND closes_at >= '2026-04-15'::DATE",
+    )
+    .execute(&pool)
+    .await
+    .expect("close 2026-04");
+
+    // Return in 2026-05 (open period).
+    let posted_by = fresh_uuid(&pool).await;
+    let key = fresh_uuid(&pool).await;
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": 10}]);
+    sqlx::query_scalar::<_, String>(
+        "SELECT post_po_return($1::UUID, $2::JSONB, '2026-05-15'::DATE,
+                                $3::UUID, $4::UUID, NULL)::text",
+    )
+    .bind(&s.vendor_id)
+    .bind(lines)
+    .bind(&posted_by)
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("cross-period return");
+
+    // variance_ppv stays — the original +200 was for an event in the
+    // closed period; a CR there would push the closed period's
+    // reported PPV to 0, which is not what we want. Adj account
+    // captures the offset.
+    assert_eq!(
+        balance(&pool, s.var_ppv).await,
+        var_ppv_after_receipt,
+        "variance_ppv unchanged on cross-period return"
+    );
+    // variance_ppv_prior_period_adj absorbed the -200 (CR side).
+    assert_eq!(
+        balance(&pool, var_pp_adj).await - var_pp_adj_before,
+        -200,
+        "variance_ppv_prior_period_adj absorbs the cross-period reversal"
+    );
+
+    // Inventory + ap drained as usual.
+    assert_eq!(balance(&pool, s.qty_acct).await, 0);
+    assert_eq!(balance(&pool, s.val_acct).await, 0);
+    assert_eq!(balance(&pool, s.ven_ap).await, 0);
+}
+
+#[tokio::test]
+async fn same_period_return_still_uses_variance_ppv() {
+    // Regression lock: receipt and return both in open period 2026-04.
+    // PPV reversal MUST hit variance_ppv (existing behavior), not
+    // variance_ppv_prior_period_adj.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "SAME-PERIOD", 10, 120).await;
+    let recv_line = receive_and_bill(&pool, &s, 10).await;
+
+    let var_ppv_after_receipt = balance(&pool, s.var_ppv).await;
+    let var_pp_adj = account_id_by_kind_currency_helper(
+        &pool, "variance_ppv_prior_period_adj", "USD",
+    ).await;
+    let var_pp_adj_before = balance(&pool, var_pp_adj).await;
+
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": 10}]);
+    call_return(&pool, &s.vendor_id, lines).await.expect("same-period return");
+
+    // variance_ppv reversed -200 (back to pre-receipt level).
+    assert_eq!(balance(&pool, s.var_ppv).await - var_ppv_after_receipt, -200);
+    // adj account untouched.
+    assert_eq!(balance(&pool, var_pp_adj).await, var_pp_adj_before);
+}
+
 #[tokio::test]
 async fn po_receipt_lines_persists_cost_method_at_receipt() {
     // Sanity: post_po_receipt actually populates cost_method_at_receipt.

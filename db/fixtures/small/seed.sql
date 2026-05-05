@@ -170,6 +170,14 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('variance_wip_revaluation', 'value', 'USD', 'unrestricted'),
   ('variance_wip_revaluation', 'value', 'EUR', 'unrestricted');
 
+-- Cross-period PPV adjustment (USD + EUR; acct-b8n, mig 0089).
+-- Bidirectional P&L for PPV reversals on returns where the original
+-- receipt's period has since closed. Distinct from variance_ppv so
+-- the income statement reports prior-period adjustments separately.
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('variance_ppv_prior_period_adj', 'value', 'USD', 'unrestricted'),
+  ('variance_ppv_prior_period_adj', 'value', 'EUR', 'unrestricted');
+
 -- Period-close variance lines (USD + EUR; acct-4mt / acct-s6n).
 -- All bidirectional — write-ups credit, write-downs debit. Three
 -- separate kinds (not one shared 'variance_close') so the income
