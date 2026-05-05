@@ -84,6 +84,16 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('vendor_pool',  'qty',   NULL,  'credit'),  -- per-vendor qty pool
   ('variance_ppv', 'value', 'USD', 'unrestricted');
 
+-- Slice C (acct-th7) outflow accounts. Un-partitioned mirrors of
+-- Slice A. Per-customer partitioned versions are created inline by
+-- Slice C matrix tests via the customer scaffold.
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('ar_unsettled',      'value', 'USD', 'debit'),  -- shipped-not-invoiced
+  ('ar_unsettled',      'value', 'EUR', 'debit'),
+  ('customer_pool',     'qty',   NULL,  'debit'),  -- per-customer qty pool
+  ('sales_tax_payable', 'value', 'USD', 'credit'),
+  ('sales_tax_payable', 'value', 'EUR', 'credit');
+
 -- Cash + revenue (EUR) — for currency-mismatch tests
 INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('cash',    'value', 'EUR', 'debit'),

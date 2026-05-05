@@ -1,0 +1,41 @@
+-- acct-th7 / Slice C — outflow enum extensions.
+--
+-- Pure additive foundation for the outflow / sales / AR cycle (epic
+-- acct-th7). PG 18 forbids new enum values from being used in DDL in
+-- the same transaction that added them; this migration adds the
+-- values so subsequent migrations (0080 schema, 0081 functions) can
+-- reference them. Mirrors the BOM2 pattern in mig 0040.
+--
+-- Adds to account_kind enum:
+--   ar_unsettled  — staging account for shipped-not-yet-invoiced
+--                   revenue. Mirror of ap_unsettled (Slice A's GRNI
+--                   shape). post_so_ship credits revenue and debits
+--                   ar_unsettled at ship; post_customer_invoice
+--                   clears ar_unsettled → ar at invoice issuance
+--                   with strict three-way match. Until a customer
+--                   invoice is sent, the customer doesn't owe us in
+--                   any documentary sense — ar_unsettled holds the
+--                   recognized-but-unbilled revenue.
+--
+-- Adds to reservation_status enum:
+--   shipped       — terminal state for reservations consumed by a
+--                   so_shipment. Distinguishes
+--                   reserved-then-cancelled from reserved-then-
+--                   shipped. The 'allocated' state remains for a
+--                   future post_so_allocate workflow (Phase 2,
+--                   pre-ship pick-and-stage). For Slice C MVP,
+--                   post_so_ship transitions reservations
+--                   'active' → 'shipped' atomically with the
+--                   so_shipment INSERT.
+--
+-- DESIGN. ar_unsettled mirrors Slice A's GRNI decision (CLAUDE.md
+-- 'PO receipt accrues to ap_unsettled, not ap'): mainstream-ERP
+-- convention (SAP SD, NetSuite, Oracle Cloud, D365 all separate ship
+-- from invoice in their data model), supports B2B monthly billing
+-- without period-boundary gymnastics, and revises the design doc's
+-- speculative §3.3 ("revenue: ar DR / revenue CR") for the same
+-- reason §3.1 was revised in Slice A.
+
+ALTER TYPE account_kind ADD VALUE 'ar_unsettled';
+
+ALTER TYPE reservation_status ADD VALUE 'shipped';
