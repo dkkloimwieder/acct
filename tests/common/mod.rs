@@ -70,6 +70,8 @@ pub async fn reset_to_fixture(pool: &PgPool) {
             skus,
             locations,
             ar_payments,
+            customer_return_lines,
+            customer_returns,
             customer_invoice_lines,
             customer_invoices,
             so_shipment_lines,
