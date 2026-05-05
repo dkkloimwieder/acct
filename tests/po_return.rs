@@ -1330,3 +1330,123 @@ async fn multi_currency_split_routes_per_currency_partition() {
 
     assert_invariants_hold(&pool, "multi_currency_split_routes_per_currency_partition").await;
 }
+
+// ============================================================
+// cost_method snapshot at receipt time (acct-6d8)
+// ============================================================
+//
+// The SKU's cost_method can change between original receipt and return.
+// Mig 0087 snapshots cost_method on po_receipt_lines.cost_method_at_receipt
+// at receipt-post time so post_po_return uses the original method's
+// math, not whatever skus.cost_method has flipped to since.
+
+#[tokio::test]
+async fn standard_at_receipt_then_wac_change_uses_snapshot_for_ppv() {
+    // SKU is standard at receipt (po=120, std=100 → PPV +200).
+    // Then SKU switches to wac_perpetual. On return:
+    //   * snapshot path (correct): use standard, PPV -200 reverses.
+    //   * naive (skus.cost_method=wac): no PPV reversal → 200 orphan.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "STD-TO-WAC", 10, 120).await;
+    let recv_line = receive_and_bill(&pool, &s, 10).await;
+
+    // After receipt+bill: variance_ppv up by 200 (debit, since po>std).
+    let var_post_receipt = balance(&pool, s.var_ppv).await;
+
+    // Now flip SKU-A to wac_perpetual.
+    sqlx::query("UPDATE skus SET cost_method = 'wac_perpetual' WHERE id = $1::UUID")
+        .bind(&s.sku_id)
+        .execute(&pool)
+        .await
+        .expect("flip cost_method");
+
+    let lines = json!([{"recv_line_id": recv_line, "qty_returned": 10}]);
+    call_return(&pool, &s.vendor_id, lines).await.expect("return after flip");
+
+    // PPV must reverse despite SKU's current cost_method being wac.
+    let var_after_return = balance(&pool, s.var_ppv).await;
+    assert_eq!(
+        var_after_return - var_post_receipt,
+        -200,
+        "snapshot path should reverse the original PPV; standard→wac flip must not strand variance"
+    );
+    assert_eq!(balance(&pool, s.qty_acct).await, 0);
+    assert_eq!(balance(&pool, s.val_acct).await, 0);
+    assert_eq!(balance(&pool, s.ven_ap).await, 0);
+
+    // Restore SKU-A back to standard so other tests aren't poisoned (test
+    // isolation: reset_to_fixture handles this for the NEXT test, but be
+    // explicit anyway for clarity).
+    sqlx::query("UPDATE skus SET cost_method = 'standard' WHERE id = $1::UUID")
+        .bind(&s.sku_id)
+        .execute(&pool)
+        .await
+        .expect("restore cost_method");
+}
+
+#[tokio::test]
+async fn wac_at_receipt_then_standard_change_uses_snapshot_no_fake_ppv() {
+    // WAC SKU at receipt (po=100, no PPV). Then SKU switches to standard.
+    // On return:
+    //   * snapshot path (correct): use wac, no PPV legs.
+    //   * naive (skus.cost_method=standard): would fabricate PPV against
+    //     the standard cost (variance_ppv touched even though receipt
+    //     didn't post any).
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let w = scaffold_wac(&pool, "WAC-TO-STD", 10, 100).await;
+    let recv_line = receive_wac_no_bill(&pool, &w, 10).await;
+    bill_wac_qty(&pool, &w, 10).await;
+
+    let var_post_receipt = balance(&pool, w.var_ppv).await;
+
+    // Flip the WAC SKU to standard. It has no standard_costs row, so
+    // resolve_standard_cost_at would raise P0018 if invoked. The snapshot
+    // path avoids the call entirely.
+    sqlx::query("UPDATE skus SET cost_method = 'standard' WHERE id = $1::UUID")
+        .bind(&w.sku_id)
+        .execute(&pool)
+        .await
+        .expect("flip cost_method");
+
+    call_wac_return(&pool, &w, &recv_line, 10).await;
+
+    assert_eq!(
+        balance(&pool, w.var_ppv).await,
+        var_post_receipt,
+        "wac→standard flip must not invoke resolve_standard_cost_at or fabricate PPV"
+    );
+    assert_eq!(balance(&pool, w.qty_acct).await, 0);
+    assert_eq!(balance(&pool, w.val_acct).await, 0);
+    assert_eq!(balance(&pool, w.ven_ap).await, 0);
+}
+
+#[tokio::test]
+async fn po_receipt_lines_persists_cost_method_at_receipt() {
+    // Sanity: post_po_receipt actually populates cost_method_at_receipt.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_standard(&pool, "PERSIST-STD", 10, 100).await;
+    let recv_line = receive_and_bill(&pool, &s, 10).await;
+
+    let snapshot: String = sqlx::query_scalar(
+        "SELECT cost_method_at_receipt::text FROM po_receipt_lines WHERE id = $1::UUID",
+    )
+    .bind(&recv_line)
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot read");
+    assert_eq!(snapshot, "standard");
+
+    let w = scaffold_wac(&pool, "PERSIST-WAC", 10, 100).await;
+    let wac_recv = receive_wac_no_bill(&pool, &w, 10).await;
+    let snapshot_wac: String = sqlx::query_scalar(
+        "SELECT cost_method_at_receipt::text FROM po_receipt_lines WHERE id = $1::UUID",
+    )
+    .bind(&wac_recv)
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot read wac");
+    assert_eq!(snapshot_wac, "wac_perpetual");
+}

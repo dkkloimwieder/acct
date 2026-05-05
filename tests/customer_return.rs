@@ -1423,3 +1423,27 @@ async fn ar_multi_currency_split_routes_per_currency_partition() {
 
     assert_invariants_hold(&pool, "ar_multi_currency_split_routes_per_currency_partition").await;
 }
+
+// ============================================================
+// cost_method snapshot at ship time (acct-6d8, AR symmetry)
+// ============================================================
+
+#[tokio::test]
+async fn so_shipment_lines_persists_cost_method_at_ship() {
+    // Sanity: post_so_ship populates cost_method_at_ship from the SKU's
+    // cost_method at ship time. AR-side symmetry with mig 0087.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold(&pool, "PERSIST-SHIP", 10).await;
+    seed_fg(&pool, &s, 10, 600).await;
+    let ship_line = ship_and_invoice(&pool, &s, 10).await;
+
+    let snapshot: String = sqlx::query_scalar(
+        "SELECT cost_method_at_ship::text FROM so_shipment_lines WHERE id = $1::UUID",
+    )
+    .bind(&ship_line)
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot read");
+    assert_eq!(snapshot, "standard");
+}
