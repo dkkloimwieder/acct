@@ -151,6 +151,15 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('variance_std_cost_roll', 'value', 'USD', 'unrestricted'),
   ('variance_std_cost_roll', 'value', 'EUR', 'unrestricted');
 
+-- WIP material revaluation variance (USD + EUR; acct-bru, mig 0078).
+-- Bidirectional P&L for the WIP-side companion of post_standard_cost_
+-- roll (p_revalue_wip=TRUE). Distinct from variance_std_cost_roll so
+-- the income statement reports raw/fg revaluation separately from
+-- pre-shipment WIP-material revaluation.
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('variance_wip_revaluation', 'value', 'USD', 'unrestricted'),
+  ('variance_wip_revaluation', 'value', 'EUR', 'unrestricted');
+
 -- Period-close variance lines (USD + EUR; acct-4mt / acct-s6n).
 -- All bidirectional — write-ups credit, write-downs debit. Three
 -- separate kinds (not one shared 'variance_close') so the income
