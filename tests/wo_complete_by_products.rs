@@ -599,11 +599,20 @@ async fn wac_parent_nrv_credit_silently_skipped() {
 }
 
 // ============================================================
-// 6. zero actual_qty: pre-pass skips
+// 6. zero actual_qty: full unfavorable yield variance (acct-7t4.6)
 // ============================================================
+//
+// Under Option A (mig 0101), value-leg base posts at planned_qty ×
+// unit_value regardless of actual. The variance leg captures the
+// (actual − planned) × unit_value delta. With actual=0, the variance
+// fully reverses the base on by-product fg, leaving net bp_val=0 and
+// variance_yield_byproduct accumulating the full unfavorable amount
+// as debit. Parent WIP still drains by planned × unit_value (the
+// committed standard-cost drain), so co-products absorb less than the
+// full parent_std × qty_target.
 
 #[tokio::test]
-async fn zero_actual_qty_skips_pre_pass() {
+async fn zero_actual_qty_records_full_yield_variance() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let wo = scaffold_wo_with_components(&pool, "ZRO", 10, 600, 60).await;
@@ -614,7 +623,6 @@ async fn zero_actual_qty_skips_pre_pass() {
 
     call_wo_start(&pool, &wo.wo_id).await;
 
-    // Caller asserts zero actual_qty (e.g. by-product didn't materialize).
     sqlx::query(
         "UPDATE wo_by_products SET actual_qty = 0 WHERE wo_id = $1::UUID AND by_product_no = 1",
     )
@@ -625,11 +633,20 @@ async fn zero_actual_qty_skips_pre_pass() {
 
     call_wo_complete(&pool, &wo.wo_id, 10).await;
 
-    // No by-product transfer fired.
+    // Qty leg skipped (actual_qty=0; post_transfers requires amount>0).
     assert_eq!(balance(&pool, bp_qty).await, 0);
+    // Value base posted +500 to bp_val; yield variance posted −500
+    // → net bp_val = 0.
     assert_eq!(balance(&pool, bp_val).await, 0);
-    // Parent FG gets full v_total_drain = 6000.
-    assert_eq!(balance(&pool, wo.parent_fg_val).await, 6000);
 
-    assert_invariants_hold(&pool, "zero_actual_qty_skips_pre_pass").await;
+    // Parent fg = parent_std × qty_target − planned_drain
+    //           = 6000 − (planned=10 × unit_value=50) = 5500.
+    assert_eq!(balance(&pool, wo.parent_fg_val).await, 5500);
+    assert_eq!(balance(&pool, wo.parent_fg_qty).await, 10);
+
+    // variance_yield_byproduct: 500 unfavorable (debit).
+    let yield_var = account_id_by_kind_currency(&pool, "variance_yield_byproduct", Some("USD")).await;
+    assert_eq!(balance(&pool, yield_var).await, 500);
+
+    assert_invariants_hold(&pool, "zero_actual_qty_records_full_yield_variance").await;
 }

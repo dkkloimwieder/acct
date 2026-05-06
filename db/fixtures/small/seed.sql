@@ -135,6 +135,13 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('disposal_expense',           'value', 'USD', 'debit'),
   ('disposal_expense',           'value', 'EUR', 'debit');
 
+-- acct-7t4.6 yield variance for by-products. Discrete P&L line for
+-- planned-vs-actual yield delta; favorable = credit, unfavorable =
+-- debit. Currency-only, unrestricted.
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('variance_yield_byproduct', 'value', 'USD', 'unrestricted'),
+  ('variance_yield_byproduct', 'value', 'EUR', 'unrestricted');
+
 -- BOM2 (acct-jg2) absorption_classes seed rows. Migration 0042 inserts
 -- these on first apply, but TRUNCATE during reset_to_fixture wipes them;
 -- re-seed here so each test starts with a known baseline.
