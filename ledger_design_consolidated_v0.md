@@ -2205,7 +2205,11 @@ Decisions that need answers before v0.2 implementation can proceed:
 
 10. **Per-WO per-op account opt-in:** which SKU families or WO types warrant job-cost grain? (Default: none; opt in when Finance or operations requests.)
 
-~~Answers to (1) and (2) determine whether this entire document is the right framing or a footnote.~~ With (1) and (2) resolved, this document is the framing. Answers to (5)–(10) determine the v0.2 spec's final shape.
+11. **Sub-ledger separation:** today every posting flows through a single `post_transfers`. Mainstream ERPs separate sub-ledgers (FI-AR, FI-AP, MM, AA, CO/PP) with sub-ledger-to-GL transfer steps; we don't. Single-`post_transfers` is operationally simpler today (no sub-ledger ↔ GL reconciliation needed; one source of truth) but as scope grows past Phase 2 features (fixed assets, projects, payroll, lot/serial, multi-entity) the dispatcher centralization will become the bottleneck where every cost-method / variance / dispatch branch concentrates. **Question:** when do we split, what constitutes a sub-ledger boundary in our model, and what's the migration shape from one-`post_transfers` to N-sub-ledgers-with-aggregation? Watch item; not yet at the inflection point. Surfaced 2026-05-05 in ERP_RESEARCH.md follow-up architectural review.
+
+12. **Multi-tenant / single-tenant architecture:** Phase 0/1 ships single-database / single-schema / single-ledger. Mainstream ERPs vary: NetSuite is multi-tenant SaaS (shared infrastructure, per-tenant row separation); SAP S/4HANA Cloud is multi-instance (separate database per tenant); Oracle Cloud is multi-instance with shared services; D365 is multi-instance with separate F&O environments per legal-entity group. **Question:** which model do we target if/when productization happens, and what schema decisions today would make the future split cheaper? Currently every transactional table assumes single-tenant; adding `tenant_id` later is a significant migration. Distinct from but adjacent to acct-3gzh (multi-entity within a single tenant). Watch item; deferred until productization scope is clearer. Surfaced 2026-05-05 in ERP_RESEARCH.md follow-up architectural review.
+
+~~Answers to (1) and (2) determine whether this entire document is the right framing or a footnote.~~ With (1) and (2) resolved, this document is the framing. Answers to (5)–(12) determine the v0.2 spec's final shape; (5)–(10) are Phase 1 scope-shaping, (11)–(12) are long-arc architectural-direction questions to revisit when their inflection points trigger.
 
 ---
 
