@@ -666,3 +666,28 @@ async fn ar_zero_tolerance_default_is_strict() {
     })
     .await;
 }
+
+// ============================================================
+// acct-nuw7 — zero-baseline tolerance check (AR side)
+// ============================================================
+
+#[tokio::test]
+async fn ar_zero_price_so_line_with_nonzero_invoice_raises_p0040_not_22012() {
+    // SO line at unit_price=0; customer tolerance > 0; invoice at
+    // unit_price=10. Pre-fix the ABS divide at mig 0090 line 476
+    // trips SQLSTATE 22012 ("division by zero"). Post-fix the
+    // zero-baseline arm routes through P0040.
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+    let s = scaffold_post_ship(&pool, "AR-ZP", 50, 0, 0).await;
+    set_customer_tolerance(&pool, &s.customer_id, "5.0").await;
+
+    let lines = json!([{
+        "kind": "so_match", "so_line_id": s.so_line_id,
+        "qty": 10, "unit_price": 10, "amount": 100
+    }]);
+    expect_sqlstate("P0040", || async {
+        call_invoice(&pool, &s.customer_id, "USD", lines.clone()).await
+    })
+    .await;
+}

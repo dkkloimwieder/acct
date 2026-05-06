@@ -448,6 +448,30 @@ async fn happy_path_wac_sku_dispatcher_priced() {
     .expect("audit");
     assert_eq!(unit_cost, 7);
 
+    // acct-5prc / R7 (AP9). The persisted unit_cost MUST equal the
+    // ledger's effective unit cost on the COGS leg (transfer.amount
+    // / transfer.qty). This is the audit-trail-vs-ledger invariant
+    // mig 0091's FOR UPDATE on v_val_acct preserves under
+    // concurrency. Single-threaded the values trivially agree, but
+    // asserting it here pins the invariant so future cost-dispatch
+    // refactors can't silently break it.
+    let cogs_acct = account_id_by_kind_currency(&pool, "cogs", Some("USD")).await;
+    let (ledger_amount, ledger_qty): (i64, i64) = sqlx::query_as(
+        "SELECT amount, qty FROM transfers
+          WHERE document_kind = 'so_shipment'
+            AND reason        = 'so_ship'
+            AND debit_account_id  = $1
+            AND credit_account_id = $2",
+    )
+    .bind(cogs_acct)
+    .bind(val_acct)
+    .fetch_one(&pool)
+    .await
+    .expect("cogs transfer");
+    assert_eq!(ledger_amount / ledger_qty, unit_cost,
+        "audit unit_cost ({unit_cost}) must equal ledger amount/qty ({}/{})",
+        ledger_amount, ledger_qty);
+
     assert_invariants_hold(&pool, "happy_path_wac_sku_dispatcher_priced").await;
 }
 

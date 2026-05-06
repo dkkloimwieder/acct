@@ -865,3 +865,45 @@ async fn within_tolerance_exact_at_boundary_succeeds() {
 
     assert_eq!(balance(&pool, sx.ap).await, -1050);
 }
+
+// ============================================================
+// acct-nuw7 — zero-baseline tolerance check
+// ============================================================
+
+#[tokio::test]
+async fn zero_cost_po_line_with_nonzero_bill_raises_p0024_not_22012() {
+    // PO line at unit_cost=0 (free-good / placeholder); vendor
+    // tolerance > 0; bill at unit_cost=10. Pre-fix the ABS divide
+    // at mig 0090 line 181 trips SQLSTATE 22012 ("division by
+    // zero"). Post-fix the zero-baseline arm routes through P0024
+    // ("out of tolerance by definition").
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let sku = id_text(&pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-A").await;
+    let loc = id_text(&pool, "SELECT id::text FROM locations WHERE code = $1", "MAIN").await;
+    let vendor = fresh_vendor(&pool, "VEN-ZC", "USD").await;
+    let po = fresh_po(&pool, &vendor).await;
+    let po_line = fresh_po_line(&pool, &po, 1, &sku, &loc, 100, 0, "USD").await;
+
+    let _ven_unsettled = open_account(
+        &pool, "ap_unsettled", "value", Some("USD"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+    let _ap = open_account(
+        &pool, "ap", "value", Some("USD"), None, None, Some(&vendor), "credit",
+    )
+    .await;
+
+    set_vendor_tolerance(&pool, &vendor, "5.0").await;
+
+    let key = fresh_uuid(&pool).await;
+    let lines = serde_json::json!([{
+        "kind": "po_match", "po_line_id": po_line,
+        "qty": 10, "unit_cost": 10, "amount": 100
+    }]);
+    expect_sqlstate("P0024", || async {
+        call_bill(&pool, &vendor, "USD", lines.clone(), "2026-04-16", &key).await.map(|_| ())
+    })
+    .await;
+}
