@@ -113,8 +113,9 @@ These are decisions the consolidated doc commits to. If a task touches one of th
   - **R4** Pool reads happen under `FOR UPDATE` on the SAME account before subsequent writes — `FOR UPDATE` on the value account does NOT cover the qty account. Motivated by **acct-du2.1 / .2 / .6 / .7 / .9 / .12** (multiple lock-gap findings).
   - **R5** Variance routing on debit-normal pools that the document path drained to 0 in-period uses single-leg (orig_debit ↔ variance_acct), not 2-leg through the pool. Motivated by **acct-smn** (wac_periodic close hook on inv_value_wip).
   - **R6** Idempotency replay checks happen BOTH before `FOR UPDATE` (fast path) AND immediately after (race-safe). Motivated by **acct-69p** (post_wo_start / post_wo_complete) and the sibling unfixed sites **acct-du2.3** (post_osp_*) and **acct-du2.5** (post_op_move / post_scrap consistency).
+  - **R7** *(added 2026-05-05 audit refresh)* Document-level audit fields persisted from pool reads (e.g., line table `unit_cost`, `cost_method` snapshots) MUST come from the post-lock dispatcher's output OR be acquired under `FOR UPDATE` on the relevant pool before the read. Distinct from R4: R4 prevents the **ledger** amount from being computed off a stale read; R7 prevents the **document audit field** from snapshotting a stale read while the ledger silently corrects via `_post_transfers_compute_amount`'s post-lock recompute. Symptom: the ledger is right but `*_lines.unit_cost` (or sibling snapshot column) disagrees with `transfer.amount / transfer.qty` for the same line. Motivated by **acct-5prc** (post_so_ship wac_* unit_cost dispatch reads inv_value_fg pre-lock; persisted snapshot drifts) and **acct-quca** (post_standard_cost_roll WIP reval reads paired stock_wip qty without FOR UPDATE; concurrent op_move skews the variance amount). Mapped to AP9 in `REVIEW.md` anti-pattern catalog.
 
-  Full audit trail and per-function 7-question walk in `REVIEW.md` at repo root.
+  Full audit trail and per-function 7-question walk in `REVIEW.md` at repo root. Phase 2 audit covers migrations 0001–0070; addendum at the bottom extends Phase 2 to migrations 0071–0090.
 
 ## Open questions that gate work
 
