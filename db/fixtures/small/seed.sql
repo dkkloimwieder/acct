@@ -66,7 +66,8 @@ INSERT INTO fx_rates (from_currency, to_currency, rate, effective_at, source) VA
 -- System
 INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('creation_void', 'qty',   NULL,  'unrestricted'),
-  ('creation_void', 'value', 'USD', 'unrestricted');
+  ('creation_void', 'value', 'USD', 'unrestricted'),
+  ('creation_void', 'value', 'EUR', 'unrestricted');
 
 -- Cash, AR, AP, revenue (USD)
 INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
@@ -185,6 +186,27 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
 INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('variance_match_tolerance', 'value', 'USD', 'unrestricted'),
   ('variance_match_tolerance', 'value', 'EUR', 'unrestricted');
+
+-- Realized FX settlement accounts (USD + EUR; acct-3xcg, mig 0092).
+-- realized_fx_gain — credit-normal P&L (income line; recognized when
+--   AR settled with cash that exceeds rate-implied conversion, OR AP
+--   settled with cash less than rate-implied).
+-- realized_fx_loss — debit-normal P&L (expense line; recognized when
+--   AR settled with cash less than rate-implied, OR AP settled with
+--   cash more than rate-implied).
+-- fx_clearing — balance-sheet bridge between counterparty currency
+--   and cash currency on cross-currency settlement events. Each pair
+--   (DR in counterparty ccy / CR in cash ccy) nets to zero in home
+--   currency at the rate prevailing at p_business_date. Currency-
+--   only un-partitioned. unrestricted normal_side because both
+--   debit and credit balances appear within a settlement event.
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('realized_fx_gain', 'value', 'USD', 'credit'),
+  ('realized_fx_gain', 'value', 'EUR', 'credit'),
+  ('realized_fx_loss', 'value', 'USD', 'debit'),
+  ('realized_fx_loss', 'value', 'EUR', 'debit'),
+  ('fx_clearing',      'value', 'USD', 'unrestricted'),
+  ('fx_clearing',      'value', 'EUR', 'unrestricted');
 
 -- Period-close variance lines (USD + EUR; acct-4mt / acct-s6n).
 -- All bidirectional — write-ups credit, write-downs debit. Three
