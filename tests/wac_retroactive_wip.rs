@@ -135,9 +135,9 @@ async fn create_bom_header(pool: &PgPool, parent: &str) -> i64 {
 async fn add_bom_item(pool: &PgPool, bom_id: i64, line_no: i32, applies_at_op: i32, comp: &str, comp_loc: &str, qty_per_parent: i64) {
     sqlx::query(
         "INSERT INTO bom_lines
-            (bom_id, line_no, kind, basis, applies_at_op, fire_at, scrap_pct,
+            (bom_id, line_no, kind, basis, applies_at_op, fire_at, yield_pct,
              component_sku_id, component_loc_id, qty_per_parent)
-         VALUES ($1, $2, 'item', 'per_unit', $3, 'op_arrival', 0,
+         VALUES ($1, $2, 'item', 'per_unit', $3, 'op_arrival', 100,
                  $4::UUID, $5::UUID, $6)",
     )
     .bind(bom_id)

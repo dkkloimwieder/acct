@@ -421,7 +421,7 @@ pub async fn create_bom_header_full(
 }
 
 /// Add an item line to a bom_header. component sku/location resolved
-/// by code. Defaults: scrap_pct=0, fire_at='op_arrival' (item lines
+/// by code. Defaults: yield_pct=100, fire_at='op_arrival' (item lines
 /// can only be per_unit + op_arrival per the bom_lines CHECKs).
 #[allow(clippy::too_many_arguments)]
 pub async fn add_bom_item(
@@ -432,11 +432,11 @@ pub async fn add_bom_item(
     component_sku_code: &str,
     component_loc_code: &str,
     qty_per_parent: i64,
-    scrap_pct: f64,
+    yield_pct: f64,
 ) {
     sqlx::query(
         "INSERT INTO bom_lines
-            (bom_id, line_no, kind, basis, applies_at_op, fire_at, scrap_pct,
+            (bom_id, line_no, kind, basis, applies_at_op, fire_at, yield_pct,
              component_sku_id, component_loc_id, qty_per_parent)
          SELECT $1, $2, 'item', 'per_unit', $3, 'op_arrival', $4,
                 s.id, l.id, $7
@@ -445,7 +445,7 @@ pub async fn add_bom_item(
     .bind(bom_id)
     .bind(line_no)
     .bind(applies_at_op)
-    .bind(scrap_pct)
+    .bind(yield_pct)
     .bind(component_sku_code)
     .bind(component_loc_code)
     .bind(qty_per_parent)

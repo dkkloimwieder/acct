@@ -959,12 +959,12 @@ The same Postgres transaction also marks the reservation as allocated (or shippe
 **BOM2 schema (replaces flat `boms` + `wo_routing_burdens`):**
 
 - `bom_headers(id, parent_sku_id, alternate_no, revision_no, code, description, status, is_primary, effective_at, obsolete_at, eco_id, created_at)` — the BOM-as-a-thing. status ∈ {draft, active, obsolete}. UNIQUE on `(parent_sku_id, alternate_no, revision_no)`. Partial UNIQUE INDEX `bom_headers_primary` enforces "one primary per (parent_sku, alternate_no) at any time" while status='active'. CHECK on `effective_at < obsolete_at`. Time-phased revisions selected via `effective_at`/`obsolete_at` window.
-- `bom_lines(bom_id, line_no, kind, basis, applies_at_op, fire_at, scrap_pct, component_sku_id, component_loc_id, qty_per_parent, absorption_class_id, std_amount)` — BOM contents. `kind` ∈ {`item`, `service`, `charge`}; `basis` ∈ {`per_unit`, `per_lot`}; `fire_at` ∈ {`wo_start`, `op_arrival`}. Items have component refs; services and charges have absorption_class + std_amount. Cross-table self-reference (component = parent) is caught by a row-level trigger raising **P0034** `bom_line_self_reference`.
+- `bom_lines(bom_id, line_no, kind, basis, applies_at_op, fire_at, yield_pct, component_sku_id, component_loc_id, qty_per_parent, absorption_class_id, std_amount)` — BOM contents. `kind` ∈ {`item`, `service`, `charge`}; `basis` ∈ {`per_unit`, `per_lot`}; `fire_at` ∈ {`wo_start`, `op_arrival`}. `yield_pct` (default 100) is per-line planned material yield (renamed from `scrap_pct` in mig 0093). Items have component refs; services and charges have absorption_class + std_amount. Cross-table self-reference (component = parent) is caught by a row-level trigger raising **P0034** `bom_line_self_reference`.
 - `absorption_classes(id, code, display_name, applied_account_kind, expense_account_kind, ...)` — runtime burden taxonomy. Seed declares `labor_std → labor_applied` and `oh_std → oh_applied`. New classes (`osp_plating`, `production_setup`, `energy_hv`, …) are plain `INSERT`s — **no `ALTER TYPE` needed**. Classes targeting `applied_account_kind='absorption_pool'` ride generic reasons `burden_apply` (per_unit) / `lot_charge_apply` (per_lot); canonical `labor_applied` / `oh_applied` keep their canonical reasons regardless of basis.
 - `engineering_change_orders(id, code, status, requested_by, requested_at, approved_by, approved_at, effective_at, rejected_reason)` — ECO workflow. Composite CHECK enforces `approved` requires `approved_by + approved_at + effective_at`; `rejected` requires `rejected_reason`.
 - `wo_outputs(wo_id, output_no, output_sku_id, fg_location_id, qty, allocation_method, allocation_pct)` — co-product / by-product table. `allocation_method` ∈ {`primary`, `sales_value`, `fixed_ratio`, `market_price`}.
 - `work_orders.bom_id BIGINT REFERENCES bom_headers(id)` — optional pin. NULL falls back to primary active at business_date via `_wo_resolve_bom_for`.
-- `skus.yield_mode TEXT NOT NULL DEFAULT 'plan_only'` ∈ {`plan_only`, `absorbed`} — caller intent for the future BOM rollup tool. Pool flow is **literal** in both modes; `yield_mode` only affects rollup output (whether scrap_pct inflates parent_std).
+- `skus.yield_mode TEXT NOT NULL DEFAULT 'plan_only'` ∈ {`plan_only`, `absorbed`} — caller intent for the future BOM rollup tool. Pool flow is **literal** in both modes; `yield_mode` only affects rollup output (whether `yield_pct` inflates parent_std).
 - `skus.default_lot_size BIGINT NOT NULL DEFAULT 1` — divisor for amortizing per-lot charges into per-unit standard cost.
 - `skus.is_phantom BOOLEAN NOT NULL DEFAULT FALSE` — phantom assemblies expand recursively at WO_start (16-level cap; **P0032** on cycle/depth).
 - `skus.consumption_policy TEXT NOT NULL DEFAULT 'forward'` ∈ {`forward`, `backflush_at_op`, `backflush_at_complete`} — only `forward` is dispatched today; the others raise **P0035** at WO start (BEFORE INSERT trigger on `wo_events`).
@@ -977,7 +977,7 @@ parent_std_cost = Σ (item lines: qty_per_parent × component_std_cost)
                 + Σ (per_lot lines: std_amount / parent.default_lot_size)
 ```
 
-The rollup is a future tool; today the standard is set caller-side via `post_standard_cost_roll`. With `skus.yield_mode='absorbed'` the rollup tool inflates per-line item contributions by `1/(1 − scrap_pct/100)`. With `plan_only` (default) `scrap_pct` is ignored at rollup; actual scrap surfaces as variance at `wo_close_v`.
+The rollup is a future tool; today the standard is set caller-side via `post_standard_cost_roll`. With `skus.yield_mode='absorbed'` the rollup tool inflates per-line item contributions by `1/(yield_pct/100)`. With `plan_only` (default) `yield_pct` is ignored at rollup; actual scrap surfaces as variance at `wo_close_v`.
 
 **Item lines vs services vs charges.** All three are "per-unit costs that apply as a unit moves through the routing." They differ only in *what* they substantively are and *when* they apply:
 - **items**: physical BOM components. `kind='item', basis='per_unit', fire_at='op_arrival'` (CHECK-enforced — items can only be per_unit op_arrival). Fire **once per lifecycle** at the first arrival of `applies_at_op` (which is `wo_start` if applies_at_op = first_op).
@@ -989,7 +989,7 @@ The rollup is a future tool; today the standard is set caller-side via `post_sta
 - `bom_header_at(parent_sku_id, alternate_no, business_date) → bom_headers` — single-row resolver. **P0033** (`bom_header_resolution_invalid`) on zero or multiple matches.
 - `_wo_resolve_bom_for(wo_id, business_date) → bom_headers` — uses `work_orders.bom_id` if set; else `bom_header_at(parent, 1, business_date)`.
 - `_wo_explode_bom(bom_id, business_date) → TABLE(...)` — recursive phantom expansion. Cap 16; **P0032** on cycle or depth.
-- `_wo_emit_bom_lines(wo_id, bom_id, routing_op, qty, filter JSONB, event_id, business_date, posted_by) → JSONB` — generic event-batch builder. `filter` selects by `{kind, basis, fire_at, applies_at_op}` subset. Emission is **literal** — `bom_lines.scrap_pct` is planning metadata only.
+- `_wo_emit_bom_lines(wo_id, bom_id, routing_op, qty, filter JSONB, event_id, business_date, posted_by) → JSONB` — generic event-batch builder. `filter` selects by `{kind, basis, fire_at, applies_at_op}` subset. Emission is **literal** — `bom_lines.yield_pct` is planning metadata only.
 - `_wo_apply_reason_for(class_id, basis) → transfer_reason` — `labor_applied → labor_apply`, `oh_applied → oh_apply`, `absorption_pool + per_unit → burden_apply`, `absorption_pool + per_lot → lot_charge_apply`. Anything else raises **P0026**.
 
 **WO start (releases the WO; charges WIP@first_op):**
@@ -1023,7 +1023,7 @@ After `post_wo_start`, `WIP@first_op = qty_target × std_cum_at_first_op`.
 
 **Op move (from_op → to_op):**
 
-`post_op_move` computes `std_cum_at_from_op` from `bom_lines` (LITERAL — scrap_pct is planning metadata only):
+`post_op_move` computes `std_cum_at_from_op` from `bom_lines` (LITERAL — yield_pct is planning metadata only):
 
 ```
 v_per_unit_cum = Σ (item.qty_per_parent × comp_std)

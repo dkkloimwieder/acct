@@ -313,9 +313,9 @@ async fn full_lifecycle_walks_clean() {
     .unwrap();
     sqlx::query(
         "INSERT INTO bom_lines
-            (bom_id, line_no, kind, basis, applies_at_op, fire_at, scrap_pct,
+            (bom_id, line_no, kind, basis, applies_at_op, fire_at, yield_pct,
              component_sku_id, component_loc_id, qty_per_parent)
-         VALUES ($1, 1, 'item', 'per_unit', 10, 'op_arrival', 0, $2::UUID, $3::UUID, 2)",
+         VALUES ($1, 1, 'item', 'per_unit', 10, 'op_arrival', 100, $2::UUID, $3::UUID, 2)",
     )
     .bind(bom_id)
     .bind(&rm_sku)

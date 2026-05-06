@@ -151,9 +151,9 @@ async fn add_bom_item_by_id(
 ) {
     sqlx::query(
         "INSERT INTO bom_lines
-            (bom_id, line_no, kind, basis, applies_at_op, fire_at, scrap_pct,
+            (bom_id, line_no, kind, basis, applies_at_op, fire_at, yield_pct,
              component_sku_id, component_loc_id, qty_per_parent)
-         VALUES ($1, $2, 'item', 'per_unit', $3, 'op_arrival', 0,
+         VALUES ($1, $2, 'item', 'per_unit', $3, 'op_arrival', 100,
                  $4::UUID, $5::UUID, $6)",
     )
     .bind(bom_id)

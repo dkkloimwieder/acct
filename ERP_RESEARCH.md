@@ -129,7 +129,7 @@ Our BOM2 (acct-jg2, migrations 0040–0062) has solid bones: header/lines, alter
 
 ## acct-c80 — Per-op planned yield + variance reporting
 
-**Problem**: BOM2 has per-line `scrap_pct` and per-parent `yield_mode`. No per-routing-op yield, no planned-vs-actual yield variance reporter.
+**Problem**: BOM2 has per-line `yield_pct` (renamed from `scrap_pct` in mig 0093) and per-parent `yield_mode`. No per-routing-op yield, no planned-vs-actual yield variance reporter. (acct-c80 closed 2026-05-06 as superseded; per-line yield is the existing column.)
 
 **Industry**:
 - **SAP**: Operation yield first-class on routing master; CO11N captures yield + scrap + rework qty. Variance buckets named (price, lot-size, qty, scrap).

@@ -284,7 +284,7 @@ async fn explode_flat_bom_returns_lines_unchanged() {
     let raw_loc = fresh_location(&pool, "PHX-RAW").await;
 
     let bom_id = create_bom_header(&pool, "PHX-FLAT-P").await;
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-FLAT-CA", "PHX-RAW", 2, 0.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-FLAT-CA", "PHX-RAW", 2, 100.0).await;
     add_bom_service(&pool, bom_id, 2, 10, "labor_std", 5, "per_unit", "op_arrival").await;
     add_bom_charge(&pool, bom_id, 3, 10, "oh_std", 100, "wo_start").await;
 
@@ -334,12 +334,12 @@ async fn explode_one_level_phantom_flattens_into_parent() {
 
     // Parent BOM points at phantom (qty=3) at op20 plus a regular item.
     let parent_bom = create_bom_header(&pool, "PHX-1P-P").await;
-    add_bom_item(&pool, parent_bom, 1, 20, "PHX-1P-PH", "PHX-1P-RAW", 3, 0.0).await;
-    add_bom_item(&pool, parent_bom, 2, 10, "PHX-1P-STEEL", "PHX-1P-RAW", 1, 0.0).await;
+    add_bom_item(&pool, parent_bom, 1, 20, "PHX-1P-PH", "PHX-1P-RAW", 3, 100.0).await;
+    add_bom_item(&pool, parent_bom, 2, 10, "PHX-1P-STEEL", "PHX-1P-RAW", 1, 100.0).await;
 
     // Phantom's own primary BOM: 4 bolts per phantom + per_unit labor std=5.
     let phantom_bom = create_bom_header(&pool, "PHX-1P-PH").await;
-    add_bom_item(&pool, phantom_bom, 1, 30, "PHX-1P-BOLT", "PHX-1P-RAW", 4, 0.0).await;
+    add_bom_item(&pool, phantom_bom, 1, 30, "PHX-1P-BOLT", "PHX-1P-RAW", 4, 100.0).await;
     add_bom_service(&pool, phantom_bom, 2, 30, "labor_std", 5, "per_unit", "op_arrival").await;
 
     let rows = explode(&pool, parent_bom).await;
@@ -379,24 +379,26 @@ async fn explode_one_level_phantom_flattens_into_parent() {
 }
 
 // ============================================================
-// C5b — yield: scrap_pct is planning metadata, not build cost
+// C5b — yield: yield_pct is planning metadata, not build cost
 // ============================================================
 //
-// bom_lines.scrap_pct records *planned* material loss for MRP/scheduling
-// (e.g. "this component routinely loses 5% during assembly"). Build cost
-// in WIP comes from ACTUAL usage — emission and per-op flow are LITERAL
-// (qty_per × p_qty × comp_std). If the floor consumes more than the
-// BOM's literal qty, the excess is a separate post_transfers call
-// (an inventory adjustment or follow-up rm_issue_to_wo).
+// bom_lines.yield_pct records *planned* per-line material yield for
+// MRP/scheduling (e.g. "this component routinely yields 95% during
+// assembly — 5% loss is normal"). Build cost in WIP comes from ACTUAL
+// usage — emission and per-op flow are LITERAL (qty_per × p_qty ×
+// comp_std). If the floor consumes more than the BOM's literal qty,
+// the excess is a separate post_transfers call (an inventory
+// adjustment or follow-up rm_issue_to_wo).
 //
 // skus.yield_mode picks how the parent's standard cost rollup treats
-// scrap_pct (acct-6jq):
+// yield_pct (acct-6jq):
 //   plan_only  (default): rollup = literal sum. variance_wo_close shows
-//                          the full scrap-driven gap as unfavorable.
-//   absorbed:             rollup factors in scrap (caller-set today;
-//                          future tooling reads yield_mode and inflates).
-//                          variance_wo_close captures the actual-vs-
-//                          planned gap (favorable if no actual scrap).
+//                          the full yield-driven gap as unfavorable.
+//   absorbed:             rollup factors in yield (caller-set today;
+//                          future tooling reads yield_mode and inflates
+//                          by 1/(yield_pct/100)). variance_wo_close
+//                          captures the actual-vs-planned gap
+//                          (favorable if no actual scrap).
 //
 // In BOTH modes pool flow is literal; only the parent_std × qty drain
 // at wo_complete differs because the caller-set parent_std embodies
@@ -405,7 +407,7 @@ async fn explode_one_level_phantom_flattens_into_parent() {
 #[tokio::test(flavor = "multi_thread")]
 async fn yield_plan_only_emits_literal_qty_no_yield_variance() {
     // Mode B (plan_only, default): parent_std = literal qty_per × comp_std.
-    // scrap_pct present but ignored at emission → drain matches pool;
+    // yield_pct present but ignored at emission → drain matches pool;
     // variance_wo_close = 0 from yield (zero actual scrap).
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
@@ -413,9 +415,9 @@ async fn yield_plan_only_emits_literal_qty_no_yield_variance() {
     fresh_location(&pool, "PHX-YPO-RAW").await;
     scaffold_component(&pool, "PHX-YPO-C", "PHX-YPO-RAW", 10, 1000).await;
 
-    // BOM with scrap_pct=5% — recorded as planning hint.
+    // BOM with yield_pct=95 (5% planned loss) — recorded as planning hint.
     let bom_id = create_bom_header(&pool, "SKU-A").await;
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-YPO-C", "PHX-YPO-RAW", 2, 5.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-YPO-C", "PHX-YPO-RAW", 2, 95.0).await;
 
     // SKU-A's fixture-seeded std_cost=100. Parent_std for plan_only mode
     // would be `2 × 10 = 20` (literal) — fixture's 100 doesn't match,
@@ -442,7 +444,7 @@ async fn yield_plan_only_emits_literal_qty_no_yield_variance() {
     assert_eq!(
         rm_issued_qty(&pool, consumed).await,
         200,
-        "scrap_pct=5 does NOT gross up emission: literal 2×100=200"
+        "yield_pct=95 does NOT gross down emission: literal 2×100=200"
     );
 
     // Pool@op10 = 200 × 10 = 2000.
@@ -494,7 +496,7 @@ async fn yield_absorbed_via_scrap_aware_parent_std_surfaces_favorable_variance()
     scaffold_component(&pool, "PHX-YAB-C", "PHX-YAB-RAW", 10, 1000).await;
 
     let bom_id = create_bom_header(&pool, "SKU-A").await;
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-YAB-C", "PHX-YAB-RAW", 2, 5.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-YAB-C", "PHX-YAB-RAW", 2, 95.0).await;
 
     // Scrap-aware rollup: 2 / (1 - 0.05) × 10 = 21.05 → caller stores 21.
     let posted_by = fresh_uuid(&pool).await;
@@ -1069,7 +1071,7 @@ async fn coproduct_two_outputs_60_40_sales_value_split() {
 
     // BOM: 2 units of component per parent at op10. value at op10 = 2×50 = 100/unit.
     let bom_id = create_bom_header(&pool, "SKU-A").await;
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-CP1-CMP", "PHX-CP1-RAW", 2, 0.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-CP1-CMP", "PHX-CP1-RAW", 2, 100.0).await;
 
     // WO + 2 routings.
     let wo_id = create_test_wo(&pool, "PHX-CP1-001", "SKU-A", "MAIN", 100).await;
@@ -1151,7 +1153,7 @@ async fn coproduct_two_outputs_70_30_fixed_ratio_partial_completion() {
     scaffold_output_sku(&pool, "PHX-CP2-B", "MAIN").await;
 
     let bom_id = create_bom_header(&pool, "SKU-A").await;
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-CP2-CMP", "PHX-CP2-RAW", 2, 0.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-CP2-CMP", "PHX-CP2-RAW", 2, 100.0).await;
 
     let wo_id = create_test_wo(&pool, "PHX-CP2-001", "SKU-A", "MAIN", 100).await;
     add_test_routing(&pool, &wo_id, 10, "MILL").await;
@@ -1225,7 +1227,7 @@ async fn coproduct_allocation_pct_mismatch_raises_p0033() {
     scaffold_output_sku(&pool, "PHX-CP3-B", "MAIN").await;
 
     let bom_id = create_bom_header(&pool, "SKU-A").await;
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-CP3-CMP", "PHX-CP3-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-CP3-CMP", "PHX-CP3-RAW", 1, 100.0).await;
 
     let wo_id = create_test_wo(&pool, "PHX-CP3-001", "SKU-A", "MAIN", 100).await;
     add_test_routing(&pool, &wo_id, 10, "MILL").await;
@@ -1292,13 +1294,13 @@ async fn explode_phantom_recursion_limit_raises_p0032() {
         "PHX-DEEP-1",
         "PHX-DEEP-RAW",
         1,
-        0.0,
+        100.0,
     )
     .await;
     for i in 1..=16 {
         let bom = create_bom_header(&pool, &format!("PHX-DEEP-{i}")).await;
         let next = format!("PHX-DEEP-{}", i + 1);
-        add_bom_item(&pool, bom, 1, 10, &next, "PHX-DEEP-RAW", 1, 0.0).await;
+        add_bom_item(&pool, bom, 1, 10, &next, "PHX-DEEP-RAW", 1, 100.0).await;
     }
 
     // PHX-DEEP-0 → 1 → 2 → ... → 17 = 18 levels including the top.
@@ -1352,14 +1354,14 @@ async fn alternates_bom_id_null_picks_primary_set_picks_alternate() {
 
     // alt 1 (primary, default helper): consumes CA1.
     let bom_alt1 = create_bom_header(&pool, "SKU-A").await;
-    add_bom_item(&pool, bom_alt1, 1, 10, "PHX-ALT-CA1", "PHX-ALT-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_alt1, 1, 10, "PHX-ALT-CA1", "PHX-ALT-RAW", 1, 100.0).await;
 
     // alt 2 (substitute, is_primary=false): consumes CA2. Different
     // alternate_no → no conflict with the bom_headers_primary partial
     // unique index even though it covers alt 1.
     let bom_alt2 =
         create_bom_header_full(&pool, "SKU-A", 2, "A", false, "active", None).await;
-    add_bom_item(&pool, bom_alt2, 1, 10, "PHX-ALT-CA2", "PHX-ALT-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_alt2, 1, 10, "PHX-ALT-CA2", "PHX-ALT-RAW", 1, 100.0).await;
 
     // WO 1: bom_id NULL → resolver falls back to primary alt 1.
     let wo1 = create_test_wo(&pool, "PHX-ALT-001", "SKU-A", "MAIN", 50).await;
@@ -1408,7 +1410,7 @@ async fn primary_bom_resolution_via_resolver_function() {
 
     // Single primary active BOM (default helper).
     let bom_id = create_bom_header(&pool, "SKU-A").await;
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-RES-CMP", "PHX-RES-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-RES-CMP", "PHX-RES-RAW", 1, 100.0).await;
 
     let wo_id = create_test_wo(&pool, "PHX-RES-001", "SKU-A", "MAIN", 25).await;
     add_test_routing(&pool, &wo_id, 10, "MILL").await;
@@ -1454,7 +1456,7 @@ async fn revisions_effective_date_picks_active_revision() {
     .execute(&pool)
     .await
     .expect("set rev A window");
-    add_bom_item(&pool, bom_a, 1, 10, "PHX-REV-CA", "PHX-REV-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_a, 1, 10, "PHX-REV-CA", "PHX-REV-RAW", 1, 100.0).await;
 
     // rev B (alt=1 rev='B', is_primary=false initially): window [2026-06-01, infinity).
     // is_primary stays false until the ECO transition below — the
@@ -1469,7 +1471,7 @@ async fn revisions_effective_date_picks_active_revision() {
     .execute(&pool)
     .await
     .expect("set rev B effective_at");
-    add_bom_item(&pool, bom_b, 1, 10, "PHX-REV-CB", "PHX-REV-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_b, 1, 10, "PHX-REV-CB", "PHX-REV-RAW", 1, 100.0).await;
 
     // Direct resolver assertions: bom_header_at filters status='active'
     // and the effectivity window — does NOT filter is_primary, so both
@@ -1573,7 +1575,7 @@ async fn bom_id_pin_overrides_default_picks_draft_bom() {
         "PHX-PIN-CDFL",
         "PHX-PIN-RAW",
         1,
-        0.0,
+        100.0,
     )
     .await;
 
@@ -1592,7 +1594,7 @@ async fn bom_id_pin_overrides_default_picks_draft_bom() {
         "PHX-PIN-CDRF",
         "PHX-PIN-RAW",
         1,
-        0.0,
+        100.0,
     )
     .await;
 
@@ -1666,7 +1668,7 @@ async fn eco_approval_happy_path_no_predecessor() {
 
     let bom_id =
         create_bom_header_full(&pool, "SKU-A", 1, "A", true, "draft", Some(eco_id)).await;
-    add_bom_item(&pool, bom_id, 1, 10, "PHX-ECO1-CMP", "PHX-ECO1-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_id, 1, 10, "PHX-ECO1-CMP", "PHX-ECO1-RAW", 1, 100.0).await;
 
     // Approve at effective_at='2026-04-01' (covered by the open
     // 2026-04 period).
@@ -1743,7 +1745,7 @@ async fn eco_obsoletes_prior_revision_then_new_rev_takes_over() {
     .execute(&pool)
     .await
     .expect("set rev A effective_at");
-    add_bom_item(&pool, bom_a, 1, 10, "PHX-ECO2-CA", "PHX-ECO2-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_a, 1, 10, "PHX-ECO2-CA", "PHX-ECO2-RAW", 1, 100.0).await;
 
     // Pre-ECO WO at 2026-04-15 picks rev A.
     let wo_pre = create_test_wo(&pool, "PHX-ECO2-PRE", "SKU-A", "MAIN", 7).await;
@@ -1772,7 +1774,7 @@ async fn eco_obsoletes_prior_revision_then_new_rev_takes_over() {
     let bom_b =
         create_bom_header_full(&pool, "SKU-A", 1, "B", true, "draft", Some(eco_id))
             .await;
-    add_bom_item(&pool, bom_b, 1, 10, "PHX-ECO2-CB", "PHX-ECO2-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_b, 1, 10, "PHX-ECO2-CB", "PHX-ECO2-RAW", 1, 100.0).await;
 
     // Approve at T='2026-05-01' (covered by 2026-05 period).
     let approved_by = fresh_uuid(&pool).await;
@@ -2014,10 +2016,10 @@ async fn phantom_cycle_a_to_b_to_a_raises_p0032() {
 
     // A's BOM points at B (phantom). B's BOM points back at A (phantom).
     let bom_a = create_bom_header(&pool, "PHX-CYC-A").await;
-    add_bom_item(&pool, bom_a, 1, 10, "PHX-CYC-B", "PHX-CYC-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_a, 1, 10, "PHX-CYC-B", "PHX-CYC-RAW", 1, 100.0).await;
 
     let bom_b = create_bom_header(&pool, "PHX-CYC-B").await;
-    add_bom_item(&pool, bom_b, 1, 10, "PHX-CYC-A", "PHX-CYC-RAW", 1, 0.0).await;
+    add_bom_item(&pool, bom_b, 1, 10, "PHX-CYC-A", "PHX-CYC-RAW", 1, 100.0).await;
 
     expect_sqlstate("P0032", || async {
         sqlx::query("SELECT _wo_explode_bom($1, '2026-04-15'::DATE)")
