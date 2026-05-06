@@ -141,6 +141,10 @@ Part IV §14 specifies a three-layer progression. Status as of Phase 1 cost-meth
 
 SLO numbers in §14.2 are deliberately TBD — they get filled in after Structured lands, not before.
 
+### Property-test-per-entry-point convention (acct-1cer)
+
+Every entry-point function (`post_*` document wrapper) MUST ship with a sibling `tests/property_<fn>.rs` (or shared-binary `tests/property_<group>.rs` when several small functions share a workflow shape) in the same migration as the function. Property tests probe random scenarios against the I1–I7 invariants in `tests/common/mod.rs::assert_invariants_hold` and pin the function-specific invariants (per-class qty divisor on cost dispatch; always-cleared routing on memos; state-machine transitions on allocate/eco; etc.). Integration tests probe specific scenarios; property tests probe random scenarios — that's where the class-confusion / R1–R7 catch-net lives. Default shape: `PROPTEST_CASES` env var (default 100), `--test-threads=1`, `mod common`, ~400–800 lines per binary, ~15–35s wall-time. As of 2026-05-06 there are 17 `property_*.rs` binaries covering ~25 entry-points; treat them as the regression baseline rather than re-deriving the discipline per-PR.
+
 ## Working with the consolidated doc
 
 - It is large (~85 KB / ~1,750 lines). When the user references "the spec" or "the design," they mean this file unless they explicitly say otherwise.
