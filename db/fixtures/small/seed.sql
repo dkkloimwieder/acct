@@ -121,6 +121,20 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
 INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('labor_expense', 'value', 'USD', 'debit');
 
+-- acct-7t4.4 disposal-cost accrual machinery. accrued_disposal_liability
+-- is vendor-partitioned in production but seeded un-partitioned here so
+-- conformance harness cases (and the bom_by_products T1 probe) have a
+-- USD/EUR row to pin against. Per-vendor partitioned accounts are
+-- created inline by acct-7t4.* matrix tests via the vendor scaffold.
+-- disposal_expense is currency-only — default destination for
+-- disposal_basis='period' value legs when bom_by_products
+-- .disposal_expense_account_kind is NULL.
+INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
+  ('accrued_disposal_liability', 'value', 'USD', 'credit'),
+  ('accrued_disposal_liability', 'value', 'EUR', 'credit'),
+  ('disposal_expense',           'value', 'USD', 'debit'),
+  ('disposal_expense',           'value', 'EUR', 'debit');
+
 -- BOM2 (acct-jg2) absorption_classes seed rows. Migration 0042 inserts
 -- these on first apply, but TRUNCATE during reset_to_fixture wipes them;
 -- re-seed here so each test starts with a known baseline.
