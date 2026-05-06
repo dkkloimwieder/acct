@@ -518,3 +518,229 @@ Walked 33 functions × 7-question structural checklist. Phase 2 surfaced **8 add
 **Final tally**: 1 P1 false-alarm caught at fix-time (re-reading the latest migration body), 5 of 5 P2 bugs fixed, 7 of 7 P3 cleanups fixed, 3 of 3 Phase 3 property-test binaries shipped. 6 fix migrations 0071–0076. ~5 regression tests added plus 3 new property-test binaries (each with 100 random scenarios by default, 200 also clean, via `PROPTEST_CASES`). All test binaries pass after every commit.
 
 **Methodology lesson**: the false alarm on acct-du2.8 surfaced a Phase 2 audit pitfall — when there are multiple `CREATE OR REPLACE FUNCTION` for the same function across migrations, only the LATEST one is the active version. Phase 2's structural walk caught this once (post_cost_adjustment latest = mig 0069) but missed it once (post_inventory_adjustment latest = mig 0031, not 0027). The right verification is `grep -nE 'CREATE OR REPLACE FUNCTION fname' db/migrations/*.up.sql | tail -1` before reading the body. The audit's verdict stays valid — even with one false alarm, 12/13 fixed bugs is a strong ROI on the structural walk.
+
+
+## Phase 2 — per-function structural audit (continued, migrations 0071–0090)
+
+Extends the original Phase 2 audit (which terminated at mig 0070) with the entry-point functions added or modified in migrations 0077–0090. Reads each function with the same 7-question checklist (Scope / Value-pool reads / Qty-divisor reads / cost_method dispatches / Document/WO-sharing / Currency / Post-write invariants) against AP1–AP8. Section order is most-recent-first (newest migration at the top); the modified entry-points (`post_po_receipt`, `post_ap_bill`, `post_standard_cost_roll`, `_post_transfers_apply_event`, `wac_periodic_close_hook`, `wac_retroactive_close_hook`) follow the new entry-points.
+
+### `post_vendor_debit_memo` (mig 0088, latest)
+
+1. **Scope**: one (vendor, currency) memo × N lines. Each line is either `kind='financial'` (caller-supplied expense GL credit + ap debit) or `kind='goods_return'` (one (sku, location, qty) reversal at caller-supplied unit_cost; no PPV).
+2. **Value-pool reads**: none. The function does NOT read any pool balance — it accepts caller-supplied `unit_cost` and computes `amount = qty × unit_cost`. Account lookups (lines 583–589 ap, 676–682 stock_available, 684–691 inv_value_raw, 693–704 vendor_pool) are id-only resolution, not balance reads.
+3. **Qty-divisor reads**: none. No averaging, no per-class divisor. Caller-supplied unit_cost.
+4. **cost_method dispatches**: none. Standalone debit memo intentionally bypasses cost_method (no original po_line.unit_cost to compare against; PPV not computed by design — documented header note line 41–43).
+5. **Document/WO-sharing**: pool may be shared across vendors / WOs; this function only adds value to ap, removes value from inv_value_raw at caller-supplied price. No solo gate needed because no averaging happens.
+6. **Currency / period**: currency is an explicit parameter; account lookups pinned (`currency=p_currency` at line 585, 686). `business_date` flows into post_transfers via the batch; `p_override_closed_period` passed through (line 753). Account-currency mismatch on `expense_account_id` rejected at line 633–636.
+7. **Post-write invariants**: vendor_debit_memos + vendor_debit_memo_lines rows; financial line: 1 transfer (ap DR / expense CR); goods_return line: 2 transfers (vendor_pool DR / stock_available CR qty leg + ap DR / inv_value_raw CR value leg). No PPV. No transfers_provisional flagging happens because reason is `po_return_to_vendor` (not in the cost-event list).
+
+**Verdict**: clean. Standalone-memo-by-design deliberately bypasses cost dispatch; AP1–AP4 are non-applicable (no pool reads, no divisors). AP5/AP6 non-applicable (pool only credited, never drained-then-revalued). AP7 satisfied (currency-pinned). AP8 satisfied via UNIQUE(idempotency_key) on header table + ON CONFLICT DO NOTHING (line 597) + fast-path replay at lines 566–568.
+
+### `post_customer_credit_memo` (mig 0088, latest)
+
+1. **Scope**: one (customer, currency) memo × N lines. Each line is `kind='financial'` (caller-supplied revenue GL debit + ar credit) or `kind='goods_return'` (one (sku, location, qty, disposition) reversal at caller-supplied unit_cost / unit_price).
+2. **Value-pool reads**: none. Mirror of vendor_debit_memo — caller-supplied costs throughout.
+3. **Qty-divisor reads**: none.
+4. **cost_method dispatches**: none. Same rationale as vendor_debit_memo (no original ship_line to reference; cost_method-aware reversal would require either snapshotted cost_method or running-WAC read — explicitly deferred per header note line 39–43).
+5. **Document/WO-sharing**: pool credit-only on inv_value_fg (restock/repair) or stock_scrap/variance_scrap (scrap); no averaging, no solo gate needed.
+6. **Currency / period**: currency parameter pinned in account lookups (lines 178, 259, 326, 407, 430). Period flows through post_transfers; `p_override_closed_period` passed through (line 457).
+7. **Post-write invariants**: customer_credit_memos + customer_credit_memo_lines rows. financial line: 1–2 transfers (revenue/expense DR / ar CR ± tax). goods_return line: 2–4 transfers (qty leg, value leg, revenue reversal, optional tax). All revenue/tax legs always credit `ar` (cleared) — no state-aware routing per header note line 28–33.
+
+**Verdict**: clean. Same shape as `post_vendor_debit_memo` and same design tradeoffs (PPV not computed, cleared-account-only). AP1–AP7 non-applicable for the same reasons. AP8 satisfied via UNIQUE(idempotency_key) + fast-path replay at line 159–161. Note the goods_return path uses caller-supplied `unit_cost` × `qty` for the cogs reversal value-leg amount; if the customer's actual standing inv_value_fg pool has a different running average (wac SKU), the goods come back into inv_value_fg at a different unit cost than current-pool — by design (audit-trail integrity over WAC accuracy, header line 38–40), but a caller passing wrong unit_cost can drift the pool's per-unit running cost. Caller's responsibility, not this function's.
+
+### `post_po_return` (mig 0089, latest body — supersedes 0085, 0086, 0087)
+
+1. **Scope**: one (vendor) return × N lines. Each line references a `po_receipt_lines` row; per-line state-aware split between staging (ap_unsettled) and cleared (ap) drains.
+2. **Value-pool reads**: none directly. Cumulative `qty_received` (line 138–141), `qty_billed` (143–146), prior-return splits (148–156) read on transactional tables — uses `purchase_order_lines` FOR UPDATE at line 136 to serialize concurrent receipts/bills/returns on the same po_line (the acct-du2.9 fix). Pool balances themselves are not read.
+3. **Qty-divisor reads**: none. Cost dispatch is unit-based (snapshotted `cost_method_at_receipt` from po_receipt_lines, line 111).
+4. **cost_method dispatches**: line 171–179 reads the SNAPSHOTTED cost_method (`v_pl.cost_method_snap`, populated at receipt time per mig 0087). standard → `resolve_standard_cost_at` (P0018-gated); wac_* → po_line.unit_cost; fifo/lot → P0006. The snapshot dispatch SIDESTEPS R2/AP2 entirely because there's no SKU-from-leg coalescing — the cost_method is fixed at receipt time. **Clean by design.**
+5. **Document/WO-sharing**: po_line FOR UPDATE at line 136 covers cumulative-state reads. State-aware split at 158–161 computes qty_to_unsettled (drain un-billed first) vs qty_to_ap (drain billed); over-return rejected at line 163–169 (P0047). Mig 0089 adds a third state read: receipt's period closed_at (line 238–242) — this read is NOT under any lock, but `periods.closed_at` is monotonic (only set, never unset; only set by close_period under FOR UPDATE on the period row), so dirty read is safe — race window only narrows the window where a concurrent close transaction has just stamped closed_at; both routes (variance_ppv vs variance_ppv_prior_period_adj) post valid value events with the same total amount, just to different P&L kinds. Defensible.
+6. **Currency / period**: currency from po_line carried throughout. Receipt's period lookup at 238–241 keys on `business_date BETWEEN opens_at AND closes_at LIMIT 1` — single period match, AP7-clean. p_override_closed_period (acct-dso) passes through to post_transfers at line 360.
+7. **Post-write invariants**: po_returns + po_return_lines rows with split tracking. Per line: 1 qty leg (vendor_pool DR / stock_available CR), 0–1 PPV leg per route (variance_ppv or variance_ppv_prior_period_adj depending on receipt-period closed state), 0–1 inv reversal per route (ap_unsettled or ap DR / inv_value_raw CR). PPV ordering before value preserved (acct-quk insight, line 287 design comment in mig 0085 carries forward). State-aware split sums to qty_returned by CHECK constraint on po_return_lines.
+
+**Verdict**: clean. Mig 0086 already added po_line FOR UPDATE (closes acct-du2.9 for this function). Mig 0087's snapshot dispatch eliminates the AP2 surface that the original mig-0085 body had (which read `skus.cost_method` directly, and would have inverted PPV math under cost-method flips). Mig 0089's prior-period-adj routing is well-formed.
+
+### `post_customer_return` (mig 0086, latest)
+
+1. **Scope**: one (customer) return × N lines. Each line references a `so_shipment_lines` row; per-line state-aware split between staging (ar_unsettled) and cleared (ar) drains for revenue; tax always credits ar_unsettled.
+2. **Value-pool reads**: none directly. Cumulative `qty_shipped` (line 598–601), `qty_invoiced` (603–606), prior-return splits (608–616) read on transactional tables; `sales_order_lines` FOR UPDATE at line 595 serializes concurrent ships/invoices/returns on the same so_line (mirror of acct-du2.9). Pool balances NOT read for cost — the function uses snapshotted unit_cost from so_shipment_lines (line 567).
+3. **Qty-divisor reads**: none. Tax pro-ration at line 633–637 is `(tax_amount × qty_returned) / qty_shipped` — division within the snapshotted line, NOT a per-class qty divisor. AP1-clean.
+4. **cost_method dispatches**: none. cogs reversal value-leg amount is `qty_returned × v_sl.unit_cost` (snapshotted from ship-line, line 775). The mig 0087 column `cost_method_at_ship` exists but is reserved for future use — `post_customer_return` does not currently read it. AP2/AP4 non-applicable.
+5. **Document/WO-sharing**: so_line FOR UPDATE at 595 covers cumulative-state reads. State split at 621–622 (drain un-invoiced first); over-return rejected at 624–630 (P0045). Pool inventory routing depends on disposition, but each disposition writes to a distinct (sku, location)-keyed pool — no shared-pool concern.
+6. **Currency / period**: currency from ship-line carried throughout. p_override_closed_period passes through to post_transfers at line 843.
+7. **Post-write invariants**: customer_returns + customer_return_lines rows with split tracking. Per line: 1 qty leg (per disposition), 1 value leg (cogs reversal — to inv_value_fg for restock/repair, to variance_scrap for scrap), 0–1 revenue reversal per route, 0–1 tax reversal (always to ar_unsettled).
+
+**Verdict**: clean. AP1–AP7 non-applicable / safe. AP8 satisfied via fast-path replay at line 526–528 + UNIQUE(idempotency_key) on header. The cost_method-at-ship snapshot is captured for reserved future use; a follow-up may want to dispatch on it (e.g., wac_perpetual ship → return at recomputed running-avg cogs, not snapshot — out of scope).
+
+### `post_so_allocate` (mig 0083, latest)
+
+1. **Scope**: one SO; flips matching `inventory_reservations` rows from `'active'` to `'allocated'` state. No ledger events, no transfers.
+2. **Value-pool reads**: none.
+3. **Qty-divisor reads**: none.
+4. **cost_method dispatches**: none.
+5. **Document/WO-sharing**: pure state transition on rows already keyed by `so_id`. No pool mutation.
+6. **Currency / period**: not relevant (no transfers).
+7. **Post-write invariants**: so_allocations row inserted; matching reservations transition. Idempotent via UNIQUE(idempotency_key) on so_allocations + ON CONFLICT DO NOTHING (line 85). Re-run after allocate finds 0 active reservations to update — safe.
+
+**Verdict**: clean. Pure workflow function with no pool / cost_method / divisor surface area. AP1–AP8 non-applicable.
+
+### `post_ap_payment` (mig 0082, latest)
+
+1. **Scope**: one (vendor, currency, amount) payment. Single ledger event: `ap(vendor, ccy) DR / cash(ccy) CR`.
+2. **Value-pool reads**: none.
+3. **Qty-divisor reads**: none.
+4. **cost_method dispatches**: none. Reason is `ap_payment` (not in cost-event list).
+5. **Document/WO-sharing**: vendor's ap and cash accounts may be shared across many in-flight payments / bills / receipts. No averaging happens; the SUM-style debit/credit balance maintenance is deferred to `_post_transfers_apply_event` under FOR UPDATE.
+6. **Currency / period**: currency is an explicit parameter; both accounts pinned (lines 84, 92). Period inherited via post_transfers (line 127). No `p_override_closed_period` — current callers cannot back-post.
+7. **Post-write invariants**: ap_payments header row + 1 transfer.
+
+**Verdict**: clean. Mirror of `post_ar_payment` (mig 0081). AP1–AP7 non-applicable. AP8 satisfied via UNIQUE(idempotency_key) + ON CONFLICT (line 105) + fast-path replay at 67–69.
+
+### `post_ar_payment` (mig 0081)
+
+1. **Scope**: one (customer, currency, amount) payment. Single ledger event: `cash(ccy) DR / ar(customer, ccy) CR`.
+2. **Value-pool reads**: none.
+3. **Qty-divisor reads**: none.
+4. **cost_method dispatches**: none. Reason is `ar_payment`.
+5. **Document/WO-sharing**: ar pool shared across many invoices / payments / returns; balance maintenance via `_post_transfers_apply_event` under FOR UPDATE.
+6. **Currency / period**: pinned account lookups at lines 935–937, 942–944. Period inherited.
+7. **Post-write invariants**: ar_payments header row + 1 transfer.
+
+**Verdict**: clean. Mirror of post_ap_payment (one sub-issue's mig later). AP1–AP7 non-applicable. AP8 satisfied via UNIQUE(idempotency_key) at line 957–959.
+
+### `post_customer_invoice` (mig 0090, latest body — supersedes 0081, 0086)
+
+1. **Scope**: one (customer, currency) invoice × N lines. Each line is `so_match` (matched to so_line, three-way tolerance match) or `service` (caller-supplied revenue account). Currency-pinned.
+2. **Value-pool reads**: none directly. Reads cumulative `qty_shipped` (line 491–492), `qty_invoiced` (493–495), and `qty_to_ar_unsettled` from prior returns (496–499) — all on transactional tables.
+3. **Qty-divisor reads**: none. Tolerance check at 476 divides one snapshotted unit_price by another snapshotted unit_price (percent computation, not a per-class divisor).
+4. **cost_method dispatches**: none. Invoice clears ar_unsettled → ar; cost was set at ship time.
+5. **Document/WO-sharing**: so_line FOR UPDATE at line 449 (`FOR UPDATE OF sl`) serializes concurrent invoices / shipments / returns on the same so_line — covers the cumulative-qty AP3/AP8 race shape. Same fix shape as acct-du2.9 (already filed in REVIEW.md base, closed by mig 0076 which post-dates the original mig-0081 body).
+6. **Currency / period**: currency parameter pinned in all account lookups (411, 513, 547, 636); explicit currency mismatch check on so_line at 462–466. Period inherited via post_transfers.
+7. **Post-write invariants**: customer_invoices + customer_invoice_lines rows. Per so_match line: 1 base ar DR / ar_unsettled CR at po-recorded amount + 0/1 tolerance absorption against `variance_match_tolerance`. Per service line: 1 ar DR / revenue CR + 0/1 tax leg (ar DR / sales_tax_payable CR).
+
+**Verdict**: clean. Tolerance-window split (mig 0090) is well-formed: the base leg always uses `v_amount_at_so = v_qty × v_sl.unit_price` (the accrual integrity at ship time, line 529), with a delta absorbed via `variance_match_tolerance`. AP1–AP4, AP7 non-applicable. AP5/AP6 non-applicable (no shared-pool drain). AP3 satisfied via FOR UPDATE on so_line. AP8 satisfied via UNIQUE(idempotency_key) at 423–425.
+
+### `post_so_ship` (mig 0087, latest body — supersedes 0081, 0083)
+
+1. **Scope**: one SO ship × N lines. Each line is one (so_line, qty, [unit_price override], [tax_amount override]). Cost dispatch on FG SKU (ship-side).
+2. **Value-pool reads**: line 483–484 reads `v_value_balance` from inv_value_fg(sku, ship_location, ccy). NOT under FOR UPDATE on this account directly — the read is BEFORE the post_transfers call at line 574 which acquires the lock via `_post_transfers_lock_pre_scan`. **AP3 candidate**: between the read at 483 and the lock-pre-scan in post_transfers, a concurrent post_so_ship / post_po_receipt / post_inventory_adjustment can mutate `inv_value_fg` and skew the unit_cost computation. The earlier mig 0081 body (line 482–483) had the same shape; mig 0087 preserves it.
+3. **Qty-divisor reads**: line 470–475 computes `v_qty_balance` via per-class signed SUM on `transfers.qty` filtered to `v_val_acct IN (debit_account_id, credit_account_id) AND qty IS NOT NULL` — class-isolated by virtue of the value-account filter. AP1-clean (R1 satisfied; the pattern matches `_post_transfers_compute_amount`'s correct shape and `_wo_emit_bom_lines`'s correct shape). HOWEVER same lock concern as the value-pool read: not under FOR UPDATE on `v_val_acct` at the read site. **AP3 candidate** — read at 470 before any FOR UPDATE.
+4. **cost_method dispatches**: line 467–487 — explicit CASE on `v_cost_method` (the SKU's CURRENT cost_method, line 409). standard → resolve_standard_cost_at; wac_* (3-way OR catch implicit at line 469 ELSE branch — actually line 467 IF / 469 ELSE, so wac_* go into the ELSE running-avg branch); fifo/lot rejected upfront at 411–415 (P0006). The dispatch resolves on the FG SKU directly (line 409: `WHERE id = v_sl.sku_id`); NOT credit-first COALESCE — but this is the document-level dispatcher, not the transfer-level one. The post_transfers refactor in mig 0081 will REDISPATCH at apply time using credit-first COALESCE (`COALESCE(v_c_acct.sku_id, v_d_acct.sku_id)` line 145, 205, 247). Both dispatches resolve the same SKU because v_sl.sku_id is also the credit account's sku_id (inv_value_fg(v_sl.sku_id) for the COGS leg). Snapshot at INSERT time at line 504 (`cost_method_at_ship`) populates the column for downstream `post_customer_return` use.
+5. **Document/WO-sharing**: stock_available + inv_value_fg pools shared with other shipments / receipts / WO completions on the same (sku, location). No solo gate needed for cost dispatch — running-avg pricing is correct against shared pools (same reasoning as op_move). Reservation flip at 568–572 covers `'active'` AND `'allocated'` (the mig-0083 widening).
+6. **Currency / period**: currency from so_line carried; account lookups pinned. Period inherited.
+7. **Post-write invariants**: so_shipments + so_shipment_lines rows. Per line: 1 qty leg (customer_pool DR / stock_available CR), 1 cogs leg (cogs DR / inv_value_fg CR), 1 revenue leg (ar_unsettled DR / revenue CR), 0–1 tax leg.
+
+**Verdict**: **suspicious — fix candidate: AP3 lock-gap on cost dispatch**. Lines 470–486 read pool qty/value to compute wac_* unit_cost without FOR UPDATE on the value account at the read site. Same shape as `acct-du2.6` (post_wo_complete), `acct-du2.7` (post_op_move) which the original audit flagged as P3 drift. The downstream post_transfers's lock-pre-scan eventually locks the account, but by then the dispatch has already snapshotted v_unit_cost from a stale read; the snapshot is then PERSISTED on so_shipment_lines.unit_cost at line 503 (becomes the source of truth for `post_customer_return`'s cogs reversal). A concurrent po_receipt landing inventory between line 484 and line 574 makes this WO's COGS quote a per-unit cost that doesn't match the inv_value_fg balance at lock time. Severity P3 because the dispatcher (`_post_transfers_compute_amount`) re-reads under lock and would post different amounts than the snapshot — meaning the LEDGER is correct but the line's `unit_cost` audit field drifts (the actual accounts.balance change at line 488–491 in `_post_transfers_apply_event` uses the dispatcher's recomputed amount, not the document's snapshot — wait, actually look at the line 531 `'amount', v_qty_shipped * v_unit_cost` in the batch, then post_transfers's WAC two-pass replaces it with the locked recompute — so the persisted unit_cost on so_shipment_lines is the pre-lock value but the actual transfer.amount is the post-lock value). Worth filing as P3 audit-trail drift; **same lock-gap pattern as acct-du2.6/.7**.
+
+Also note: mig 0087 line 470–474 uses `WHEN t.debit_account_id = v_val_acct THEN  t.qty WHEN t.credit_account_id = v_val_acct THEN -t.qty END` (no `ELSE 0`); ungrouped CASE returns NULL on no-match, but the WHERE-clause filter `v_val_acct IN (debit, credit)` guarantees a match — so this is functionally equivalent to the shape with explicit `ELSE 0`. Not a bug, just stylistic.
+
+### `_post_transfers_apply_event` (mig 0067, latest body; mig 0081 changed `post_transfers` orchestrator, NOT this function)
+
+The original Phase 2 audit covered this. The relevant delta is: **mig 0081 did not change `_post_transfers_apply_event`** — the SO_ship non-SKU-leg pass-through is implemented in `post_transfers` (the orchestrator) lines 153–159 and 207–213. `_post_transfers_apply_event` itself still uses credit-first COALESCE at line 528 for `transfers_provisional` flagging, exactly as the original Phase 2 entry described.
+
+1. **Scope**: same as Phase 2 entry — single transfer event apply step.
+2. **Value-pool reads**: none (caller pre-loaded accounts).
+3. **Qty-divisor reads**: none.
+4. **cost_method dispatches**: line 522–537 — flags wac_periodic / wac_retroactive depletions for `transfers_provisional`. The flagging list now includes 8 reasons (line 522–524): canonical 4 (op_move / scrap / wo_complete / so_ship), BOM2 *_v reasons (op_move_v / scrap_v / wo_complete_v), and rm_issue_to_wo. SKU resolution at line 528 is **credit-first** (`COALESCE(p_c_acct.sku_id, p_d_acct.sku_id)`). For so_ship's revenue / tax legs (no SKU on either side), `v_cost_sku` is NULL and the IF at 529 is FALSE — no flagging. Correct: those legs are not depletions of inventory pools.
+5. **Document/WO-sharing**: caller is responsible for lock pre-scan.
+6. **Currency / period**: validated lines 462–478 (P0001 / P0002 / P0003 / P0004 / P0005).
+7. **Post-write invariants**: 1 transfer row + balance updates + 0/1 transfers_provisional row.
+
+**Verdict**: clean (unchanged from Phase 2 entry). AP2 R2 satisfied (credit-first COALESCE at line 528 — the canonical correct shape). The mig 0081 orchestrator-level non-SKU pass-through for so_ship value legs does NOT relax flagging in `_post_transfers_apply_event`: NULL SKU on both sides → IF guard at line 529 short-circuits, no flag. **The relaxation is sound — non-SKU value legs (revenue, tax) are not inventory pools and would not be flagged regardless.**
+
+### `wac_periodic_close_hook` (mig 0077, latest body — supersedes 0067)
+
+The Phase 2 entry covered the mig-0067 body. The relevant delta is: **mig 0077 adds a mixed-method branch** at lines 550–629. When walking a wac_periodic-flagged provisional `rm_issue_to_wo` row, the hook now checks if the destination's SKU has a different cost_method (line 554–562); if so, posts SINGLE-LEG variance through `variance_material_mixed` against the component pool (the value pool we are walking), leaving the destination WIP untouched.
+
+1. **Scope**: unchanged — one period × all wac_periodic-flagged provisionals; topological per-pool walk.
+2. **Value-pool reads**: unchanged (line 494–503 implicit via transfer log + LEFT JOIN to provisional cache).
+3. **Qty-divisor reads**: unchanged (`_wac_close_pool_qty_in` at 505–507).
+4. **cost_method dispatches**: NEW mixed-detection at line 554–562 — resolves `v_dest_method` via `accounts a JOIN skus s` on the debit account's `sku_id`. This is debit-side SKU resolution, but it's NOT for cost dispatch — it's for **route detection** (decide which variance kind to use). The depletion source dispatch happens earlier (the row is already wac_periodic-flagged because the credit-side SKU was wac_periodic at flagging time). R2 still satisfied — the wac_periodic recompute still walks credit-side pool. The debit-side read at 558 is to determine "is destination homogeneous wac_periodic, or mixed?" — necessary because internal-chain treatment differs.
+5. **Document/WO-sharing**: pool-level recompute spans all flagged depletions. Mixed branch posts single-leg (variance_material_mixed DR/CR ↔ component pool — line 591–615), leaving destination WIP untouched per CLAUDE.md R5 (debit-normal pool that the WO path drained to 0 — single-leg, not 2-leg).
+6. **Currency / period**: variance_material_mixed account looked up by currency from the COMPONENT pool (`v_pool_acct.currency`, line 582). AP7-clean.
+7. **Post-write invariants**: each flagged row finalized; mixed rm_issue_to_wo → 1 single-leg variance transfer (variance_transfer_id set); homogeneous internal-chain (op_move_v / wac_periodic-destination rm_issue_to_wo) → variance recorded, no transfer; leaf raw/fg → 2-leg wash; leaf inv_value_wip → single-leg.
+
+**Verdict**: clean (mixed-method branch correctly implements R5 single-leg routing). AP1–AP4 unchanged from Phase 2. AP5 satisfied (mixed branch posts only against component pool, never touches destination — which is correct because destination is governed by its OWN cost_method's hook). AP6 satisfied (single-leg routing against credit-normal pool the WO path drains in caller). AP7 satisfied. The only subtle concern is the `accounts a JOIN skus s` lookup at 555–558 has no currency filter, but `accounts.id` is unique so the `WHERE a.id = v_orig.debit_account_id` is sufficient; AP7 not violated.
+
+### `wac_retroactive_close_hook` (mig 0077, latest body — supersedes 0070)
+
+The Phase 2 entry covered the mig-0070 body. The relevant delta is: **mig 0077 adds the analogous mixed-method branch** at lines 1025–1096 of mig 0077. Same shape as wac_periodic's mixed branch, applied to the per-event chronological replay.
+
+1. **Scope**: unchanged — one period × all wac_retroactive-flagged provisionals; topological per-pool walk + per-event chronological replay.
+2. **Value-pool reads**: unchanged (merged value/qty stream sorted by (business_date, doc_chrono, document_id, sub_priority, id), with LEFT JOIN to provisional cache for upstream variance).
+3. **Qty-divisor reads**: unchanged (running pool_qty maintained through replay).
+4. **cost_method dispatches**: line 1025–1035 — resolves `v_dest_method` for mixed detection; same shape as wac_periodic's mig-0077 branch. Cost recompute still uses the credit-side pool's running avg (line 1018–1019: `v_recomputed_avg := v_pool_value / v_pool_qty`; `v_recomputed_amt := v_event.qty * v_recomputed_avg`). R2 satisfied — recompute is on the depletion source pool.
+5. **Document/WO-sharing**: pool replay is cross-document. Mixed branch posts single-leg variance_material_mixed against `v_event.credit_account_id` (the component pool we're walking) — line 1066, 1077. Note line 1166, 1188 — homogeneous-wac_retroactive WIP path uses `v_pool_id` for credit/debit on the second wash leg, which is the same as the credit-side pool we're walking; correct.
+6. **Currency / period**: variance_material_mixed account looked up by `v_pool_acct.currency` at line 1051. AP7-clean.
+7. **Post-write invariants**: each flagged row finalized; per-event chronological pool_qty / pool_value updated; mixed → single-leg variance against component; homogeneous internal-chain → variance recorded, no transfer; leaf inv_value_wip → single-leg, leaf raw/fg → 2-leg wash. Pool_value decrement at lines 1213, 1218 is by `v_recomputed_amt` (provisional row case) or `v_event.orig_amount` (non-provisional case) — chosen correctly per event type.
+
+**Verdict**: clean. Mixed-method branch is correctly implemented. The pre-decrement subtraction logic at lines 1213–1221 is subtle but consistent with the Phase 2 (mig-0070) entry's audit — for inv_value_wip pools the pool_qty is NOT decremented inside the value-event walk (paired with stock_wip qty events via sub_priority ordering), which is what acct-rso requires. AP1–AP7 satisfied.
+
+### `post_po_receipt` (mig 0087, latest body — supersedes 0036)
+
+Original Phase 2 entry covered mig-0036 body. The relevant delta is: **mig 0087 adds `cost_method_at_receipt` snapshot** persisted on po_receipt_lines (line 226–230) and resolves it from the SKU's CURRENT cost_method at receipt-post time (line 163: `SELECT cost_method INTO v_cost_method FROM skus WHERE id = v_pl.sku_id`).
+
+1. **Scope**: unchanged.
+2. **Value-pool reads**: unchanged (none; cost is unit-based via standard or po_unit_cost).
+3. **Qty-divisor reads**: unchanged (none).
+4. **cost_method dispatches**: line 163 reads SKU's current cost_method (single SKU resolution at po_line.sku_id — no COALESCE). For wac_*, value posts at po_unit_cost (no PPV). For standard, PPV computed at lines 209, 264–292. The snapshot at line 229 (`cost_method_at_receipt`) captures this method for downstream `post_po_return` to dispatch on (mig 0087 fix).
+5. **Document/WO-sharing**: po_line FOR UPDATE at line 142 (mig 0036-original); cumulative-qty over-receipt check at 153–161 is now under that lock — a cleanup that landed via the acct-du2.9 fix-batch (mig 0076).
+6. **Currency / period**: pinned (lines 173, 181–182, 199). Period inherited.
+7. **Post-write invariants**: po_receipts + po_receipt_lines rows (now with cost_method_at_receipt). Per line: 1 qty leg (stock_available DR / vendor_pool CR), 1 value leg (inv_value_raw DR / ap_unsettled CR), 0/1 PPV leg.
+
+**Verdict**: clean. Snapshot at INSERT time (line 226–230) is correctly placed AFTER all validation but BEFORE the post_transfers call — meaning the column is committed atomically with the receipt's transfers. The `cost_method` read at line 163 is on the SKU row (no FOR UPDATE), but cost_method changes are infrequent and ALL methods route correctly through the dispatcher gate at 165–169 (fifo/lot rejected). A concurrent SKU `cost_method` flip between line 163 and the post_transfers call at line 295 would cause a one-shot mismatch (snapshot says X, dispatcher uses fresh X' — both consistent with their respective inputs, but the snapshot might be stale). Severity P3 audit-trail drift — same shape as the post_so_ship pre-lock issue noted above; no functional bug because the pricing is unit-based (resolve_standard_cost_at is canonical) not pool-based.
+
+### `post_ap_bill` (mig 0090, latest body — supersedes 0035, 0086)
+
+Original Phase 2 entry covered mig-0035 body. The relevant deltas are: (a) mig 0086 adds po_line FOR UPDATE at line 154 + subtracts `qty_to_ap_unsettled` from prior returns in v_avail at lines 202–206, and (b) mig 0090 adds tolerance-window dispatch.
+
+1. **Scope**: unchanged.
+2. **Value-pool reads**: unchanged (none).
+3. **Qty-divisor reads**: unchanged (none). Tolerance-pct check at 181 is `ABS(...) * 100.0 / v_pl.unit_cost` — divides snapshotted prices, NOT a per-class qty divisor. AP1-clean.
+4. **cost_method dispatches**: not relevant — bill is post-receipt; cost was set at receipt time.
+5. **Document/WO-sharing**: po_line FOR UPDATE at 154 (`FOR UPDATE OF pl`) — fix from acct-du2.9. Cumulative `qty_received` (197), `qty_billed` (199), and `qty_to_ap_unsettled` from prior returns (202) all under that lock.
+6. **Currency / period**: currency parameter pinned. Period inherited.
+7. **Post-write invariants**: vendor_bills + vendor_bill_lines rows. Per po_match line: 1 base ap_unsettled DR / ap CR at po-recorded amount + 0/1 tolerance absorption against `variance_match_tolerance` (mig 0090 — line 251–290). Per service line: 1 expense DR / ap CR.
+
+**Verdict**: clean. Tolerance absorption is well-formed: base leg uses `v_amount_at_po = v_qty * v_pl.unit_cost` (line 234), with delta absorbed via variance_match_tolerance. Out-of-tolerance still raises P0024 (line 182–188). Two micro-concerns:
+- The tolerance check at line 181 divides by `v_pl.unit_cost`; if `v_pl.unit_cost = 0` and `v_unit_cost <> 0`, we get division-by-zero. Defensive: line 173 only enters this block when `v_unit_cost <> v_pl.unit_cost`, and a non-zero bill on a zero-cost po_line is a caller bug — but `% 0` would raise SQLSTATE 22012 instead of a clean P0024. Cosmetic; **fix candidate (P4)**: add an explicit `v_pl.unit_cost = 0` arm.
+- Tolerance pct comparison uses NUMERIC arithmetic; `v_diff_pct > v_tolerance_pct` at line 182 is fine.
+
+AP1–AP7 satisfied. AP8 satisfied via UNIQUE(idempotency_key) at line 131–133.
+
+### `post_standard_cost_roll` (mig 0078, latest body — supersedes 0028, 0071)
+
+Original Phase 2 entry covered the mig-0028 body. The relevant delta is: **mig 0078 adds `p_revalue_wip` parameter** (default FALSE) that lifts the WIP-present gate and adds a per-pool inv_value_wip revaluation loop (lines 308–382).
+
+1. **Scope**: unchanged for raw/fg path. New WIP path: per inv_value_wip(parent, routing_op, ccy) pool for the SKU, posts `pool_qty × Δstd` against `variance_wip_revaluation`.
+2. **Value-pool reads**: existing raw/fg path unchanged. NEW WIP path: line 328–331 reads pool_qty from the PAIRED stock_wip account (the qty side, not the value side) under FOR UPDATE acquired at line 222–224 on `v_lock_ids` which now INCLUDES inv_value_wip values (per the conditional at line 207–219: when p_revalue_wip is TRUE, lock-set adds inv_value_wip). **The lock targets the VALUE pools, NOT the paired stock_wip qty accounts** — line 318–322 finds stock_wip via `s.kind = 'stock_wip' AND s.sku_id = v.sku_id AND s.routing_op = v.routing_op` and reads stock_wip's `debits_total - credits_total` at line 328–331 without locking that account. **AP3 candidate**: same shape as acct-du2.6 / .7 (FOR UPDATE on the value pool does not cover the qty pool). A concurrent post_op_move / post_wo_complete / post_scrap on this `(sku, routing_op)` could change qty between the read at 328 and the post_transfers commit at 408.
+3. **Qty-divisor reads**: line 328–331 reads `pool_qty` from stock_wip account `debits_total - credits_total` directly (NOT a per-class signed SUM on `transfers.qty`). For inv_value_wip, this is correct because `stock_wip` is per-(sku, routing_op) and its balance IS parent-qty-in-WIP. The mig 0078 design comment (line 28–34) explicitly justifies why per-class signed SUM on `transfers.qty` won't work for inv_value_wip (mixed component-qty / parent-qty in transfers.qty). **R1 satisfied**: stock_wip is single-class by partition (`sku_id, routing_op` only — location is NOT part of the WIP key).
+4. **cost_method dispatches**: line 117–142 — standard-only, P0011 for wac_*, P0006 for fifo/lot. Trivially gated.
+5. **Document/WO-sharing**: stock_wip pool may be shared across multiple WOs at the same (sku, routing_op). The revaluation walks each pool ONCE (per its accounts.id) and posts one variance per pool. The WHERE-clause-with-FOR-UPDATE on skus row at line 112 serializes concurrent rolls on the same SKU. But across-WO concurrent transfers on stock_wip are NOT serialized — see (2). The mig 0078 design rests on the "every roll revalues WIP atomically" invariant; the same-transaction post_transfers handles atomicity, but a concurrent op_move during the read window could push qty up or down, causing the delta computation to use a stale qty.
+6. **Currency / period**: per-pool currency pinned (line 264 raw/fg, 349 wip). AP7-clean.
+7. **Post-write invariants**: standard_costs row inserted at line 194–199; raw/fg variance per pool (mig 0071 shape); WIP variance per pool against `variance_wip_revaluation` (new). Pool's value balance changes by `pool_qty × Δstd`; absorbed labor/OH untouched. Atomic with the standard write per design.
+
+**Verdict**: **suspicious — fix candidate: AP3 lock-gap on stock_wip qty read in WIP revaluation loop**. Lines 328–331 read the paired stock_wip account's `debits_total - credits_total` to drive `v_pool_qty`, but the FOR UPDATE batch at line 222–224 locks only inv_value_wip (the value pool), not stock_wip (the qty pool). Same shape as acct-du2.6 / .7 / .12 (closed via mig 0073 / 0071). The WAC tier's `_wac_close_pool_qty_in` (mig 0064) handles the analogous case differently — it reads the stock_wip balance under the close_period lock context. Here we have no period lock; only the SKU-level FOR UPDATE serializes concurrent rolls. A concurrent post_op_move arriving units to `stock_wip(parent, op)` between the read at 328 and the post_transfers commit at 408 makes `v_pool_qty` stale. Severity: race window narrow but real; magnitude is `Δqty × Δstd` per pool. **File as new sub-issue (P3)**: add `PERFORM 1 FROM accounts WHERE id = v_wip_record.qty_acct FOR UPDATE` immediately after the JOIN-resolution at line 313–326 inside the loop (or extend the lock-set at 207–219 to include stock_wip accounts via a UNION to the existing array build).
+
+The existing acct-du2.11 / .12 closure for raw/fg path used per-class signed SUM on `transfers.qty` (which doesn't need stock_available locking because the read targets transfers, not accounts). The WIP path can't use that approach (per the mig 0078 design note). So the fix is structural: add stock_wip account ids to v_lock_ids when p_revalue_wip is TRUE.
+
+AP1, AP2, AP4 satisfied. AP5 satisfied (the SKU-level FOR UPDATE serializes rolls; concurrent op_move/wo_complete don't write to standard_costs). AP6 non-applicable (variance routes against debit-normal pool that GROWS on positive Δstd; the variance account absorbs the diff cleanly). AP7 satisfied. AP8 satisfied (idempotency_key on standard_costs / inventory_standard_cost_rolls; fast-path replay at 99–104).
+
+---
+
+## Per-anti-pattern verdict summary (15 functions in this addendum)
+
+| AP | Verdict | Notes |
+|----|---------|-------|
+| AP1 | clean | All per-class qty divisors in this audit set are correctly scoped: `post_so_ship` uses per-class signed SUM on `transfers.qty` filtered to `v_val_acct IN (debit, credit)` (line 470–474); `post_standard_cost_roll`'s WIP path reads stock_wip qty (single-class by partition: sku × routing_op only). The other functions don't compute divisors. |
+| AP2 | clean | `_post_transfers_apply_event` retains credit-first COALESCE at line 528 (the canonical correct shape, unchanged from Phase 2). `post_so_ship` pre-dispatches on `v_sl.sku_id` (single SKU on the FG line, no COALESCE drift). `wac_periodic_close_hook` / `wac_retroactive_close_hook` mixed-method branches resolve destination SKU on `v_orig.debit_account_id` for ROUTE detection only — recompute still walks credit-side pool (R2 satisfied). |
+| AP3 | **fix-needed (2 hits)** | (a) **`post_so_ship`** lines 470–486: pool qty/value read for wac_* unit_cost without FOR UPDATE on `v_val_acct` at the read site; the post_transfers lock-pre-scan acquires it later, but the audit-trail unit_cost persisted on so_shipment_lines.unit_cost is from the stale read. P3 audit-trail drift; same shape as acct-du2.6/.7. (b) **`post_standard_cost_roll`** WIP loop lines 328–331: reads paired stock_wip qty without FOR UPDATE (lock-set at 207–224 covers inv_value_wip but not stock_wip). Concurrent op_move/wo_complete on the (sku, routing_op) can skew the delta. P3 race; **fix candidate**: extend v_lock_ids to include stock_wip accounts. |
+| AP4 | clean | `resolve_standard_cost_at` is gated by `cost_method = 'standard'` arm in every caller in this audit set (post_po_return, post_so_ship, post_po_receipt, post_standard_cost_roll). |
+| AP5 | clean | No new shared-pool drain-then-revalue paths. Mixed-method close-hook branches correctly use single-leg routing against component pool (CLAUDE.md R5). |
+| AP6 | clean | All variance routings in this audit set either: (a) post against pools that grow (post_standard_cost_roll WIP), (b) absorb tolerance against non-drained pool (post_ap_bill / post_customer_invoice variance_match_tolerance), (c) follow CLAUDE.md R5 single-leg pattern (mixed-method close-hook). |
+| AP7 | clean | All inv_value_*  / variance account lookups include `currency = ...` filters. The receipt-period-closed lookup in mig 0089 (line 238–241) keys on date range only but `periods` is currency-agnostic by design. |
+| AP8 | clean | All entry-points in this audit set use UNIQUE(idempotency_key) on header table + ON CONFLICT DO NOTHING + fast-path replay. The mig 0085 / 0086 / 0087 / 0089 chain of post_po_return DROP+CREATE re-issues preserve the same idempotency shape across each iteration. No transfers-key-only race surfaces (the acct-du2.3 OSP shape) appear in the new entry-points. |
+
+**Severity totals (this addendum)**: 0 × bug, 0 × P1, 0 × P2, 2 × P3 (both AP3 lock-gaps), 1 × P4 (cosmetic divide-by-zero in tolerance check). Other 12 functions clean.
+
+**Headline finding**: the new functions in migrations 0077–0090 are largely well-built — caller-supplied amounts (memos, payments, invoices, returns) bypass the cost-dispatch surface and AP1–AP4 are mostly non-applicable. The two AP3 sub-issues are structurally identical to the original acct-du2.6/.7 cluster (lock-the-value-pool-but-read-qty-pool-without-lock pattern). Both should be filed as fix-needed P3 follow-ups using the lock-set extension pattern that closed acct-du2.6/.7 in mig 0073.
