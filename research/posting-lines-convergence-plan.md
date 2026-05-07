@@ -902,15 +902,52 @@ Recon failures are gates — Phase X cannot ship until X's invariants pass + rem
 
 ## §9 Open Questions for the User
 
-1. **Functional-currency default.** Phase B2 introduces `legal_entities.functional_currency` defaulting to USD. Confirm USD as the project default? (Today's tests all assume USD as the reference; EUR fixtures exist but aren't a "different functional currency" per se.)
+1. **Functional-currency default.** ✅ **RESOLVED 2026-05-07: USD.** Phase B2 introduces `legal_entities.functional_currency CHAR(3) NOT NULL DEFAULT 'USD'`. Per-LE override remains. EUR fixtures continue to be transactional currency, not functional.
 
-2. **Cost-book scoping.** `inventory_movements.cost_book_id` defaults to 1 in Phase D. We're not building multi-book in this convergence (deferred per R18). Confirm single-book is acceptable as the convergence target — multi-book becomes a separate epic if/when IFRS-vs-GAAP-vs-tax dual reporting is needed?
+2. **Cost-book scoping.** ✅ **RESOLVED 2026-05-07: schema supports multi-book; implementation deferred.** Phase D ships `inventory_movements.cost_book_id SMALLINT NOT NULL DEFAULT 1` and a `cost_books` lookup table seeded with id=1 ('primary'). All Phase D dispatchers write `cost_book_id=1`. Multi-book *implementation* (parallel postings under different methods, IFRS-vs-GAAP-vs-tax dual reporting) deferred to **acct-zf80** (filed 2026-05-07; blocked-by D1 + D5). The schema columns are prelaid so adding multi-book later is additive, not a structural rewrite.
 
-3. **Phase G versus convergence proper.** Phase G (chart-of-accounts conversion) is technically independent of B/C/D/E (it touches `accounts.kind` + table-vs-enum, not extensions). It can run early, late, or parallel. Should it run earliest (parallel with B), as a foundation for cleaner extension semantics, or last (after E ships, when row-per-pair-with-extensions is stable)?
+3. **Phase G timing — needs more info.** See §9.3 below for the three options compared.
 
-4. **Pre-flight audit before Phase C backfill.** Phase C backfill assumes credit-side account.sku_id is populated for inventory-touching transfers. The R14 audit query may surface latent rows that need manual fix. Should the audit be filed as a sub-issue of Phase C (preventing C from starting until clean) or as a separate housekeeping issue?
+4. **Pre-flight audit before Phase C backfill — needs more info.** See §9.4 below.
 
-5. **Phase F services wrappers — scope and timing.** F1/F2/F3 are independent of D-E. Should they ship in parallel with the early phases (so services scenarios are first-class sooner), or after the convergence keystone (Phase D) ships (so the unified machinery is ready first)?
+5. **Phase F services wrappers — needs more info.** See §9.5 below.
+
+### §9.3 Phase G timing options
+
+Phase G = enum→row conversion of `account_kind` (acct-2thf) + COA hierarchy (acct-v9sq). It touches every codepath that references `account_kind` literals.
+
+| Option | Pros | Cons |
+|---|---|---|
+| **Early** (parallel with Phase B) | Cleaner extension semantics — extensions tag by `account_kind_id` (FK) instead of enum literal | Phase G's sweep happens concurrently with B's introductions; doubles audit surface (every migration touches account_kind in some form during this window) |
+| **Mid** (parallel with D-E, after Phase D ships) | Phase D adds new account_kinds anyway (`variance_*` family); natural alignment to convert when several pile up. Phase D keystone is stable so G's sweep operates against settled foundation | Phase E1 (FIFO/LIFO) is happening concurrently — both touch dispatcher; risk of merge conflicts on cost-method-strategies registry |
+| **Late** (after Phase E completes) | Lowest concurrent risk; row-per-pair-with-extensions architecture is stable; sweep is one focused pass | Phase E is 3-9 months; deferring G means current enum-based code accretes more references during that window, making sweep larger |
+
+**Recommendation: Mid (parallel with E1).** Phase D's keystone is too risky to share oxygen with G; Phase E timeline is too long to wait. Running G alongside E1 (the first method-specific subledger) is the sweet spot — G's enum-conversion mechanics are independent of E1's FIFO state machine, and merge-conflict risk is manageable since the cost-method-strategies registry pattern (mig 0094) localizes the touch points.
+
+### §9.4 Phase C backfill pre-flight audit
+
+The R14 risk: Phase C backfill computes `transfer_line_inventory.product_id` from credit-side `account.sku_id`. Existing rows where `qty IS NOT NULL` but the credit-side account's `sku_id IS NULL` (or where qty isn't paired with a value-leg) are exceptions that need manual handling before backfill can proceed.
+
+| Option | Description |
+|---|---|
+| **Sub-issue blocking C** | Audit query is its own sub-issue (acct-wb75.2.0); resolves to "0 exceptions" or surfaces a list. C cannot start until this closes. Backfill SQL becomes part of acct-wb75.2.1 once preflight is clean |
+| **Separate housekeeping issue** | Audit lives outside the convergence epic; C starts when audit confirms cleanliness, but no formal dep |
+
+**Recommendation: sub-issue blocking C** (acct-wb75.2.0). The audit IS part of Phase C — it's the pre-flight check on the backfill correctness. Filing it as a blocking sub-issue makes the DAG explicit (`bd ready` won't surface C-1 until preflight closes) and gives a clean ledger entry of "audit ran, found N exceptions, fixed them." Zero-exception case closes in minutes; non-zero case surfaces real housekeeping that would have blocked C anyway.
+
+### §9.5 Phase F services-wrappers timing
+
+F1 = `post_journal_entry` (generic dr/cr); F2 = `post_service_bill`; F3 = `post_expense_report`. All three are pure callers of `post_transfers` with non-inventory account combinations. None depends on Phase D's `inventory_movements` subledger.
+
+| Option | F1 | F2 | F3 |
+|---|---|---|---|
+| **All parallel with Phase B** | Ships immediately; trivial wrapper | Needs B3 (`transfer_line_dimensions`) for vendor/cost-center tagging | Needs B3 + B1 (`transfer_line_sources`) for employee tagging |
+| **After Phase B completes** | Same as left, just waited | All three write extensions correctly first time | Same as F2 |
+| **After Phase D** | Trivially shippable; no dep on D | No dep on D either; same as B-after | No dep on D either |
+
+**Recommendation: F1 immediately (parallel with B); F2/F3 after Phase B completes.** F1 is a generic dr/cr wrapper — it has no inventory side, no dimension tagging, no source-extension tagging beyond the existing `idempotency_key` + `posted_by_id`. It ships in days. F2/F3 want to write `transfer_line_dimensions` (cost-center tagging on expenses) and `transfer_line_sources` (vendor / employee link); waiting for Phase B means both ship correctly the first time without a follow-up rewrite.
+
+This gets services-only orgs the *minimum viable* services flow (F1 = arbitrary journal entries) immediately, and full vendor/employee-linked AP service flows after Phase B.
 
 ---
 
