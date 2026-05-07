@@ -1,0 +1,21 @@
+DROP FUNCTION IF EXISTS post_vendor_debit_memo(UUID, CHAR, JSONB, DATE, UUID, UUID, TEXT, BOOLEAN);
+DROP FUNCTION IF EXISTS post_customer_credit_memo(UUID, CHAR, JSONB, DATE, UUID, UUID, TEXT, BOOLEAN);
+DROP FUNCTION IF EXISTS post_customer_return(UUID, JSONB, DATE, UUID, UUID, TEXT, BOOLEAN);
+DROP FUNCTION IF EXISTS post_ar_payment(UUID, CHAR, BIGINT, DATE, UUID, UUID, TEXT, CHAR, BIGINT);
+DROP FUNCTION IF EXISTS post_customer_invoice(UUID, CHAR, JSONB, DATE, UUID, UUID, TEXT);
+DROP FUNCTION IF EXISTS post_so_ship(UUID, JSONB, DATE, UUID, UUID, TEXT);
+DROP FUNCTION IF EXISTS post_so_allocate(UUID, DATE, UUID, UUID, TEXT);
+
+DROP TABLE IF EXISTS vendor_debit_memo_lines;
+DROP TABLE IF EXISTS vendor_debit_memos;
+DROP TABLE IF EXISTS customer_credit_memo_lines;
+DROP TABLE IF EXISTS customer_credit_memos;
+DROP TABLE IF EXISTS customer_return_lines;
+DROP TABLE IF EXISTS customer_returns;
+DROP TABLE IF EXISTS ar_payments;
+DROP TABLE IF EXISTS customer_invoice_lines;
+DROP TABLE IF EXISTS customer_invoices;
+DROP TABLE IF EXISTS so_shipment_lines;
+DROP TABLE IF EXISTS so_shipments;
+DROP TABLE IF EXISTS so_allocations;
+DROP TABLE IF EXISTS sales_order_lines;
