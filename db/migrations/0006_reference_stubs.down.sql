@@ -1,3 +1,5 @@
+DROP TABLE IF EXISTS purchase_orders;
+DROP TABLE IF EXISTS sales_orders;
 DROP TABLE IF EXISTS customers;
 DROP TABLE IF EXISTS vendors;
 DROP TABLE IF EXISTS locations;

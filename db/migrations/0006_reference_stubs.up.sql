@@ -106,3 +106,23 @@ COMMENT ON TABLE customers IS
   'for sales_orders.customer_id, customer_invoices.customer_id, '
   'ar_payments.customer_id, etc. unit_price_tolerance_pct gates the '
   'three-way-match in post_customer_invoice (acct-7mc).';
+
+-- ============================================================
+-- sales_orders + purchase_orders: header tables. Defined here so
+-- inventory_reservations (0011) can FK them. Line tables (and any
+-- additional columns) come in 0016 / 0018 with the document wrappers.
+-- ============================================================
+
+CREATE TABLE sales_orders (
+  id          UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
+  customer_id UUID REFERENCES customers(id),
+  status      TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE purchase_orders (
+  id          UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
+  vendor_id   UUID REFERENCES vendors(id),
+  status      TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
