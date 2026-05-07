@@ -1,0 +1,9 @@
+DROP TYPE IF EXISTS consumption_policy;
+DROP TYPE IF EXISTS yield_mode;
+DROP TYPE IF EXISTS return_disposition;
+DROP TYPE IF EXISTS reservation_status;
+DROP TYPE IF EXISTS cost_method;
+DROP TYPE IF EXISTS posting_line_reason;
+DROP TYPE IF EXISTS account_kind;
+DROP TYPE IF EXISTS balance_direction;
+DROP TYPE IF EXISTS ledger_kind;
