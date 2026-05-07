@@ -314,38 +314,35 @@ Each phase below specifies the 9 fields per the plan: **prerequisites / delivera
 
 **Prerequisites.** Phase A complete (legal_entity_id required for B2's functional-currency lookup).
 
-**B1 — `transfer_line_sources` extension.**
+**B1 — `transfer_line_sources` extension.** ✅ **SHIPPED 2026-05-07 (mig 0104).**
 
-- *Deliverables.* New table; backfill from existing per-document FK columns (po_line_id, vendor_bill_id, so_line_id, wo_event_id, customer_invoice_id, ar_payment_id, ap_payment_id, customer_return_id, po_return_id, customer_credit_memo_id, vendor_debit_memo_id, so_allocation_id, inventory_adjustment_id, cost_adjustment_id, std_cost_roll_id, etc.); dispatcher writes alongside transfers.
-- *Schema additions.*
+> **Discovery during execution.** The proposal's `posting_line_sources.source_doc_type` / `source_doc_id` / `source_doc_line_id` fields are already first-class on our `transfers` table (mig 0007: `document_kind TEXT`, `document_id UUID`, `document_line_id UUID`). Re-encoding them in the extension would create fragmentation — two parallel encodings of the same source link. Per acct-1584 (row-per-pair preserved) and the convergence-additive principle, the extension adds **only the four NEW fields the proposal contributes that we do not have**. The eventual `document_kind` TEXT → SMALLINT FK conversion tracks alongside acct-2thf (account_kind enum→row); not in scope for B1.
+
+- *Deliverables.* `transfer_line_sources` extension table (1:1 PK = transfer_id); `_post_transfers_apply_event` extended to write the row when any of the four fields is non-NULL on the event JSONB.
+- *Schema added (mig 0104).*
   ```sql
   CREATE TABLE transfer_line_sources (
-    transfer_id BIGINT PRIMARY KEY REFERENCES transfers(id),
-    source_doc_type SMALLINT NOT NULL,           -- enum-table: 'po_receipt','vendor_bill','so_ship',...
-    source_doc_id UUID NOT NULL,                 -- already on transfers.document_id; denormalized for typed access
-    source_doc_line_id UUID,                     -- when applicable
-    reverses_transfer_id BIGINT REFERENCES transfers(id),
-    parent_document_id UUID,
-    intercompany_pair_id UUID,
-    created_by_process VARCHAR(64),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    transfer_id           BIGINT PRIMARY KEY REFERENCES transfers(id),
+    reverses_transfer_id  BIGINT REFERENCES transfers(id),  -- new
+    parent_document_id    UUID,                              -- new
+    intercompany_pair_id  UUID,                              -- new
+    created_by_process    VARCHAR(64),                       -- new
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CHECK (reverses_transfer_id IS NOT NULL          -- not-all-NULL
+        OR parent_document_id IS NOT NULL
+        OR intercompany_pair_id IS NOT NULL
+        OR created_by_process IS NOT NULL),
+    CHECK (reverses_transfer_id IS NULL              -- no self-reversal
+        OR reverses_transfer_id <> transfer_id)
   );
-  CREATE INDEX ON transfer_line_sources (source_doc_type, source_doc_id);
-  CREATE INDEX ON transfer_line_sources (reverses_transfer_id) WHERE reverses_transfer_id IS NOT NULL;
-  CREATE INDEX ON transfer_line_sources (intercompany_pair_id) WHERE intercompany_pair_id IS NOT NULL;
-  -- source_doc_types lookup
-  CREATE TABLE source_doc_types (
-    source_doc_type SMALLINT PRIMARY KEY,
-    name VARCHAR(64) NOT NULL UNIQUE,
-    reference_table VARCHAR(64) NOT NULL
-  );
+  -- partial indexes on each non-null filter
   ```
-- *Dispatcher.* `_post_transfers_apply_event` (mig 0033) extended to INSERT a `transfer_line_sources` row when caller provides `source_doc_type` + `source_doc_id` (most callers already have these via document_kind / document_id). Atomic with the transfer INSERT.
-- *Backfill SQL.* Single-pass: for each document_kind ∈ (po_receipt, vendor_bill, so_ship, ...), JOIN transfers to the document table, INSERT a `transfer_line_sources` row mapping document_kind → source_doc_type. Existing transfers.reason and document_kind suffice as proxies. Estimated rows: ~equal to current transfers count (each transfer gets one source row; pre-existing inventory adjustments and reversals included).
-- *Reconciliation.* Add `run_daily_reconciliation` invariant: `count(transfers WHERE document_kind != 'system') = count(transfer_line_sources)`. Alert on mismatch.
-- *Test.* New `tests/transfer_line_sources_t1.rs` (T1 schema invariant probe). Property test added: every `post_*` function call produces a `transfer_line_sources` row.
-- *Rollback.* DROP `transfer_line_sources`; DROP `source_doc_types`. Down migration tested via ci-check.
-- *Stop-point.* Mig applies clean; ci-check clean; tests pass; recon invariant returns 0 alerts; commit; close sub-issue.
+- *Dispatcher.* `_post_transfers_apply_event` reads four optional fields off `p_event`: `reverses_transfer_id`, `parent_document_id`, `intercompany_pair_id`, `created_by_process`. INSERTs one `transfer_line_sources` row when any are non-NULL. Skips when all four are NULL (most transfers — pure-NULL extension rows are CHECK-rejected).
+- *Backfill SQL.* **NONE.** All four fields are forward-only. Historical transfers (mig 0001-0103) have no extension row. Any future reversal / nested-doc / intercompany / audit caller opts in via the event JSONB.
+- *Reconciliation.* FK + CHECK enforce structural integrity; no row-count invariant added (the dispatcher writes the extension only when fields are present, so a count-vs-transfers mismatch is expected and not an error).
+- *Test.* `tests/transfer_line_sources_t1.rs` — 9 cases: 4 schema constraints (not-all-NULL, no-self-reversal, FK transfer_id, FK reverses_transfer_id, PK uniqueness); 5 dispatcher behaviors (single-field accepted, multi-field accepted, no-fields-skipped, with-fields-written, reverses-pointer-roundtrip). Property test extension skipped — the dispatcher's branch is a single conditional INSERT with no method-specific math; deterministic tests cover the surface.
+- *Rollback.* `0104_transfer_line_sources.down.sql` drops the table and reverts `_post_transfers_apply_event` to its mig 0067 body. ci-check verified the round-trip.
+- *Stop-point — REACHED.* Mig 0104 applies clean; tests pass; ci-check clean; closed acct-wb75.1.1.
 
 **B2 — `transfer_line_currencies` extension + functional-currency model.**
 
