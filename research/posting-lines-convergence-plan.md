@@ -906,11 +906,11 @@ Recon failures are gates — Phase X cannot ship until X's invariants pass + rem
 
 2. **Cost-book scoping.** ✅ **RESOLVED 2026-05-07: schema supports multi-book; implementation deferred.** Phase D ships `inventory_movements.cost_book_id SMALLINT NOT NULL DEFAULT 1` and a `cost_books` lookup table seeded with id=1 ('primary'). All Phase D dispatchers write `cost_book_id=1`. Multi-book *implementation* (parallel postings under different methods, IFRS-vs-GAAP-vs-tax dual reporting) deferred to **acct-zf80** (filed 2026-05-07; blocked-by D1 + D5). The schema columns are prelaid so adding multi-book later is additive, not a structural rewrite.
 
-3. **Phase G timing — needs more info.** See §9.3 below for the three options compared.
+3. **Phase G timing.** ✅ **RESOLVED 2026-05-07: Mid (parallel with E1).** acct-2thf and acct-v9sq blocked-by **acct-wb75.3.5** (D5 recon invariant); they begin once Phase D's keystone is settled and can run alongside E1 (FIFO/LIFO). See §9.3 for trade-off analysis.
 
-4. **Pre-flight audit before Phase C backfill — needs more info.** See §9.4 below.
+4. **Pre-flight audit before Phase C backfill.** ✅ **RESOLVED 2026-05-07: sub-issue blocking C.** Filed as **acct-wb75.2.1** (C0); the schema work moved to **acct-wb75.2.2** (C1) and is blocked-by C0. See §9.4.
 
-5. **Phase F services wrappers — needs more info.** See §9.5 below.
+5. **Phase F services-wrappers timing.** ✅ **RESOLVED 2026-05-07: F1 immediately, F2/F3 after Phase B completes.** F1 (`acct-wb75.4.1`) remains unblocked; F2/F3 (`acct-wb75.4.2`/`acct-wb75.4.3`) blocked-by **acct-wb75.1.3** (B3 dimensions). See §9.5.
 
 ### §9.3 Phase G timing options
 
