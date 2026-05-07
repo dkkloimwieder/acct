@@ -26,9 +26,9 @@ async fn per_ledger_sum_is_zero_after_posts() {
         make_event("ar_payment", cash, ar, 1_000, "2026-04-15", &key2),
     ]);
 
-    let result = call_post_transfers(&pool, events, false)
+    let result = call_post_posting_lines(&pool, events, false)
         .await
-        .expect("post_transfers ok");
+        .expect("post_posting_lines ok");
     assert_eq!(
         result.as_array().map(|a| a.len()),
         Some(2),

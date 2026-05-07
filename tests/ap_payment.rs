@@ -38,7 +38,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -106,7 +106,7 @@ async fn scaffold_with_ap(pool: &PgPool, code: &str, seed_ap: i64) -> (String, i
              "idempotency_key":fresh_uuid(pool).await,
              "posted_by":posted_by},
         ]);
-        sqlx::query("SELECT post_transfers($1, FALSE)")
+        sqlx::query("SELECT post_posting_lines($1, FALSE)")
             .bind(mint).execute(pool).await.expect("seed ap");
     }
     (vend_id, vend_ap)

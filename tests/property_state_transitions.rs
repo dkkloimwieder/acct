@@ -92,7 +92,7 @@ async fn open_account(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id,
              counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID,
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID,
                  $7::balance_direction)
          RETURNING id",
     )
@@ -240,7 +240,7 @@ async fn build_alloc_scaffold(pool: &PgPool, suffix: &str) -> Vec<AllocSoMirror>
              "amount":FG_SEED_VAL,"qty":FG_SEED_QTY,"business_date":"2026-04-15",
              "idempotency_key":fresh_uuid(pool).await,"posted_by":posted_by},
         ]);
-        sqlx::query("SELECT post_transfers($1, FALSE)")
+        sqlx::query("SELECT post_posting_lines($1, FALSE)")
             .bind(mint)
             .execute(pool)
             .await
@@ -300,7 +300,7 @@ async fn count_allocations_for(pool: &PgPool, so_id: &str) -> i64 {
 /// Assert NO transfers carry a document_id matching any so_allocations row.
 async fn assert_no_alloc_transfers(pool: &PgPool, label: &str) {
     let leaked: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers t
+        "SELECT COUNT(*) FROM posting_lines t
           WHERE t.document_id IN (SELECT id FROM so_allocations)",
     )
     .fetch_one(pool)
@@ -528,7 +528,7 @@ async fn build_eco_scaffold(pool: &PgPool, suffix: &str) -> Vec<EcoMirror> {
                 create_bom_header_full(pool, &parent_code, 1, "A", true, "active", None)
                     .await;
             sqlx::query(
-                "UPDATE bom_headers SET effective_at='2026-01-01'::TIMESTAMPTZ WHERE id=$1",
+                "UPDATE bom_headers SET effective_at='2026-01-01'::DATE WHERE id=$1",
             )
             .bind(prior_id)
             .execute(pool)
@@ -596,7 +596,7 @@ async fn assert_no_eco_transfers(pool: &PgPool, label: &str) {
     // document_kind containing 'eco' or 'bom_header'. Both are reasonable
     // proxies for "approval shouldn't post ledger events."
     let leaked: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers
+        "SELECT COUNT(*) FROM posting_lines
           WHERE document_kind ILIKE '%eco%'
              OR document_kind ILIKE '%bom_header%'",
     )
@@ -641,7 +641,7 @@ async fn property_eco_approve_state_machine() {
 
         // Pick a unique effective_at per case so multiple approvals
         // across SOs don't collide in their stamps.
-        let effective_at = "2026-04-15 00:00:00+00";
+        let effective_at = "2026-04-15";
         let approved_by = fresh_uuid(&pool).await;
 
         for (step, op) in ops.iter().enumerate() {
@@ -652,7 +652,7 @@ async fn property_eco_approve_state_machine() {
                     if m.is_approved {
                         // Re-approving an approved ECO must raise P0031.
                         let res = sqlx::query(
-                            "SELECT post_eco_approve($1, $2::TIMESTAMPTZ, $3::UUID)",
+                            "SELECT post_eco_approve($1, $2::DATE, $3::UUID)",
                         )
                         .bind(m.eco_id)
                         .bind(effective_at)
@@ -675,7 +675,7 @@ async fn property_eco_approve_state_machine() {
                         continue;
                     }
 
-                    sqlx::query("SELECT post_eco_approve($1, $2::TIMESTAMPTZ, $3::UUID)")
+                    sqlx::query("SELECT post_eco_approve($1, $2::DATE, $3::UUID)")
                         .bind(m.eco_id)
                         .bind(effective_at)
                         .bind(&approved_by)
@@ -706,7 +706,7 @@ async fn property_eco_approve_state_machine() {
                 EcoOp::DoubleApprove { idx } => {
                     let m = &ecos[idx];
                     let res = sqlx::query(
-                        "SELECT post_eco_approve($1, $2::TIMESTAMPTZ, $3::UUID)",
+                        "SELECT post_eco_approve($1, $2::DATE, $3::UUID)",
                     )
                     .bind(m.eco_id)
                     .bind(effective_at)
@@ -771,7 +771,7 @@ async fn property_eco_approve_null_args_raise_p0031() {
 
     // null eco_id
     expect_sqlstate("P0031", || async {
-        sqlx::query("SELECT post_eco_approve(NULL::BIGINT, '2026-04-15'::TIMESTAMPTZ, $1::UUID)")
+        sqlx::query("SELECT post_eco_approve(NULL::BIGINT, '2026-04-15'::DATE, $1::UUID)")
             .bind(fresh_uuid(&pool).await)
             .execute(&pool)
             .await
@@ -780,7 +780,7 @@ async fn property_eco_approve_null_args_raise_p0031() {
 
     // null effective_at
     expect_sqlstate("P0031", || async {
-        sqlx::query("SELECT post_eco_approve(1, NULL::TIMESTAMPTZ, $1::UUID)")
+        sqlx::query("SELECT post_eco_approve(1, NULL::DATE, $1::UUID)")
             .bind(fresh_uuid(&pool).await)
             .execute(&pool)
             .await
@@ -789,7 +789,7 @@ async fn property_eco_approve_null_args_raise_p0031() {
 
     // null approved_by
     expect_sqlstate("P0031", || async {
-        sqlx::query("SELECT post_eco_approve(1, '2026-04-15'::TIMESTAMPTZ, NULL::UUID)")
+        sqlx::query("SELECT post_eco_approve(1, '2026-04-15'::DATE, NULL::UUID)")
             .execute(&pool)
             .await
     })
@@ -801,7 +801,7 @@ async fn property_eco_approve_unknown_eco_raises_p0031() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     expect_sqlstate("P0031", || async {
-        sqlx::query("SELECT post_eco_approve(99999::BIGINT, '2026-04-15'::TIMESTAMPTZ, $1::UUID)")
+        sqlx::query("SELECT post_eco_approve(99999::BIGINT, '2026-04-15'::DATE, $1::UUID)")
             .bind(fresh_uuid(&pool).await)
             .execute(&pool)
             .await
@@ -824,7 +824,7 @@ async fn property_eco_approve_no_attached_boms_raises_p0031() {
     .expect("create eco");
 
     expect_sqlstate("P0031", || async {
-        sqlx::query("SELECT post_eco_approve($1, '2026-04-15'::TIMESTAMPTZ, $2::UUID)")
+        sqlx::query("SELECT post_eco_approve($1, '2026-04-15'::DATE, $2::UUID)")
             .bind(eco_id)
             .bind(fresh_uuid(&pool).await)
             .execute(&pool)

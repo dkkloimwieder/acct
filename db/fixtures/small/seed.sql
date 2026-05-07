@@ -234,25 +234,25 @@ INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
 -- separate kinds (not one shared 'variance_close') so the income
 -- statement reports the three close-time correction stories
 -- separately:
---   variance_wac_period          — wac_periodic close adjustment
+--   variance_wac_periodic          — wac_periodic close adjustment
 --                                   (Epic B, acct-qfj)
 --   variance_wac_retroactive     — wac_retroactive late-data
 --                                   correction (Epic C, acct-9tw)
---   variance_cost_adjust_retro   — retroactive cost_adjustment
+--   variance_cost_adjust_retroactive   — retroactive cost_adjustment
 --                                   correction (Epic E, acct-og1)
 INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
-  ('variance_wac_period',         'value', 'USD', 'unrestricted'),
-  ('variance_wac_period',         'value', 'EUR', 'unrestricted'),
+  ('variance_wac_periodic',         'value', 'USD', 'unrestricted'),
+  ('variance_wac_periodic',         'value', 'EUR', 'unrestricted'),
   ('variance_wac_retroactive',    'value', 'USD', 'unrestricted'),
   ('variance_wac_retroactive',    'value', 'EUR', 'unrestricted'),
-  ('variance_cost_adjust_retro',  'value', 'USD', 'unrestricted'),
-  ('variance_cost_adjust_retro',  'value', 'EUR', 'unrestricted');
+  ('variance_cost_adjust_retroactive',  'value', 'USD', 'unrestricted'),
+  ('variance_cost_adjust_retroactive',  'value', 'EUR', 'unrestricted');
 
 -- Mixed-method material variance (USD + EUR; acct-7eo / mig 0077).
 -- Bidirectional P&L for rm_issue_to_wo where component is wac_periodic
 -- or wac_retroactive but parent is not; close hook posts single-leg
 -- variance through this account at period close. Distinct from
--- variance_wac_period / variance_wac_retroactive (which carry the
+-- variance_wac_periodic / variance_wac_retroactive (which carry the
 -- close-time recompute variance for HOMOGENEOUS shapes).
 INSERT INTO accounts (kind, ledger_kind, currency, normal_side) VALUES
   ('variance_material_mixed',     'value', 'USD', 'unrestricted'),

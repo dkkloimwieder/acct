@@ -142,7 +142,7 @@ async fn open_account(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id,
              counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID,
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID,
                  $7::balance_direction)
          RETURNING id",
     )
@@ -264,7 +264,7 @@ async fn seed_fg(pool: &PgPool, s: &ReturnScaffold, qty: i64, total_value: i64) 
          "idempotency_key":fresh_uuid(pool).await,
          "posted_by":posted_by},
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint)
         .execute(pool)
         .await
@@ -1125,7 +1125,7 @@ async fn ar_multi_line_return_routes_each_line_independently() {
          "amount":800,"qty":10,"business_date":"2026-04-15",
          "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by}
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint)
         .execute(&pool)
         .await
@@ -1344,7 +1344,7 @@ async fn ar_multi_currency_split_routes_per_currency_partition() {
          "amount":800,"qty":10,"business_date":"2026-04-15",
          "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by}
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint)
         .execute(&pool)
         .await

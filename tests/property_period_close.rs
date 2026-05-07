@@ -5,12 +5,12 @@
 //! Per scenario: fresh wac_periodic + wac_retroactive SKUs at a fresh
 //! location, pre-seeded with non-empty pools. Random sequence of adjust
 //! IN (asserted unit cost) and adjust OUT (depletion at running avg —
-//! flags transfers_provisional). Random retroactive cost-adjust queue
+//! flags posting_lines_provisional). Random retroactive cost-adjust queue
 //! rows against the same open period. Then close_period.
 //!
 //! Post-close assertions:
 //!   - close_period succeeded
-//!   - all transfers_provisional rows targeting this period have
+//!   - all posting_lines_provisional rows targeting this period have
 //!     finalized_at NOT NULL (no orphan provisional flags)
 //!   - all inventory_cost_adjustments_retroactive rows targeting this
 //!     period have flushed_at NOT NULL
@@ -276,10 +276,10 @@ async fn property_period_close_invariants_hold() {
             panic!("[{label}] close_period failed: {e}")
         });
 
-        // (a) all transfers_provisional rows for this period are
+        // (a) all posting_lines_provisional rows for this period are
         // finalized_at NOT NULL (no orphans).
         let unfinalized: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM transfers_provisional WHERE period_id = $1 AND finalized_at IS NULL",
+            "SELECT COUNT(*) FROM posting_lines_provisional WHERE period_id = $1 AND finalized_at IS NULL",
         )
         .bind(pid)
         .fetch_one(&pool)
@@ -287,7 +287,7 @@ async fn property_period_close_invariants_hold() {
         .expect("unfinalized count");
         assert_eq!(
             unfinalized, 0,
-            "[{label}] {unfinalized} transfers_provisional rows un-finalized after close \
+            "[{label}] {unfinalized} posting_lines_provisional rows un-finalized after close \
              (summary={summary})",
         );
 
@@ -365,7 +365,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)

@@ -7,7 +7,7 @@
 //! then close_period with force_provisional=TRUE and asserts:
 //!
 //!   - close_period succeeded
-//!   - 0 unfinalized transfers_provisional rows for the closed period
+//!   - 0 unfinalized posting_lines_provisional rows for the closed period
 //!   - 0 unflushed inventory_cost_adjustments_retroactive rows
 //!   - I1-I7 hold (assert_invariants_hold)
 //!
@@ -18,7 +18,7 @@
 //!
 //!   - Hook-ordering interactions when standard / wac_perpetual SKUs are
 //!     present alongside SKUs that need close hooks
-//!   - Cross-class drift in _post_transfers_compute_amount under
+//!   - Cross-class drift in _post_posting_lines_compute_amount under
 //!     interleaved cost methods (R2 credit-side resolution)
 //!   - cost_adjust_retroactive_hook flushing across SKUs of all 4 methods
 //!     without leaving orphans
@@ -77,7 +77,7 @@ enum Op {
     /// receipt-style adjustment that grows the (sku, class) pool.
     AdjustIn { sku_idx: usize, class: InvClass, qty: i64, unit_cost: i64 },
     /// Adjust OUT: negative qty_delta. wac_* depletes at running avg and
-    /// flags transfers_provisional; standard depletes at std cost; all
+    /// flags posting_lines_provisional; standard depletes at std cost; all
     /// methods reduce qty.
     AdjustOut { sku_idx: usize, class: InvClass, qty: i64 },
     /// Queue retroactive cost-adjust entry. Method-agnostic — the close
@@ -170,7 +170,7 @@ async fn property_costmethod_hybrid_invariants_hold() {
             let code = format!("D5T8-S{i}-{case_idx}");
             let sku = fresh_sku(&pool, &code, cm.as_pg()).await;
             // Standard SKUs need a standard_costs row before any
-            // adjust-OUT can dispatch (resolve_standard_cost_at otherwise
+            // adjust-OUT can dispatch (_resolve_standard_cost_at otherwise
             // raises P0018).
             if matches!(cm, CostMethod::Standard) {
                 set_std_cost(&pool, &sku, 10).await;
@@ -302,9 +302,9 @@ async fn property_costmethod_hybrid_invariants_hold() {
             panic!("[{scenario_label}] close_period failed: {e}")
         });
 
-        // (a) all transfers_provisional rows for this period are finalized.
+        // (a) all posting_lines_provisional rows for this period are finalized.
         let unfinalized: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM transfers_provisional
+            "SELECT COUNT(*) FROM posting_lines_provisional
               WHERE period_id = $1 AND finalized_at IS NULL",
         )
         .bind(pid)
@@ -313,7 +313,7 @@ async fn property_costmethod_hybrid_invariants_hold() {
         .expect("unfinalized count");
         assert_eq!(
             unfinalized, 0,
-            "[{scenario_label}] {unfinalized} transfers_provisional rows un-finalized after close (summary={summary})",
+            "[{scenario_label}] {unfinalized} posting_lines_provisional rows un-finalized after close (summary={summary})",
         );
 
         // (b) all retroactive cost-adjust queue rows for this period are flushed.
@@ -404,7 +404,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)

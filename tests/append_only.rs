@@ -17,12 +17,12 @@ async fn update_and_delete_transfers_raise_p9999() {
     let revenue = account_id_by_kind_currency(&pool, "revenue", Some("USD")).await;
     let key = fresh_uuid(&pool).await;
     let event = make_event("ar_payment", cash, revenue, 100, "2026-04-15", &key);
-    call_post_transfers(&pool, json!([event]), false)
+    call_post_posting_lines(&pool, json!([event]), false)
         .await
         .expect("seed transfer row");
 
     expect_sqlstate("P9999", || async {
-        sqlx::query("UPDATE transfers SET amount = 1 WHERE idempotency_key = $1::UUID")
+        sqlx::query("UPDATE posting_lines SET amount = 1 WHERE idempotency_key = $1::UUID")
             .bind(&key)
             .execute(&pool)
             .await
@@ -30,7 +30,7 @@ async fn update_and_delete_transfers_raise_p9999() {
     .await;
 
     expect_sqlstate("P9999", || async {
-        sqlx::query("DELETE FROM transfers WHERE idempotency_key = $1::UUID")
+        sqlx::query("DELETE FROM posting_lines WHERE idempotency_key = $1::UUID")
             .bind(&key)
             .execute(&pool)
             .await

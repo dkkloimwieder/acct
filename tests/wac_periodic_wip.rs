@@ -74,7 +74,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -177,7 +177,7 @@ async fn pre_load_raw(pool: &PgPool, raw_qty: i64, raw_val: i64, qty: i64, value
           "amount": value, "qty": qty, "business_date": "2026-04-15",
           "idempotency_key": fresh_uuid(pool).await, "posted_by": posted_by },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(events)
         .execute(pool)
         .await
@@ -284,7 +284,7 @@ async fn close_period(pool: &PgPool, pid: i64) -> serde_json::Value {
 /// Single-op WO on wac_periodic parent. Lifecycle:
 ///   wo_start: rm_issue 20 × $10 = $200 + labor 10 × $5 = $50 → pool@op10 = $250.
 ///   wo_complete(10): provisional unit = 250/10 = 25. drain $250.
-///   wo_complete_v gets flagged into transfers_provisional with cost_method='wac_periodic'.
+///   wo_complete_v gets flagged into posting_lines_provisional with cost_method='wac_periodic'.
 ///   close period: pool_value_in = $250; pool_qty_in = 10. final_avg = 25. Variance = 0.
 #[tokio::test(flavor = "multi_thread")]
 async fn wac_periodic_single_op_clean() {
@@ -304,8 +304,8 @@ async fn wac_periodic_single_op_clean() {
 
     // Verify the wo_complete_v depletion was flagged.
     let provisional_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM transfers_provisional tp
-         JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT COUNT(*)::BIGINT FROM posting_lines_provisional tp
+         JOIN posting_lines t ON t.id = tp.posting_line_id
          WHERE tp.cost_method = 'wac_periodic'
            AND tp.period_id = $1
            AND t.reason = 'wo_complete_v'",
@@ -321,8 +321,8 @@ async fn wac_periodic_single_op_clean() {
 
     let (finalized_at, variance_amount): (Option<String>, Option<i64>) = sqlx::query_as(
         "SELECT finalized_at::text, variance_amount
-           FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+           FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method = 'wac_periodic' AND t.reason = 'wo_complete_v'
             AND tp.period_id = $1",
     )
@@ -376,7 +376,7 @@ async fn wac_periodic_drift_posts_variance() {
     let raw_val_a = open_account(&pool, "inv_value_raw", "value", Some("USD"), Some(&comp_a), Some(&raw_loc_a), None, "debit").await;
     let raw_qty_b = open_account(&pool, "stock_available", "qty", None, Some(&comp_b), Some(&raw_loc_b), None, "debit").await;
     let raw_val_b = open_account(&pool, "inv_value_raw", "value", Some("USD"), Some(&comp_b), Some(&raw_loc_b), None, "debit").await;
-    let var_period = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    let var_period = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
 
     pre_load_raw(&pool, raw_qty_a, raw_val_a, 100, 1000).await;
     pre_load_raw(&pool, raw_qty_b, raw_val_b, 100, 2000).await;
@@ -423,7 +423,7 @@ async fn wac_periodic_drift_posts_variance() {
     // Read variance per row.
     let rows: Vec<(i64, i64)> = sqlx::query_as(
         "SELECT t.amount, tp.variance_amount
-           FROM transfers_provisional tp JOIN transfers t ON t.id = tp.transfer_id
+           FROM posting_lines_provisional tp JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method = 'wac_periodic' AND t.reason = 'wo_complete_v'
             AND tp.period_id = $1
           ORDER BY t.id",
@@ -439,7 +439,7 @@ async fn wac_periodic_drift_posts_variance() {
 
     // For inv_value_wip source pools, variance posts a SINGLE-leg event (not
     // the 2-leg wash used for raw/fg) so the WIP pool isn't credited into
-    // negative territory by intermediate variance postings. variance_wac_period
+    // negative territory by intermediate variance postings. variance_wac_periodic
     // accumulates per-row variances:
     //   WO1 variance +50: dr fg / cr variance — adds $50 credit to variance.
     //   WO2 variance -50: dr variance / cr fg — adds $50 debit to variance.
@@ -458,7 +458,7 @@ async fn wac_periodic_drift_posts_variance() {
     let _ = fg_val;
 }
 
-/// scrap_v on a wac_periodic parent gets flagged into transfers_provisional
+/// scrap_v on a wac_periodic parent gets flagged into posting_lines_provisional
 /// and finalized at close. With single-op single-WO no drift, variance=0.
 #[tokio::test(flavor = "multi_thread")]
 async fn wac_periodic_scrap_finalized() {
@@ -492,8 +492,8 @@ async fn wac_periodic_scrap_finalized() {
 
     // Both scrap_v and wo_complete_v should be flagged.
     let reasons: Vec<String> = sqlx::query_scalar(
-        "SELECT t.reason::text FROM transfers_provisional tp
-         JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT t.reason::text FROM posting_lines_provisional tp
+         JOIN posting_lines t ON t.id = tp.posting_line_id
          WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
          ORDER BY t.id",
     )
@@ -508,8 +508,8 @@ async fn wac_periodic_scrap_finalized() {
 
     // Both finalized. No drift since pool only had wo_start receipts.
     let variances: Vec<i64> = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional tp
-         JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT variance_amount FROM posting_lines_provisional tp
+         JOIN posting_lines t ON t.id = tp.posting_line_id
          WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
          ORDER BY t.id",
     )
@@ -545,8 +545,8 @@ async fn wac_periodic_partial_wo_complete() {
     assert_eq!(balance(&pool, wo.wip_val_op10).await, 0);
 
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM transfers_provisional tp
-         JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT COUNT(*)::BIGINT FROM posting_lines_provisional tp
+         JOIN posting_lines t ON t.id = tp.posting_line_id
          WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
            AND t.reason = 'wo_complete_v'",
     )
@@ -560,8 +560,8 @@ async fn wac_periodic_partial_wo_complete() {
     assert_eq!(summary["hook_results"]["wac_periodic"].as_i64(), Some(2));
 
     let variances: Vec<i64> = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional tp
-         JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT variance_amount FROM posting_lines_provisional tp
+         JOIN posting_lines t ON t.id = tp.posting_line_id
          WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
          ORDER BY t.id",
     )
@@ -622,8 +622,8 @@ async fn wac_periodic_fully_scrapped_close_unproduced() {
     assert_eq!(summary["hook_results"]["wac_periodic"].as_i64(), Some(1));
 
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional tp
-         JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT variance_amount FROM posting_lines_provisional tp
+         JOIN posting_lines t ON t.id = tp.posting_line_id
          WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
            AND t.reason = 'scrap_v'",
     )

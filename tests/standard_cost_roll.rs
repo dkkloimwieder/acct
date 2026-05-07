@@ -155,7 +155,7 @@ async fn first_roll_no_inventory_audit_records_no_revaluation() {
 
     // standard_costs row exists for this SKU.
     let cost: i64 = sqlx::query_scalar(
-        "SELECT resolve_standard_cost_at($1::UUID, '2026-04-15'::DATE)",
+        "SELECT _resolve_standard_cost_at($1::UUID, '2026-04-15'::DATE)",
     )
     .bind(&sku)
     .fetch_one(&pool)
@@ -179,7 +179,7 @@ async fn second_roll_revalues_existing_inventory() {
     // Receive 50 units at standard 100 → inv_value_fg += 5000.
     let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
     let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 50, "2026-04-15", &fresh_uuid(&pool).await),
@@ -231,7 +231,7 @@ async fn future_dated_roll_inserts_no_revaluation() {
     // Receive 30 units at 100 → 3000.
     let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
     let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 30, "2026-04-15", &fresh_uuid(&pool).await),
@@ -260,7 +260,7 @@ async fn future_dated_roll_inserts_no_revaluation() {
 
     // resolve at business_date='2026-04-20' still returns 100.
     let cur: i64 = sqlx::query_scalar(
-        "SELECT resolve_standard_cost_at($1::UUID, '2026-04-20'::DATE)",
+        "SELECT _resolve_standard_cost_at($1::UUID, '2026-04-20'::DATE)",
     )
     .bind(&sku)
     .fetch_one(&pool)
@@ -270,7 +270,7 @@ async fn future_dated_roll_inserts_no_revaluation() {
 
     // resolve at '2026-06-15' returns the new 150.
     let fut: i64 = sqlx::query_scalar(
-        "SELECT resolve_standard_cost_at($1::UUID, '2026-06-15'::DATE)",
+        "SELECT _resolve_standard_cost_at($1::UUID, '2026-06-15'::DATE)",
     )
     .bind(&sku)
     .fetch_one(&pool)
@@ -318,7 +318,7 @@ async fn wip_present_blocks_with_p0006_referencing_epic_g() {
 
     // Engineer a non-zero WIP balance: open the inv_value_wip account
     // and post a value to it via inventory_adjustment-style direct
-    // accounts.debits_total update (skipping post_transfers since WIP
+    // accounts.debits_total update (skipping post_posting_lines since WIP
     // events have their own dispatch). Simplest: direct UPDATE for the
     // smoke test. Real WIP comes from rm_issue_to_wo + op_move flows.
     let wip_acct = open_inv_value_wip(&pool, &sku, 10).await;
@@ -363,7 +363,7 @@ async fn roll_down_revalues_existing_inventory() {
 
     let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
     let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 40, "2026-04-15", &fresh_uuid(&pool).await),
@@ -406,7 +406,7 @@ async fn roll_down_revalues_existing_inventory() {
 async fn post_roll_adjustment_uses_new_standard() {
     // After a roll, post_inventory_adjustment with NULL p_unit_cost on
     // the SKU must use the NEW standard, not the old. This verifies the
-    // standard_costs row is canonical and resolve_standard_cost_at picks
+    // standard_costs row is canonical and _resolve_standard_cost_at picks
     // it up.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
@@ -471,7 +471,7 @@ async fn multi_location_roll_revalues_each_pool() {
 
     // 30 units at MAIN, 20 at ALT; both at standard 100.
     for (q, v, qty) in [(qty_main, val_main, 30i64), (qty_alt, val_alt, 20i64)] {
-        let _ = call_post_transfers(
+        let _ = call_post_posting_lines(
             &pool,
             serde_json::json!([
                 make_event("inventory_adjustment", q, void_qty, qty, "2026-04-15", &fresh_uuid(&pool).await),
@@ -532,7 +532,7 @@ async fn no_op_same_cost_records_audit_no_transfer() {
 
     let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
     let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 25, "2026-04-15", &fresh_uuid(&pool).await),
@@ -583,7 +583,7 @@ async fn no_op_same_cost_records_audit_no_transfer() {
 
     // No standard_cost_roll transfers posted.
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers WHERE reason = 'standard_cost_roll'",
+        "SELECT COUNT(*) FROM posting_lines WHERE reason = 'standard_cost_roll'",
     )
     .fetch_one(&pool)
     .await
@@ -603,7 +603,7 @@ async fn audit_row_records_prior_target_delta_qty_after_revaluation() {
 
     let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
     let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 15, "2026-04-15", &fresh_uuid(&pool).await),
@@ -889,7 +889,7 @@ async fn multi_class_same_location_roll_uses_per_class_qty() {
 
     // Seed 30 units to inv_value_raw and 20 units to inv_value_fg, all
     // at MAIN. stock_available qty becomes 50 (raw + fg combined).
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             // raw qty leg + value leg

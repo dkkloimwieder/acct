@@ -75,7 +75,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts (kind, ledger_kind, currency, sku_id, location_id,
                                 counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID,
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID,
                  $7::balance_direction) RETURNING id",
     )
     .bind(kind)
@@ -142,7 +142,7 @@ async fn seed_ap_balance(pool: &PgPool, s: &Scaffold, amount: i64) {
         "amount":amount,"business_date":"2026-04-15",
         "idempotency_key":fresh_uuid(pool).await,"posted_by":posted_by
     }]);
-    sqlx::query("SELECT post_transfers($1, FALSE)").bind(mint)
+    sqlx::query("SELECT post_posting_lines($1, FALSE)").bind(mint)
         .execute(pool).await.expect("seed ap");
 }
 
@@ -165,7 +165,7 @@ async fn seed_prior_receipt(pool: &PgPool, s: &Scaffold, qty: i64, unit_cost: i6
          "amount":qty * unit_cost,"qty":qty,"business_date":"2026-04-15",
          "idempotency_key":fresh_uuid(pool).await,"posted_by":posted_by}
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)").bind(mint)
+    sqlx::query("SELECT post_posting_lines($1, FALSE)").bind(mint)
         .execute(pool).await.expect("seed prior receipt");
 }
 

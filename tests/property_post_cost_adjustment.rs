@@ -263,7 +263,7 @@ async fn open_account_acct(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -292,7 +292,7 @@ async fn class_qty(pool: &PgPool, val_acct: i64) -> i64 {
                   WHEN t.debit_account_id  = $1 THEN  t.qty
                   WHEN t.credit_account_id = $1 THEN -t.qty
                 END), 0)::BIGINT
-           FROM transfers t
+           FROM posting_lines t
           WHERE $1 IN (t.debit_account_id, t.credit_account_id)
             AND t.qty IS NOT NULL",
     )
@@ -367,7 +367,7 @@ async fn seed_class_inner(
             "idempotency_key": fresh_uuid(pool).await, "posted_by": posted_by
         },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(events)
         .execute(pool)
         .await

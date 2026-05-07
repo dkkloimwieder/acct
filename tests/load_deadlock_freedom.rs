@@ -24,7 +24,7 @@
 //!   (P0003 not applicable), business_date is in the open period
 //!   (P0004/P0005 ok). Therefore the **only** failure mode this test
 //!   should ever surface is a deadlock — non-deadlock errors
-//!   indicate a real regression in `post_transfers`.
+//!   indicate a real regression in `post_posting_lines`.
 //!
 //!   The debit pool includes both stock_wip (SKU-A op 10/20) accounts
 //!   so the W2 op_move dispatch is exercised under contention — that
@@ -279,7 +279,7 @@ async fn deadlock_freedom_under_concurrent_post_transfers() {
                 }
                 let batch = json!(events);
                 let t0 = Instant::now();
-                let res = call_post_transfers(&pool_w, batch, false).await;
+                let res = call_post_posting_lines(&pool_w, batch, false).await;
                 let dur_us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
                 latencies_us.push(dur_us);
                 match res {

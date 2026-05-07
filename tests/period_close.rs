@@ -2,7 +2,7 @@
 //!
 //! Acceptance:
 //!   * P0014 fires for missing or already-closed periods.
-//!   * P0015 fires when transfers_provisional has un-finalized rows in
+//!   * P0015 fires when posting_lines_provisional has un-finalized rows in
 //!     the period; p_force_provisional bypasses it.
 //!   * P0016 fires when run_daily_reconciliation() raises new alerts;
 //!     p_force_recon bypasses it.
@@ -10,7 +10,7 @@
 //!   * All three close-hooks are invoked, in the spec'd order.
 //!   * Concurrent callers serialize via FOR UPDATE: exactly one
 //!     succeeds, the other raises P0014.
-//!   * Once closed, post_transfers' P0005 still fires on writes into
+//!   * Once closed, post_posting_lines' P0005 still fires on writes into
 //!     that period.
 
 mod common;
@@ -52,18 +52,18 @@ async fn call_close_period(
         .await
 }
 
-/// Insert a single un-finalized transfers_provisional row in the named
+/// Insert a single un-finalized posting_lines_provisional row in the named
 /// period. Posts a placeholder transfer first so we have an FK-able id.
 async fn make_unfinalized_provisional(pool: &sqlx::PgPool, pid: i64) {
     let stock = account_id_stock_available(pool, "SKU-A", "MAIN").await;
     let void = account_id_by_kind_currency(pool, "creation_void", None).await;
     let key = fresh_uuid(pool).await;
     let event = make_event("cycle_count_adj", stock, void, 1, "2026-04-15", &key);
-    let _ = call_post_transfers(pool, serde_json::json!([event]), false)
+    let _ = call_post_posting_lines(pool, serde_json::json!([event]), false)
         .await
         .expect("seed transfer");
     let tid: i64 = sqlx::query_scalar(
-        "SELECT id FROM transfers WHERE idempotency_key = $1::UUID",
+        "SELECT id FROM posting_lines WHERE idempotency_key = $1::UUID",
     )
     .bind(&key)
     .fetch_one(pool)
@@ -79,7 +79,7 @@ async fn make_unfinalized_provisional(pool: &sqlx::PgPool, pid: i64) {
     // acct-8gg, this gate test will need a different sentinel — possibly
     // rewriting to a tx-rollback pattern like the spy test.)
     sqlx::query(
-        "INSERT INTO transfers_provisional (transfer_id, period_id, cost_method)
+        "INSERT INTO posting_lines_provisional (posting_line_id, period_id, cost_method)
          VALUES ($1, $2, 'fifo')",
     )
     .bind(tid)
@@ -225,7 +225,7 @@ async fn close_period_force_provisional_bypasses_p0015() {
     // Documented behavior: forced close does NOT auto-finalize the
     // un-finalized row. It stays as-is for forensics.
     let still_unfin: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional
+        "SELECT COUNT(*) FROM posting_lines_provisional
           WHERE period_id = $1 AND finalized_at IS NULL",
     )
     .bind(pid)
@@ -375,7 +375,7 @@ async fn closed_period_blocks_subsequent_post_transfers_per_p0005() {
         .expect("clean close");
     assert!(period_closed_at(&pool, pid).await.is_some());
 
-    // Subsequent post_transfers into 2026-04 must hit the existing
+    // Subsequent post_posting_lines into 2026-04 must hit the existing
     // P0005 gate. The qty leg picks any in-period business_date.
     let stock = account_id_stock_available(&pool, "SKU-A", "MAIN").await;
     let void = account_id_by_kind_currency(&pool, "creation_void", None).await;
@@ -383,7 +383,7 @@ async fn closed_period_blocks_subsequent_post_transfers_per_p0005() {
     let event = make_event("cycle_count_adj", stock, void, 1, "2026-04-15", &key);
 
     expect_sqlstate("P0005", || async {
-        call_post_transfers(&pool, serde_json::json!([event]), false)
+        call_post_posting_lines(&pool, serde_json::json!([event]), false)
             .await
             .map(|_| ())
     })

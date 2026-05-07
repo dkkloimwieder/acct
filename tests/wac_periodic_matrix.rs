@@ -2,7 +2,7 @@
 //!
 //! Comprehensive integration tests for periodic WAC re-costing. Each
 //! test sets up a period of transactions, calls close_period, and
-//! verifies the resulting state (account balances, transfers_provisional
+//! verifies the resulting state (account balances, posting_lines_provisional
 //! finalization, variance routing).
 //!
 //! Smoke tests for the basic flow live in tests/wac_periodic.rs (qfj.1).
@@ -193,7 +193,7 @@ async fn one_receipt_one_depletion_no_variance() {
 
     let (variance, finalized): (i64, Option<String>) = sqlx::query_as(
         "SELECT variance_amount, finalized_at::text
-           FROM transfers_provisional WHERE cost_method='wac_periodic'",
+           FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
     )
     .fetch_one(&pool)
     .await
@@ -224,12 +224,12 @@ async fn depletion_between_two_receipts_write_up_variance() {
     let _ = close_period(&pool, "2026-04", false).await.expect("close");
 
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional WHERE cost_method='wac_periodic'",
+        "SELECT variance_amount FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
     ).fetch_one(&pool).await.expect("variance");
     assert_eq!(variance, 60, "write-up variance");
 
     // After close, val_acct adjusted by -60 (variance routes from inv_value to itself
-    // via variance_wac_period; net effect on inv_value_fg = -60).
+    // via variance_wac_periodic; net effect on inv_value_fg = -60).
     assert_eq!(balance(&pool, val).await, 1250 - 60);
 }
 
@@ -248,7 +248,7 @@ async fn depletion_between_two_receipts_write_down_variance() {
     let _ = close_period(&pool, "2026-04", false).await.expect("close");
 
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional WHERE cost_method='wac_periodic'",
+        "SELECT variance_amount FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
     ).fetch_one(&pool).await.expect("variance");
     assert_eq!(variance, -60, "write-down variance");
 
@@ -279,9 +279,9 @@ async fn many_depletions_at_running_avg_each_gets_own_variance() {
     let _ = close_period(&pool, "2026-04", false).await.expect("close");
 
     let variances: Vec<i64> = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional
+        "SELECT variance_amount FROM posting_lines_provisional
           WHERE cost_method='wac_periodic'
-          ORDER BY transfer_id",
+          ORDER BY posting_line_id",
     ).fetch_all(&pool).await.expect("variances");
     assert_eq!(variances, vec![20, 0]);
 }
@@ -298,7 +298,7 @@ async fn integer_rounding_truncates_provisional_unit_cost() {
 
     let _ = close_period(&pool, "2026-04", false).await.expect("close");
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional WHERE cost_method='wac_periodic'",
+        "SELECT variance_amount FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
     ).fetch_one(&pool).await.expect("variance");
     assert_eq!(variance, 0);
 }
@@ -321,7 +321,7 @@ async fn integer_rounding_with_uneven_division() {
     // Variance = 3 × (10 - 10) = 0.
     let _ = close_period(&pool, "2026-04", false).await.expect("close");
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional WHERE cost_method='wac_periodic'",
+        "SELECT variance_amount FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
     ).fetch_one(&pool).await.expect("variance");
     assert_eq!(variance, 0);
 }
@@ -354,13 +354,13 @@ async fn multi_location_pools_close_independently() {
     // MAIN variance: 50 × (6 - 5) = +50.
     // ALT variance: 30 × (10 - 10) = 0.
     let main_variance: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_periodic' AND t.credit_account_id = $1",
     ).bind(v_main).fetch_one(&pool).await.expect("main variance");
     let alt_variance: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_periodic' AND t.credit_account_id = $1",
     ).bind(v_alt).fetch_one(&pool).await.expect("alt variance");
     assert_eq!(main_variance, 50);
@@ -398,13 +398,13 @@ async fn raw_class_and_fg_class_close_independently_via_separate_skus() {
     let _ = close_period(&pool, "2026-04", false).await.expect("close");
 
     let raw_var: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_periodic' AND t.credit_account_id = $1",
     ).bind(v_raw).fetch_one(&pool).await.expect("raw variance");
     let fg_var: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_periodic' AND t.credit_account_id = $1",
     ).bind(v_fg).fetch_one(&pool).await.expect("fg variance");
     assert_eq!(raw_var, 40);
@@ -471,13 +471,13 @@ async fn raw_class_and_fg_class_close_independently_via_one_sku() {
                "two depletions finalized — one per class");
 
     let raw_var: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_periodic' AND t.credit_account_id = $1",
     ).bind(v_raw).fetch_one(&pool).await.expect("raw variance");
     let fg_var: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_periodic' AND t.credit_account_id = $1",
     ).bind(v_fg).fetch_one(&pool).await.expect("fg variance");
 
@@ -509,7 +509,7 @@ async fn multiple_skus_in_same_period_close_independently() {
     let _ = close_period(&pool, "2026-04", false).await.unwrap();
 
     let total_finalized: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional
+        "SELECT COUNT(*) FROM posting_lines_provisional
           WHERE cost_method='wac_periodic' AND finalized_at IS NOT NULL",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(total_finalized, 2);
@@ -548,8 +548,8 @@ async fn cross_period_uses_only_in_period_receipts() {
     let _ = close_period(&pool, "2026-05", false).await.expect("close 05");
 
     let may_variance: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_periodic'
             AND t.business_date >= '2026-05-01'",
     ).fetch_one(&pool).await.unwrap();
@@ -581,13 +581,13 @@ async fn multi_period_chain_each_close_independent() {
     let _ = close_period(&pool, "2026-05", false).await.unwrap();
 
     let april: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_periodic' AND t.business_date < '2026-05-01'",
     ).fetch_one(&pool).await.unwrap();
     let may: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_periodic' AND t.business_date >= '2026-05-01'",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(april, 20);
@@ -608,10 +608,10 @@ async fn mixed_receipt_reasons_aggregate_into_period_avg() {
     adjust(&pool, &sku, "MAIN", 50, Some(5), "2026-04-05").await.unwrap();
     // pool: 50, value: 250.
 
-    // Receipt via cycle_count_adj (direct post_transfers).
+    // Receipt via cycle_count_adj (direct post_posting_lines).
     let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
     let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             make_event("cycle_count_adj", qty, void_qty, 50, "2026-04-08", &fresh_uuid(&pool).await),
@@ -627,7 +627,7 @@ async fn mixed_receipt_reasons_aggregate_into_period_avg() {
     // Final period avg = (250 + 350) / (50 + 50) = 6. Variance = 40 × (6 - 6) = 0.
     let _ = close_period(&pool, "2026-04", false).await.unwrap();
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional WHERE cost_method='wac_periodic'",
+        "SELECT variance_amount FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(variance, 0);
 }
@@ -657,11 +657,11 @@ async fn mixed_depletion_reasons_both_flagged() {
         "idempotency_key":   fresh_uuid(&pool).await,
         "posted_by":         "00000000-0000-0000-0000-0000000000bb",
     });
-    let _ = call_post_transfers(&pool, serde_json::json!([event]), false)
+    let _ = call_post_posting_lines(&pool, serde_json::json!([event]), false)
         .await.expect("so_ship");
 
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional WHERE cost_method='wac_periodic'",
+        "SELECT COUNT(*) FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(count, 2, "both depletion paths flag");
 }
@@ -681,7 +681,7 @@ async fn period_with_only_receipts_close_succeeds_no_provisional() {
     assert_eq!(summary["hook_results"]["wac_periodic"].as_i64(), Some(0));
 
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional WHERE cost_method='wac_periodic'",
+        "SELECT COUNT(*) FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(count, 0);
 }
@@ -703,13 +703,13 @@ async fn force_bypass_processes_some_skips_unprocessable() {
 
     // Pool B: pre-seed via direct INSERT (no receipt in period), then deplete.
     // To create a depletion without a receipt, we need stock first. Insert
-    // qty + value via post_transfers in a closed PRIOR period via business_date
+    // qty + value via post_posting_lines in a closed PRIOR period via business_date
     // backdate, then deplete in 2026-04. We disable the append-only trigger
     // briefly to backdate.
     let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
     let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
     // Seed in 2026-04 to get past period checks, then backdate.
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             make_event("cycle_count_adj", qty_b, void_qty, 100, "2026-04-01", &fresh_uuid(&pool).await),
@@ -718,13 +718,13 @@ async fn force_bypass_processes_some_skips_unprocessable() {
         false,
     ).await.expect("seed B");
     // Backdate the receipts out of period.
-    sqlx::query("ALTER TABLE transfers DISABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines DISABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool).await.unwrap();
     sqlx::query(
-        "UPDATE transfers SET business_date = '2026-03-15'
+        "UPDATE posting_lines SET business_date = '2026-03-15'
           WHERE business_date = '2026-04-01' AND debit_account_id IN ($1, $2)",
     ).bind(qty_b).bind(val_b).execute(&pool).await.unwrap();
-    sqlx::query("ALTER TABLE transfers ENABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines ENABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool).await.unwrap();
 
     // Now deplete B in 2026-04 — no receipts in period for B.
@@ -736,7 +736,7 @@ async fn force_bypass_processes_some_skips_unprocessable() {
     assert_eq!(summary["forced"]["provisional"].as_bool(), Some(true));
 
     let unfin: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional
+        "SELECT COUNT(*) FROM posting_lines_provisional
           WHERE cost_method='wac_periodic' AND finalized_at IS NULL",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(unfin, 1, "B's row stays un-finalized");
@@ -751,7 +751,7 @@ async fn close_fails_then_retries_after_posting_receipts() {
     // Seed via a 2026-03 backdate so we have stock without an in-period receipt.
     let void_qty = account_id_by_kind_currency(&pool, "creation_void", None).await;
     let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             make_event("cycle_count_adj", qty, void_qty, 100, "2026-04-01", &fresh_uuid(&pool).await),
@@ -759,12 +759,12 @@ async fn close_fails_then_retries_after_posting_receipts() {
         ]),
         false,
     ).await.unwrap();
-    sqlx::query("ALTER TABLE transfers DISABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines DISABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool).await.unwrap();
-    sqlx::query("UPDATE transfers SET business_date='2026-03-15'
+    sqlx::query("UPDATE posting_lines SET business_date='2026-03-15'
                   WHERE business_date='2026-04-01' AND debit_account_id IN ($1, $2)")
         .bind(qty).bind(val).execute(&pool).await.unwrap();
-    sqlx::query("ALTER TABLE transfers ENABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines ENABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool).await.unwrap();
 
     // Deplete in 2026-04 with no in-period receipts.
@@ -782,7 +782,7 @@ async fn close_fails_then_retries_after_posting_receipts() {
     // March-backdated receipt at depletion time = 500/100). Variance = 30 × (7-5) = 60.
     let _ = close_period(&pool, "2026-04", false).await.expect("retry");
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional WHERE cost_method='wac_periodic'",
+        "SELECT variance_amount FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(variance, 60);
 }
@@ -803,8 +803,8 @@ async fn variance_wac_period_account_nets_to_zero_per_close() {
     adjust(&pool, &sku, "MAIN", 100, Some(9), "2026-04-15").await.unwrap();
     let _ = close_period(&pool, "2026-04", false).await.unwrap();
 
-    let var_acct = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
-    assert_eq!(balance(&pool, var_acct).await, 0, "variance_wac_period nets to zero");
+    let var_acct = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
+    assert_eq!(balance(&pool, var_acct).await, 0, "variance_wac_periodic nets to zero");
 
     // But the variance DID flow through it (debits + credits both > 0).
     let (debits, credits): (i64, i64) = sqlx::query_as(
@@ -827,8 +827,8 @@ async fn audit_row_records_full_close_state() {
 
     let (qty, finalized_at, variance_amount, variance_xfer_id): (i64, Option<String>, i64, Option<i64>)
         = sqlx::query_as(
-            "SELECT qty, finalized_at::text, variance_amount, variance_transfer_id
-               FROM transfers_provisional WHERE cost_method='wac_periodic'",
+            "SELECT qty, finalized_at::text, variance_amount, variance_posting_line_id
+               FROM posting_lines_provisional WHERE cost_method='wac_periodic'",
         ).fetch_one(&pool).await.unwrap();
 
     assert_eq!(qty, 25);
@@ -836,9 +836,9 @@ async fn audit_row_records_full_close_state() {
     assert_eq!(variance_amount, 50);  // 25 × (7 - 5)
     assert!(variance_xfer_id.is_some());
 
-    // The variance_transfer_id points at a real transfer with reason='cost_restate'.
+    // The variance_posting_line_id points at a real transfer with reason='cost_restate'.
     let reason: String = sqlx::query_scalar(
-        "SELECT reason::text FROM transfers WHERE id = $1",
+        "SELECT reason::text FROM posting_lines WHERE id = $1",
     ).bind(variance_xfer_id.unwrap()).fetch_one(&pool).await.unwrap();
     assert_eq!(reason, "cost_restate");
 }
@@ -855,7 +855,7 @@ async fn variance_transfers_have_correct_document_kind() {
     let _ = close_period(&pool, "2026-04", false).await.unwrap();
 
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers
+        "SELECT COUNT(*) FROM posting_lines
           WHERE document_kind = 'wac_periodic_close'
             AND reason = 'cost_restate'",
     ).fetch_one(&pool).await.unwrap();
@@ -906,10 +906,10 @@ async fn standard_sku_unaffected_by_wac_periodic_changes() {
     assert_eq!(summary["hook_results"]["wac_periodic"].as_i64(), Some(0),
                "standard SKU produces no provisional rows");
 
-    // No transfers_provisional rows for this SKU.
+    // No posting_lines_provisional rows for this SKU.
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT COUNT(*) FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE t.business_date BETWEEN '2026-04-01' AND '2026-04-30'
             AND tp.cost_method='wac_periodic'",
     ).fetch_one(&pool).await.unwrap();

@@ -104,7 +104,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -662,7 +662,7 @@ async fn receipt_persists_document_rows_and_links_transfers() {
 
     // 3 transfers expected (qty + value + ppv) with this doc_id.
     let xfer_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers WHERE document_id = $1::UUID AND document_kind = 'po_receipt'",
+        "SELECT COUNT(*) FROM posting_lines WHERE document_id = $1::UUID AND document_kind = 'po_receipt'",
     )
     .bind(&doc_id)
     .fetch_one(&pool)

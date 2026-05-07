@@ -19,14 +19,14 @@ use common::*;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Helper: post a single-event batch via `post_transfers`. Returns the
+/// Helper: post a single-event batch via `post_posting_lines`. Returns the
 /// raw JSONB result.
 async fn post_one(
     pool: &sqlx::PgPool,
     event: serde_json::Value,
 ) -> sqlx::Result<serde_json::Value> {
     let batch = json!([event]);
-    sqlx::query_scalar("SELECT post_transfers($1, $2)")
+    sqlx::query_scalar("SELECT post_posting_lines($1, $2)")
         .bind(&batch)
         .bind(false)
         .fetch_one(pool)
@@ -149,7 +149,7 @@ async fn wac_unit_cost_re_averages_across_receipts() {
             "posted_by":         fresh_uuid(&pool).await,
         }
     ]);
-    sqlx::query_scalar::<_, serde_json::Value>("SELECT post_transfers($1, $2)")
+    sqlx::query_scalar::<_, serde_json::Value>("SELECT post_posting_lines($1, $2)")
         .bind(&batch)
         .bind(false)
         .fetch_one(&pool)
@@ -184,7 +184,7 @@ async fn wac_unit_cost_re_averages_across_receipts() {
             "posted_by":         fresh_uuid(&pool).await,
         }
     ]);
-    sqlx::query_scalar::<_, serde_json::Value>("SELECT post_transfers($1, $2)")
+    sqlx::query_scalar::<_, serde_json::Value>("SELECT post_posting_lines($1, $2)")
         .bind(&batch2)
         .bind(false)
         .fetch_one(&pool)
@@ -246,7 +246,7 @@ async fn wac_concurrent_issues_serialize_no_deadlock() {
                     "posted_by":         fresh_uuid(&pool).await,
                 }
             ]);
-            sqlx::query_scalar::<_, serde_json::Value>("SELECT post_transfers($1, $2)")
+            sqlx::query_scalar::<_, serde_json::Value>("SELECT post_posting_lines($1, $2)")
                 .bind(&batch)
                 .bind(false)
                 .fetch_one(&*pool)
@@ -309,7 +309,7 @@ async fn wac_zero_qty_pool_raises_p0006() {
             "idempotency_key":   key,
             "posted_by":         fresh_uuid(&pool).await,
         }]);
-        sqlx::query_scalar::<_, serde_json::Value>("SELECT post_transfers($1, $2)")
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT post_posting_lines($1, $2)")
             .bind(&batch)
             .bind(false)
             .fetch_one(&pool)

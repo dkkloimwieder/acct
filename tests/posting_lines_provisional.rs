@@ -1,4 +1,4 @@
-//! `acct-4mt` / `acct-s6n.1` — Schema smoke test for transfers_provisional.
+//! `acct-4mt` / `acct-s6n.1` — Schema smoke test for posting_lines_provisional.
 //!
 //! This is the foundational schema layer for the period-close machinery
 //! (acct-s6n). The orchestration function close_period() and its hooks
@@ -21,11 +21,11 @@ async fn post_one_transfer(pool: &sqlx::PgPool, qty: i64) -> i64 {
     let void_qty = account_id_by_kind_currency(pool, "creation_void", None).await;
     let key = fresh_uuid(pool).await;
     let event = make_event("cycle_count_adj", stock, void_qty, qty, "2026-04-15", &key);
-    let _ = call_post_transfers(pool, serde_json::json!([event]), false)
+    let _ = call_post_posting_lines(pool, serde_json::json!([event]), false)
         .await
-        .expect("post_transfers");
+        .expect("post_posting_lines");
     sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM transfers WHERE idempotency_key = $1::UUID",
+        "SELECT id FROM posting_lines WHERE idempotency_key = $1::UUID",
     )
     .bind(&key)
     .fetch_one(pool)
@@ -56,8 +56,8 @@ async fn three_lifecycle_states_round_trip() {
 
     // State 1: un-finalized.
     sqlx::query(
-        "INSERT INTO transfers_provisional
-            (transfer_id, period_id, cost_method)
+        "INSERT INTO posting_lines_provisional
+            (posting_line_id, period_id, cost_method)
          VALUES ($1, $2, 'wac_periodic')",
     )
     .bind(t_unfinalized)
@@ -68,9 +68,9 @@ async fn three_lifecycle_states_round_trip() {
 
     // State 2: finalized, no variance.
     sqlx::query(
-        "INSERT INTO transfers_provisional
-            (transfer_id, period_id, cost_method,
-             finalized_at, variance_amount, variance_transfer_id)
+        "INSERT INTO posting_lines_provisional
+            (posting_line_id, period_id, cost_method,
+             finalized_at, variance_amount, variance_posting_line_id)
          VALUES ($1, $2, 'wac_retroactive',
                  clock_timestamp(), 0, NULL)",
     )
@@ -82,9 +82,9 @@ async fn three_lifecycle_states_round_trip() {
 
     // State 3: finalized with variance.
     sqlx::query(
-        "INSERT INTO transfers_provisional
-            (transfer_id, period_id, cost_method,
-             finalized_at, variance_amount, variance_transfer_id)
+        "INSERT INTO posting_lines_provisional
+            (posting_line_id, period_id, cost_method,
+             finalized_at, variance_amount, variance_posting_line_id)
          VALUES ($1, $2, 'wac_periodic',
                  clock_timestamp(), 500, $3)",
     )
@@ -97,9 +97,9 @@ async fn three_lifecycle_states_round_trip() {
 
     // Partial index hot path: un-finalized rows for this period.
     let unfin: Vec<i64> = sqlx::query_scalar(
-        "SELECT transfer_id FROM transfers_provisional
+        "SELECT posting_line_id FROM posting_lines_provisional
           WHERE period_id = $1 AND finalized_at IS NULL
-          ORDER BY transfer_id",
+          ORDER BY posting_line_id",
     )
     .bind(pid)
     .fetch_all(&pool)
@@ -109,7 +109,7 @@ async fn three_lifecycle_states_round_trip() {
 
     // Total round-trip: 3 rows.
     let total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transfers_provisional WHERE period_id = $1")
+        sqlx::query_scalar("SELECT COUNT(*) FROM posting_lines_provisional WHERE period_id = $1")
             .bind(pid)
             .fetch_one(&pool)
             .await
@@ -118,8 +118,8 @@ async fn three_lifecycle_states_round_trip() {
 
     // Spot-check the variance-bearing row's payload.
     let (var_amt, var_tid): (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT variance_amount, variance_transfer_id
-           FROM transfers_provisional WHERE transfer_id = $1",
+        "SELECT variance_amount, variance_posting_line_id
+           FROM posting_lines_provisional WHERE posting_line_id = $1",
     )
     .bind(t_finalized_var)
     .fetch_one(&pool)
@@ -140,8 +140,8 @@ async fn check_rejects_unfinalized_with_variance_amount() {
     // Un-finalized (finalized_at NULL) cannot carry a variance_amount.
     expect_sqlstate("23514", || async {
         sqlx::query(
-            "INSERT INTO transfers_provisional
-                (transfer_id, period_id, cost_method, variance_amount)
+            "INSERT INTO posting_lines_provisional
+                (posting_line_id, period_id, cost_method, variance_amount)
              VALUES ($1, $2, 'wac_periodic', 100)",
         )
         .bind(tid)
@@ -164,8 +164,8 @@ async fn check_rejects_finalized_without_variance_amount() {
     // Finalized rows must record the variance amount (even if zero).
     expect_sqlstate("23514", || async {
         sqlx::query(
-            "INSERT INTO transfers_provisional
-                (transfer_id, period_id, cost_method, finalized_at)
+            "INSERT INTO posting_lines_provisional
+                (posting_line_id, period_id, cost_method, finalized_at)
              VALUES ($1, $2, 'wac_periodic', clock_timestamp())",
         )
         .bind(tid)
@@ -189,9 +189,9 @@ async fn check_rejects_zero_variance_with_transfer_id() {
     // A zero-variance close shouldn't have posted a transfer.
     expect_sqlstate("23514", || async {
         sqlx::query(
-            "INSERT INTO transfers_provisional
-                (transfer_id, period_id, cost_method,
-                 finalized_at, variance_amount, variance_transfer_id)
+            "INSERT INTO posting_lines_provisional
+                (posting_line_id, period_id, cost_method,
+                 finalized_at, variance_amount, variance_posting_line_id)
              VALUES ($1, $2, 'wac_periodic',
                      clock_timestamp(), 0, $3)",
         )
@@ -209,9 +209,9 @@ async fn check_rejects_zero_variance_with_transfer_id() {
 async fn finalized_nonzero_variance_without_transfer_id_is_allowed() {
     // Tier 2 (acct-smn, mig 0065): the close hook's internal-chain
     // op_move_v finalization records a non-zero variance_amount with
-    // variance_transfer_id NULL — the cost shift propagates via the
+    // variance_posting_line_id NULL — the cost shift propagates via the
     // topological cache, no audit transfer is posted. The CHECK was
-    // relaxed to permit this. Zero-variance + non-NULL transfer_id and
+    // relaxed to permit this. Zero-variance + non-NULL posting_line_id and
     // finalized + NULL variance are still rejected (verified by
     // siblings above).
     let pool = connect_test_db().await;
@@ -221,9 +221,9 @@ async fn finalized_nonzero_variance_without_transfer_id_is_allowed() {
     let tid = post_one_transfer(&pool, 5).await;
 
     sqlx::query(
-        "INSERT INTO transfers_provisional
-            (transfer_id, period_id, cost_method,
-             finalized_at, variance_amount, variance_transfer_id)
+        "INSERT INTO posting_lines_provisional
+            (posting_line_id, period_id, cost_method,
+             finalized_at, variance_amount, variance_posting_line_id)
          VALUES ($1, $2, 'wac_periodic',
                  clock_timestamp(), 500, NULL)",
     )
@@ -231,7 +231,7 @@ async fn finalized_nonzero_variance_without_transfer_id_is_allowed() {
     .bind(pid)
     .execute(&pool)
     .await
-    .expect("non-zero variance with NULL transfer_id is allowed post-tier-2");
+    .expect("non-zero variance with NULL posting_line_id is allowed post-tier-2");
 }
 
 #[tokio::test]
@@ -246,9 +246,9 @@ async fn check_rejects_self_referencing_variance_transfer() {
     // provisional one being closed out.
     expect_sqlstate("23514", || async {
         sqlx::query(
-            "INSERT INTO transfers_provisional
-                (transfer_id, period_id, cost_method,
-                 finalized_at, variance_amount, variance_transfer_id)
+            "INSERT INTO posting_lines_provisional
+                (posting_line_id, period_id, cost_method,
+                 finalized_at, variance_amount, variance_posting_line_id)
              VALUES ($1, $2, 'wac_periodic',
                      clock_timestamp(), 500, $1)",
         )
@@ -272,9 +272,9 @@ async fn variance_account_kinds_are_seeded_in_both_currencies() {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM accounts
           WHERE kind::text IN (
-                  'variance_wac_period',
+                  'variance_wac_periodic',
                   'variance_wac_retroactive',
-                  'variance_cost_adjust_retro')
+                  'variance_cost_adjust_retroactive')
             AND ledger_kind = 'value'
             AND currency IN ('USD', 'EUR')
             AND normal_side = 'unrestricted'

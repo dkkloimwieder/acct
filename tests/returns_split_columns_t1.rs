@@ -334,7 +334,7 @@ async fn make_ship_line(pool: &PgPool) -> (String, String) {
          "amount":1000,"qty":10,"business_date":"2026-04-15",
          "idempotency_key":fresh_uuid(pool).await,"posted_by":posted_by}
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint)
         .execute(pool)
         .await

@@ -50,16 +50,23 @@ pub async fn pg_deadlock_count(pool: &PgPool) -> i64 {
 pub async fn reset_to_fixture(pool: &PgPool) {
     sqlx::raw_sql(
         "TRUNCATE TABLE
-            transfers,
+            posting_line_sources,
+            posting_lines_provisional,
+            posting_lines,
             inventory_reservations,
+            inventory_adjustments,
+            inventory_cost_adjustments,
+            inventory_cost_adjustments_retroactive,
+            inventory_standard_cost_rolls,
             reconciliation_alerts,
-            period_snapshots,
-            commodity_receipts,
             ledger_outbox,
+            wo_by_products,
             wo_events,
             wo_routings,
             wo_outputs,
             work_orders,
+            bom_by_products,
+            bom_lines,
             bom_headers,
             engineering_change_orders,
             absorption_classes,
@@ -85,8 +92,13 @@ pub async fn reset_to_fixture(pool: &PgPool) {
             ap_payments,
             vendor_debit_memo_lines,
             vendor_debit_memos,
+            vendor_bill_lines,
+            vendor_bills,
             po_return_lines,
             po_returns,
+            po_receipt_lines,
+            po_receipts,
+            purchase_order_lines,
             purchase_orders,
             vendors
          RESTART IDENTITY CASCADE",
@@ -126,14 +138,14 @@ where
     );
 }
 
-/// Thin wrapper around `SELECT post_transfers($1, $2)`. Returns the JSONB
+/// Thin wrapper around `SELECT post_posting_lines($1, $2)`. Returns the JSONB
 /// result array on success.
-pub async fn call_post_transfers(
+pub async fn call_post_posting_lines(
     pool: &PgPool,
     events: serde_json::Value,
     override_closed: bool,
 ) -> sqlx::Result<serde_json::Value> {
-    sqlx::query_scalar("SELECT post_transfers($1, $2)")
+    sqlx::query_scalar("SELECT post_posting_lines($1, $2)")
         .bind(events)
         .bind(override_closed)
         .fetch_one(pool)
@@ -268,11 +280,11 @@ pub async fn snapshot_balances(pool: &PgPool) -> std::collections::HashMap<i64, 
     rows.into_iter().map(|(id, d, c)| (id, (d, c))).collect()
 }
 
-/// Build a `post_transfers` event JSON with explicit qty. Use this for
+/// Build a `post_posting_lines` event JSON with explicit qty. Use this for
 /// value-leg receipts that go through wac_perpetual or wac_periodic
 /// pools — the per-class qty divisor (migration 0030, transfers.qty
 /// column) needs the qty to populate. For qty-leg events where qty
-/// equals amount, the regular `make_event` is fine; the post_transfers
+/// equals amount, the regular `make_event` is fine; the post_posting_lines
 /// INSERT logic infers qty := amount when both sides are qty-class.
 pub fn make_event_with_qty(
     reason: &str,
@@ -297,10 +309,10 @@ pub fn make_event_with_qty(
     })
 }
 
-/// Build a minimal `post_transfers` event JSON. Fixed `document_kind`,
+/// Build a minimal `post_posting_lines` event JSON. Fixed `document_kind`,
 /// `document_id`, and `posted_by` — those don't affect any invariant the
 /// T2 suite exercises. Optional fields (document_line_id, routing_op,
-/// counterparty_id) are omitted; `post_transfers` casts them as NULL.
+/// counterparty_id) are omitted; `post_posting_lines` casts them as NULL.
 ///
 /// Note: as of acct-1vr (migration 0030), value-leg events posting to
 /// wac_perpetual / wac_periodic pools must include qty for the per-class
@@ -334,7 +346,7 @@ pub async fn fresh_sales_order(pool: &PgPool) -> String {
         .expect("insert sales_order")
 }
 
-/// Stock a (sku, location) by `qty` units via post_transfers — the
+/// Stock a (sku, location) by `qty` units via post_posting_lines — the
 /// fixture seeds zero on-hand. Posts a `cycle_count_adj` event with
 /// stock_available on the debit side and `creation_void` (qty) on the
 /// credit side, which is the canonical "balance from nothing" pattern
@@ -344,9 +356,9 @@ pub async fn seed_stock(pool: &PgPool, sku_code: &str, loc_code: &str, qty: i64)
     let void_qty = account_id_by_kind_currency(pool, "creation_void", None).await;
     let key = fresh_uuid(pool).await;
     let event = make_event("cycle_count_adj", stock, void_qty, qty, "2026-04-15", &key);
-    let result = call_post_transfers(pool, serde_json::json!([event]), false)
+    let result = call_post_posting_lines(pool, serde_json::json!([event]), false)
         .await
-        .expect("seed_stock post_transfers");
+        .expect("seed_stock post_posting_lines");
     assert_eq!(result[0]["result"], "ok", "seed_stock: {result}");
 }
 
@@ -630,11 +642,11 @@ pub async fn try_reserve(
 //       BIGINT-truncation tolerance).
 //   I6  Per-(ledger_kind, currency) double-entry: SUM(debits) =
 //       SUM(credits).
-//   I7  No transfers_provisional row violates the existing CHECK
+//   I7  No posting_lines_provisional row violates the existing CHECK
 //       (schema-enforced; we double-check post-write).
 //
 // I1 / I2 / I7 are also enforced by Postgres CHECK constraints — this
-// helper detects schema-violation paths that bypass post_transfers.
+// helper detects schema-violation paths that bypass post_posting_lines.
 // I3 / I5 / I6 are application-level and need queries.
 //
 // Use from property tests + targeted regression tests. Panics on
@@ -680,7 +692,7 @@ pub async fn assert_invariants_hold(pool: &PgPool, label: &str) {
                 END), 0)::BIGINT AS net_qty
            FROM accounts a
            JOIN skus s ON s.id = a.sku_id
-           JOIN transfers t
+           JOIN posting_lines t
              ON a.id IN (t.debit_account_id, t.credit_account_id)
             AND t.qty IS NOT NULL
           WHERE a.kind::TEXT IN ('inv_value_raw', 'inv_value_fg', 'inv_value_wip')
@@ -735,7 +747,7 @@ pub async fn assert_invariants_hold(pool: &PgPool, label: &str) {
                    END), 0)::BIGINT AS net_qty
               FROM accounts a
               JOIN skus s ON s.id = a.sku_id
-              LEFT JOIN transfers t
+              LEFT JOIN posting_lines t
                      ON a.id IN (t.debit_account_id, t.credit_account_id)
                     AND t.qty IS NOT NULL
              WHERE a.kind::TEXT IN ('inv_value_raw','inv_value_fg','inv_value_wip')
@@ -775,15 +787,15 @@ pub async fn assert_invariants_hold(pool: &PgPool, label: &str) {
         "[{label}] I6 violation — per-(ledger_kind, currency) double-entry: {bad_de:?}",
     );
 
-    // I7: transfers_provisional CHECK consistency.
+    // I7: posting_lines_provisional CHECK consistency.
     // Schema-enforced; double-check post-write. The CHECK constraint
     // (mig 0029 + 0065 relaxation) enforces:
-    //   - finalized_at NULL ↔ variance_amount NULL ↔ variance_transfer_id NULL
+    //   - finalized_at NULL ↔ variance_amount NULL ↔ variance_posting_line_id NULL
     //   - finalized_at NOT NULL with variance_amount != 0 may have
-    //     variance_transfer_id NULL (internal-chain) OR NOT NULL (leaf).
+    //     variance_posting_line_id NULL (internal-chain) OR NOT NULL (leaf).
     let bad_prov: Vec<(i64,)> = sqlx::query_as(
-        "SELECT transfer_id
-           FROM transfers_provisional
+        "SELECT posting_line_id
+           FROM posting_lines_provisional
           WHERE (finalized_at IS NULL AND variance_amount IS NOT NULL)
              OR (finalized_at IS NOT NULL AND variance_amount IS NULL)",
     )
@@ -792,6 +804,6 @@ pub async fn assert_invariants_hold(pool: &PgPool, label: &str) {
     .expect("invariants I7 query");
     assert!(
         bad_prov.is_empty(),
-        "[{label}] I7 violation — transfers_provisional finalized/variance mismatch: {bad_prov:?}",
+        "[{label}] I7 violation — posting_lines_provisional finalized/variance mismatch: {bad_prov:?}",
     );
 }

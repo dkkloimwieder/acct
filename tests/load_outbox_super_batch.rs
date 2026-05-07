@@ -5,7 +5,7 @@
 //! same instrumentation. The ONE difference: the drain worker uses
 //! `super_batched_drain_loop` instead of `drain_loop`. Each iteration
 //! the worker concatenates events from up to T4_OUTBOX_BATCH_SIZE
-//! pending rows into ONE `post_transfers` call. On any error from
+//! pending rows into ONE `post_posting_lines` call. On any error from
 //! the merged call, falls back to per-row savepoint drain so error
 //! attribution is preserved (cost: one bad event poisons the bundle's
 //! optimistic commit; recovery is a per-row pass).
@@ -36,7 +36,7 @@
 //!
 //! In an unbounded-writer / single-drainer setup, the queue grows
 //! whenever enqueue rate > drain rate, which is the common case here:
-//! INSERT is fast (~ms), `post_transfers` per-call is ~ms but executed
+//! INSERT is fast (~ms), `post_posting_lines` per-call is ~ms but executed
 //! sequentially by one worker. The headline metric we want is sustained
 //! **committed-events-per-sec** — i.e., the worker's drain rate during
 //! the run, NOT the time-to-drain-the-tail. After the writer phase, we

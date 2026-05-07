@@ -26,10 +26,10 @@
 //!  12. post_inventory_adjustment — write off 1 FG (kind='fg',
 //!      qty_delta=-1, unit_cost=NULL → reads system standard cost).
 //!  13. close_period for 2026-04 — three close hooks run; with only
-//!      standard SKUs there are no transfers_provisional flags and
+//!      standard SKUs there are no posting_lines_provisional flags and
 //!      no recon alerts; close stamps cleanly.
 //!  14. Final invariant assertions — assert_invariants_hold (I1-I7),
-//!      no orphan reservations, no orphan transfers_provisional rows.
+//!      no orphan reservations, no orphan posting_lines_provisional rows.
 //!
 //! Out of scope (separate kitchen-sinks needed):
 //!   - cost_adjustment + cost_adjustment_retroactive (require wac_*
@@ -129,7 +129,7 @@ async fn open_account(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, counterparty_id,
              routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID, $7,
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID, $7,
                  $8::balance_direction)
          RETURNING id",
     )
@@ -583,16 +583,16 @@ async fn full_lifecycle_walks_clean() {
     // Re-run all 7 invariants post-close.
     assert_invariants_hold(&pool, "ks step 14 post-close").await;
 
-    // No orphan transfers_provisional rows in this period (standard SKU
+    // No orphan posting_lines_provisional rows in this period (standard SKU
     // flow doesn't flag, but assert anyway).
     let orphan_prov: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional
+        "SELECT COUNT(*) FROM posting_lines_provisional
           WHERE finalized_at IS NULL",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(orphan_prov, 0, "step 14: no un-finalized transfers_provisional");
+    assert_eq!(orphan_prov, 0, "step 14: no un-finalized posting_lines_provisional");
 
     // Reservation lifecycle reached terminal state.
     let non_terminal_reservations: i64 = sqlx::query_scalar(

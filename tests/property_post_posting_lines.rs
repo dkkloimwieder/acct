@@ -1,6 +1,6 @@
-//! acct-du2 Phase 3 — property tests for post_transfers.
+//! acct-du2 Phase 3 — property tests for post_posting_lines.
 //!
-//! Generates random valid post_transfers batches over the seed fixture
+//! Generates random valid post_posting_lines batches over the seed fixture
 //! and asserts the 7 invariants (I1-I7) hold after each call. Acts as
 //! a regression net for class-confusion bugs that bypass pattern-grep
 //! and structural-walk detection.
@@ -69,7 +69,7 @@ async fn property_post_transfers_invariants_hold() {
             .expect("strategy.new_tree");
         let ops: Vec<Op> = tree.current();
 
-        let label = format!("post_transfers#{case_idx}");
+        let label = format!("post_posting_lines#{case_idx}");
 
         // Track AR balance so ar_payment can't exceed it (would violate
         // ar account's debit-normal CHECK).
@@ -107,8 +107,8 @@ async fn property_post_transfers_invariants_hold() {
             continue;
         }
 
-        let result = common::call_post_transfers(&pool, json!(events), false).await;
-        result.unwrap_or_else(|e| panic!("[{label}] post_transfers: {e}"));
+        let result = common::call_post_posting_lines(&pool, json!(events), false).await;
+        result.unwrap_or_else(|e| panic!("[{label}] post_posting_lines: {e}"));
 
         common::assert_invariants_hold(&pool, &label).await;
     }

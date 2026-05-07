@@ -30,5 +30,5 @@ async fn overdraw_debit_normal_account_raises_23514() {
         &key,
     )]);
 
-    expect_sqlstate("23514", || call_post_transfers(&pool, events, false)).await;
+    expect_sqlstate("23514", || call_post_posting_lines(&pool, events, false)).await;
 }

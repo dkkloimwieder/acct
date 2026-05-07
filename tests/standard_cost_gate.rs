@@ -30,7 +30,7 @@ async fn insert_standard_sku(pool: &sqlx::PgPool, code: &str) -> String {
     .unwrap_or_else(|e| panic!("insert sku {code}: {e}"))
 }
 
-/// Open the value account inv_value_fg(sku, MAIN, USD) so post_transfers
+/// Open the value account inv_value_fg(sku, MAIN, USD) so post_posting_lines
 /// has a debit target. Reads MAIN's id from the fixture.
 async fn open_inv_value_fg(pool: &sqlx::PgPool, sku_id: &str) -> i64 {
     sqlx::query_scalar(
@@ -67,7 +67,7 @@ async fn helper_raises_p0018_when_no_standard_exists() {
     let sku_id = insert_standard_sku(&pool, "STD-NEW").await;
 
     expect_sqlstate("P0018", || async {
-        sqlx::query("SELECT resolve_standard_cost_at($1::UUID, '2026-04-15'::DATE)")
+        sqlx::query("SELECT _resolve_standard_cost_at($1::UUID, '2026-04-15'::DATE)")
             .bind(&sku_id)
             .execute(&pool)
             .await
@@ -94,7 +94,7 @@ async fn helper_raises_p0018_when_business_date_predates_first_standard() {
 
     // Backdated query: '2026-03-15' < earliest effective_at '2026-04-01'.
     expect_sqlstate("P0018", || async {
-        sqlx::query("SELECT resolve_standard_cost_at($1::UUID, '2026-03-15'::DATE)")
+        sqlx::query("SELECT _resolve_standard_cost_at($1::UUID, '2026-03-15'::DATE)")
             .bind(&sku_id)
             .execute(&pool)
             .await
@@ -112,7 +112,7 @@ async fn helper_succeeds_when_standard_in_effect() {
     seed_standard_cost(&pool, "STD-OK", 250).await;
 
     let cost: i64 =
-        sqlx::query_scalar("SELECT resolve_standard_cost_at($1::UUID, '2026-04-15'::DATE)")
+        sqlx::query_scalar("SELECT _resolve_standard_cost_at($1::UUID, '2026-04-15'::DATE)")
             .bind(&sku_id)
             .fetch_one(&pool)
             .await
@@ -198,7 +198,7 @@ async fn post_inventory_adjustment_succeeds_after_seed_standard_cost() {
 
 #[tokio::test]
 async fn post_transfers_value_event_blocks_unestablished_standard_sku_p0018() {
-    // wo_complete is in the cost-relevant set — _post_transfers_compute_amount
+    // wo_complete is in the cost-relevant set — _post_posting_lines_compute_amount
     // is called for these reasons. With no standard cost established for the
     // SKU on the debit-side inv_value_fg, P0018 surfaces from the helper.
     let pool = connect_test_db().await;
@@ -221,7 +221,7 @@ async fn post_transfers_value_event_blocks_unestablished_standard_sku_p0018() {
     });
 
     expect_sqlstate("P0018", || async {
-        call_post_transfers(&pool, serde_json::json!([event]), false)
+        call_post_posting_lines(&pool, serde_json::json!([event]), false)
             .await
             .map(|_| ())
     })
@@ -230,7 +230,7 @@ async fn post_transfers_value_event_blocks_unestablished_standard_sku_p0018() {
 
 #[tokio::test]
 async fn business_date_at_effective_succeeds_boundary_inclusive() {
-    // resolve_standard_cost_at uses `effective_at <= business_date`,
+    // _resolve_standard_cost_at uses `effective_at <= business_date`,
     // so a business_date exactly equal to the earliest effective row
     // resolves successfully (no P0018).
     let pool = connect_test_db().await;
@@ -248,7 +248,7 @@ async fn business_date_at_effective_succeeds_boundary_inclusive() {
     .expect("seed boundary-effective standard");
 
     let cost: i64 = sqlx::query_scalar(
-        "SELECT resolve_standard_cost_at($1::UUID, '2026-04-01'::DATE)",
+        "SELECT _resolve_standard_cost_at($1::UUID, '2026-04-01'::DATE)",
     )
     .bind(&sku_id)
     .fetch_one(&pool)
@@ -265,7 +265,7 @@ async fn fixture_skus_resolve_via_migrated_standards() {
     reset_to_fixture(&pool).await;
 
     let cost: i64 = sqlx::query_scalar(
-        "SELECT resolve_standard_cost_at(s.id, '2026-04-15'::DATE)
+        "SELECT _resolve_standard_cost_at(s.id, '2026-04-15'::DATE)
            FROM skus s WHERE s.code = 'SKU-A'",
     )
     .fetch_one(&pool)

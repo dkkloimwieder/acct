@@ -1,7 +1,7 @@
 //! T5 — Conformance fixture (input/expected-output triples).
 //!
 //! Per doc Appendix B item 4: a wide table-driven semantic regression
-//! net for `post_transfers`. ~100 cases live in `tests/data/conformance.json`.
+//! net for `post_posting_lines`. ~100 cases live in `tests/data/conformance.json`.
 //! Each case names itself; on failure the harness reports which cases
 //! diverged from their declared expectation.
 //!
@@ -47,7 +47,7 @@ enum Precondition {
         location_code: String,
         qty: i64,
     },
-    PostTransfers {
+    PostPostingLines {
         events: Vec<EventInput>,
         #[serde(default)]
         override_closed_period: bool,
@@ -237,7 +237,7 @@ async fn apply_precondition(
         } => {
             seed_stock(pool, sku_code, location_code, *qty).await;
         }
-        Precondition::PostTransfers {
+        Precondition::PostPostingLines {
             events,
             override_closed_period,
         } => {
@@ -245,8 +245,8 @@ async fn apply_precondition(
             for ev in events {
                 built.push(build_event_json(pool, ev, idempotency_keys, rng).await);
             }
-            let result = call_post_transfers(pool, json!(built), *override_closed_period).await;
-            result.expect("post_transfers precondition");
+            let result = call_post_posting_lines(pool, json!(built), *override_closed_period).await;
+            result.expect("post_posting_lines precondition");
         }
     }
 }
@@ -305,7 +305,7 @@ async fn run_case(pool: &sqlx::PgPool, case: &Case) -> Result<(), String> {
         event_jsons.push(build_event_json(pool, ev, &mut idempotency_keys, &mut rng).await);
     }
     let batch_json = json!(event_jsons);
-    let result = call_post_transfers(pool, batch_json, case.override_closed_period).await;
+    let result = call_post_posting_lines(pool, batch_json, case.override_closed_period).await;
 
     match (&case.expected, &result) {
         (Expected::Ok { results, deltas }, Ok(actual)) => {
@@ -433,7 +433,7 @@ async fn run_split(pool: &sqlx::PgPool, case: &Case) -> SplitOutcome {
     let mut per_call = Vec::with_capacity(case.events.len());
     for ev in &case.events {
         let event_json = build_event_json(pool, ev, &mut idempotency_keys, &mut rng).await;
-        let r = call_post_transfers(pool, json!([event_json]), case.override_closed_period).await;
+        let r = call_post_posting_lines(pool, json!([event_json]), case.override_closed_period).await;
         match r {
             Ok(v) => per_call.push(Ok(v)),
             Err(e) => {

@@ -18,5 +18,5 @@ async fn qty_to_value_transfer_raises_p0002() {
     let key = fresh_uuid(&pool).await;
     let event = make_event("cycle_count_adj", cash, stock, 100, "2026-04-15", &key);
 
-    expect_sqlstate("P0002", || call_post_transfers(&pool, json!([event]), false)).await;
+    expect_sqlstate("P0002", || call_post_posting_lines(&pool, json!([event]), false)).await;
 }

@@ -1,6 +1,6 @@
 //! `acct-tzh` / `acct-75z.2` — proves the multi-class fix on wac_perpetual.
 //!
-//! Pre-0030 `_post_transfers_compute_amount` for `wac_perpetual` divided
+//! Pre-0030 `_post_posting_lines_compute_amount` for `wac_perpetual` divided
 //! `inv_value_<pool>.balance / stock_available.balance`. For a SKU with
 //! both `inv_value_raw` AND `inv_value_fg` open, `stock_available`
 //! pooled the qty across classes, inflating the divisor — unit cost
@@ -76,7 +76,7 @@ async fn seed_class(
     value_usd: i64,
     business_date: &str,
 ) {
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         pool,
         serde_json::json!([
             make_event("cycle_count_adj", qty_acct, void_qty, qty, business_date, &fresh_uuid(pool).await),
@@ -135,7 +135,7 @@ async fn perpetual_so_ship_uses_per_class_fg_avg_not_pooled() {
         "idempotency_key":   fresh_uuid(&pool).await,
         "posted_by":         "00000000-0000-0000-0000-0000000000bb",
     });
-    let _ = call_post_transfers(&pool, serde_json::json!([event]), false)
+    let _ = call_post_posting_lines(&pool, serde_json::json!([event]), false)
         .await
         .expect("so_ship");
 
@@ -179,7 +179,7 @@ async fn perpetual_scrap_from_raw_uses_per_class_raw_avg() {
         "idempotency_key":   fresh_uuid(&pool).await,
         "posted_by":         "00000000-0000-0000-0000-0000000000bb",
     });
-    let _ = call_post_transfers(&pool, serde_json::json!([event]), false)
+    let _ = call_post_posting_lines(&pool, serde_json::json!([event]), false)
         .await
         .expect("scrap");
 
@@ -228,7 +228,7 @@ async fn perpetual_raw_pool_avg_independent_of_fg_activity() {
         "idempotency_key":   fresh_uuid(&pool).await,
         "posted_by":         "00000000-0000-0000-0000-0000000000bb",
     });
-    let _ = call_post_transfers(&pool, serde_json::json!([event]), false)
+    let _ = call_post_posting_lines(&pool, serde_json::json!([event]), false)
         .await
         .expect("scrap");
 

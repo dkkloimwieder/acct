@@ -150,7 +150,7 @@ async fn open_account(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id,
              counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID,
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID,
                  $7::balance_direction)
          RETURNING id",
     )
@@ -272,7 +272,7 @@ async fn seed_fg(pool: &PgPool, s: &ShipScaffold, qty: i64, total_value: i64) {
          "idempotency_key":fresh_uuid(pool).await,
          "posted_by":posted_by},
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint)
         .execute(pool)
         .await
@@ -426,7 +426,7 @@ async fn happy_path_wac_sku_dispatcher_priced() {
          "amount":700,"qty":100,"business_date":"2026-04-15",
          "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by},
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint).execute(&pool).await.expect("seed");
 
     let lines = json!([{"so_line_id": so_line_id, "qty_shipped": 10}]);
@@ -457,8 +457,8 @@ async fn happy_path_wac_sku_dispatcher_priced() {
     // refactors can't silently break it.
     let cogs_acct = account_id_by_kind_currency(&pool, "cogs", Some("USD")).await;
     let (ledger_amount, ledger_qty): (i64, i64) = sqlx::query_as(
-        "SELECT amount, qty FROM transfers
-          WHERE document_kind = 'so_shipment'
+        "SELECT amount, qty FROM posting_lines
+          WHERE document_kind = 'so_ship'
             AND reason        = 'so_ship'
             AND debit_account_id  = $1
             AND credit_account_id = $2",

@@ -1,4 +1,4 @@
-//! T1 probes for `transfer_line_sources` (mig 0104, acct-wb75.1.1).
+//! T1 probes for `posting_line_sources` (mig 0104, acct-wb75.1.1).
 //! Phase B1 of the convergence plan (acct-wb75). Pin the table-level
 //! constraints — CHECK (not-all-NULL), CHECK (no-self-reversal),
 //! FK to transfers, PK uniqueness — so a regression in the schema
@@ -15,10 +15,10 @@ async fn one_transfer(pool: &PgPool) -> i64 {
     let revenue = account_id_by_kind_currency(pool, "revenue", Some("USD")).await;
     let key = fresh_uuid(pool).await;
     let event = make_event("ar_payment", cash, revenue, 100, "2026-04-15", &key);
-    call_post_transfers(pool, json!([event]), false)
+    call_post_posting_lines(pool, json!([event]), false)
         .await
         .expect("seed transfer");
-    sqlx::query_scalar("SELECT id FROM transfers WHERE idempotency_key = $1::UUID")
+    sqlx::query_scalar("SELECT id FROM posting_lines WHERE idempotency_key = $1::UUID")
         .bind(&key)
         .fetch_one(pool)
         .await
@@ -35,7 +35,7 @@ async fn all_null_extension_violates_check() {
     // Pure-NULL extension row is forbidden (CHECK 23514).
     expect_sqlstate("23514", || async {
         sqlx::query(
-            "INSERT INTO transfer_line_sources (transfer_id) VALUES ($1)",
+            "INSERT INTO posting_line_sources (posting_line_id) VALUES ($1)",
         )
         .bind(xfer)
         .execute(&pool)
@@ -51,11 +51,11 @@ async fn self_reversal_violates_check() {
 
     let xfer = one_transfer(&pool).await;
 
-    // reverses_transfer_id = transfer_id is rejected.
+    // reverses_posting_line_id = posting_line_id is rejected.
     expect_sqlstate("23514", || async {
         sqlx::query(
-            "INSERT INTO transfer_line_sources
-                (transfer_id, reverses_transfer_id) VALUES ($1, $1)",
+            "INSERT INTO posting_line_sources
+                (posting_line_id, reverses_posting_line_id) VALUES ($1, $1)",
         )
         .bind(xfer)
         .execute(&pool)
@@ -71,8 +71,8 @@ async fn unknown_transfer_id_fk_violation() {
 
     expect_sqlstate("23503", || async {
         sqlx::query(
-            "INSERT INTO transfer_line_sources
-                (transfer_id, created_by_process)
+            "INSERT INTO posting_line_sources
+                (posting_line_id, created_by_process)
              VALUES (999999999, 'test')",
         )
         .execute(&pool)
@@ -88,11 +88,11 @@ async fn unknown_reverses_transfer_id_fk_violation() {
 
     let xfer = one_transfer(&pool).await;
 
-    // reverses_transfer_id pointing to a nonexistent transfer → FK fail.
+    // reverses_posting_line_id pointing to a nonexistent transfer → FK fail.
     expect_sqlstate("23503", || async {
         sqlx::query(
-            "INSERT INTO transfer_line_sources
-                (transfer_id, reverses_transfer_id)
+            "INSERT INTO posting_line_sources
+                (posting_line_id, reverses_posting_line_id)
              VALUES ($1, 999999999)",
         )
         .bind(xfer)
@@ -110,8 +110,8 @@ async fn duplicate_transfer_id_violates_pk() {
     let xfer = one_transfer(&pool).await;
 
     sqlx::query(
-        "INSERT INTO transfer_line_sources
-            (transfer_id, created_by_process)
+        "INSERT INTO posting_line_sources
+            (posting_line_id, created_by_process)
          VALUES ($1, 'first')",
     )
     .bind(xfer)
@@ -121,8 +121,8 @@ async fn duplicate_transfer_id_violates_pk() {
 
     expect_sqlstate("23505", || async {
         sqlx::query(
-            "INSERT INTO transfer_line_sources
-                (transfer_id, created_by_process)
+            "INSERT INTO posting_line_sources
+                (posting_line_id, created_by_process)
              VALUES ($1, 'second')",
         )
         .bind(xfer)
@@ -145,8 +145,8 @@ async fn any_single_field_satisfies_not_all_null() {
 
     // process-only.
     sqlx::query(
-        "INSERT INTO transfer_line_sources
-            (transfer_id, created_by_process)
+        "INSERT INTO posting_line_sources
+            (posting_line_id, created_by_process)
          VALUES ($1, 'unit_test')",
     )
     .bind(x1)
@@ -156,8 +156,8 @@ async fn any_single_field_satisfies_not_all_null() {
 
     // reverses-only.
     sqlx::query(
-        "INSERT INTO transfer_line_sources
-            (transfer_id, reverses_transfer_id)
+        "INSERT INTO posting_line_sources
+            (posting_line_id, reverses_posting_line_id)
          VALUES ($1, $2)",
     )
     .bind(x2)
@@ -168,8 +168,8 @@ async fn any_single_field_satisfies_not_all_null() {
 
     // parent-doc-only.
     sqlx::query(
-        "INSERT INTO transfer_line_sources
-            (transfer_id, parent_document_id)
+        "INSERT INTO posting_line_sources
+            (posting_line_id, parent_document_id)
          VALUES ($1, gen_random_uuid())",
     )
     .bind(x3)
@@ -179,8 +179,8 @@ async fn any_single_field_satisfies_not_all_null() {
 
     // intercompany-pair-only.
     sqlx::query(
-        "INSERT INTO transfer_line_sources
-            (transfer_id, intercompany_pair_id)
+        "INSERT INTO posting_line_sources
+            (posting_line_id, intercompany_pair_id)
          VALUES ($1, gen_random_uuid())",
     )
     .bind(x4)
@@ -190,8 +190,8 @@ async fn any_single_field_satisfies_not_all_null() {
 
     // multi-field combination.
     sqlx::query(
-        "INSERT INTO transfer_line_sources
-            (transfer_id, reverses_transfer_id,
+        "INSERT INTO posting_line_sources
+            (posting_line_id, reverses_posting_line_id,
              parent_document_id, intercompany_pair_id, created_by_process)
          VALUES ($1, $2, gen_random_uuid(), gen_random_uuid(), 'multi')",
     )
@@ -202,7 +202,7 @@ async fn any_single_field_satisfies_not_all_null() {
     .unwrap();
 
     let n: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transfer_line_sources")
+        sqlx::query_scalar("SELECT COUNT(*) FROM posting_line_sources")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -222,19 +222,19 @@ async fn dispatcher_writes_extension_when_field_present() {
     event["created_by_process"] = json!("post_ar_payment");
     event["intercompany_pair_id"] = json!(ic_pair);
 
-    call_post_transfers(&pool, json!([event]), false)
+    call_post_posting_lines(&pool, json!([event]), false)
         .await
         .expect("post");
 
     let xfer: i64 =
-        sqlx::query_scalar("SELECT id FROM transfers WHERE idempotency_key = $1::UUID")
+        sqlx::query_scalar("SELECT id FROM posting_lines WHERE idempotency_key = $1::UUID")
             .bind(&key)
             .fetch_one(&pool)
             .await
             .unwrap();
 
     let proc: String = sqlx::query_scalar(
-        "SELECT created_by_process FROM transfer_line_sources WHERE transfer_id = $1",
+        "SELECT created_by_process FROM posting_line_sources WHERE posting_line_id = $1",
     )
     .bind(xfer)
     .fetch_one(&pool)
@@ -253,19 +253,19 @@ async fn dispatcher_skips_extension_when_no_fields_present() {
     let key = fresh_uuid(&pool).await;
     let event = make_event("ar_payment", cash, revenue, 100, "2026-04-15", &key);
     // No B1 extension fields on the event JSONB.
-    call_post_transfers(&pool, json!([event]), false)
+    call_post_posting_lines(&pool, json!([event]), false)
         .await
         .expect("post");
 
     let xfer: i64 =
-        sqlx::query_scalar("SELECT id FROM transfers WHERE idempotency_key = $1::UUID")
+        sqlx::query_scalar("SELECT id FROM posting_lines WHERE idempotency_key = $1::UUID")
             .bind(&key)
             .fetch_one(&pool)
             .await
             .unwrap();
 
     let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfer_line_sources WHERE transfer_id = $1",
+        "SELECT COUNT(*) FROM posting_line_sources WHERE posting_line_id = $1",
     )
     .bind(xfer)
     .fetch_one(&pool)
@@ -285,28 +285,28 @@ async fn dispatcher_writes_reverses_pointer() {
     // First transfer.
     let k1 = fresh_uuid(&pool).await;
     let e1 = make_event("ar_payment", cash, revenue, 100, "2026-04-15", &k1);
-    call_post_transfers(&pool, json!([e1]), false).await.unwrap();
+    call_post_posting_lines(&pool, json!([e1]), false).await.unwrap();
     let t1: i64 =
-        sqlx::query_scalar("SELECT id FROM transfers WHERE idempotency_key = $1::UUID")
+        sqlx::query_scalar("SELECT id FROM posting_lines WHERE idempotency_key = $1::UUID")
             .bind(&k1)
             .fetch_one(&pool)
             .await
             .unwrap();
 
-    // Reversing transfer (debit/credit swapped, reverses_transfer_id set).
+    // Reversing transfer (debit/credit swapped, reverses_posting_line_id set).
     let k2 = fresh_uuid(&pool).await;
     let mut e2 = make_event("ar_payment", revenue, cash, 100, "2026-04-15", &k2);
-    e2["reverses_transfer_id"] = json!(t1);
-    call_post_transfers(&pool, json!([e2]), false).await.unwrap();
+    e2["reverses_posting_line_id"] = json!(t1);
+    call_post_posting_lines(&pool, json!([e2]), false).await.unwrap();
     let t2: i64 =
-        sqlx::query_scalar("SELECT id FROM transfers WHERE idempotency_key = $1::UUID")
+        sqlx::query_scalar("SELECT id FROM posting_lines WHERE idempotency_key = $1::UUID")
             .bind(&k2)
             .fetch_one(&pool)
             .await
             .unwrap();
 
     let reversed: i64 = sqlx::query_scalar(
-        "SELECT reverses_transfer_id FROM transfer_line_sources WHERE transfer_id = $1",
+        "SELECT reverses_posting_line_id FROM posting_line_sources WHERE posting_line_id = $1",
     )
     .bind(t2)
     .fetch_one(&pool)

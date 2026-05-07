@@ -97,7 +97,7 @@ async fn worker_drains_seeded_outbox_with_one_failure() {
     .unwrap();
     assert_eq!(sample_committed, 0, "committed rows must have committed_at set");
 
-    let posted_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transfers")
+    let posted_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posting_lines")
         .fetch_one(&pool)
         .await
         .unwrap();

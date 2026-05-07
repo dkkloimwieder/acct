@@ -193,7 +193,7 @@ async fn build_scaffold(pool: &PgPool, label: &str) -> Scaffold {
              "posted_by":posted_by,
              "counterparty_id":cust_id},
         ]);
-        sqlx::query("SELECT post_transfers($1, FALSE)")
+        sqlx::query("SELECT post_posting_lines($1, FALSE)")
             .bind(mint)
             .execute(pool)
             .await
@@ -241,7 +241,7 @@ async fn build_scaffold(pool: &PgPool, label: &str) -> Scaffold {
              "idempotency_key":fresh_uuid(pool).await,
              "posted_by":posted_by},
         ]);
-        sqlx::query("SELECT post_transfers($1, FALSE)")
+        sqlx::query("SELECT post_posting_lines($1, FALSE)")
             .bind(mint)
             .execute(pool)
             .await
@@ -534,7 +534,7 @@ async fn property_idempotency_no_duplicate_transfer() {
     let key = fresh_uuid(&pool).await;
 
     let baseline_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transfers WHERE reason = 'ar_payment'")
+        sqlx::query_scalar("SELECT COUNT(*) FROM posting_lines WHERE reason = 'ar_payment'")
             .fetch_one(&pool)
             .await
             .expect("count");
@@ -544,7 +544,7 @@ async fn property_idempotency_no_duplicate_transfer() {
         .expect("first call");
 
     let after_first: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transfers WHERE reason = 'ar_payment'")
+        sqlx::query_scalar("SELECT COUNT(*) FROM posting_lines WHERE reason = 'ar_payment'")
             .fetch_one(&pool)
             .await
             .expect("count after first");
@@ -560,7 +560,7 @@ async fn property_idempotency_no_duplicate_transfer() {
     assert_eq!(id1, id2, "idempotent replay returns same id");
 
     let after_replay: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transfers WHERE reason = 'ar_payment'")
+        sqlx::query_scalar("SELECT COUNT(*) FROM posting_lines WHERE reason = 'ar_payment'")
             .fetch_one(&pool)
             .await
             .expect("count after replay");

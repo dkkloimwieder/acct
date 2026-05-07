@@ -3,7 +3,7 @@
 //! Three cases:
 //!   - Clean fixture → 0 alerts.
 //!   - Per-ledger double-entry imbalance (induced by direct UPDATE
-//!     bypassing post_transfers) → 1 `double_entry_imbalance` alert
+//!     bypassing post_posting_lines) → 1 `double_entry_imbalance` alert
 //!     with the expected payload.
 //!   - Reservation over-promise (induced by direct INSERT bypassing
 //!     reserve_inventory) → 1 `reservation_over_promise` alert.
@@ -36,7 +36,7 @@ async fn double_entry_imbalance_produces_alert() {
     reset_to_fixture(&pool).await;
 
     // Inject an imbalance into the value/USD ledger by directly
-    // updating cash USD's debits_total. This bypasses post_transfers
+    // updating cash USD's debits_total. This bypasses post_posting_lines
     // — exactly the kind of drift the recon job exists to detect.
     let cash = account_id_by_kind_currency(&pool, "cash", Some("USD")).await;
     sqlx::query("UPDATE accounts SET debits_total = debits_total + 100 WHERE id = $1")
@@ -52,7 +52,7 @@ async fn double_entry_imbalance_produces_alert() {
     assert_eq!(inserted, 1);
 
     let row: (String, serde_json::Value) = sqlx::query_as(
-        "SELECT alert_type, payload FROM reconciliation_alerts ORDER BY id DESC LIMIT 1",
+        "SELECT alert_kind, payload FROM reconciliation_alerts ORDER BY id DESC LIMIT 1",
     )
     .fetch_one(&pool)
     .await
@@ -94,7 +94,7 @@ async fn reservation_over_promise_produces_alert() {
     assert_eq!(inserted, 1);
 
     let row: (String, serde_json::Value) = sqlx::query_as(
-        "SELECT alert_type, payload FROM reconciliation_alerts ORDER BY id DESC LIMIT 1",
+        "SELECT alert_kind, payload FROM reconciliation_alerts ORDER BY id DESC LIMIT 1",
     )
     .fetch_one(&pool)
     .await

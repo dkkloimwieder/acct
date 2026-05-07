@@ -491,7 +491,7 @@ async fn snapshot_value_pools(pool: &PgPool, sku_id: &str) -> Vec<PoolSnap> {
              WHEN t.credit_account_id = a.id THEN -t.qty
            END), 0)::BIGINT AS net_qty
           FROM accounts a
-          LEFT JOIN transfers t
+          LEFT JOIN posting_lines t
             ON a.id IN (t.debit_account_id, t.credit_account_id)
            AND t.qty IS NOT NULL
          WHERE a.sku_id = $1::UUID
@@ -622,7 +622,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -674,7 +674,7 @@ async fn pool_signed_qty(pool: &PgPool, sku_id: &str, value_kind: &str) -> i64 {
                   WHEN t.credit_account_id = a.id THEN -t.qty
                 END), 0)::BIGINT
            FROM accounts a
-           LEFT JOIN transfers t
+           LEFT JOIN posting_lines t
              ON a.id IN (t.debit_account_id, t.credit_account_id)
             AND t.qty IS NOT NULL
           WHERE a.sku_id = $1::UUID

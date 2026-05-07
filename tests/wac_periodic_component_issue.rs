@@ -11,7 +11,7 @@
 //!   * Two WOs sharing the same wac_periodic component: drift accumulates
 //!     across both WOs.
 //!   * Mixed components in same BOM (one std + one wac_periodic): only the
-//!     wac side flags into transfers_provisional and gets recompute.
+//!     wac side flags into posting_lines_provisional and gets recompute.
 //!   * 3-tier chain: raw (wac_periodic) → WIP@op10 → WIP@op20 → FG.
 //!     Topological walk handles all 4 pools.
 //!   * Mixed parent/component cost methods raise P0026 (deferred to acct-7eo).
@@ -80,7 +80,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -136,7 +136,7 @@ async fn seed_pool(
           "amount": value, "qty": qty, "business_date": business_date,
           "idempotency_key": fresh_uuid(pool).await, "posted_by": posted_by },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(events)
         .execute(pool)
         .await
@@ -295,7 +295,7 @@ async fn open_component_raw(pool: &PgPool, comp: &str, raw_loc: &str) -> (i64, i
 ///   * Seed comp pool: 100 units @ $10 = $1000.
 ///   * Create WO qty_target=10 with comp×2/unit ⇒ adj_qty=20 at op10.
 ///   * post_wo_start: rm_issue at running avg $10 → value=$200. WIP@op10
-///     fills with $200. rm_issue's value-leg flagged into transfers_provisional.
+///     fills with $200. rm_issue's value-leg flagged into posting_lines_provisional.
 ///   * Mid-period: seed 100 more units @ $14 = $1400. Pool now 180 units / $2200.
 ///   * Complete WO. wo_complete_v drains WIP@op10 at running avg $20 (=$200/10)
 ///     to FG. Both rm_issue and wo_complete_v are flagged.
@@ -307,8 +307,8 @@ async fn open_component_raw(pool: &PgPool, comp: &str, raw_loc: &str) -> (i64, i
 ///       = $240. qty_in = 10. final_avg = $24.
 ///     - For wo_complete_v with credit=WIP@op10: provisional_unit = $200/10 = $20.
 ///       variance = (24 - 20) × 10 = $40. WIP source → single-leg pattern.
-///       variance > 0 → DR FG (orig_debit), CR variance_wac_period, amount=$40.
-///     - Net: FG +$40, variance_wac_period +$40 (ledger-balanced).
+///       variance > 0 → DR FG (orig_debit), CR variance_wac_periodic, amount=$40.
+///     - Net: FG +$40, variance_wac_periodic +$40 (ledger-balanced).
 #[tokio::test(flavor = "multi_thread")]
 async fn rm_issue_close_drift_propagates_to_leaf_via_cache() {
     let pool = connect_test_db().await;
@@ -323,7 +323,7 @@ async fn rm_issue_close_drift_propagates_to_leaf_via_cache() {
     let (wip_vals, fg_v) = open_parent_wip_fg(&pool, &parent, &fg_loc, &[10]).await;
     let wip10 = wip_vals[0];
 
-    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
     let var_wac_pre = balance(&pool, var_wac).await;
 
     seed_pool(&pool, raw_q, raw_v, 100, 1000, "2026-04-10").await;
@@ -349,17 +349,17 @@ async fn rm_issue_close_drift_propagates_to_leaf_via_cache() {
 
     close_period_force(&pool, pid, false).await.expect("close");
 
-    // After close: variance > 0 routes DR FG / CR variance_wac_period.
-    // FG: original $200 + $40 = $240; variance_wac_period balance -$40.
+    // After close: variance > 0 routes DR FG / CR variance_wac_periodic.
+    // FG: original $200 + $40 = $240; variance_wac_periodic balance -$40.
     assert_eq!(balance(&pool, var_wac).await - var_wac_pre, -40,
-               "variance_wac_period credited (decreases) on variance>0");
+               "variance_wac_periodic credited (decreases) on variance>0");
     assert_eq!(balance(&pool, fg_v).await, 240, "FG corrected to $240 = qty × final_chain_avg");
 
-    // rm_issue's TP row: variance_amount = 40, transfer_id NULL (internal).
+    // rm_issue's TP row: variance_amount = 40, posting_line_id NULL (internal).
     let (rm_var, rm_xfer_id): (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT p.variance_amount, p.variance_transfer_id
-           FROM transfers_provisional p
-           JOIN transfers t ON t.id = p.transfer_id
+        "SELECT p.variance_amount, p.variance_posting_line_id
+           FROM posting_lines_provisional p
+           JOIN posting_lines t ON t.id = p.posting_line_id
           WHERE t.reason = 'rm_issue_to_wo' AND t.amount = 200",
     )
     .fetch_one(&pool)
@@ -387,7 +387,7 @@ async fn two_wo_share_wac_periodic_component_drift_aggregates() {
     let (wip_vals, fg_v) = open_parent_wip_fg(&pool, &parent, &fg_loc, &[10]).await;
     let wip10 = wip_vals[0];
 
-    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
     let var_wac_pre = balance(&pool, var_wac).await;
 
     // Initial: 100 @ $10 = $1000. WO1 at $10.
@@ -433,16 +433,16 @@ async fn two_wo_share_wac_periodic_component_drift_aggregates() {
     // For each wo_complete_v (credit=WIP@op10):
     //   WO1 wo_complete_v: amount=$200, qty=10 → prov=$20, variance=(24-20)×10=$40. Leaf, post: FG +$40.
     //   WO2 wo_complete_v: amount=$240, qty=10 → prov=$24, variance=(24-24)×10=$0. No post.
-    // Total FG correction: +$40. variance_wac_period: -$40 (credited).
+    // Total FG correction: +$40. variance_wac_periodic: -$40 (credited).
     assert_eq!(balance(&pool, fg_v).await, fg_pre_close + 40);
     assert_eq!(balance(&pool, var_wac).await - var_wac_pre, -40);
 
     // Verify both rm_issues recorded variance, neither posted.
     let (n_internal, n_with_xfer): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*) FILTER (WHERE p.variance_transfer_id IS NULL),
-                COUNT(*) FILTER (WHERE p.variance_transfer_id IS NOT NULL)
-           FROM transfers_provisional p
-           JOIN transfers t ON t.id = p.transfer_id
+        "SELECT COUNT(*) FILTER (WHERE p.variance_posting_line_id IS NULL),
+                COUNT(*) FILTER (WHERE p.variance_posting_line_id IS NOT NULL)
+           FROM posting_lines_provisional p
+           JOIN posting_lines t ON t.id = p.posting_line_id
           WHERE t.reason = 'rm_issue_to_wo' AND p.finalized_at IS NOT NULL",
     )
     .fetch_one(&pool)
@@ -492,13 +492,13 @@ async fn mixed_std_and_wac_periodic_components_only_wac_flagged() {
     call_wo_complete(&pool, &wo, 10, &fresh_uuid(&pool).await).await.unwrap();
     // FG @ WIP avg = 250/10 = $25 → FG +$250. WIP=0.
 
-    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
     let var_wac_pre = balance(&pool, var_wac).await;
     let fg_pre = balance(&pool, fg_v).await;
 
     close_period_force(&pool, pid, false).await.expect("close");
 
-    // Std side: NO transfers_provisional rows for std component (component is standard).
+    // Std side: NO posting_lines_provisional rows for std component (component is standard).
     // WAC side rm_issue: variance=$40 internal-chain. WIP@op10 corrected_value_in = $50 + $200 + $40 = $290.
     // qty_in (parent's stock_wip per _wac_close_pool_qty_in) = 10.
     // WIP final_avg = $29. wo_complete_v provisional_unit = $250/10 = $25.
@@ -506,10 +506,10 @@ async fn mixed_std_and_wac_periodic_components_only_wac_flagged() {
     assert_eq!(balance(&pool, var_wac).await - var_wac_pre, -40);
     assert_eq!(balance(&pool, fg_v).await, fg_pre + 40);
 
-    // Verify std rm_issue NOT in transfers_provisional.
+    // Verify std rm_issue NOT in posting_lines_provisional.
     let std_flagged: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional p
-           JOIN transfers t ON t.id = p.transfer_id
+        "SELECT COUNT(*) FROM posting_lines_provisional p
+           JOIN posting_lines t ON t.id = p.posting_line_id
           WHERE t.reason = 'rm_issue_to_wo' AND t.credit_account_id = $1",
     )
     .bind(std_v)
@@ -519,8 +519,8 @@ async fn mixed_std_and_wac_periodic_components_only_wac_flagged() {
     assert_eq!(std_flagged, 0, "std component rm_issue unflagged");
 
     let wac_flagged: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional p
-           JOIN transfers t ON t.id = p.transfer_id
+        "SELECT COUNT(*) FROM posting_lines_provisional p
+           JOIN posting_lines t ON t.id = p.posting_line_id
           WHERE t.reason = 'rm_issue_to_wo' AND t.credit_account_id = $1",
     )
     .bind(wac_v)
@@ -547,7 +547,7 @@ async fn three_tier_chain_raw_to_wip10_to_wip20_to_fg() {
     let (wip_vals, fg_v) = open_parent_wip_fg(&pool, &parent, &fg_loc, &[10, 20]).await;
     let (wip10, wip20) = (wip_vals[0], wip_vals[1]);
 
-    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
     let var_wac_pre = balance(&pool, var_wac).await;
 
     seed_pool(&pool, raw_q, raw_v, 100, 1000, "2026-04-10").await;
@@ -585,17 +585,17 @@ async fn three_tier_chain_raw_to_wip10_to_wip20_to_fg() {
     // WIP20 corrected_value_in = $200 + $40 = $240. qty_in=10.
     //   final_avg = $24. wo_complete_v provisional_unit = $200/10 = $20.
     //   variance = (24-20)×10 = $40. LEAF (single-leg, FG side debit-normal).
-    //   FG +$40, variance_wac_period -$40 (credited on variance>0).
+    //   FG +$40, variance_wac_periodic -$40 (credited on variance>0).
     assert_eq!(balance(&pool, fg_v).await, fg_pre_close + 40);
     assert_eq!(balance(&pool, var_wac).await - var_wac_pre, -40);
 
     // Verify rm_issue + op_move_v are internal-chain; only wo_complete_v posts.
     let (rm_post, op_post, wc_post): (i64, i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*) FILTER (WHERE t.reason = 'rm_issue_to_wo' AND p.variance_transfer_id IS NOT NULL),
-                COUNT(*) FILTER (WHERE t.reason = 'op_move_v' AND p.variance_transfer_id IS NOT NULL),
-                COUNT(*) FILTER (WHERE t.reason = 'wo_complete_v' AND p.variance_transfer_id IS NOT NULL)
-           FROM transfers_provisional p
-           JOIN transfers t ON t.id = p.transfer_id
+        "SELECT COUNT(*) FILTER (WHERE t.reason = 'rm_issue_to_wo' AND p.variance_posting_line_id IS NOT NULL),
+                COUNT(*) FILTER (WHERE t.reason = 'op_move_v' AND p.variance_posting_line_id IS NOT NULL),
+                COUNT(*) FILTER (WHERE t.reason = 'wo_complete_v' AND p.variance_posting_line_id IS NOT NULL)
+           FROM posting_lines_provisional p
+           JOIN posting_lines t ON t.id = p.posting_line_id
           WHERE p.finalized_at IS NOT NULL",
     )
     .fetch_one(&pool)
@@ -654,7 +654,7 @@ async fn standard_parent_with_wac_periodic_component_routes_mixed_variance() {
     // Destination WIP NOT touched.
     let pid = period_id(&pool, "2026-04").await;
     let var_mix = account_id_by_kind_currency(&pool, "variance_material_mixed", Some("USD")).await;
-    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
     let pre_var_mix = balance(&pool, var_mix).await;
     let pre_var_wac = balance(&pool, var_wac).await;
     let pre_raw_v = balance(&pool, raw_v).await;
@@ -666,9 +666,9 @@ async fn standard_parent_with_wac_periodic_component_routes_mixed_variance() {
     // Mixed-case variance lands on variance_material_mixed (single-leg).
     assert_eq!(balance(&pool, var_mix).await - pre_var_mix, 20,
                "mixed-case variance posted to variance_material_mixed");
-    // Homogeneous variance_wac_period unchanged.
+    // Homogeneous variance_wac_periodic unchanged.
     assert_eq!(balance(&pool, var_wac).await - pre_var_wac, 0,
-               "variance_wac_period not touched for mixed case");
+               "variance_wac_periodic not touched for mixed case");
     // Raw component pool credited by variance — depleted to reflect $6 avg.
     assert_eq!(balance(&pool, raw_v).await - pre_raw_v, -20,
                "component pool credited by variance");
@@ -676,12 +676,12 @@ async fn standard_parent_with_wac_periodic_component_routes_mixed_variance() {
     assert_eq!(balance(&pool, wip10).await, pre_wip,
                "destination WIP untouched in mixed-case variance routing");
 
-    // Provisional row finalized with variance_transfer_id NOT NULL (leaf).
+    // Provisional row finalized with variance_posting_line_id NOT NULL (leaf).
     let (finalized_at, var_amount, var_xfer): (Option<String>, Option<i64>, Option<i64>) =
         sqlx::query_as(
-            "SELECT finalized_at::text, variance_amount, variance_transfer_id
-               FROM transfers_provisional p
-               JOIN transfers t ON t.id = p.transfer_id
+            "SELECT finalized_at::text, variance_amount, variance_posting_line_id
+               FROM posting_lines_provisional p
+               JOIN posting_lines t ON t.id = p.posting_line_id
               WHERE p.cost_method='wac_periodic' AND t.reason='rm_issue_to_wo'",
         )
         .fetch_one(&pool)
@@ -765,7 +765,7 @@ async fn single_wo_no_drift_all_variances_zero() {
 
     seed_pool(&pool, raw_q, raw_v, 100, 1000, "2026-04-10").await; // $10/unit
 
-    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
     let var_wac_pre = balance(&pool, var_wac).await;
 
     let wo = create_wo(&pool, "WO7", &parent, &fg_loc, 10).await;
@@ -789,7 +789,7 @@ async fn single_wo_no_drift_all_variances_zero() {
 
     // All TPs finalized with variance=0.
     let nonzero: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional p
+        "SELECT COUNT(*) FROM posting_lines_provisional p
           WHERE p.finalized_at IS NOT NULL AND p.variance_amount <> 0",
     )
     .fetch_one(&pool)

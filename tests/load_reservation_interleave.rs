@@ -14,7 +14,7 @@
 //!
 //! Both contend for the same `stock_available` row locks:
 //!
-//!   * `post_transfers` locks accounts in ascending-id order via
+//!   * `post_posting_lines` locks accounts in ascending-id order via
 //!     `FOR UPDATE` inside its transaction.
 //!   * `reserve_inventory` takes a single `FOR UPDATE` on the matching
 //!     `stock_available` row before reading promisable.
@@ -342,7 +342,7 @@ async fn reservation_interleave_workload() {
                 }
                 let batch = json!(events);
                 let t0 = Instant::now();
-                let res = call_post_transfers(&pool_w, batch, false).await;
+                let res = call_post_posting_lines(&pool_w, batch, false).await;
                 let dur_us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
                 latencies_us.push(dur_us);
                 match res {

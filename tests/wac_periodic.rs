@@ -2,7 +2,7 @@
 //!
 //! Acceptance scope (per the bd issue):
 //!   * Migration applies.
-//!   * wac_periodic depletion at running pool avg flags transfers_provisional.
+//!   * wac_periodic depletion at running pool avg flags posting_lines_provisional.
 //!   * wac_periodic empty-pool depletion raises P0006.
 //!   * wac_periodic WIP-class adjustment raises P0006 with epic-pointer.
 //!   * Period close lifecycle: receive twice + deplete + close → variance posted.
@@ -134,9 +134,9 @@ async fn wac_periodic_depletion_flags_provisional() {
         .expect("seed");
     assert_eq!(balance(&pool, val).await, 500);
 
-    // No transfers_provisional rows yet (receipt doesn't flag).
+    // No posting_lines_provisional rows yet (receipt doesn't flag).
     let pre_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transfers_provisional WHERE cost_method='wac_periodic'")
+        sqlx::query_scalar("SELECT COUNT(*) FROM posting_lines_provisional WHERE cost_method='wac_periodic'")
             .fetch_one(&pool)
             .await
             .expect("count");
@@ -150,7 +150,7 @@ async fn wac_periodic_depletion_flags_provisional() {
 
     // The depletion's value-leg should be flagged.
     let post_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transfers_provisional WHERE cost_method='wac_periodic'")
+        sqlx::query_scalar("SELECT COUNT(*) FROM posting_lines_provisional WHERE cost_method='wac_periodic'")
             .fetch_one(&pool)
             .await
             .expect("count");
@@ -158,7 +158,7 @@ async fn wac_periodic_depletion_flags_provisional() {
 
     // The flagged row's qty should be 30.
     let qty: i64 =
-        sqlx::query_scalar("SELECT qty FROM transfers_provisional WHERE cost_method='wac_periodic' LIMIT 1")
+        sqlx::query_scalar("SELECT qty FROM posting_lines_provisional WHERE cost_method='wac_periodic' LIMIT 1")
             .fetch_one(&pool)
             .await
             .expect("qty");
@@ -281,7 +281,7 @@ async fn wac_periodic_close_lifecycle_posts_variance() {
     // Provisional row finalized with zero variance.
     let (finalized_at, variance_amount): (Option<String>, Option<i64>) = sqlx::query_as(
         "SELECT finalized_at::text, variance_amount
-           FROM transfers_provisional
+           FROM posting_lines_provisional
           WHERE cost_method='wac_periodic' AND period_id=$1",
     )
     .bind(pid)
@@ -302,7 +302,7 @@ async fn wac_periodic_close_with_drift_posts_variance() {
     // receive 100 @ $9. Final period avg = (500 + 900) / 200 = 7.
     // Variance = (7 - 5) * 50 = 100. After close: pool should be 150 units
     // at avg 7, but only the depletion is re-costed; the pool gets the
-    // variance applied via routing through variance_wac_period.
+    // variance applied via routing through variance_wac_periodic.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
@@ -341,7 +341,7 @@ async fn wac_periodic_close_with_drift_posts_variance() {
 
     // Variance = (7 - 5) * 50 = 100.
     let variance_amount: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional
+        "SELECT variance_amount FROM posting_lines_provisional
           WHERE cost_method='wac_periodic' AND period_id=$1",
     )
     .bind(pid)
@@ -350,15 +350,15 @@ async fn wac_periodic_close_with_drift_posts_variance() {
     .expect("variance");
     assert_eq!(variance_amount, 100);
 
-    // The two-transfer pattern routes through variance_wac_period.
+    // The two-transfer pattern routes through variance_wac_periodic.
     // Net effect on the original pair (cogs/inv_adj_expense vs inv_value_fg)
     // is what we want to verify. inv_value_fg (the original credit side)
     // should now reflect: 1150 - 100 = 1050 (post-variance-routing).
     assert_eq!(balance(&pool, val).await, 1050);
 
-    // variance_wac_period should net to zero (two equal-and-opposite legs).
-    let var_acct = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
-    assert_eq!(balance(&pool, var_acct).await, 0, "variance_wac_period nets to zero");
+    // variance_wac_periodic should net to zero (two equal-and-opposite legs).
+    let var_acct = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
+    assert_eq!(balance(&pool, var_acct).await, 0, "variance_wac_periodic nets to zero");
 }
 
 #[tokio::test]
@@ -403,7 +403,7 @@ async fn wac_periodic_close_no_receipts_raises_p0020() {
     let void_val = account_id_by_kind_currency(&pool, "inv_adj_expense", Some("USD")).await;
 
     // Pre-seed in the 2026-04 period BUT we need to ensure no receipts
-    // remain when we deplete. Simpler: seed via post_transfers in 2026-04
+    // remain when we deplete. Simpler: seed via post_posting_lines in 2026-04
     // (counts as a receipt), then deplete, then DELETE the receipt rows
     // before close so the hook sees zero receipts.
     //
@@ -411,9 +411,9 @@ async fn wac_periodic_close_no_receipts_raises_p0020() {
     // before close, manually mark only the receipts as out-of-period.
     //
     // Cleanest: seed in 2026-04 as a regular receipt + depletion, then
-    // manually UPDATE transfers to push the receipt's business_date
+    // manually UPDATE posting_lines to push the receipt's business_date
     // outside the period. This isolates the hook's behavior.
-    let _ = call_post_transfers(
+    let _ = call_post_posting_lines(
         &pool,
         serde_json::json!([
             make_event("inventory_adjustment", qty_acct, void_qty, 50, "2026-04-05", &fresh_uuid(&pool).await),
@@ -432,19 +432,19 @@ async fn wac_periodic_close_no_receipts_raises_p0020() {
     // Move the receipt transfers out of the period so the hook sees zero
     // receipts. (This bypasses append-only normally, but for the test
     // we use a helper that disables the trigger.)
-    sqlx::query("ALTER TABLE transfers DISABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines DISABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool)
         .await
         .expect("disable trigger");
     sqlx::query(
-        "UPDATE transfers
+        "UPDATE posting_lines
             SET business_date = '2026-03-15'
           WHERE business_date = '2026-04-05'",
     )
     .execute(&pool)
     .await
     .expect("backdate");
-    sqlx::query("ALTER TABLE transfers ENABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines ENABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool)
         .await
         .expect("enable trigger");
@@ -470,7 +470,7 @@ async fn wac_periodic_close_no_receipts_raises_p0020() {
         .await
         .expect("force close");
     let still_unfin: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional
+        "SELECT COUNT(*) FROM posting_lines_provisional
           WHERE cost_method='wac_periodic' AND finalized_at IS NULL",
     )
     .fetch_one(&pool)
@@ -481,7 +481,7 @@ async fn wac_periodic_close_no_receipts_raises_p0020() {
 
 #[tokio::test]
 async fn wac_periodic_two_pass_engages_for_wac_periodic_in_batch() {
-    // post_transfers' two-pass path is engaged when wac_periodic events
+    // post_posting_lines' two-pass path is engaged when wac_periodic events
     // exist in the batch. Verify the lock-pre-scan picks up the qty
     // account so the running-avg read is consistent.
     let pool = connect_test_db().await;
@@ -496,7 +496,7 @@ async fn wac_periodic_two_pass_engages_for_wac_periodic_in_batch() {
         .expect("seed");
 
     // A so_ship cost-relevant event for a wac_periodic SKU should engage
-    // the two-pass path AND flag transfers_provisional.
+    // the two-pass path AND flag posting_lines_provisional.
     let cogs = account_id_by_kind_currency(&pool, "cogs", Some("USD")).await;
     let event = serde_json::json!({
         "reason":            "so_ship",
@@ -509,7 +509,7 @@ async fn wac_periodic_two_pass_engages_for_wac_periodic_in_batch() {
         "idempotency_key":   fresh_uuid(&pool).await,
         "posted_by":         "00000000-0000-0000-0000-0000000000bb",
     });
-    let _ = call_post_transfers(&pool, serde_json::json!([event]), false)
+    let _ = call_post_posting_lines(&pool, serde_json::json!([event]), false)
         .await
         .expect("so_ship");
 
@@ -518,7 +518,7 @@ async fn wac_periodic_two_pass_engages_for_wac_periodic_in_batch() {
 
     // The so_ship value-leg should be flagged.
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional
+        "SELECT COUNT(*) FROM posting_lines_provisional
           WHERE cost_method='wac_periodic'
             AND qty = 20",
     )

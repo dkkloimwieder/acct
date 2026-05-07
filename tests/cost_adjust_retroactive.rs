@@ -160,7 +160,7 @@ async fn queue_then_close_posts_variance_per_depletion() {
     let loc = loc_id(&pool, "MAIN").await;
     let val = account_id_for_selector(&pool, "inv_value_fg",
         Some("SKU-WAC"), Some("MAIN"), Some("USD"), None).await;
-    let var = account_id_by_kind_currency(&pool, "variance_cost_adjust_retro", Some("USD")).await;
+    let var = account_id_by_kind_currency(&pool, "variance_cost_adjust_retroactive", Some("USD")).await;
 
     receive_fg(&pool, &sku, &loc, 100, 6, "2026-04-05").await;
     deplete_fg(&pool, &sku, &loc, 50, "2026-04-15").await;
@@ -177,7 +177,7 @@ async fn queue_then_close_posts_variance_per_depletion() {
 
     // Variance: 50 × (7 - 6) = 50. Pool credited additional 50 → 300 - 50 = 250.
     assert_eq!(balance(&pool, val).await, 250);
-    assert_eq!(balance(&pool, var).await, 0, "variance_cost_adjust_retro nets to zero");
+    assert_eq!(balance(&pool, var).await, 0, "variance_cost_adjust_retroactive nets to zero");
 
     let total_var: i64 = sqlx::query_scalar(
         "SELECT total_variance FROM inventory_cost_adjustments_retroactive WHERE id = $1::UUID",
@@ -225,7 +225,7 @@ async fn zero_variance_no_op_records_finalized() {
 
     let sku = sku_id(&pool, "SKU-WAC").await;
     let loc = loc_id(&pool, "MAIN").await;
-    let var = account_id_by_kind_currency(&pool, "variance_cost_adjust_retro", Some("USD")).await;
+    let var = account_id_by_kind_currency(&pool, "variance_cost_adjust_retroactive", Some("USD")).await;
 
     receive_fg(&pool, &sku, &loc, 100, 5, "2026-04-05").await;
     deplete_fg(&pool, &sku, &loc, 30, "2026-04-10").await;
@@ -239,7 +239,7 @@ async fn zero_variance_no_op_records_finalized() {
 
     // No variance posted (target equals provisional).
     let xfer_count: i64 = sqlx::query_scalar(
-        "SELECT count(*)::BIGINT FROM transfers
+        "SELECT count(*)::BIGINT FROM posting_lines
           WHERE document_kind = 'cost_adjust_retroactive_close' AND document_id = $1::UUID",
     ).bind(&qid).fetch_one(&pool).await.expect("count");
     assert_eq!(xfer_count, 0);
@@ -453,9 +453,9 @@ async fn cost_adjust_retroactive_works_on_standard_sku() {
     let loc = loc_id(&pool, "MAIN").await;
     let val = account_id_for_selector(&pool, "inv_value_fg",
         Some("SKU-A"), Some("MAIN"), Some("USD"), None).await;
-    let var = account_id_by_kind_currency(&pool, "variance_cost_adjust_retro", Some("USD")).await;
+    let var = account_id_by_kind_currency(&pool, "variance_cost_adjust_retroactive", Some("USD")).await;
 
-    // post_inventory_adjustment for standard SKUs uses resolve_standard_cost_at;
+    // post_inventory_adjustment for standard SKUs uses _resolve_standard_cost_at;
     // do NOT pass unit_cost.
     let posted_by = fresh_uuid(&pool).await;
     let key = fresh_uuid(&pool).await;
@@ -524,22 +524,22 @@ async fn cost_adjust_retroactive_works_on_wac_periodic_double_correction() {
                "cost_adjust_retroactive finalized 1");
 
     // Both variance accumulators received activity.
-    let var_wp = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
-    let var_cr = account_id_by_kind_currency(&pool, "variance_cost_adjust_retro", Some("USD")).await;
+    let var_wp = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
+    let var_cr = account_id_by_kind_currency(&pool, "variance_cost_adjust_retroactive", Some("USD")).await;
     let wp_activity: i64 = sqlx::query_scalar(
         "SELECT (debits_total + credits_total)::BIGINT FROM accounts WHERE id = $1",
     ).bind(var_wp).fetch_one(&pool).await.expect("wp");
     let cr_activity: i64 = sqlx::query_scalar(
         "SELECT (debits_total + credits_total)::BIGINT FROM accounts WHERE id = $1",
     ).bind(var_cr).fetch_one(&pool).await.expect("cr");
-    assert!(wp_activity > 0, "variance_wac_period saw activity");
-    assert!(cr_activity > 0, "variance_cost_adjust_retro saw activity");
-    assert_eq!(balance(&pool, var_wp).await, 0, "variance_wac_period nets to 0");
-    assert_eq!(balance(&pool, var_cr).await, 0, "variance_cost_adjust_retro nets to 0");
+    assert!(wp_activity > 0, "variance_wac_periodic saw activity");
+    assert!(cr_activity > 0, "variance_cost_adjust_retroactive saw activity");
+    assert_eq!(balance(&pool, var_wp).await, 0, "variance_wac_periodic nets to 0");
+    assert_eq!(balance(&pool, var_cr).await, 0, "variance_cost_adjust_retroactive nets to 0");
 
     // Both document_kinds present in transfers.
     let kinds: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT document_kind::text FROM transfers
+        "SELECT DISTINCT document_kind::text FROM posting_lines
           WHERE document_kind IN ('wac_periodic_close', 'cost_adjust_retroactive_close')
           ORDER BY document_kind::text",
     ).fetch_all(&pool).await.expect("kinds");
@@ -559,7 +559,7 @@ async fn variance_cost_adjust_retro_nets_to_zero_per_close() {
 
     let sku = sku_id(&pool, "SKU-WAC").await;
     let loc = loc_id(&pool, "MAIN").await;
-    let var = account_id_by_kind_currency(&pool, "variance_cost_adjust_retro", Some("USD")).await;
+    let var = account_id_by_kind_currency(&pool, "variance_cost_adjust_retroactive", Some("USD")).await;
 
     receive_fg(&pool, &sku, &loc, 100, 5, "2026-04-05").await;
     deplete_fg(&pool, &sku, &loc, 30, "2026-04-10").await;
@@ -597,7 +597,7 @@ async fn variance_transfer_reason_and_doc_kind() {
 
     // Two variance transfers per processed depletion (2-transfer routing).
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT reason::text, document_kind::text FROM transfers
+        "SELECT reason::text, document_kind::text FROM posting_lines
           WHERE document_id = $1::UUID
           ORDER BY id",
     ).bind(&qid).fetch_all(&pool).await.expect("rows");

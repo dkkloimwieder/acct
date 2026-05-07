@@ -64,7 +64,7 @@ async fn open_account(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id,
              counterparty_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID, $7,
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID, $7,
                  $8::balance_direction)
          RETURNING id",
     )
@@ -178,7 +178,7 @@ async fn scaffold_wo_with_components(
          "business_date":"2026-04-15",
          "idempotency_key":fresh_uuid(pool).await,"posted_by":posted_by},
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint).execute(pool).await.expect("seed raw");
 
     // BOM with one component item line.
@@ -547,7 +547,7 @@ async fn wac_parent_nrv_credit_silently_skipped() {
          "amount":6000,"qty":100,"business_date":"2026-04-15",
          "idempotency_key":fresh_uuid(&pool).await,"posted_by":posted_by},
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint).execute(&pool).await.expect("seed raw");
 
     let bom_id = create_bom_header(&pool, parent_code).await;
@@ -633,7 +633,7 @@ async fn zero_actual_qty_records_full_yield_variance() {
 
     call_wo_complete(&pool, &wo.wo_id, 10).await;
 
-    // Qty leg skipped (actual_qty=0; post_transfers requires amount>0).
+    // Qty leg skipped (actual_qty=0; post_posting_lines requires amount>0).
     assert_eq!(balance(&pool, bp_qty).await, 0);
     // Value base posted +500 to bp_val; yield variance posted −500
     // → net bp_val = 0.

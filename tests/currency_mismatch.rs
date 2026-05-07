@@ -19,5 +19,5 @@ async fn cross_currency_value_transfer_raises_p0003() {
     let key = fresh_uuid(&pool).await;
     let event = make_event("ar_payment", cash_usd, cash_eur, 100, "2026-04-15", &key);
 
-    expect_sqlstate("P0003", || call_post_transfers(&pool, json!([event]), false)).await;
+    expect_sqlstate("P0003", || call_post_posting_lines(&pool, json!([event]), false)).await;
 }

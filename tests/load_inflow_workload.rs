@@ -11,7 +11,7 @@
 //!      unit_cost:1, amount:N}], ...)` — emits 1 event (ap_unsettled DR /
 //!      ap CR clearance).
 //!
-//! Per cycle: 2 doc-function calls → 3 post_transfers events. Latency
+//! Per cycle: 2 doc-function calls → 3 post_posting_lines events. Latency
 //! recorded is end-to-end (receipt start → bill commit).
 //!
 //! Setup pre-creates N vendors, one PO per vendor with one PO line

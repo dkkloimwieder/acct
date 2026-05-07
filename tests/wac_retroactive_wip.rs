@@ -80,7 +80,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -166,7 +166,7 @@ async fn pre_load_raw(pool: &PgPool, raw_qty: i64, raw_val: i64, qty: i64, value
           "amount": value, "qty": qty, "business_date": "2026-04-15",
           "idempotency_key": fresh_uuid(pool).await, "posted_by": posted_by },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(events)
         .execute(pool)
         .await
@@ -329,8 +329,8 @@ async fn wac_retroactive_single_op_clean() {
 
     // All flagged provisionals finalized with variance_amount=0.
     let unfinalized: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional p
-         JOIN transfers t ON t.id = p.transfer_id
+        "SELECT COUNT(*) FROM posting_lines_provisional p
+         JOIN posting_lines t ON t.id = p.posting_line_id
          WHERE p.cost_method = 'wac_retroactive' AND p.finalized_at IS NULL",
     )
     .fetch_one(&pool)
@@ -457,7 +457,7 @@ async fn standard_parent_wac_retroactive_component_routes_mixed_variance() {
           "amount": 700, "qty": 100, "business_date": "2026-04-10",
           "idempotency_key": fresh_uuid(&pool).await, "posted_by": posted_by },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(events)
         .execute(&pool).await.unwrap();
 
@@ -531,7 +531,7 @@ async fn wac_perpetual_parent_wac_retroactive_component_routes_mixed_variance() 
           "amount": 700, "qty": 100, "business_date": "2026-04-10",
           "idempotency_key": fresh_uuid(&pool).await, "posted_by": posted_by },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(events)
         .execute(&pool).await.unwrap();
 
@@ -618,7 +618,7 @@ async fn wac_retroactive_component_on_wac_retroactive_parent_clean() {
 
     // All wac_retroactive provisionals finalized.
     let unfinalized: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional
+        "SELECT COUNT(*) FROM posting_lines_provisional
          WHERE cost_method = 'wac_retroactive' AND finalized_at IS NULL",
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(unfinalized, 0);
@@ -674,7 +674,7 @@ async fn wac_retroactive_chronological_replay_late_receipt() {
           "idempotency_key": fresh_uuid(&pool).await, "posted_by": posted_by },
     ]);
     // Pre-period seed bypasses period-closed check (2026-03 is closed in the fixture).
-    sqlx::query("SELECT post_transfers($1, TRUE)").bind(pre_seed).execute(&pool).await.unwrap();
+    sqlx::query("SELECT post_posting_lines($1, TRUE)").bind(pre_seed).execute(&pool).await.unwrap();
 
     let bom = create_bom_header(&pool, &infra.parent_id).await;
     add_bom_item(&pool, bom, 1, 10, &comp, &infra.raw_loc, 2).await; // qty/p=2
@@ -703,7 +703,7 @@ async fn wac_retroactive_chronological_replay_late_receipt() {
           "amount": 400, "qty": 20, "business_date": "2026-04-05",
           "idempotency_key": fresh_uuid(&pool).await, "posted_by": posted_by },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)").bind(late).execute(&pool).await.unwrap();
+    sqlx::query("SELECT post_posting_lines($1, FALSE)").bind(late).execute(&pool).await.unwrap();
 
     // 4. Close 2026-04.
     let pid = period_id(&pool, "2026-04").await;

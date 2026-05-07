@@ -95,7 +95,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -244,7 +244,7 @@ async fn scaffold_component(
             "posted_by": posted_by,
         }
     ]);
-    call_post_transfers(pool, events, false)
+    call_post_posting_lines(pool, events, false)
         .await
         .expect("scaffold_component pre-stock");
 }
@@ -261,7 +261,7 @@ async fn balance(pool: &PgPool, account_id: i64) -> i64 {
 /// useful for "how many units were rm_issued for component X" assertions.
 async fn rm_issued_qty(pool: &PgPool, consumed_acct_id: i64) -> i64 {
     sqlx::query_scalar(
-        "SELECT COALESCE(SUM(qty), 0)::BIGINT FROM transfers
+        "SELECT COALESCE(SUM(qty), 0)::BIGINT FROM posting_lines
           WHERE debit_account_id = $1 AND qty IS NOT NULL",
     )
     .bind(consumed_acct_id)
@@ -387,7 +387,7 @@ async fn explode_one_level_phantom_flattens_into_parent() {
 // assembly — 5% loss is normal"). Build cost in WIP comes from ACTUAL
 // usage — emission and per-op flow are LITERAL (qty_per × p_qty ×
 // comp_std). If the floor consumes more than the BOM's literal qty,
-// the excess is a separate post_transfers call (an inventory
+// the excess is a separate post_posting_lines call (an inventory
 // adjustment or follow-up rm_issue_to_wo).
 //
 // skus.yield_mode picks how the parent's standard cost rollup treats
@@ -845,7 +845,7 @@ async fn partial_scrap_with_fired_per_lot_charge_absorbs_proportional_share() {
     //     op_move_v amount = 100 × std_cum_at_op10
     //     std_cum_at_op10 = parent SKU-A's std=100 BUT bom-driven cum
     //     is 0 (no per_unit at op10, no fired per_lot). Actually the
-    //     resolve_standard_cost_at(SKU-A) returns 100 (fixture seed)
+    //     _resolve_standard_cost_at(SKU-A) returns 100 (fixture seed)
     //     but our bom_lines compute has only op20 lines. std_cum_at_op10
     //     under new path = sum of per_unit at op<=10 = 0; sum of fired
     //     per_lot at op<=10 = 0 (none with fire_at=wo_start in this BOM).
@@ -1324,7 +1324,7 @@ async fn explode_phantom_recursion_limit_raises_p0032() {
 //
 // _wo_resolve_bom_for picks:
 //   - work_orders.bom_id if set (caller pin — bypasses effectivity/primary)
-//   - else bom_header_at(parent, alt=1, business_date) — the primary path,
+//   - else _bom_header_at(parent, alt=1, business_date) — the primary path,
 //     filtered by status='active' AND effective_at < business_date < obsolete_at
 //
 // post_wo_start's dispatch-by-existence check additionally requires a
@@ -1448,8 +1448,8 @@ async fn revisions_effective_date_picks_active_revision() {
     let bom_a = create_bom_header(&pool, "SKU-A").await;
     sqlx::query(
         "UPDATE bom_headers
-            SET effective_at='2026-01-01'::TIMESTAMPTZ,
-                obsolete_at='2026-06-01'::TIMESTAMPTZ
+            SET effective_at='2026-01-01'::DATE,
+                obsolete_at='2026-06-01'::DATE
           WHERE id=$1",
     )
     .bind(bom_a)
@@ -1465,7 +1465,7 @@ async fn revisions_effective_date_picks_active_revision() {
     let bom_b =
         create_bom_header_full(&pool, "SKU-A", 1, "B", false, "active", None).await;
     sqlx::query(
-        "UPDATE bom_headers SET effective_at='2026-06-01'::TIMESTAMPTZ WHERE id=$1",
+        "UPDATE bom_headers SET effective_at='2026-06-01'::DATE WHERE id=$1",
     )
     .bind(bom_b)
     .execute(&pool)
@@ -1473,7 +1473,7 @@ async fn revisions_effective_date_picks_active_revision() {
     .expect("set rev B effective_at");
     add_bom_item(&pool, bom_b, 1, 10, "PHX-REV-CB", "PHX-REV-RAW", 1, 100.0).await;
 
-    // Direct resolver assertions: bom_header_at filters status='active'
+    // Direct resolver assertions: _bom_header_at filters status='active'
     // and the effectivity window — does NOT filter is_primary, so both
     // revs are eligible per their own window.
     let parent_sku_a: String = sqlx::query_scalar("SELECT id::text FROM skus WHERE code='SKU-A'")
@@ -1481,7 +1481,7 @@ async fn revisions_effective_date_picks_active_revision() {
         .await
         .expect("SKU-A id");
     let resolved_a: i64 =
-        sqlx::query_scalar("SELECT (bom_header_at($1::UUID, 1, '2026-04-15'::DATE)).id")
+        sqlx::query_scalar("SELECT (_bom_header_at($1::UUID, 1, '2026-04-15'::DATE)).id")
             .bind(&parent_sku_a)
             .fetch_one(&pool)
             .await
@@ -1489,7 +1489,7 @@ async fn revisions_effective_date_picks_active_revision() {
     assert_eq!(resolved_a, bom_a, "2026-04-15 picks rev A by effective_at filter");
 
     let resolved_b: i64 =
-        sqlx::query_scalar("SELECT (bom_header_at($1::UUID, 1, '2026-07-15'::DATE)).id")
+        sqlx::query_scalar("SELECT (_bom_header_at($1::UUID, 1, '2026-07-15'::DATE)).id")
             .bind(&parent_sku_a)
             .fetch_one(&pool)
             .await
@@ -1579,7 +1579,7 @@ async fn bom_id_pin_overrides_default_picks_draft_bom() {
     )
     .await;
 
-    // Draft BOM (status='draft', is_primary=false). bom_header_at would
+    // Draft BOM (status='draft', is_primary=false). _bom_header_at would
     // skip this since it filters status='active'; but caller pins it
     // explicitly via work_orders.bom_id. _wo_resolve_bom_for honors
     // the pin without re-checking status — caller may legitimately
@@ -1674,7 +1674,7 @@ async fn eco_approval_happy_path_no_predecessor() {
     // 2026-04 period).
     let approved_by = fresh_uuid(&pool).await;
     sqlx::query(
-        "SELECT post_eco_approve($1, '2026-04-01 00:00:00+00'::TIMESTAMPTZ, $2::UUID)",
+        "SELECT post_eco_approve($1, '2026-04-01 00:00:00+00'::DATE, $2::UUID)",
     )
     .bind(eco_id)
     .bind(&approved_by)
@@ -1690,7 +1690,7 @@ async fn eco_approval_happy_path_no_predecessor() {
         bool,
     ) = sqlx::query_as(
         "SELECT status,
-                effective_at = '2026-04-01 00:00:00+00'::TIMESTAMPTZ,
+                effective_at = '2026-04-01'::DATE,
                 approved_by  = $2::UUID,
                 approved_at  IS NOT NULL
            FROM engineering_change_orders WHERE id = $1",
@@ -1707,7 +1707,7 @@ async fn eco_approval_happy_path_no_predecessor() {
 
     // bom_header now active with effective_at = ECO.effective_at.
     let (bom_status, bom_eff_match): (String, bool) = sqlx::query_as(
-        "SELECT status, effective_at = '2026-04-01 00:00:00+00'::TIMESTAMPTZ
+        "SELECT status, effective_at = '2026-04-01'::DATE
            FROM bom_headers WHERE id = $1",
     )
     .bind(bom_id)
@@ -1739,7 +1739,7 @@ async fn eco_obsoletes_prior_revision_then_new_rev_takes_over() {
     // Existing primary active rev A for SKU-A alt 1.
     let bom_a = create_bom_header(&pool, "SKU-A").await;
     sqlx::query(
-        "UPDATE bom_headers SET effective_at='2026-01-01'::TIMESTAMPTZ WHERE id=$1",
+        "UPDATE bom_headers SET effective_at='2026-01-01'::DATE WHERE id=$1",
     )
     .bind(bom_a)
     .execute(&pool)
@@ -1779,7 +1779,7 @@ async fn eco_obsoletes_prior_revision_then_new_rev_takes_over() {
     // Approve at T='2026-05-01' (covered by 2026-05 period).
     let approved_by = fresh_uuid(&pool).await;
     sqlx::query(
-        "SELECT post_eco_approve($1, '2026-05-01 00:00:00+00'::TIMESTAMPTZ, $2::UUID)",
+        "SELECT post_eco_approve($1, '2026-05-01 00:00:00+00'::DATE, $2::UUID)",
     )
     .bind(eco_id)
     .bind(&approved_by)
@@ -1789,7 +1789,7 @@ async fn eco_obsoletes_prior_revision_then_new_rev_takes_over() {
 
     // rev A: status='obsolete', obsolete_at = T.
     let (a_status, a_obs_match): (String, bool) = sqlx::query_as(
-        "SELECT status, obsolete_at = '2026-05-01 00:00:00+00'::TIMESTAMPTZ
+        "SELECT status, obsolete_at = '2026-05-01'::DATE
            FROM bom_headers WHERE id = $1",
     )
     .bind(bom_a)
@@ -1801,7 +1801,7 @@ async fn eco_obsoletes_prior_revision_then_new_rev_takes_over() {
 
     // rev B: status='active', effective_at = T.
     let (b_status, b_eff_match): (String, bool) = sqlx::query_as(
-        "SELECT status, effective_at = '2026-05-01 00:00:00+00'::TIMESTAMPTZ
+        "SELECT status, effective_at = '2026-05-01'::DATE
            FROM bom_headers WHERE id = $1",
     )
     .bind(bom_b)

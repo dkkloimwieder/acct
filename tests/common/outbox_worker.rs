@@ -1,13 +1,13 @@
 //! Outbox drain worker for the acct-tyq shape-G benchmark. Single-writer
 //! by design: callers spawn ONE task running `drain_loop`, which pulls
 //! pending rows from `ledger_outbox` in batches and drives them through
-//! `post_transfers`. Multi-worker variants are out of scope here — the
+//! `post_posting_lines`. Multi-worker variants are out of scope here — the
 //! ORDER BY id + FOR UPDATE SKIP LOCKED pattern is forward-compatible
 //! with multiple drainers (acct-dtv).
 //!
 //! Per-row error isolation uses sqlx nested transactions, which compile
 //! to PostgreSQL savepoints. Without the savepoint, a failing
-//! post_transfers (e.g. P0001 / 23514) would abort the entire batch tx
+//! post_posting_lines (e.g. P0001 / 23514) would abort the entire batch tx
 //! and force every previously-drained row in the iteration to be retried.
 
 use sqlx::{Acquire, PgPool, Row};
@@ -43,7 +43,7 @@ pub struct DrainStats {
     pub duration_ms: u64,
     /// Super-batch attempts (only nonzero in `super_batched_drain_loop`).
     pub super_batch_attempts: u64,
-    /// Super-batch successes — one `post_transfers` call committed N rows.
+    /// Super-batch successes — one `post_posting_lines` call committed N rows.
     pub super_batch_successes: u64,
     /// Super-batch failures — fell back to per-row drain for that batch.
     pub super_batch_fallbacks: u64,
@@ -115,7 +115,7 @@ async fn drain_one_batch(
 
         let mut sp = tx.begin().await?;
         let result: sqlx::Result<serde_json::Value> =
-            sqlx::query_scalar("SELECT post_transfers($1, $2)")
+            sqlx::query_scalar("SELECT post_posting_lines($1, $2)")
                 .bind(&events)
                 .bind(override_closed)
                 .fetch_one(&mut *sp)
@@ -169,7 +169,7 @@ async fn drain_one_batch(
 // ============================================================
 //
 // Variant of drain_loop that, on each iteration, attempts to commit ALL
-// drained rows via a SINGLE post_transfers call by concatenating their
+// drained rows via a SINGLE post_posting_lines call by concatenating their
 // event arrays. On success — one fsync, one set of FOR UPDATE acquires,
 // one function entry — recovers shape B's per-batch amortization. On
 // any error from the merged call, falls back to the per-row savepoint
@@ -177,7 +177,7 @@ async fn drain_one_batch(
 // per-row error attribution is preserved.
 //
 // Caveat: rows with mixed `override_closed_period` flags are split into
-// two super-batches (one per flag value), since `post_transfers`'s
+// two super-batches (one per flag value), since `post_posting_lines`'s
 // override is a single function argument applied uniformly across the
 // merged events. In Phase 0 our load workload always has override=false,
 // so the split rarely triggers.
@@ -289,7 +289,7 @@ async fn try_super_batch_or_fallback(
     stats.super_batch_attempts += 1;
     let mut sp = tx.begin().await?;
     let result: sqlx::Result<serde_json::Value> = sqlx::query_scalar(
-        "SELECT post_transfers($1, $2)",
+        "SELECT post_posting_lines($1, $2)",
     )
     .bind(&merged_value)
     .bind(override_flag)
@@ -321,11 +321,11 @@ async fn try_super_batch_or_fallback(
         Err(_) => {
             sp.rollback().await?;
             stats.super_batch_fallbacks += 1;
-            // Per-row fallback: each row gets its own savepoint + post_transfers.
+            // Per-row fallback: each row gets its own savepoint + post_posting_lines.
             for (id, events) in group {
                 let mut sp2 = tx.begin().await?;
                 let res: sqlx::Result<serde_json::Value> =
-                    sqlx::query_scalar("SELECT post_transfers($1, $2)")
+                    sqlx::query_scalar("SELECT post_posting_lines($1, $2)")
                         .bind(events)
                         .bind(override_flag)
                         .fetch_one(&mut *sp2)

@@ -176,8 +176,8 @@ CREATE TABLE bom_lines (
   applies_at_op       INT  NOT NULL CHECK (applies_at_op > 0),
   fire_at             TEXT NOT NULL DEFAULT 'op_arrival'
                       CHECK (fire_at IN ('wo_start', 'op_arrival')),
-  yield_pct           NUMERIC(5,2) NOT NULL DEFAULT 0
-                      CHECK (yield_pct >= 0 AND yield_pct < 100),
+  yield_pct           NUMERIC(5,2) NOT NULL DEFAULT 100
+                      CHECK (yield_pct > 0 AND yield_pct <= 100),
   component_sku_id    UUID REFERENCES skus(id),
   component_loc_id    UUID REFERENCES locations(id),
   qty_per_parent      BIGINT,

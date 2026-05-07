@@ -211,7 +211,7 @@ async fn no_op_records_audit_row_but_no_transfer() {
 
     // No cost_adjustment transfer was posted.
     let transfer_count: i64 = sqlx::query_scalar(
-        "SELECT count(*)::BIGINT FROM transfers
+        "SELECT count(*)::BIGINT FROM posting_lines
           WHERE document_id = $1::UUID AND reason = 'cost_adjustment'",
     )
     .bind(&doc_id)

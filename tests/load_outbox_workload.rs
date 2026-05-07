@@ -3,9 +3,9 @@
 //! Counterpart to `tests/load_realistic_workload.rs` (shape F). Same
 //! cross-account-spread workload (50 SKUs × 2 locations of bin_move
 //! traffic), same instrumentation. The ONLY difference: writers
-//! `INSERT INTO ledger_outbox` instead of calling `post_transfers`
+//! `INSERT INTO ledger_outbox` instead of calling `post_posting_lines`
 //! directly, and a single drain worker (acct-6hm) sequentially walks
-//! the queue and runs each row through `post_transfers`.
+//! the queue and runs each row through `post_posting_lines`.
 //!
 //! Two distinct latency families are captured per run:
 //!
@@ -26,7 +26,7 @@
 //!
 //! In an unbounded-writer / single-drainer setup, the queue grows
 //! whenever enqueue rate > drain rate, which is the common case here:
-//! INSERT is fast (~ms), `post_transfers` per-call is ~ms but executed
+//! INSERT is fast (~ms), `post_posting_lines` per-call is ~ms but executed
 //! sequentially by one worker. The headline metric we want is sustained
 //! **committed-events-per-sec** — i.e., the worker's drain rate during
 //! the run, NOT the time-to-drain-the-tail. After the writer phase, we

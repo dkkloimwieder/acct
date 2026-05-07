@@ -113,7 +113,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -407,7 +407,7 @@ async fn pre_load_raw(pool: &PgPool, wo: &Wo, qty_a: i64, qty_b: i64, value_a: i
           "idempotency_key": fresh_uuid(pool).await,
           "posted_by": posted_by },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint)
         .execute(pool)
         .await
@@ -883,7 +883,7 @@ async fn missing_routing_raises_p0026() {
 #[tokio::test]
 async fn missing_bom_raises_p0033() {
     // BOM2: no bom_header for parent → _wo_resolve_bom_for falls
-    // through bom_header_at, which raises P0033
+    // through _bom_header_at, which raises P0033
     // (bom_header_resolution_invalid). The pre-BOM2 P0029 path is
     // gone; per-spec migration has no boms / wo_routing_burdens.
     let pool = connect_test_db().await;
@@ -979,8 +979,8 @@ async fn applied_account_kind_no_mapping_raises_p0026() {
 #[tokio::test]
 async fn standard_component_without_std_cost_raises_p0018() {
     // Standard-cost component without a standard_costs row → P0018 from
-    // resolve_standard_cost_at. wac_perpetual components no longer go
-    // through resolve_standard_cost_at (acct-24b, mig 0066) — they hit
+    // _resolve_standard_cost_at. wac_perpetual components no longer go
+    // through _resolve_standard_cost_at (acct-24b, mig 0066) — they hit
     // P0010 'empty pool' instead, covered by a separate test below.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;

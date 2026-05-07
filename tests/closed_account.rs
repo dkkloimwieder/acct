@@ -1,4 +1,4 @@
-//! P0001 account_closed: post_transfers refuses any event whose
+//! P0001 account_closed: post_posting_lines refuses any event whose
 //! debit OR credit account has `is_closed = TRUE`. Closure is
 //! permanent (the account is never reopened — a new account is
 //! created instead).
@@ -27,5 +27,5 @@ async fn post_against_closed_account_raises_p0001() {
     let key = fresh_uuid(&pool).await;
     let event = make_event("ar_payment", cash, revenue, 100, "2026-04-15", &key);
 
-    expect_sqlstate("P0001", || call_post_transfers(&pool, json!([event]), false)).await;
+    expect_sqlstate("P0001", || call_post_posting_lines(&pool, json!([event]), false)).await;
 }

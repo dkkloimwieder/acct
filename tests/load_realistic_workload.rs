@@ -304,7 +304,7 @@ async fn realistic_workload_cross_account_spread() {
                 }
                 let batch = json!(events);
                 let t0 = Instant::now();
-                let res = call_post_transfers(&pool_w, batch, false).await;
+                let res = call_post_posting_lines(&pool_w, batch, false).await;
                 let dur_us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
                 latencies_us.push(dur_us);
                 match res {

@@ -149,8 +149,8 @@ async fn assert_audit_matches_cogs_for_latest_ship(
     for (line_id, qty_shipped, audit_unit_cost) in rows {
         let (ledger_amount, ledger_qty): (i64, i64) = sqlx::query_as(
             "SELECT amount, qty
-               FROM transfers
-              WHERE document_kind  = 'so_shipment'
+               FROM posting_lines
+              WHERE document_kind  = 'so_ship'
                 AND reason         = 'so_ship'
                 AND document_line_id = $1::UUID
                 AND debit_account_id  = $2
@@ -357,7 +357,7 @@ async fn do_receipt(
          "idempotency_key": uuid_for(label, step, "rcv_val"),
          "posted_by": posted_by},
     ]);
-    let r = common::call_post_transfers(pool, mint, false).await;
+    let r = common::call_post_posting_lines(pool, mint, false).await;
     r.unwrap_or_else(|e| panic!("[{label}/step {step}] receipt mint: {e}"));
 }
 
@@ -507,7 +507,7 @@ async fn open_account(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id,
              counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID,
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID,
                  $7::balance_direction)
          RETURNING id",
     )

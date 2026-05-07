@@ -152,7 +152,7 @@ async fn canonical_late_arrival_posts_variance() {
     );
 
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional WHERE cost_method='wac_retroactive'",
+        "SELECT variance_amount FROM posting_lines_provisional WHERE cost_method='wac_retroactive'",
     )
     .fetch_one(&pool)
     .await
@@ -196,7 +196,7 @@ async fn no_late_arrival_zero_variance() {
     .expect("close");
 
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional WHERE cost_method='wac_retroactive'",
+        "SELECT variance_amount FROM posting_lines_provisional WHERE cost_method='wac_retroactive'",
     )
     .fetch_one(&pool)
     .await
@@ -233,8 +233,8 @@ async fn multiple_depletions_each_at_their_running_avg() {
         .bind(pid).bind(&actor).fetch_one(&pool).await.expect("close");
 
     let variances: Vec<i64> = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional
-          WHERE cost_method='wac_retroactive' ORDER BY transfer_id")
+        "SELECT variance_amount FROM posting_lines_provisional
+          WHERE cost_method='wac_retroactive' ORDER BY posting_line_id")
         .fetch_all(&pool).await.unwrap();
     assert_eq!(variances, vec![0, 0],
         "no late arrivals → both depletions match perpetual chain");
@@ -272,7 +272,7 @@ async fn tied_business_date_replays_in_posted_at_order() {
         .bind(pid).bind(&actor).fetch_one(&pool).await.expect("close");
 
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional
+        "SELECT variance_amount FROM posting_lines_provisional
           WHERE cost_method='wac_retroactive'")
         .fetch_one(&pool).await.unwrap();
     // Replay order: receipt (2026-04-01) → depletion (2026-04-05 T0) →
@@ -311,13 +311,13 @@ async fn depletion_uses_pre_period_carry_forward() {
         .bind(&sku).bind(&loc_id).bind(&posted_by).bind(&key)
         .fetch_one(&pool).await.unwrap();
 
-    sqlx::query("ALTER TABLE transfers DISABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines DISABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool).await.unwrap();
     sqlx::query(
-        "UPDATE transfers SET business_date = '2026-03-15'
+        "UPDATE posting_lines SET business_date = '2026-03-15'
           WHERE business_date = '2026-04-01'")
         .execute(&pool).await.unwrap();
-    sqlx::query("ALTER TABLE transfers ENABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines ENABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool).await.unwrap();
 
     // In-period depletion (no in-period receipts).
@@ -330,7 +330,7 @@ async fn depletion_uses_pre_period_carry_forward() {
         .bind(pid).bind(&actor).fetch_one(&pool).await.expect("close");
 
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional
+        "SELECT variance_amount FROM posting_lines_provisional
           WHERE cost_method='wac_retroactive'")
         .fetch_one(&pool).await.unwrap();
     // Pre-period state: 100/$500. Depletion at avg=5. Recomputed=5. Variance=0.
@@ -393,15 +393,15 @@ async fn raw_and_fg_pools_replay_independently_one_sku() {
         .bind(pid).bind(&actor).fetch_one(&pool).await.expect("close");
 
     let raw_var: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_retroactive' AND t.credit_account_id = $1")
         .bind(v_raw).fetch_one(&pool).await.unwrap();
     assert_eq!(raw_var, 40, "raw class with late arrival → variance 40");
 
     let fg_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT COUNT(*) FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_retroactive' AND tp.variance_amount = 0")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(fg_count, 1, "fg class no late arrival → variance 0");
@@ -492,14 +492,14 @@ async fn retroactive_and_periodic_diverge_on_late_arrival() {
         .bind(pid).bind(&actor).fetch_one(&pool).await.expect("close");
 
     let p_variance: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
            JOIN accounts a ON a.id = t.credit_account_id
           WHERE tp.cost_method='wac_periodic' AND a.sku_id = $1::UUID")
         .bind(&p_sku).fetch_one(&pool).await.unwrap();
     let r_variance: i64 = sqlx::query_scalar(
-        "SELECT tp.variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT tp.variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
            JOIN accounts a ON a.id = t.credit_account_id
           WHERE tp.cost_method='wac_retroactive' AND a.sku_id = $1::UUID")
         .bind(&r_sku).fetch_one(&pool).await.unwrap();
@@ -549,13 +549,13 @@ async fn multi_period_chain_each_close_independent() {
         .bind(pid_may).bind(&actor).fetch_one(&pool).await.expect("close may");
 
     let april_var: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_retroactive' AND t.business_date < '2026-05-01'")
         .fetch_one(&pool).await.unwrap();
     let may_var: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method='wac_retroactive' AND t.business_date >= '2026-05-01'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(april_var, 0);
@@ -569,7 +569,7 @@ async fn multi_period_chain_each_close_independent() {
 #[tokio::test]
 async fn empty_period_no_provisional_rows() {
     // Period has receipts but no depletions. Hook returns 0; no
-    // variance posted; no transfers_provisional rows created.
+    // variance posted; no posting_lines_provisional rows created.
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
     let sku = insert_wac_retroactive_sku(&pool, "WACR-NODEP").await;
@@ -586,7 +586,7 @@ async fn empty_period_no_provisional_rows() {
     assert_eq!(summary["hook_results"]["wac_retroactive"].as_i64(), Some(0));
 
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM transfers_provisional WHERE cost_method='wac_retroactive'")
+        "SELECT COUNT(*) FROM posting_lines_provisional WHERE cost_method='wac_retroactive'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(count, 0);
 }
@@ -616,11 +616,11 @@ async fn no_p0020_when_only_pre_period_receipts() {
         .bind(&sku).bind(&loc_id).bind(&posted_by).bind(&key)
         .fetch_one(&pool).await.unwrap();
 
-    sqlx::query("ALTER TABLE transfers DISABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines DISABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool).await.unwrap();
-    sqlx::query("UPDATE transfers SET business_date = '2026-03-15' WHERE business_date = '2026-04-01'")
+    sqlx::query("UPDATE posting_lines SET business_date = '2026-03-15' WHERE business_date = '2026-04-01'")
         .execute(&pool).await.unwrap();
-    sqlx::query("ALTER TABLE transfers ENABLE TRIGGER trg_transfers_append_only")
+    sqlx::query("ALTER TABLE posting_lines ENABLE TRIGGER trg_posting_lines_append_only")
         .execute(&pool).await.unwrap();
 
     // In-period depletion only.
@@ -634,7 +634,7 @@ async fn no_p0020_when_only_pre_period_receipts() {
         .bind(pid).bind(&actor).fetch_one(&pool).await.expect("close");
 
     let variance: i64 = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional WHERE cost_method='wac_retroactive'")
+        "SELECT variance_amount FROM posting_lines_provisional WHERE cost_method='wac_retroactive'")
         .fetch_one(&pool).await.unwrap();
     // Pre-period: 100/$700, avg=7. Depletion at avg=7. Recomputed=7. Variance=0.
     assert_eq!(variance, 0);
@@ -693,8 +693,8 @@ async fn audit_row_records_finalized_state() {
 
     let (qty, finalized_at, variance, var_xfer): (i64, Option<String>, i64, Option<i64>) =
         sqlx::query_as(
-            "SELECT qty, finalized_at::text, variance_amount, variance_transfer_id
-               FROM transfers_provisional WHERE cost_method='wac_retroactive'")
+            "SELECT qty, finalized_at::text, variance_amount, variance_posting_line_id
+               FROM posting_lines_provisional WHERE cost_method='wac_retroactive'")
             .fetch_one(&pool).await.unwrap();
     assert_eq!(qty, 25);
     assert!(finalized_at.is_some());
@@ -703,7 +703,7 @@ async fn audit_row_records_finalized_state() {
 
     // Variance transfer carries reason=cost_restate, document_kind=wac_retroactive_close.
     let (reason, doc_kind): (String, String) = sqlx::query_as(
-        "SELECT reason::text, document_kind FROM transfers WHERE id = $1")
+        "SELECT reason::text, document_kind FROM posting_lines WHERE id = $1")
         .bind(var_xfer.unwrap()).fetch_one(&pool).await.unwrap();
     assert_eq!(reason, "cost_restate");
     assert_eq!(doc_kind, "wac_retroactive_close");

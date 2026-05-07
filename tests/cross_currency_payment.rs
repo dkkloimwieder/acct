@@ -76,7 +76,7 @@ async fn open_account(
 ) -> i64 {
     sqlx::query_scalar(
         "INSERT INTO accounts (kind, ledger_kind, currency, counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -151,7 +151,7 @@ async fn seed_ar(pool: &PgPool, customer_id: &str, currency: &str, amount: i64) 
           "idempotency_key":fresh_uuid(pool).await,
           "posted_by":posted_by,"counterparty_id":customer_id },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint)
         .execute(pool)
         .await
@@ -166,7 +166,7 @@ async fn mint_cash(pool: &PgPool, currency: &str, amount: i64) {
     let cash = account_id_by_kind_currency(pool, "cash", Some(currency)).await;
     let void_val = account_id_by_kind_currency(pool, "creation_void", Some(currency)).await;
     let posted_by = fresh_uuid(pool).await;
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(json!([
             { "reason":"cycle_count_adj","document_kind":"seed",
               "document_id":fresh_uuid(pool).await,
@@ -211,7 +211,7 @@ async fn seed_ap(pool: &PgPool, vendor_id: &str, currency: &str, amount: i64) ->
           "idempotency_key":fresh_uuid(pool).await,
           "posted_by":posted_by,"counterparty_id":vendor_id },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint)
         .execute(pool)
         .await

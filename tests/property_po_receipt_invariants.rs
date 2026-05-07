@@ -46,7 +46,7 @@ struct ReceiveOp {
 #[derive(Debug, Clone)]
 struct ScenarioParams {
     std_unit_cost: i64,    // po_line.unit_cost for the standard line
-    std_cost_at_bd: i64,   // resolve_standard_cost_at value
+    std_cost_at_bd: i64,   // _resolve_standard_cost_at value
     wac_unit_cost: i64,    // po_line.unit_cost for the wac line
     qty_ordered: i64,      // po_line.qty_ordered for both lines
     receipts: Vec<ReceiveOp>,
@@ -509,7 +509,7 @@ async fn open_account(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id,
              counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID,
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID,
                  $7::balance_direction)
          RETURNING id",
     )

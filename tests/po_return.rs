@@ -113,7 +113,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -1402,7 +1402,7 @@ async fn wac_at_receipt_then_standard_change_uses_snapshot_no_fake_ppv() {
     let var_post_receipt = balance(&pool, w.var_ppv).await;
 
     // Flip the WAC SKU to standard. It has no standard_costs row, so
-    // resolve_standard_cost_at would raise P0018 if invoked. The snapshot
+    // _resolve_standard_cost_at would raise P0018 if invoked. The snapshot
     // path avoids the call entirely.
     sqlx::query("UPDATE skus SET cost_method = 'standard' WHERE id = $1::UUID")
         .bind(&w.sku_id)
@@ -1415,7 +1415,7 @@ async fn wac_at_receipt_then_standard_change_uses_snapshot_no_fake_ppv() {
     assert_eq!(
         balance(&pool, w.var_ppv).await,
         var_post_receipt,
-        "wac→standard flip must not invoke resolve_standard_cost_at or fabricate PPV"
+        "wac→standard flip must not invoke _resolve_standard_cost_at or fabricate PPV"
     );
     assert_eq!(balance(&pool, w.qty_acct).await, 0);
     assert_eq!(balance(&pool, w.val_acct).await, 0);

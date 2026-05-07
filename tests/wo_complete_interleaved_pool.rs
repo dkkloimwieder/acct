@@ -78,7 +78,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -209,7 +209,7 @@ async fn seed_raw_pool(pool: &PgPool, raw_q: i64, raw_v: i64, qty: i64, value: i
           "amount": value, "qty": qty, "business_date": business_date,
           "idempotency_key": fresh_uuid(pool).await, "posted_by": posted_by },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(events)
         .execute(pool)
         .await
@@ -437,8 +437,8 @@ async fn wac_periodic_parent_two_wos_interleaved() {
     assert_eq!(balance(&pool, val20).await, 0);
 
     // Close hook: no drift in component pool; final_avg = $10 (raw) and
-    // $20 (WIP). All variances 0. variance_wac_period unchanged.
-    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    // $20 (WIP). All variances 0. variance_wac_periodic unchanged.
+    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
     let var_wac_pre = balance(&pool, var_wac).await;
     let actor = fresh_uuid(&pool).await;
     sqlx::query("SELECT close_period($1, $2::UUID, FALSE, FALSE)")

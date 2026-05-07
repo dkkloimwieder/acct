@@ -75,7 +75,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -172,7 +172,7 @@ async fn pre_load_raw(pool: &PgPool, raw_qty: i64, raw_val: i64, qty: i64, value
           "amount": value, "qty": qty, "business_date": "2026-04-15",
           "idempotency_key": fresh_uuid(pool).await, "posted_by": posted_by },
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(events)
         .execute(pool)
         .await
@@ -338,8 +338,8 @@ async fn wac_periodic_two_op_clean() {
 
     // Both op_move_v and wo_complete_v flagged.
     let flagged_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM transfers_provisional tp
-         JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT COUNT(*)::BIGINT FROM posting_lines_provisional tp
+         JOIN posting_lines t ON t.id = tp.posting_line_id
          WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
            AND t.reason IN ('op_move_v', 'wo_complete_v')",
     )
@@ -355,8 +355,8 @@ async fn wac_periodic_two_op_clean() {
     // No drift → all variances 0.
     let variances: Vec<(String, Option<i64>)> = sqlx::query_as(
         "SELECT t.reason::text, tp.variance_amount
-           FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+           FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
           ORDER BY t.id",
     )
@@ -403,11 +403,11 @@ async fn wac_periodic_two_op_clean() {
 ///
 ///   Posted:
 ///     op_move_v rows: variance_amount recorded, NO variance transfer
-///       (variance_transfer_id IS NULL). pool@op10/op20 untouched.
-///     WO1 wo_complete_v: dr fg / cr variance_wac_period $100 (single-leg).
-///     WO2 wo_complete_v: dr variance_wac_period / cr fg $100.
+///       (variance_posting_line_id IS NULL). pool@op10/op20 untouched.
+///     WO1 wo_complete_v: dr fg / cr variance_wac_periodic $100 (single-leg).
+///     WO2 wo_complete_v: dr variance_wac_periodic / cr fg $100.
 ///
-///   Final balances: FG = $200 + $400 + $100 − $100 = $600. variance_wac_period = 0.
+///   Final balances: FG = $200 + $400 + $100 − $100 = $600. variance_wac_periodic = 0.
 ///   Per-WO economics: WO1's 10 units cost $300 ($30/unit); WO2's 10 cost
 ///   $300 ($30/unit). Both at the period average.
 #[tokio::test(flavor = "multi_thread")]
@@ -468,9 +468,9 @@ async fn wac_periodic_two_op_drift_propagates_to_leaf() {
 
     // Inspect variances per row.
     let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT t.reason::text, tp.variance_amount, tp.variance_transfer_id
-           FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT t.reason::text, tp.variance_amount, tp.variance_posting_line_id
+           FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
           ORDER BY t.id",
     )
@@ -503,9 +503,9 @@ async fn wac_periodic_two_op_drift_propagates_to_leaf() {
     // FG: started $600, +$100 (WO1 wo_complete_v variance), -$100 (WO2) = $600.
     assert_eq!(balance(&pool, infra.fg_val_acct).await, 600, "FG balance preserved");
 
-    // variance_wac_period: net 0 for clean drift (no truncation residue).
-    let var_acct = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
-    assert_eq!(balance(&pool, var_acct).await, 0, "variance_wac_period net 0");
+    // variance_wac_periodic: net 0 for clean drift (no truncation residue).
+    let var_acct = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
+    assert_eq!(balance(&pool, var_acct).await, 0, "variance_wac_periodic net 0");
 }
 
 /// 3-op chain: cost shift propagates through three pools.
@@ -550,8 +550,8 @@ async fn wac_periodic_three_op_chain_clean() {
 
     let variances: Vec<(String, Option<i64>)> = sqlx::query_as(
         "SELECT t.reason::text, tp.variance_amount
-           FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+           FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
           ORDER BY t.id",
     )
@@ -591,9 +591,9 @@ async fn wac_periodic_three_op_chain_clean() {
 ///     $300, var = ($30-$40)*10 = -$100).
 ///   Pool@op30: same propagation; same result.
 ///   Leaf wo_complete_v: WO1 var +$100, WO2 var -$100. Posted to FG /
-///     variance_wac_period.
+///     variance_wac_periodic.
 ///
-///   FG: $200 + $400 + $100 - $100 = $600. variance_wac_period: 0.
+///   FG: $200 + $400 + $100 - $100 = $600. variance_wac_periodic: 0.
 ///   Pools at op10/op20/op30 unchanged by close (no internal posting).
 #[tokio::test(flavor = "multi_thread")]
 async fn wac_periodic_three_op_drift_propagates() {
@@ -649,9 +649,9 @@ async fn wac_periodic_three_op_drift_propagates() {
     assert_eq!(summary["hook_results"]["wac_periodic"].as_i64(), Some(6));
 
     let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT t.reason::text, tp.variance_amount, tp.variance_transfer_id
-           FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT t.reason::text, tp.variance_amount, tp.variance_posting_line_id
+           FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.cost_method = 'wac_periodic' AND tp.period_id = $1
           ORDER BY t.id",
     )
@@ -677,7 +677,7 @@ async fn wac_periodic_three_op_drift_propagates() {
         assert_eq!(&rows[i].0, reason, "row {} reason", i);
         assert_eq!(rows[i].1, Some(*var), "row {} variance", i);
         assert_eq!(rows[i].2.is_some(), *has_xfer,
-                   "row {} variance_transfer_id (op_move_v internal vs wo_complete_v leaf)", i);
+                   "row {} variance_posting_line_id (op_move_v internal vs wo_complete_v leaf)", i);
     }
 
     // Pool balances stay zero (no internal variance posted).
@@ -688,8 +688,8 @@ async fn wac_periodic_three_op_drift_propagates() {
     // FG: 600 + 100 - 100 = 600.
     assert_eq!(balance(&pool, infra.fg_val_acct).await, 600);
 
-    // variance_wac_period: net 0.
-    let var_acct = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
+    // variance_wac_periodic: net 0.
+    let var_acct = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
     assert_eq!(balance(&pool, var_acct).await, 0);
 }
 
@@ -795,7 +795,7 @@ async fn wac_periodic_mixed_with_standard() {
 
     // Only the wac_periodic WO's depletions flagged.
     let flagged_wac: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM transfers_provisional
+        "SELECT COUNT(*)::BIGINT FROM posting_lines_provisional
           WHERE cost_method = 'wac_periodic' AND period_id = $1",
     )
     .bind(pid)

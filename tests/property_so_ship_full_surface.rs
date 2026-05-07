@@ -512,7 +512,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID, $7::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID, $7::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -543,7 +543,7 @@ async fn ensure_account(
 ) -> i64 {
     if let Some(id) = sqlx::query_scalar::<_, i64>(
         "SELECT id FROM accounts
-          WHERE kind::text = $1 AND ledger_kind = $2
+          WHERE kind::text = $1 AND ledger_kind = $2::ledger_kind
             AND ((currency = $3) OR ($3 IS NULL AND currency IS NULL))
             AND ((sku_id = $4::UUID) OR ($4 IS NULL AND sku_id IS NULL))
             AND ((location_id = $5::UUID) OR ($5 IS NULL AND location_id IS NULL))
@@ -587,7 +587,7 @@ async fn seed_fg_pool(pool: &PgPool, qty_acct: i64, val_acct: i64, qty: i64, val
          "idempotency_key":fresh_uuid(pool).await,
          "posted_by":posted_by},
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(mint)
         .execute(pool)
         .await

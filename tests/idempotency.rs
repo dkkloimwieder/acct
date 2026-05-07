@@ -19,12 +19,12 @@ async fn duplicate_idempotency_key_skips_without_double_post() {
     let key = fresh_uuid(&pool).await;
     let event = make_event("ar_payment", cash, revenue, 500, "2026-04-15", &key);
 
-    let r1 = call_post_transfers(&pool, json!([event.clone()]), false)
+    let r1 = call_post_posting_lines(&pool, json!([event.clone()]), false)
         .await
         .expect("first post");
     assert_eq!(r1[0]["result"], "ok", "first call should be ok: {r1}");
 
-    let r2 = call_post_transfers(&pool, json!([event]), false)
+    let r2 = call_post_posting_lines(&pool, json!([event]), false)
         .await
         .expect("second post");
     assert_eq!(
@@ -33,7 +33,7 @@ async fn duplicate_idempotency_key_skips_without_double_post() {
     );
 
     let row_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transfers WHERE idempotency_key = $1::UUID")
+        sqlx::query_scalar("SELECT COUNT(*) FROM posting_lines WHERE idempotency_key = $1::UUID")
             .bind(&key)
             .fetch_one(&pool)
             .await

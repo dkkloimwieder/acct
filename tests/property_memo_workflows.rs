@@ -221,7 +221,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts (kind, ledger_kind, currency, sku_id, location_id,
                                 counterparty_id, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID,
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID,
                  $7::balance_direction) RETURNING id",
     )
     .bind(kind)
@@ -332,7 +332,7 @@ async fn build_scaffold(pool: &PgPool, label: &str) -> Scaffold {
         "posted_by":pby,
         "counterparty_id":customer_id
     }]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(ar_seed)
         .execute(pool)
         .await
@@ -349,7 +349,7 @@ async fn build_scaffold(pool: &PgPool, label: &str) -> Scaffold {
         "posted_by":pby,
         "counterparty_id":customer_id
     }]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(tax_seed)
         .execute(pool)
         .await
@@ -371,7 +371,7 @@ async fn build_scaffold(pool: &PgPool, label: &str) -> Scaffold {
          "business_date":"2026-04-15",
          "idempotency_key":fresh_uuid(pool).await,"posted_by":pby},
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(cust_ship_seed)
         .execute(pool)
         .await
@@ -396,7 +396,7 @@ async fn build_scaffold(pool: &PgPool, label: &str) -> Scaffold {
          "idempotency_key":fresh_uuid(pool).await,"posted_by":pby,
          "counterparty_id":vendor_id},
     ]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(ap_seed)
         .execute(pool)
         .await
@@ -414,7 +414,7 @@ async fn build_scaffold(pool: &PgPool, label: &str) -> Scaffold {
         "business_date":"2026-04-15",
         "idempotency_key":fresh_uuid(pool).await,"posted_by":pby
     }]);
-    sqlx::query("SELECT post_transfers($1, FALSE)")
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
         .bind(fg_seed)
         .execute(pool)
         .await

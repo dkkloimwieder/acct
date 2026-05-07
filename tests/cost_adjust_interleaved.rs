@@ -124,7 +124,7 @@ async fn open_account(
     sqlx::query_scalar(
         "INSERT INTO accounts
             (kind, ledger_kind, currency, sku_id, location_id, counterparty_id, routing_op, normal_side)
-         VALUES ($1::account_kind, $2, $3, $4::UUID, $5::UUID, $6::UUID, $7, $8::balance_direction)
+         VALUES ($1::account_kind, $2::ledger_kind, $3, $4::UUID, $5::UUID, $6::UUID, $7, $8::balance_direction)
          RETURNING id",
     )
     .bind(kind)
@@ -520,7 +520,7 @@ async fn wac_perpetual_cost_adjust_is_forward_only() {
     assert_eq!(balance(&pool, s.raw_val).await, 400);
 
     let dep1_value_amount: i64 = sqlx::query_scalar(
-        "SELECT amount FROM transfers
+        "SELECT amount FROM posting_lines
           WHERE document_id = $1::UUID AND credit_account_id = $2",
     )
     .bind(&dep1_id)
@@ -539,7 +539,7 @@ async fn wac_perpetual_cost_adjust_is_forward_only() {
 
     // D1's transfer record stands.
     let dep1_value_amount_after: i64 = sqlx::query_scalar(
-        "SELECT amount FROM transfers
+        "SELECT amount FROM posting_lines
           WHERE document_id = $1::UUID AND credit_account_id = $2",
     )
     .bind(&dep1_id)
@@ -551,7 +551,7 @@ async fn wac_perpetual_cost_adjust_is_forward_only() {
 
     // No revaluation transfer was posted referencing D1's document.
     let cost_restate_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM transfers
+        "SELECT COUNT(*)::BIGINT FROM posting_lines
           WHERE document_id = $1::UUID AND reason = 'cost_restate'",
     )
     .bind(&dep1_id)
@@ -612,7 +612,7 @@ async fn wac_perpetual_cost_adjust_idempotent_under_interleaved_load() {
 
     // Count cost_adjustment transfers against the audit row: 1 (single posting).
     let adj_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM transfers
+        "SELECT COUNT(*)::BIGINT FROM posting_lines
           WHERE document_id = $1::UUID AND reason = 'cost_adjustment'",
     )
     .bind(&id1)
@@ -703,8 +703,8 @@ async fn wac_periodic_cost_adjust_retro_interleaved_with_depletions() {
     let loc_id = fresh_location(&pool, "WACPER-RETRO-LOC").await;
     let _qty_acct = open_account(&pool, "stock_available", "qty", None, Some(&sku_id), Some(&loc_id), None, None, "debit").await;
     let fg_val = open_account(&pool, "inv_value_fg", "value", Some("USD"), Some(&sku_id), Some(&loc_id), None, None, "debit").await;
-    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_period", Some("USD")).await;
-    let var_retro = account_id_by_kind_currency(&pool, "variance_cost_adjust_retro", Some("USD")).await;
+    let var_wac = account_id_by_kind_currency(&pool, "variance_wac_periodic", Some("USD")).await;
+    let var_retro = account_id_by_kind_currency(&pool, "variance_cost_adjust_retroactive", Some("USD")).await;
 
     let pid = period_id(&pool, "2026-04").await;
 
@@ -769,10 +769,10 @@ async fn wac_periodic_cost_adjust_retro_interleaved_with_depletions() {
 
     // wac_periodic provisional row finalized state: D1 variance $30, D2 $0.
     let wac_variances: Vec<i64> = sqlx::query_scalar(
-        "SELECT variance_amount FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+        "SELECT variance_amount FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.period_id = $1 AND tp.cost_method = 'wac_periodic'
-          ORDER BY tp.transfer_id",
+          ORDER BY tp.posting_line_id",
     )
     .bind(pid)
     .fetch_all(&pool)
@@ -781,7 +781,7 @@ async fn wac_periodic_cost_adjust_retro_interleaved_with_depletions() {
     assert_eq!(wac_variances, vec![30, 0], "D1 +$30 drift, D2 zero");
 
     let unfinalized: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM transfers_provisional
+        "SELECT COUNT(*)::BIGINT FROM posting_lines_provisional
           WHERE period_id = $1 AND finalized_at IS NULL",
     )
     .bind(pid)
@@ -844,8 +844,8 @@ async fn wac_periodic_retro_multi_class_independent_close() {
 
     let raw_var_total: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(variance_amount),0)::BIGINT
-           FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+           FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.period_id = $1 AND tp.cost_method = 'wac_periodic'
             AND t.credit_account_id = $2",
     )
@@ -856,8 +856,8 @@ async fn wac_periodic_retro_multi_class_independent_close() {
     .unwrap();
     let fg_var_total: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(variance_amount),0)::BIGINT
-           FROM transfers_provisional tp
-           JOIN transfers t ON t.id = tp.transfer_id
+           FROM posting_lines_provisional tp
+           JOIN posting_lines t ON t.id = tp.posting_line_id
           WHERE tp.period_id = $1 AND tp.cost_method = 'wac_periodic'
             AND t.credit_account_id = $2",
     )
