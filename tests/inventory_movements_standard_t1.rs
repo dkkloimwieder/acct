@@ -313,13 +313,13 @@ async fn po_receipt_with_ppv_keeps_subledger_at_standard() {
 // ============================================================
 
 #[tokio::test]
-async fn wac_sku_does_not_write_movement_yet() {
+async fn fifo_sku_does_not_write_movement() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    // SKU-WAC is wac_perpetual. Scaffold a receipt; D-block must skip
-    // (D3 will lift the gate for WAC).
-    let sku: String = sqlx::query_scalar("SELECT id::text FROM skus WHERE code = 'SKU-WAC'")
+    // FIFO is still blocked at dispatcher level (P0006); the receipt
+    // never reaches apply_event. SKU-FIF accounts are in the fixture.
+    let sku: String = sqlx::query_scalar("SELECT id::text FROM skus WHERE code = 'SKU-FIF'")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -327,41 +327,30 @@ async fn wac_sku_does_not_write_movement_yet() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let vendor = fresh_vendor(&pool, "VEND-WAC-D2", "USD").await;
+    let vendor = fresh_vendor(&pool, "VEND-FIF-D2", "USD").await;
     let po = fresh_po(&pool, &vendor).await;
-    let po_line = fresh_po_line(&pool, &po, 1, &sku, &loc, 5, 200, "USD").await;
+    let po_line = fresh_po_line(&pool, &po, 1, &sku, &loc, 5, 50, "USD").await;
     open_account(&pool, "vendor_pool", "qty", None, Some(&vendor), "credit").await;
     open_account(&pool, "ap_unsettled", "value", Some("USD"), Some(&vendor), "credit").await;
     open_account(&pool, "ap", "value", Some("USD"), Some(&vendor), "credit").await;
 
     let key = fresh_uuid(&pool).await;
     let lines = json!([{ "po_line_id": po_line, "qty_received": 5 }]);
-    call_receipt(&pool, &po, lines, "2026-04-15", &key)
-        .await
-        .expect("wac receipt");
-
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM inventory_movements")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        count, 0,
-        "WAC SKUs are deferred to D3; D2 must NOT write movements for them"
+    let result = call_receipt(&pool, &po, lines, "2026-04-15", &key).await;
+    assert!(
+        result.is_err(),
+        "FIFO must raise P0006 at dispatcher (Phase E ships the implementation)"
     );
 
-    // Sanity: posting_line_inventory still wrote (Phase C is method-agnostic).
-    let pli_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM posting_line_inventory pli
-           JOIN posting_lines pl ON pl.id = pli.posting_line_id
-          WHERE pli.cost_method_at_event = 'wac_perpetual'",
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM inventory_movements
+          WHERE product_id = $1::UUID",
     )
+    .bind(&sku)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(
-        pli_count > 0,
-        "Phase C extension still writes for WAC; got {pli_count}"
-    );
+    assert_eq!(count, 0, "FIFO blocked at dispatcher; no movement");
 }
 
 // ============================================================

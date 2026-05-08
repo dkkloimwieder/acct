@@ -1,0 +1,6 @@
+-- Best-effort down (project convention).
+--
+-- Reverts the cost_method gate in `_post_posting_lines_apply_event`
+-- back to standard-only. In practice, full unwind requires wipe +
+-- reapply since the body is a CREATE OR REPLACE on a body that has
+-- accumulated through multiple migrations.
