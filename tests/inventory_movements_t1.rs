@@ -497,21 +497,22 @@ async fn rollover_helper_is_idempotent() {
 }
 
 // ============================================================
-// D2 / D3 / D4 / D5 are not yet wired — confirming the table is
-// EMPTY after a normal seed + posting flow. This is the regression
-// gate that catches accidental dispatcher writes before they're
-// sanctioned.
+// Dispatcher gate: qty-only posts do NOT write to the subledger.
+//
+// inventory_movements is the cost-flow subledger; only value-leg
+// posts on inventory accounts contribute. cycle_count_adj on the
+// qty ledger (stock_available ↔ creation_void) is a quantity-only
+// adjustment with no value flow, so the apply_event D-block (mig
+// 0026) deliberately skips it. Phase C still writes
+// posting_line_inventory because that extension tracks qty per-
+// posting; the value-leg subledger has stricter gates.
 // ============================================================
 
 #[tokio::test]
-async fn dispatcher_does_not_write_yet() {
+async fn qty_leg_posts_do_not_write_movement() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    // Run a normal posting that DOES produce a posting_line_inventory
-    // row (Phase C is wired). After D1 ships, inventory_movements
-    // should still be empty — D2 wires the dispatcher. This test
-    // intentionally fails when D2 lands and is rewritten there.
     let _ = stage_posting_line(&pool, "SKU-A", 5).await;
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM inventory_movements")
@@ -520,11 +521,11 @@ async fn dispatcher_does_not_write_yet() {
         .unwrap();
     assert_eq!(
         count, 0,
-        "D1 ships schema only; dispatcher integration is D2/D3 — \
-         this test will need to be rewritten when D2 lands"
+        "qty-leg cycle_count_adj has no value flow; D-block must skip"
     );
 
-    // Sanity: the posting_line_inventory row from C1 IS present.
+    // Sanity: the posting_line_inventory row from C1 IS present —
+    // C extension writes for any qty-bearing inventory posting.
     let pli_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM posting_line_inventory")
             .fetch_one(&pool)
