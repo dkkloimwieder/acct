@@ -370,56 +370,5 @@ async fn wac_periodic_receipt_writes_movement_and_keeps_provisional_lifecycle() 
     );
 }
 
-// ============================================================
-// FIFO SKU still blocked
-// ============================================================
-
-#[tokio::test]
-async fn fifo_sku_still_blocks_at_dispatcher_no_movement_written() {
-    let pool = connect_test_db().await;
-    reset_to_fixture(&pool).await;
-
-    // SKU-FIF is in the fixture at cost_method='fifo'; dispatcher
-    // raises P0006 before reaching apply_event. So no movement and
-    // no posting_line should land.
-    // SKU-FIF accounts are in the fixture (stock_available, inv_value_raw).
-    let sku: String = sqlx::query_scalar("SELECT id::text FROM skus WHERE code = 'SKU-FIF'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-    let vendor = fresh_vendor(&pool, "VEND-FIF-D3", "USD").await;
-    let po = fresh_po(&pool, &vendor).await;
-    let loc: String = sqlx::query_scalar("SELECT id::text FROM locations WHERE code = 'MAIN'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let po_line = fresh_po_line(&pool, &po, 1, &sku, &loc, 5, 50, "USD").await;
-    open_account(&pool, "vendor_pool", "qty", None, Some(&vendor), "credit").await;
-    open_account(&pool, "ap_unsettled", "value", Some("USD"), Some(&vendor), "credit").await;
-    open_account(&pool, "ap", "value", Some("USD"), Some(&vendor), "credit").await;
-
-    expect_sqlstate("P0006", || async {
-        let key = fresh_uuid(&pool).await;
-        call_receipt(
-            &pool,
-            &po,
-            json!([{ "po_line_id": po_line, "qty_received": 5 }]),
-            "2026-04-15",
-            &key,
-        )
-        .await
-        .map(|_| ())
-    })
-    .await;
-
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM inventory_movements
-          WHERE product_id = $1::UUID",
-    )
-    .bind(&sku)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 0, "FIFO blocked at dispatcher; no movement");
-}
+// FIFO via post_po_receipt is now supported (Phase E1.2 + W1 acct-t1sc).
+// The end-to-end positive path is covered by tests/fifo_po_receipt_t1.rs.

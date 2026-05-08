@@ -308,50 +308,8 @@ async fn po_receipt_with_ppv_keeps_subledger_at_standard() {
     assert_eq!(ppv_total, 50, "variance_ppv = 5 × (110 - 100) = 50");
 }
 
-// ============================================================
-// Cost-method gate
-// ============================================================
-
-#[tokio::test]
-async fn fifo_sku_does_not_write_movement() {
-    let pool = connect_test_db().await;
-    reset_to_fixture(&pool).await;
-
-    // FIFO is still blocked at dispatcher level (P0006); the receipt
-    // never reaches apply_event. SKU-FIF accounts are in the fixture.
-    let sku: String = sqlx::query_scalar("SELECT id::text FROM skus WHERE code = 'SKU-FIF'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let loc: String = sqlx::query_scalar("SELECT id::text FROM locations WHERE code = 'MAIN'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let vendor = fresh_vendor(&pool, "VEND-FIF-D2", "USD").await;
-    let po = fresh_po(&pool, &vendor).await;
-    let po_line = fresh_po_line(&pool, &po, 1, &sku, &loc, 5, 50, "USD").await;
-    open_account(&pool, "vendor_pool", "qty", None, Some(&vendor), "credit").await;
-    open_account(&pool, "ap_unsettled", "value", Some("USD"), Some(&vendor), "credit").await;
-    open_account(&pool, "ap", "value", Some("USD"), Some(&vendor), "credit").await;
-
-    let key = fresh_uuid(&pool).await;
-    let lines = json!([{ "po_line_id": po_line, "qty_received": 5 }]);
-    let result = call_receipt(&pool, &po, lines, "2026-04-15", &key).await;
-    assert!(
-        result.is_err(),
-        "FIFO must raise P0006 at dispatcher (Phase E ships the implementation)"
-    );
-
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::BIGINT FROM inventory_movements
-          WHERE product_id = $1::UUID",
-    )
-    .bind(&sku)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 0, "FIFO blocked at dispatcher; no movement");
-}
+// FIFO via post_po_receipt is supported as of W1 (acct-t1sc, mig 0034).
+// Positive cost-flow assertions live in tests/fifo_po_receipt_t1.rs.
 
 // ============================================================
 // Non-inventory postings — must not write

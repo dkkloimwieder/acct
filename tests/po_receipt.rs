@@ -549,17 +549,22 @@ async fn scaffold_skua_with_code(
     }
 }
 
+// FIFO via post_po_receipt is supported as of W1 (acct-t1sc, mig 0034);
+// see tests/fifo_po_receipt_t1.rs for the positive path. 'lot' remains
+// the only un-implemented value and still raises P0006 (acct-uze).
 #[tokio::test]
-async fn fifo_sku_raises_p0006() {
+async fn lot_sku_raises_p0006() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
-    // SKU-FIF (fifo cost_method) is in the fixture but has no value account.
-    // Make one + vendor scaffold so the function gets to the cost_method
-    // dispatch, which raises P0006.
+    // Promote SKU-FIF to 'lot' for this test (no 'lot' SKU in fixture).
+    sqlx::query("UPDATE skus SET cost_method = 'lot' WHERE code = 'SKU-FIF'")
+        .execute(&pool)
+        .await
+        .unwrap();
     let sku = id_text(&pool, "SELECT id::text FROM skus WHERE code = $1", "SKU-FIF").await;
     let loc = id_text(&pool, "SELECT id::text FROM locations WHERE code = $1", "MAIN").await;
-    let vendor = fresh_vendor(&pool, "SUPP-FIF", "USD").await;
+    let vendor = fresh_vendor(&pool, "SUPP-LOT", "USD").await;
     let po = fresh_po(&pool, &vendor).await;
     let line = fresh_po_line(&pool, &po, 1, &sku, &loc, 10, 100, "USD").await;
     let _ = open_account(

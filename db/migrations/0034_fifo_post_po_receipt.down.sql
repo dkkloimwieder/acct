@@ -1,0 +1,4 @@
+-- Best-effort down (project convention).
+-- Reverting the function body across phases is wider than this
+-- migration's scope; CREATE OR REPLACE on a wipe-and-reapply
+-- naturally rebuilds the prior body via mig 0016.
