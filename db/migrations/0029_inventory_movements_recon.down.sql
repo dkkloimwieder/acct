@@ -1,0 +1,5 @@
+-- Best-effort down (project convention).
+--
+-- Reverting check #7 alone would require restoring the prior
+-- run_daily_reconciliation body without the check. wipe + reapply
+-- is the clean path.
