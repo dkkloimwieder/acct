@@ -344,35 +344,29 @@ Each phase below specifies the 9 fields per the plan: **prerequisites / delivera
 - *Rollback.* `0019_posting_line_extensions.down.sql` drops the table; the consolidated `_post_posting_lines_apply_event` body in `0014` writes the extension row only when fields are present, so a missing extension table simply means those fields go unwritten.
 - *Stop-point — REACHED.* Tests pass; ci-check clean; closed acct-wb75.1.1.
 
-**B2 — `posting_line_currencies` extension + functional-currency model.**
+**B2 — `posting_line_currencies` extension + functional-currency model. — SHIPPED 2026-05-07 (acct-wb75.1.2).**
 
-- *Deliverables.* New table; new `legal_entities.functional_currency` (default USD); backfill from `accounts.currency`; dispatcher writes when transaction currency ≠ functional currency.
-- *Schema additions.*
+- *Deliverables — DONE.* `posting_line_currencies` extension table; `legal_entities.functional_currency` (already shipped in consolidated `0005_legal_entities`); backfill from `accounts.currency`; `_post_posting_lines_apply_event` extended to write the row when transaction currency ≠ functional currency; `run_daily_reconciliation` extended with check #3.
+- *Schema added (consolidated `0022_posting_line_currencies`).*
   ```sql
-  CREATE TABLE legal_entities (
-    id SMALLINT PRIMARY KEY,
-    name VARCHAR(128) NOT NULL,
-    functional_currency CHAR(3) NOT NULL DEFAULT 'USD',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-  );
-  INSERT INTO legal_entities (id, name, functional_currency) VALUES (1, 'Default Entity', 'USD');
-  -- legal_entities is created NOW (sooner than acct-3gzh) but with single-row default
-
   CREATE TABLE posting_line_currencies (
-    posting_line_id BIGINT PRIMARY KEY REFERENCES posting_lines(id),
-    amount_transaction NUMERIC(19,4) NOT NULL,
-    currency_transaction CHAR(3) NOT NULL,
-    fx_rate_to_functional NUMERIC(19,9) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    posting_line_id       BIGINT PRIMARY KEY REFERENCES posting_lines(id),
+    amount_transaction    BIGINT NOT NULL,                 -- BIGINT integer cents
+    currency_transaction  CHAR(3) NOT NULL,                -- to match posting_lines.amount
+    fx_rate_to_functional NUMERIC(20, 10) NOT NULL,        -- matches fx_rates.rate precision
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT posting_line_currencies_fx_rate_positive CHECK (fx_rate_to_functional > 0)
   );
-  CREATE INDEX ON posting_line_currencies (currency_transaction);
+  CREATE INDEX posting_line_currencies_by_currency
+    ON posting_line_currencies (currency_transaction);
   ```
-- *Dispatcher.* `_post_posting_lines_apply_event` extended: if `transfer.currency` (resolved from credit/debit account.currency) differs from `legal_entity.functional_currency`, INSERT a `posting_line_currencies` row with `amount_transaction` = transfer.amount, `currency_transaction` = account.currency, `fx_rate_to_functional` = looked up from `fx_rates`. If equal, no extension row.
+  *(Note: `amount_transaction` typed BIGINT, not the originally-drafted NUMERIC(19,4), to match the project's integer-cents `posting_lines.amount` convention. Sub-cent precision becomes a follow-up if/when needed. `legal_entities.functional_currency` was already shipped in consolidated `0005_legal_entities`.)*
+- *Dispatcher.* `_post_posting_lines_apply_event` reads `p_c_acct.currency` and `legal_entities.functional_currency WHERE id = p_c_acct.legal_entity_id` (R2: credit-side governs). If transaction = functional or `ledger_kind = 'qty'`: skip. Else: look up `fx_rates` effective at `business_date` (raises **P0050** if missing); INSERT one row.
 - *Backfill SQL.* For each existing transfer where account.currency ≠ 'USD' (the default functional), INSERT a `posting_line_currencies` row with fx_rate=1 (since today\u2019s posting_lines are already in their account's currency, with no functional translation). Rows where account.currency = 'USD' get no extension row (functional = transaction).
-- *Reconciliation.* Add invariant: every transfer-currency-row's `amount_transaction × fx_rate_to_functional ≈ transfer.amount` (within rounding tolerance).
-- *Test.* New `tests/posting_line_currencies_t1.rs`; property test on dispatcher branch.
-- *Rollback.* DROP `posting_line_currencies`; keep `legal_entities` (used by Phase D too).
-- *Stop-point.* Mig applies; ci-check clean; tests pass; recon clean; commit; close sub-issue.
+- *Reconciliation.* `run_daily_reconciliation` extended with **check #3** (`currency_extension_amount_mismatch`): every `posting_line_currencies` row's `amount_transaction` must equal its paired `posting_lines.amount`. Note: the originally-drafted invariant `amount_transaction × fx_rate ≈ amount` is dormant at this phase — `posting_lines.amount` stays in transaction currency, so the multiplication is meaningful only after a future migration translates amounts to functional currency (Phase D / acct-3gzh). The deterministic equality form is what we can hold today.
+- *Test.* `tests/posting_line_currencies_t1.rs` — 8 cases: 3 schema (`fx_rate > 0` CHECK, FK, PK uniqueness); 5 dispatcher (skip when transaction = functional, write when transaction ≠ functional with correct fx_rate, skip qty legs, P0050 on missing fx_rate, amount_transaction = amount across multiple postings).
+- *Rollback.* `0022_posting_line_currencies.down.sql` drops the table. The CREATE OR REPLACE on `_post_posting_lines_apply_event` is not reverted in down (project convention: down is best-effort for ci-check symmetry).
+- *Stop-point — REACHED.* 664/0/9 tests; ci-check clean; closed acct-wb75.1.2.
 
 **B3 — `posting_line_dimensions` extension + `dimension_types` lookup.**
 

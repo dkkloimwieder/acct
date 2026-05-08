@@ -51,6 +51,7 @@ pub async fn reset_to_fixture(pool: &PgPool) {
     sqlx::raw_sql(
         "TRUNCATE TABLE
             posting_line_sources,
+            posting_line_currencies,
             posting_lines_provisional,
             posting_lines,
             inventory_reservations,
