@@ -368,9 +368,9 @@ Each phase below specifies the 9 fields per the plan: **prerequisites / delivera
 - *Rollback.* `0022_posting_line_currencies.down.sql` drops the table. The CREATE OR REPLACE on `_post_posting_lines_apply_event` is not reverted in down (project convention: down is best-effort for ci-check symmetry).
 - *Stop-point — REACHED.* 664/0/9 tests; ci-check clean; closed acct-wb75.1.2.
 
-**B3 — `posting_line_dimensions` extension + `dimension_types` lookup.**
+**B3 — `posting_line_dimensions` extension + `dimension_types` lookup. — SHIPPED 2026-05-07 (acct-wb75.1.3).**
 
-- *Deliverables.* New tables; backfill from inline composition columns on `accounts` (counterparty_id → 'customer'/'vendor' dimension; sku_id → 'product' dimension; location_id → 'location'; routing_op → 'routing_op'); dispatcher writes alongside posting_lines.
+- *Deliverables — DONE.* `dimension_types` lookup seeded with 9 types (5 active, 4 forward-looking); `posting_line_dimensions` extension table; backfill from inline composition columns; dispatcher writes via 4 conditional INSERTs in `_post_posting_lines_apply_event`; `run_daily_reconciliation` extended with checks #4 + #5.
 - *Schema additions.*
   ```sql
   CREATE TABLE dimension_types (
@@ -402,15 +402,15 @@ Each phase below specifies the 9 fields per the plan: **prerequisites / delivera
   CREATE INDEX ON posting_line_dimensions (dimension_type, dimension_value_uuid)
     WHERE dimension_value_uuid IS NOT NULL;
   ```
-  *(Note: dimension_value vs dimension_value_uuid is a workaround for the mixed BIGINT/UUID typing of our existing entity tables. Phase G's chart-of-accounts conversion may unify these.)*
-- *Dispatcher.* For each transfer, walk debit + credit account composition columns; emit one `posting_line_dimensions` row per non-null inline column on either account.
-- *Backfill SQL.* Multi-pass JOIN against posting_lines + accounts; emit one row per (transfer, dimension_type) where the relevant inline column is populated.
-- *Reconciliation.* Invariant: every transfer-with-inventory-touching-account has at least a 'product' + 'location' dimension row; every transfer-with-counterparty-account has 'customer' or 'vendor' dimension row.
-- *Test.* `tests/posting_line_dimensions_t1.rs`; property tests.
-- *Rollback.* DROP `posting_line_dimensions`, `dimension_types`. Down migration symmetry verified by ci-check.
-- *Stop-point.* Same as B1/B2.
+  *(Notes on the shipped form: `dimension_value` vs `dimension_value_uuid` workaround retained, with an additional `value_exclusive` CHECK that exactly one of the two columns is populated per row — the originally-drafted CHECK only required at-least-one; making it exclusive prevents ambiguity at lookup time. `created_at` timestamp added for audit symmetry with B1/B2. Active dim types use UUID column for customer/vendor/product/location, BIGINT column for routing_op. Forward-looking dim types 6–9 (cost_center / profit_center / project / department) are seeded with their planned `reference_table` names; source tables don't yet exist.)*
+- *Dispatcher.* `_post_posting_lines_apply_event` extended with 4 conditional INSERTs after B2: product (credit-first SKU), location (credit-first location), routing_op (per-event override > credit > debit), counterparty (per-event > credit > debit, dispatched to dim_type 1=customer or 2=vendor by hardcoded account-kind list). Conflict resolution = credit-first (R2) — when debit and credit disagree on a composition column (op_move with raw_sku/fg_sku), credit wins. Counterparty kinds with ambiguous classification (counterparty_id present on a non-AR/AP kind) are skipped.
+- *Backfill SQL (in 0023 up).* 5 INSERT…SELECT statements, one per active dimension type, with `ON CONFLICT (posting_line_id, dimension_type) DO NOTHING` for replay idempotency. Backfill applies the same credit-first / kind-dispatch logic as the dispatcher.
+- *Reconciliation.* `run_daily_reconciliation` extended with **check #4** (`dimension_product_missing`) and **check #5** (`dimension_counterparty_missing`). Note: the originally-drafted invariant required *both* product *and* location for every inventory-touching posting, but stock_wip / inv_value_wip carry (sku, routing_op) without location, so a strict "product AND location" rule would false-positive on every WIP posting. Check #4 verifies product coverage only; location coverage is not enforced at the recon layer.
+- *Test.* `tests/posting_line_dimensions_t1.rs` — 12 cases: dimension_types seed; 3 schema CHECKs (value_present, value_exclusive, dim_type FK); PK uniqueness; 5 dispatcher branches (product+location for inventory, no-composition skip, routing_op for WIP, customer for AR, vendor for AP); credit-first resolution on conflicting SKUs; recon clean-state probe.
+- *Rollback.* `0023_posting_line_dimensions.down.sql` drops both tables. Function CREATE OR REPLACEs not reverted (project convention).
+- *Stop-point — REACHED.* 676/0/9 tests; ci-check clean; closed acct-wb75.1.3.
 
-**Phase B aggregate.** Three sub-issues; each commits independently. Total ~6–9 weeks. Phase C cannot start until B1/B2/B3 all ship.
+**Phase B aggregate — COMPLETE 2026-05-07.** All three sub-issues shipped: B1 (acct-wb75.1.1) folded into the consolidation cutover (`0019`); B2 (acct-wb75.1.2) at `0022`; B3 (acct-wb75.1.3) at `0023`. Phase C is now unblocked.
 
 ### §4.C Phase C — `posting_line_inventory` extension
 

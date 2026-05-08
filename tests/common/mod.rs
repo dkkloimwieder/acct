@@ -52,6 +52,7 @@ pub async fn reset_to_fixture(pool: &PgPool) {
         "TRUNCATE TABLE
             posting_line_sources,
             posting_line_currencies,
+            posting_line_dimensions,
             posting_lines_provisional,
             posting_lines,
             inventory_reservations,
