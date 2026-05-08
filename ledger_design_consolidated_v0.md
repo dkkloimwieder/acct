@@ -261,7 +261,7 @@ The expiry worker calls `post_transfer_batch` once per expired pending. Under re
 
 The 65,536-value space will never be approached. Reserve-range editorial structure is for humans, not a constraint that needs justification.
 
-**Resolution:** v0.2's `transfer_reason` enum names every reason explicitly.
+**Resolution:** v0.2's `posting_line_reason` enum names every reason explicitly.
 
 ### m4 — §5.7 AR/AP payment is too terse
 
@@ -441,10 +441,12 @@ CREATE INDEX accounts_counterparty
 - `is_closed BOOLEAN` instead of bit flag.
 - `flags.history` dropped. Period snapshots produced by snapshot job.
 
-### 1.2 Transfers
+### 1.2 Posting lines
+
+> **Naming note.** The original v0.1 design and the early v0.2 implementation called this table `transfers` (TigerBeetle inheritance). The schema-consolidation epic (`acct-dhzc`, 2026-05-07) renamed it to `posting_lines` end-to-end alongside the rename of every related identifier (`posting_line_reason`, `posting_lines_provisional`, `posting_line_sources`, `post_posting_lines`, `_post_posting_lines_*`, `block_posting_line_modifications`, `trg_posting_lines_append_only`). Parts I–III of this document continue to refer to the v0.1 design's `transfers` table — that's historical; do not "correct" it. Part IV onward uses the post-consolidation naming.
 
 ```sql
-CREATE TYPE transfer_reason AS ENUM (
+CREATE TYPE posting_line_reason AS ENUM (
   'po_receipt', 'po_receipt_provisional', 'po_return_to_vendor', 'customer_return',
   'so_ship', 'rm_issue_to_wo',
   'to_release', 'to_receipt', 'bin_move',
@@ -459,9 +461,9 @@ CREATE TYPE transfer_reason AS ENUM (
   'price_trueup_inventory', 'price_trueup_cogs', 'price_trueup_wip'
 );
 
-CREATE TABLE transfers (
+CREATE TABLE posting_lines (
   id                BIGSERIAL PRIMARY KEY,
-  reason            transfer_reason NOT NULL,
+  reason            posting_line_reason NOT NULL,
   document_kind     TEXT NOT NULL,
   document_id       UUID NOT NULL,
   document_line_id  UUID,
@@ -478,14 +480,14 @@ CREATE TABLE transfers (
   CHECK (debit_account_id <> credit_account_id)
 ) PARTITION BY RANGE (posted_at);
 
-CREATE INDEX transfers_document  ON transfers(document_kind, document_id, posted_at);
-CREATE INDEX transfers_debit_ts  ON transfers(debit_account_id, posted_at DESC);
-CREATE INDEX transfers_credit_ts ON transfers(credit_account_id, posted_at DESC);
-CREATE INDEX transfers_reason_ts ON transfers(reason, posted_at);
+CREATE INDEX transfers_document  ON posting_lines(document_kind, document_id, posted_at);
+CREATE INDEX transfers_debit_ts  ON posting_lines(debit_account_id, posted_at DESC);
+CREATE INDEX transfers_credit_ts ON posting_lines(credit_account_id, posted_at DESC);
+CREATE INDEX transfers_reason_ts ON posting_lines(reason, posted_at);
 CREATE INDEX transfers_counterparty
-  ON transfers(counterparty_id) WHERE counterparty_id IS NOT NULL;
+  ON posting_lines(counterparty_id) WHERE counterparty_id IS NOT NULL;
 CREATE INDEX transfers_routing_op
-  ON transfers(routing_op) WHERE routing_op IS NOT NULL;
+  ON posting_lines(routing_op) WHERE routing_op IS NOT NULL;
 ```
 
 **What changed vs v0.1:**
@@ -499,7 +501,7 @@ CREATE INDEX transfers_routing_op
 
 **No `flags`. No `user_data_*`. No `code` u16. No `pending_id`, `timeout_seconds`, or pending/post/void flag bits.**
 
-**Row-per-pair shape — deliberate divergence from industry** (acct-1584, 2026-05-07; cross-ref `research/architecture-synthesis.md` §5.1 / §6.4 / §10.1). The schema records ONE row per (`debit_account_id`, `credit_account_id`, `amount`) pair — TigerBeetle-style — rather than ONE row per posting LEG. Industry orthodoxy is row-per-leg: SAP `ACDOCA`, Oracle Fusion `XLA_AE_LINES`, D365 `GeneralJournalAccountEntry`, NetSuite `transactionaccountingline` all use one row per debit OR credit line. We chose row-per-pair from v0.1 TigerBeetle inheritance (where every transfer is a debit-credit pair) and have not reversed it. Three- or four-leg postings (e.g., `post_po_receipt`'s 3-event PPV split, `post_so_ship`'s 4-leg COGS+revenue+tax+AR-staging) use multiple rows correlated by a shared `document_id` UUID. Double-entry is preserved per row, redundantly — every row is its own self-balancing pair. The divergence is acknowledged, not a defect: industry's row-per-leg shape would require replacing every `post_*` function and every test, with no correctness gain at our scale. **Future contributors reading the alternate Postgres-ledger proposal (`research/ledger-architecture-proposal.md` §2.3) or the ERP survey (§7.3) should NOT "fix" this shape to row-per-leg — it is an explicit design choice, not an oversight.** The ledger-architecture proposal's `posting_lines` shape and our `transfers` shape are functionally equivalent for double-entry correctness; the difference is the unit of accounting (pair vs leg). Re-litigation requires deliberate justification per the load-bearing-decisions bar.
+**Row-per-pair shape — deliberate divergence from industry** (acct-1584, 2026-05-07; cross-ref `research/architecture-synthesis.md` §5.1 / §6.4 / §10.1). The schema records ONE row per (`debit_account_id`, `credit_account_id`, `amount`) pair — TigerBeetle-style — rather than ONE row per posting LEG. Industry orthodoxy is row-per-leg: SAP `ACDOCA`, Oracle Fusion `XLA_AE_LINES`, D365 `GeneralJournalAccountEntry`, NetSuite `transactionaccountingline` all use one row per debit OR credit line. We chose row-per-pair from v0.1 TigerBeetle inheritance (where every transfer is a debit-credit pair) and have not reversed it. Three- or four-leg postings (e.g., `post_po_receipt`'s 3-event PPV split, `post_so_ship`'s 4-leg COGS+revenue+tax+AR-staging) use multiple rows correlated by a shared `document_id` UUID. Double-entry is preserved per row, redundantly — every row is its own self-balancing pair. The divergence is acknowledged, not a defect: industry's row-per-leg shape would require replacing every `post_*` function and every test, with no correctness gain at our scale. **Future contributors reading the alternate Postgres-ledger proposal (`research/ledger-architecture-proposal.md` §2.3) or the ERP survey (§7.3) should NOT "fix" this shape to row-per-leg — it is an explicit design choice, not an oversight.** The ledger-architecture proposal's `posting_lines` shape and our `posting_lines` shape are functionally equivalent for double-entry correctness; the difference is the unit of accounting (pair vs leg). Re-litigation requires deliberate justification per the load-bearing-decisions bar.
 
 ### 1.3 Inventory reservations (replaces self-pending pattern)
 
@@ -607,30 +609,30 @@ CREATE INDEX outbox_pending    ON ledger_outbox(created_at) WHERE state = 'pendi
 CREATE INDEX outbox_processing ON ledger_outbox(submitted_at) WHERE state = 'processing';
 ```
 
-### 1.9 Append-only enforcement on `transfers`
+### 1.9 Append-only enforcement on `posting_lines`
 
 ```sql
-CREATE OR REPLACE FUNCTION fn_block_transfer_modifications()
+CREATE OR REPLACE FUNCTION block_posting_line_modifications()
 RETURNS TRIGGER AS $$
 BEGIN
-  RAISE EXCEPTION 'transfers are append-only; UPDATE/DELETE rejected'
+  RAISE EXCEPTION 'posting_lines are append-only; UPDATE/DELETE rejected'
     USING ERRCODE = 'P9999';
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_transfers_append_only
-  BEFORE UPDATE OR DELETE ON transfers
-  FOR EACH ROW EXECUTE FUNCTION fn_block_transfer_modifications();
+CREATE TRIGGER trg_posting_lines_append_only
+  BEFORE UPDATE OR DELETE ON posting_lines
+  FOR EACH ROW EXECUTE FUNCTION block_posting_line_modifications();
 ```
 
-Combined with strict role-based access (no human/role has UPDATE/DELETE on `transfers` except a documented break-glass DBA role), this is the practical equivalent of TB's append-only guarantee. See Part VI §2 for the honest delta.
+Combined with strict role-based access (no human/role has UPDATE/DELETE on `posting_lines` except a documented break-glass DBA role), this is the practical equivalent of TB's append-only guarantee. See Part VI §2 for the honest delta.
 
 ## §2. Write path
 
 ### 2.1 The write function
 
 ```sql
-CREATE OR REPLACE FUNCTION post_transfers(
+CREATE OR REPLACE FUNCTION post_posting_lines(
   p_events                 JSONB,
   p_override_closed_period BOOLEAN DEFAULT FALSE
 )
@@ -662,7 +664,7 @@ BEGIN
 
     -- Idempotency
     IF EXISTS (
-      SELECT 1 FROM transfers WHERE idempotency_key = (v_event->>'idempotency_key')::UUID
+      SELECT 1 FROM posting_lines WHERE idempotency_key = (v_event->>'idempotency_key')::UUID
     ) THEN
       v_results := v_results || jsonb_build_object('index', v_idx, 'result', 'exists');
       CONTINUE;
@@ -703,13 +705,13 @@ BEGIN
     -- The CHECK on (debits_total, credits_total, normal_side) raises if violated
     -- and the surrounding transaction rolls back the entire batch — that IS the linked semantics.
 
-    INSERT INTO transfers (
+    INSERT INTO posting_lines (
       reason, document_kind, document_id, document_line_id,
       debit_account_id, credit_account_id, amount,
       routing_op, counterparty_id, period_id, business_date,
       idempotency_key, posted_by
     ) VALUES (
-      (v_event->>'reason')::transfer_reason,
+      (v_event->>'reason')::posting_line_reason,
       v_event->>'document_kind',
       (v_event->>'document_id')::UUID,
       NULLIF(v_event->>'document_line_id','')::UUID,
@@ -778,7 +780,7 @@ def drain_outbox():
         for row in batch:
             try:
                 with pg.transaction():
-                    pg.execute("SELECT post_transfers(%s)", [row.batch_payload])
+                    pg.execute("SELECT post_posting_lines(%s)", [row.batch_payload])
                     pg.execute(
                         "UPDATE ledger_outbox SET state='committed', completed_at=now() WHERE id=%s",
                         [row.id]
@@ -799,7 +801,7 @@ Stale-processing recovery: a separate job resets `state='processing' AND submitt
 
 ## §3. Transaction patterns
 
-All patterns are a single `post_transfers` call with one or more events in the JSONB array. Atomicity comes from the surrounding Postgres transaction.
+All patterns are a single `post_posting_lines` call with one or more events in the JSONB array. Atomicity comes from the surrounding Postgres transaction.
 
 ### 3.1 PO receipt (firm-priced)
 
@@ -865,7 +867,7 @@ receipt:
 
 ### 3.3 SO reservation, allocation, ship
 
-Reservations are NOT transfers in v0.2. They are rows in `inventory_reservations`.
+Reservations are NOT posting_lines in v0.2. They are rows in `inventory_reservations`.
 
 **Reserve** — call the `reserve_inventory()` PL/pgSQL function (migration `0014_reserve_inventory.up.sql`). Returns the new reservation's UUID on success, or NULL when `qty_promisable < qty`:
 
@@ -961,7 +963,7 @@ The same Postgres transaction also marks the reservation as allocated (or shippe
 **BOM2 schema (replaces flat `boms` + `wo_routing_burdens`):**
 
 - `bom_headers(id, parent_sku_id, alternate_no, revision_no, code, description, status, is_primary, effective_at, obsolete_at, eco_id, created_at)` — the BOM-as-a-thing. status ∈ {draft, active, obsolete}. UNIQUE on `(parent_sku_id, alternate_no, revision_no)`. Partial UNIQUE INDEX `bom_headers_primary` enforces "one primary per (parent_sku, alternate_no) at any time" while status='active'. CHECK on `effective_at < obsolete_at`. Time-phased revisions selected via `effective_at`/`obsolete_at` window.
-- `bom_lines(bom_id, line_no, kind, basis, applies_at_op, fire_at, yield_pct, component_sku_id, component_loc_id, qty_per_parent, absorption_class_id, std_amount)` — BOM contents. `kind` ∈ {`item`, `service`, `charge`}; `basis` ∈ {`per_unit`, `per_lot`}; `fire_at` ∈ {`wo_start`, `op_arrival`}. `yield_pct` (default 100) is per-line planned material yield (renamed from `scrap_pct` in mig 0093). Items have component refs; services and charges have absorption_class + std_amount. Cross-table self-reference (component = parent) is caught by a row-level trigger raising **P0034** `bom_line_self_reference`.
+- `bom_lines(bom_id, line_no, kind, basis, applies_at_op, fire_at, yield_pct, component_sku_id, component_loc_id, qty_per_parent, absorption_class_id, std_amount)` — BOM contents. `kind` ∈ {`item`, `service`, `charge`}; `basis` ∈ {`per_unit`, `per_lot`}; `fire_at` ∈ {`wo_start`, `op_arrival`}. `yield_pct` (default 100) is per-line planned material yield (renamed from `yield_pct` in mig 0093). Items have component refs; services and charges have absorption_class + std_amount. Cross-table self-reference (component = parent) is caught by a row-level trigger raising **P0034** `bom_line_self_reference`.
 - `absorption_classes(id, code, display_name, applied_account_kind, expense_account_kind, ...)` — runtime burden taxonomy. Seed declares `labor_std → labor_applied` and `oh_std → oh_applied`. New classes (`osp_plating`, `production_setup`, `energy_hv`, …) are plain `INSERT`s — **no `ALTER TYPE` needed**. Classes targeting `applied_account_kind='absorption_pool'` ride generic reasons `burden_apply` (per_unit) / `lot_charge_apply` (per_lot); canonical `labor_applied` / `oh_applied` keep their canonical reasons regardless of basis.
 - `engineering_change_orders(id, code, status, requested_by, requested_at, approved_by, approved_at, effective_at, rejected_reason)` — ECO workflow. Composite CHECK enforces `approved` requires `approved_by + approved_at + effective_at`; `rejected` requires `rejected_reason`.
 - `wo_outputs(wo_id, output_no, output_sku_id, fg_location_id, qty, allocation_method, allocation_pct)` — co-product / by-product table. `allocation_method` ∈ {`primary`, `sales_value`, `fixed_ratio`, `market_price`}.
@@ -988,11 +990,11 @@ The rollup is a future tool; today the standard is set caller-side via `post_sta
 
 **Resolver and helpers.**
 
-- `bom_header_at(parent_sku_id, alternate_no, business_date) → bom_headers` — single-row resolver. **P0033** (`bom_header_resolution_invalid`) on zero or multiple matches.
-- `_wo_resolve_bom_for(wo_id, business_date) → bom_headers` — uses `work_orders.bom_id` if set; else `bom_header_at(parent, 1, business_date)`.
+- `_bom_header_at(parent_sku_id, alternate_no, business_date) → bom_headers` — single-row resolver. **P0033** (`bom_header_resolution_invalid`) on zero or multiple matches.
+- `_wo_resolve_bom_for(wo_id, business_date) → bom_headers` — uses `work_orders.bom_id` if set; else `_bom_header_at(parent, 1, business_date)`.
 - `_wo_explode_bom(bom_id, business_date) → TABLE(...)` — recursive phantom expansion. Cap 16; **P0032** on cycle or depth.
 - `_wo_emit_bom_lines(wo_id, bom_id, routing_op, qty, filter JSONB, event_id, business_date, posted_by) → JSONB` — generic event-batch builder. `filter` selects by `{kind, basis, fire_at, applies_at_op}` subset. Emission is **literal** — `bom_lines.yield_pct` is planning metadata only.
-- `_wo_apply_reason_for(class_id, basis) → transfer_reason` — `labor_applied → labor_apply`, `oh_applied → oh_apply`, `absorption_pool + per_unit → burden_apply`, `absorption_pool + per_lot → lot_charge_apply`. Anything else raises **P0026**.
+- `_wo_apply_reason_for(class_id, basis) → posting_line_reason` — `labor_applied → labor_apply`, `oh_applied → oh_apply`, `absorption_pool + per_unit → burden_apply`, `absorption_pool + per_lot → lot_charge_apply`. Anything else raises **P0026**.
 
 **WO start (releases the WO; charges WIP@first_op):**
 
@@ -1216,7 +1218,7 @@ Never UPDATE or DELETE a transfer. A reversal is a new transaction with `reason=
 
 ### 3.10 Cross-currency transfer (Currency Exchange recipe)
 
-Two transfers in one transaction, through an FX liquidity-provider account pair:
+Two posting_lines in one transaction, through an FX liquidity-provider account pair:
 
 ```
 events:
@@ -1269,8 +1271,8 @@ Notes:
 | `standard` | use `skus.standard_cost` | **P0011** — standard SKUs have a fixed cost; do not pass one |
 | `wac_perpetual` IN | use pool average; **P0011** if pool empty (caller must seed) | use it; pool re-averages |
 | `wac_perpetual` OUT | use pool average (classic WAC; pool average preserved); **P0010** if pool empty | **P0011** — asserted-cost-on-depletion belongs in `'lot'` cost_method (see `acct-8gg`) |
-| `wac_periodic` | use pool average; flagged in `transfers_provisional` for re-cost at close (`acct-qfj`, migration 0029); P0006 if pool empty on depletion | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
-| `wac_retroactive` | use pool average; flagged in `transfers_provisional` for chronological replay at close (`acct-9tw`, migration 0031) | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
+| `wac_periodic` | use pool average; flagged in `posting_lines_provisional` for re-cost at close (`acct-qfj`, migration 0029); P0006 if pool empty on depletion | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
+| `wac_retroactive` | use pool average; flagged in `posting_lines_provisional` for chronological replay at close (`acct-9tw`, migration 0031) | **P0011** (asserted-cost-on-depletion is `'lot'` territory) |
 | `fifo` / `lot` | always **P0006** (`acct-8gg`) | always **P0006** |
 
 WAC perpetual is one of three textbook WAC variants (per Oracle/PeopleSoft): perpetual (live average, recomputed every putaway), periodic (single average per period applied at close), and retroactive perpetual (perpetual chain with late-data corrections at close). Phase 1 ships only perpetual; the other two are filed as future epics. The audit row records the **effective** unit cost — what was actually applied — not the caller's input.
@@ -1285,7 +1287,7 @@ Use cases:
 - Late vendor credit applied retroactively to current inventory.
 - Cost basis correction after audit.
 
-Document layer: `inventory_cost_adjustments` table (migration 0024). Function: `post_cost_adjustment`. Underlying ledger reason: `cost_adjustment` (transfer_reason). P&L counterpart: `variance_cost_adjustment` — bidirectional account_kind, `normal_side='unrestricted'`. Distinct from `inv_adj_expense` (qty-driven adjustments) so the income statement reports revaluation events separately from cycle-count gain/loss.
+Document layer: `inventory_cost_adjustments` table (migration 0024). Function: `post_cost_adjustment`. Underlying ledger reason: `cost_adjustment` (posting_line_reason). P&L counterpart: `variance_cost_adjustment` — bidirectional account_kind, `normal_side='unrestricted'`. Distinct from `inv_adj_expense` (qty-driven adjustments) so the income statement reports revaluation events separately from cycle-count gain/loss.
 
 ```
 post_cost_adjustment(sku, location, currency, inventory_class, target_unit_cost, ...)
@@ -1346,13 +1348,13 @@ Append-only by convention. Each row is the standard that takes effect on `effect
 **Canonical lookup.** All cost-relevant operations on standard-method SKUs go through one helper:
 
 ```sql
-resolve_standard_cost_at(p_sku_id UUID, p_business_date DATE) RETURNS BIGINT
+_resolve_standard_cost_at(p_sku_id UUID, p_business_date DATE) RETURNS BIGINT
 ```
 
 Returns the cost from the latest row with `effective_at <= p_business_date`, or raises **P0018** (`standard_cost_not_established`) if no such row exists for the SKU at that date. This is a STABLE function (no side effects).
 
 **P0018 gate.** A standard-method SKU with no `standard_costs` row in effect at `business_date` is in an incomplete state. Cost-relevant operations refuse with P0018. Currently caught by:
-- `_post_transfers_compute_amount` — `post_transfers` value-side dispatcher (touches `op_move`, `scrap`, `wo_complete`, `so_ship`).
+- `_post_posting_lines_compute_amount` — `post_posting_lines` value-side dispatcher (touches `op_move`, `scrap`, `wo_complete`, `so_ship`).
 - `post_inventory_adjustment` — standard branch with `NULL` p_unit_cost.
 
 Future workflows (PO receipt, SO ship, etc.) inherit the gate by going through these helpers. Operations that don't read the cost — qty-only events, account creation, metadata queries — are unaffected.
@@ -1364,7 +1366,7 @@ post_standard_cost_roll(
   p_sku_id            UUID,
   p_new_cost          BIGINT,
   p_effective_at      DATE,                     -- when the new standard takes effect
-  p_business_date     DATE,                     -- date for variance transfers
+  p_business_date     DATE,                     -- date for variance posting_lines
   p_posted_by         UUID,
   p_idempotency_key   UUID,
   p_notes             TEXT   DEFAULT NULL,
@@ -1383,9 +1385,9 @@ Behavior:
 7. **Revaluation pass** — if the new cost takes effect at or before `p_business_date`, walk every open `inv_value_raw` and `inv_value_fg` pool for the SKU; per pool with non-zero on-hand, post a variance transfer for `on_hand × (new − prior)` against `variance_std_cost_roll(currency)`. Write-up: dr inventory, cr variance. Write-down: reverse. WIP excluded by step 5's guard.
 8. **Audit row** — records `prior_standard_cost` (NULLABLE; first roll has no prior), `target_standard_cost`, `total_delta_value`, `pool_qty`, plus `effective_at` and `business_date` for self-explanatory reporting.
 
-**Future-dated rolls.** If `p_effective_at > p_business_date`, the new cost is queued (INSERT only) but no revaluation posts. Transactions whose `business_date >= effective_at` automatically pick up the new standard via `resolve_standard_cost_at`. Phase 1 has no scheduled-revaluation mechanism for the future-dated case — when the effective date passes, on-hand pools simply continue to carry the prior standard until they flow out or a follow-up roll re-revalues. This is acknowledged imprecision; out of scope for Phase 1 to schedule.
+**Future-dated rolls.** If `p_effective_at > p_business_date`, the new cost is queued (INSERT only) but no revaluation posts. Transactions whose `business_date >= effective_at` automatically pick up the new standard via `_resolve_standard_cost_at`. Phase 1 has no scheduled-revaluation mechanism for the future-dated case — when the effective date passes, on-hand pools simply continue to carry the prior standard until they flow out or a follow-up roll re-revalues. This is acknowledged imprecision; out of scope for Phase 1 to schedule.
 
-**Lock order.** `skus` row `FOR UPDATE` first (serializes concurrent rolls on the same SKU even though we don't UPDATE the row directly), then `inv_value_raw` + `inv_value_fg` accounts in ascending id order. Matches `post_transfers`' lock-order invariant.
+**Lock order.** `skus` row `FOR UPDATE` first (serializes concurrent rolls on the same SKU even though we don't UPDATE the row directly), then `inv_value_raw` + `inv_value_fg` accounts in ascending id order. Matches `post_posting_lines`' lock-order invariant.
 
 **Variance account.** `variance_std_cost_roll` (one per currency, `normal_side='unrestricted'`). Distinct from:
 - `variance_cost_adjustment` (§3.12) — WAC pool revaluation
@@ -1400,14 +1402,14 @@ Each tells a different income-statement story.
 
 ### 3.14 Cost adjustment retroactive (period-close-applied)
 
-A second cost-adjustment workflow that complements §3.12. §3.12 (`post_cost_adjustment`) revalues the **live pool** at the moment of call — instantaneous effect, only on the value side, only on `wac_perpetual` pools. §3.14 (`post_cost_adjustment_retroactive`) is **operator-queued** and **flushes at period close** — it walks every credit-side qty-bearing depletion in the target period and re-costs it against an operator-supplied `target_avg`, posting one variance batch per non-zero-variance depletion through `variance_cost_adjust_retro`.
+A second cost-adjustment workflow that complements §3.12. §3.12 (`post_cost_adjustment`) revalues the **live pool** at the moment of call — instantaneous effect, only on the value side, only on `wac_perpetual` pools. §3.14 (`post_cost_adjustment_retroactive`) is **operator-queued** and **flushes at period close** — it walks every credit-side qty-bearing depletion in the target period and re-costs it against an operator-supplied `target_avg`, posting one variance batch per non-zero-variance depletion through `variance_cost_adjust_retroactive`.
 
 Use cases (different from §3.12):
 - Audit determines the period's effective cost should have been different from what mid-period perpetual produced.
 - Late vendor pricing data arrives after the period's first depletion but before close, and the operator wants every depletion re-costed (not just the live pool).
 - Regulatory or reporting cost basis correction across all in-period consumption.
 
-Document layer: `inventory_cost_adjustments_retroactive` table (queue, migration 0032). Function: `post_cost_adjustment_retroactive`. Underlying ledger reason: `cost_restate` (same as wac_periodic / wac_retroactive variances). Document kind: `cost_adjust_retroactive_close`. P&L counterpart: `variance_cost_adjust_retro` (added in migration 0025; seeded in `db/fixtures/small/seed.sql` for USD + EUR).
+Document layer: `inventory_cost_adjustments_retroactive` table (queue, migration 0032). Function: `post_cost_adjustment_retroactive`. Underlying ledger reason: `cost_restate` (same as wac_periodic / wac_retroactive variances). Document kind: `cost_adjust_retroactive_close`. P&L counterpart: `variance_cost_adjust_retroactive` (added in migration 0025; seeded in `db/fixtures/small/seed.sql` for USD + EUR).
 
 ```
 post_cost_adjustment_retroactive(
@@ -1422,24 +1424,24 @@ queue-time (synchronous):
   - validate inventory_class in (raw, fg)        → P0006 if wip (acct-p7v)
   - validate target_avg >= 0                     → 23514
   - validate sku exists, pool exists             → P0010
-  - INSERT queue row, return its id (no transfers posted yet)
+  - INSERT queue row, return its id (no posting_lines posted yet)
 
 close-time (cost_adjust_retroactive_hook):
   for each un-finalized queue row in this period (FOR UPDATE):
-    walk transfers WHERE credit_account_id = pool
+    walk posting_lines WHERE credit_account_id = pool
                      AND business_date IN period
                      AND qty IS NOT NULL AND qty > 0
     for each depletion:
       provisional_unit = amount / qty
       variance = qty × (target_avg − provisional_unit)
       if variance != 0:
-        post 2-transfer batch routed through variance_cost_adjust_retro
+        post 2-transfer batch routed through variance_cost_adjust_retroactive
     UPDATE queue row finalized_at, finalized_count, total_variance
 ```
 
 **Method-agnostic.** Works on any `cost_method` — `standard`, `wac_perpetual`, `wac_periodic`, `wac_retroactive`. Operator override of whatever cost was originally applied. With `wac_periodic` / `wac_retroactive` the close-time variance posted by their own hooks is **already in place** (their hooks run before this one); §3.14 then layers an additional variance on top. Documented as "double-correction is acceptable" — the simplest semantic, matching what the operator sees in the depletion's `amount` (the original, not the wac-corrected value).
 
-**Why qty=NULL on prior-hook variances matters.** Variance transfers from `wac_periodic_close_hook` and `wac_retroactive_close_hook` carry `qty=NULL` (they're value-only corrections, not new physical movement). The `qty IS NOT NULL AND qty > 0` filter on the depletion walk naturally excludes those rows from being re-walked, so each depletion contributes to §3.14's variance exactly once even when other hooks have already posted variance.
+**Why qty=NULL on prior-hook variances matters.** Variance posting_lines from `wac_periodic_close_hook` and `wac_retroactive_close_hook` carry `qty=NULL` (they're value-only corrections, not new physical movement). The `qty IS NOT NULL AND qty > 0` filter on the depletion walk naturally excludes those rows from being re-walked, so each depletion contributes to §3.14's variance exactly once even when other hooks have already posted variance.
 
 **Period must be open at queue time.** Closed periods raise **P0021** (`target_period_closed`) referencing `acct-7h4` (Phase 2 Epic K — period reopen workflow). For a closed period the operator must reopen it first, then queue, then re-close. This is intentional — the queue is the period's audit trail and must be seen by `close_period`.
 
@@ -1447,7 +1449,7 @@ close-time (cost_adjust_retroactive_hook):
 
 **Idempotency.** `idempotency_key UUID NOT NULL UNIQUE` on the queue table. Replay returns the existing queue row's id without re-inserting; the hook's `FOR UPDATE` walk also tolerates concurrent close attempts.
 
-The audit row records `target_avg`, `business_date`, `posted_by`, `posted_at`, `finalized_at`, `finalized_count` (depletions processed at close), `total_variance` (signed sum of variance_amount across all 2-transfer batches), and free-form `notes`. The full lifecycle is reconstructable from this row plus the variance transfers (joined via `document_id = queue_row.id`, `document_kind = 'cost_adjust_retroactive_close'`).
+The audit row records `target_avg`, `business_date`, `posted_by`, `posted_at`, `finalized_at`, `finalized_count` (depletions processed at close), `total_variance` (signed sum of variance_amount across all 2-transfer batches), and free-form `notes`. The full lifecycle is reconstructable from this row plus the variance posting_lines (joined via `document_id = queue_row.id`, `document_kind = 'cost_adjust_retroactive_close'`).
 
 ### 3.15 AP bill (vendor invoice)
 
@@ -1496,7 +1498,7 @@ The schema partitions value accounts by the same dimensions as their qty-side co
 | `inv_value_fg` (value) | `(sku, location, currency)` | Per-location finished-goods value pool — pairs with `stock_available` (FG location). |
 | `cogs`, `revenue`, `cash`, `ar`, `ap`, `variance_*`, `labor_applied`, etc. | `(currency)` only | No per-sku, per-loc, or per-op partition. Aggregated. |
 
-**Per-WO breakdown:** reconstructed via `SELECT * FROM transfers WHERE document_kind='work_order' AND document_id=$wo_id`. Single B-tree lookup, no projector required.
+**Per-WO breakdown:** reconstructed via `SELECT * FROM posting_lines WHERE document_kind='work_order' AND document_id=$wo_id`. Single B-tree lookup, no projector required.
 
 For long-cycle/regulated job-cost WOs, opt in to per-WO per-op accounts at WO creation time. Close them via `is_closed=true` on WO completion. Default off; enable per SKU family or WO type.
 
@@ -1506,37 +1508,37 @@ For long-cycle/regulated job-cost WOs, opt in to per-WO per-op accounts at WO cr
 
 **Default: standard costing with variance capture.** Standard costs from `skus.standard_cost` and `routings.std_*_cost`. PPV at receipt, MUV/LV/OHV at apply, scrap_v at scrap, wo_close_v at close.
 
-**Cost is computed inside `post_transfers`.** As of acct-0ig (migration 0019), the value-side amount on cost-relevant events (`op_move`, `scrap`, `wo_complete`, `so_ship`) is computed by a dispatcher helper keyed on `skus.cost_method`. The system is the cost engine — there is no external cost engine.
+**Cost is computed inside `post_posting_lines`.** As of acct-0ig (migration 0019), the value-side amount on cost-relevant events (`op_move`, `scrap`, `wo_complete`, `so_ship`) is computed by a dispatcher helper keyed on `skus.cost_method`. The system is the cost engine — there is no external cost engine.
 
-**Implemented branches:** `'standard'` (migration 0019, `amount = qty × resolve_standard_cost_at(sku, business_date)` after the standard-cost refactor in migration 0027 / `acct-x4t`); `'wac_perpetual'` (migration 0021 / `acct-uxu`, refactored in migration 0030 / `acct-1vr` for per-class qty correctness); `'wac_periodic'` (migration 0029 / `acct-qfj`, mid-period dispatcher matches wac_perpetual but flags depletions in `transfers_provisional` for re-cost at close); `'wac_retroactive'` (migration 0031 / `acct-9tw`, same mid-period dispatcher and provisional flagging as wac_periodic; differs only at close-time replay). The qty-side gate relaxes for all four. `wac_perpetual` / `wac_periodic` / `wac_retroactive` raise `P0006` only when the qty pool is zero at depletion time.
+**Implemented branches:** `'standard'` (migration 0019, `amount = qty × _resolve_standard_cost_at(sku, business_date)` after the standard-cost refactor in migration 0027 / `acct-x4t`); `'wac_perpetual'` (migration 0021 / `acct-uxu`, refactored in migration 0030 / `acct-1vr` for per-class qty correctness); `'wac_periodic'` (migration 0029 / `acct-qfj`, mid-period dispatcher matches wac_perpetual but flags depletions in `posting_lines_provisional` for re-cost at close); `'wac_retroactive'` (migration 0031 / `acct-9tw`, same mid-period dispatcher and provisional flagging as wac_periodic; differs only at close-time replay). The qty-side gate relaxes for all four. `wac_perpetual` / `wac_periodic` / `wac_retroactive` raise `P0006` only when the qty pool is zero at depletion time.
 
 **Per-class qty divisor (acct-1vr, migration 0030).** `wac_perpetual` and `wac_periodic` no longer divide by `stock_available.balance` — that account pools qty across raw and fg lifecycle states for the same `(sku, location)`, which gave incorrect per-class unit costs when a SKU had multiple value pools active. Instead, the divisor is a per-pool sum from transfer history:
 
 ```sql
 SELECT SUM(CASE WHEN t.debit_account_id  = pool_id THEN  t.qty
                 WHEN t.credit_account_id = pool_id THEN -t.qty END)
-  FROM transfers t
+  FROM posting_lines t
  WHERE pool_id IN (t.debit_account_id, t.credit_account_id) AND t.qty IS NOT NULL
 ```
 
-Each transfer that touches the value pool carries `qty` (added as a column in 0030, populated at INSERT time from the event JSONB), so the sum is class-isolated. Numerator (`pool.balance`) is unchanged — value-side accounts are already partitioned per class. `_post_transfers_lookup_qty_account` is retained for `post_transfers`'s lock pre-scan but no longer participates in divisor computation.
+Each transfer that touches the value pool carries `qty` (added as a column in 0030, populated at INSERT time from the event JSONB), so the sum is class-isolated. Numerator (`pool.balance`) is unchanged — value-side accounts are already partitioned per class. `_post_posting_lines_lookup_qty_account` is retained for `post_posting_lines`'s lock pre-scan but no longer participates in divisor computation.
 
 **Three WAC variants (Oracle/PeopleSoft taxonomy).** `wac_perpetual` is one of three textbook variants — all three are shipped:
 - `wac_perpetual` — live average, recomputed on every putaway. Mid-period and post-close are the same number.
-- `wac_periodic` — single average per period, computed at close, applied to every depletion in the period (acct-qfj, migration 0029). Mid-period the dispatcher posts depletions at the running pool average — exact same math as wac_perpetual — but the value-leg transfer is flagged in `transfers_provisional` with `cost_method='wac_periodic'`. At close, `wac_periodic_close_hook` walks each pool with un-finalized rows, computes `final_avg = Σ(in-period receipts value) / Σ(in-period receipts qty)` (Oracle PAC convention; numerator and denominator both per-pool, signed by debit/credit on the value account), and posts variance per depletion routed through `variance_wac_period`. Empty-pool-on-depletion = P0006 (same as wac_perpetual). Zero-receipts-in-period = **P0020** (`wac_periodic_close_no_receipts`); operator either posts a receipt and retries, or closes with `p_force_provisional=TRUE` to leave un-finalized rows on the side table for forensics. Receipts on wac_periodic SKUs do not flag — they post at their actual asserted cost (po_unit_price, cycle_count_adj amount, etc.) and contribute to `final_avg` directly. Alternate provisional cost sources (last period close avg, last purchase price, configured value, zero, standard) tracked as Epic I (`acct-cms`).
+- `wac_periodic` — single average per period, computed at close, applied to every depletion in the period (acct-qfj, migration 0029). Mid-period the dispatcher posts depletions at the running pool average — exact same math as wac_perpetual — but the value-leg transfer is flagged in `posting_lines_provisional` with `cost_method='wac_periodic'`. At close, `wac_periodic_close_hook` walks each pool with un-finalized rows, computes `final_avg = Σ(in-period receipts value) / Σ(in-period receipts qty)` (Oracle PAC convention; numerator and denominator both per-pool, signed by debit/credit on the value account), and posts variance per depletion routed through `variance_wac_periodic`. Empty-pool-on-depletion = P0006 (same as wac_perpetual). Zero-receipts-in-period = **P0020** (`wac_periodic_close_no_receipts`); operator either posts a receipt and retries, or closes with `p_force_provisional=TRUE` to leave un-finalized rows on the side table for forensics. Receipts on wac_periodic SKUs do not flag — they post at their actual asserted cost (po_unit_price, cycle_count_adj amount, etc.) and contribute to `final_avg` directly. Alternate provisional cost sources (last period close avg, last purchase price, configured value, zero, standard) tracked as Epic I (`acct-cms`).
 - `wac_retroactive` — perpetual chain mid-period; chronological replay at period close re-costs each depletion against the running avg it should have had given full-period data, including late-arriving receipts that were originally booked out of order (acct-9tw, migration 0031). Replay order is `(business_date, posted_at, id)` with full determinism. Variance per depletion routes through `variance_wac_retroactive`. WIP class deferred (`acct-p7v`).
 
 **FIFO/LIFO/lot scaffolded but unimplemented.** The dispatcher's `'fifo'` and `'lot'` branches RAISE `P0006`. Real implementation requires lot-tracking infrastructure (lot creation, expiry, traceability), which is a feature larger than just costing. Tracked as `acct-8gg` once lot infrastructure is scoped.
 
 ### 4.3 Operational queries
 
-All served by base-table queries on `transfers`:
+All served by base-table queries on `posting_lines`:
 
 - "Value in WIP right now by op": `SELECT (debits_total - credits_total) FROM accounts WHERE kind='inv_value_wip' AND routing_op=$op`.
-- "RM consumed at Op N this period": `SELECT SUM(amount) FROM transfers WHERE reason='rm_issue_to_wo' AND routing_op=$op AND period_id=$p`.
+- "RM consumed at Op N this period": `SELECT SUM(amount) FROM posting_lines WHERE reason='rm_issue_to_wo' AND routing_op=$op AND period_id=$p`.
 - "Labor applied by op by period": same shape.
-- "Full cost trail for WO X": `SELECT * FROM transfers WHERE document_kind='work_order' AND document_id=$wo ORDER BY posted_at`.
-- "Scrap $ by op YTD": `SELECT routing_op, SUM(amount) FROM transfers WHERE reason='scrap_v' AND posted_at >= $year_start GROUP BY routing_op`.
+- "Full cost trail for WO X": `SELECT * FROM posting_lines WHERE document_kind='work_order' AND document_id=$wo ORDER BY posted_at`.
+- "Scrap $ by op YTD": `SELECT routing_op, SUM(amount) FROM posting_lines WHERE reason='scrap_v' AND posted_at >= $year_start GROUP BY routing_op`.
 
 ### 4.4 Sub-assembly consumption
 
@@ -1546,8 +1548,8 @@ A sub-assembly consumed at an op of a higher-level parent is a component issue: 
 
 - Transacting currency is a column on `accounts` and is enforced same-currency on every transfer (write-function check).
 - Reporting currency (USD) rollups happen at query time joining `fx_rates`.
-- Period-end revaluation: posted as `fx_leg` transfers against `fx_revaluation` accounts (Part IV §3.10 pattern).
-- Cross-currency transactions: two transfers in one Postgres transaction (Part IV §3.10).
+- Period-end revaluation: posted as `fx_leg` posting_lines against `fx_revaluation` accounts (Part IV §3.10 pattern).
+- Cross-currency transactions: two posting_lines in one Postgres transaction (Part IV §3.10).
 
 The "Currency Exchange recipe" carries forward in shape; the implementation drops the "linked transfer" flag because Postgres transactions provide the same atomicity.
 
@@ -1569,13 +1571,13 @@ Sequence inside `close_period`:
 1. **Validate** — `SELECT ... FROM periods WHERE id = p_period_id FOR UPDATE`. Raises **P0014** (`period_close_invalid`) if the period is missing or already closed. The row-level lock serializes concurrent close attempts on the same period — the loser re-reads `closed_at` after the winner commits and surfaces P0014.
 
 2. **Run hooks** in a fixed order. As of `acct-og1` (migration 0032) all three hooks have real bodies; the s6n stub-bullet era is over.
-   - `wac_periodic_close_hook(period_id, p_force_provisional)` — real body landed `acct-qfj` (migration 0029). For each pool with un-finalized `wac_periodic` provisional rows, computes the period avg as `Σ(in-period receipts value) / Σ(in-period qty)` and re-costs every depletion in the period against it; posts variance through `variance_wac_period`. Oracle PAC convention.
+   - `wac_periodic_close_hook(period_id, p_force_provisional)` — real body landed `acct-qfj` (migration 0029). For each pool with un-finalized `wac_periodic` provisional rows, computes the period avg as `Σ(in-period receipts value) / Σ(in-period qty)` and re-costs every depletion in the period against it; posts variance through `variance_wac_periodic`. Oracle PAC convention.
    - `wac_retroactive_close_hook(period_id, p_force_provisional)` — real body landed `acct-9tw` (migration 0031). Walks pool events chronologically `(business_date, posted_at, id)`, re-costs each provisional depletion against the recomputed running avg, posts variance through `variance_wac_retroactive`.
-   - `cost_adjust_retroactive_hook(period_id, p_force_provisional)` — real body landed `acct-og1` (migration 0032). Walks the `inventory_cost_adjustments_retroactive` queue rows for this period (operator-queued via §3.14); for each, walks every in-period credit-side qty-bearing depletion on the pool and posts a 2-transfer variance batch through `variance_cost_adjust_retro` per non-zero-variance depletion. Method-agnostic — works regardless of the SKU's `cost_method`.
+   - `cost_adjust_retroactive_hook(period_id, p_force_provisional)` — real body landed `acct-og1` (migration 0032). Walks the `inventory_cost_adjustments_retroactive` queue rows for this period (operator-queued via §3.14); for each, walks every in-period credit-side qty-bearing depletion on the pool and posts a 2-transfer variance batch through `variance_cost_adjust_retroactive` per non-zero-variance depletion. Method-agnostic — works regardless of the SKU's `cost_method`.
 
-   Each hook returns `BIGINT` — the count of rows it finalized. Hooks run **before** step 5 stamps `closed_at` so any variance transfers they post don't trip `post_transfers`' P0005 gate on the period being closed.
+   Each hook returns `BIGINT` — the count of rows it finalized. Hooks run **before** step 5 stamps `closed_at` so any variance posting_lines they post don't trip `post_posting_lines`' P0005 gate on the period being closed.
 
-3. **Provisional gate** — count `transfers_provisional` rows in this period with `finalized_at IS NULL`. If > 0 and `p_force_provisional = FALSE`, raise **P0015** (`period_close_provisional`). Forced close leaves un-finalized rows on the side table as-is for forensics — it does not auto-finalize them.
+3. **Provisional gate** — count `posting_lines_provisional` rows in this period with `finalized_at IS NULL`. If > 0 and `p_force_provisional = FALSE`, raise **P0015** (`period_close_provisional`). Forced close leaves un-finalized rows on the side table as-is for forensics — it does not auto-finalize them.
 
 4. **Reconciliation gate** — call `run_daily_reconciliation()`. If new alerts > 0 and `p_force_recon = FALSE`, raise **P0016** (`period_close_reconciliation`). Forced close still records the alerts; the gate just doesn't block.
 
@@ -1603,40 +1605,40 @@ Sequence inside `close_period`:
 
 The two force flags are **independent** by design — provisional and reconciliation gates protect against very different failure modes (incomplete workflow vs corrupt ledger), and an operator might reasonably need to bypass one without bypassing the other.
 
-**`transfers_provisional` side table** (migration 0025, `acct-4mt`):
+**`posting_lines_provisional` side table** (migration 0025, `acct-4mt`):
 
 ```sql
-CREATE TABLE transfers_provisional (
-  transfer_id          BIGINT PRIMARY KEY REFERENCES transfers(id),
+CREATE TABLE posting_lines_provisional (
+  posting_line_id          BIGINT PRIMARY KEY REFERENCES posting_lines(id),
   period_id            BIGINT NOT NULL REFERENCES periods(id),
   cost_method          cost_method NOT NULL,
   finalized_at         TIMESTAMPTZ,
   variance_amount      BIGINT,
-  variance_transfer_id BIGINT REFERENCES transfers(id)
+  variance_posting_line_id BIGINT REFERENCES posting_lines(id)
 );
 ```
 
 Three lifecycle states enforced by CHECK:
 
-| `finalized_at` | `variance_amount` | `variance_transfer_id` | Meaning |
+| `finalized_at` | `variance_amount` | `variance_posting_line_id` | Meaning |
 |---|---|---|---|
 | `NULL` | `NULL` | `NULL` | un-finalized (writer just inserted) |
 | `NOT NULL` | `0` | `NULL` | finalized, no variance to post |
 | `NOT NULL` | `<> 0` | `NOT NULL` | finalized, variance posted (transfer FK) |
 
-A side table is required because the append-only trigger on `transfers` (§1.9) blocks `UPDATE`/`DELETE`, so `finalized_at` can't live as a column on the transfer itself.
+A side table is required because the append-only trigger on `posting_lines` (§1.9) blocks `UPDATE`/`DELETE`, so `finalized_at` can't live as a column on the transfer itself.
 
 **Variance account kinds** (added in migration 0025, seeded in `db/fixtures/small/seed.sql` for USD + EUR):
 
 | `account_kind` | Posted by | Income-statement story |
 |---|---|---|
-| `variance_wac_period`         | `wac_periodic_close_hook`         | wac_periodic re-pricing close adjustment |
+| `variance_wac_periodic`         | `wac_periodic_close_hook`         | wac_periodic re-pricing close adjustment |
 | `variance_wac_retroactive`    | `wac_retroactive_close_hook`      | wac_retroactive late-data correction |
-| `variance_cost_adjust_retro`  | `cost_adjust_retroactive_hook`    | retroactive cost_adjustment correction |
+| `variance_cost_adjust_retroactive`  | `cost_adjust_retroactive_hook`    | retroactive cost_adjustment correction |
 
 All three are bidirectional (`normal_side='unrestricted'`); write-ups credit them, write-downs debit them — same convention as `inv_adj_expense` and `variance_cost_adjustment`. Three separate kinds rather than one shared `variance_close` so the income statement reports the three close-time correction stories distinctly.
 
-Adjusting entries posted **after** close use `post_transfers(..., p_override_closed_period := TRUE)` with the `reversal` reason or one of the variance reasons.
+Adjusting entries posted **after** close use `post_posting_lines(..., p_override_closed_period := TRUE)` with the `reversal` reason or one of the variance reasons.
 
 **Known limitation.** `p_actor` is unvalidated — `close_period` accepts any UUID and stores it. RBAC is Part VII Q6, still open.
 
@@ -1695,7 +1697,7 @@ Shard when `pg_stat_activity` shows lock waits >0.5% on a row, sustained. Typica
 
 **Tier 1 — direct queries against base tables.** Sufficient for most reads:
 - "Available stock at (sku, location)": one accounts row + one reservations aggregate.
-- "WO cost trail": one transfers index range scan.
+- "WO cost trail": one posting_lines index range scan.
 - "GL trial balance": `SELECT kind, SUM(debits_total - credits_total) FROM accounts GROUP BY kind`.
 
 **Tier 2 — incremental materialized views.** For aggregations too heavy for tier-1:
@@ -1705,7 +1707,7 @@ Shard when `pg_stat_activity` shows lock waits >0.5% on a row, sustained. Typica
 
 ```sql
 CREATE TRIGGER trg_update_inv_by_sku_loc
-  AFTER INSERT ON transfers
+  AFTER INSERT ON posting_lines
   FOR EACH ROW
   WHEN (NEW.reason IN ('po_receipt', 'so_ship', 'bin_move', 'to_release', 'to_receipt',
                        'cycle_count_adj', 'rm_issue_to_wo', 'wo_complete'))
@@ -1743,7 +1745,7 @@ Same Postgres transaction inserts the `commodity_receipts` row and sets `purchas
 
 ### 10.2 Settlement
 
-**Step 1 — compute attribution (Postgres).** Default policy: **FIFO** (recommended — §△-15 resolution). Maintain `commodity_pool_activity` as a tier-2 mat view from `transfers` filtered to receipts/issues for commodity SKUs:
+**Step 1 — compute attribution (Postgres).** Default policy: **FIFO** (recommended — §△-15 resolution). Maintain `commodity_pool_activity` as a tier-2 mat view from `posting_lines` filtered to receipts/issues for commodity SKUs:
 
 ```sql
 CREATE MATERIALIZED VIEW commodity_pool_activity AS
@@ -1752,7 +1754,7 @@ SELECT
   t.posted_at,
   t.amount AS qty,
   CASE WHEN t.reason = 'po_receipt_provisional' THEN 'in' ELSE 'out' END AS direction
-FROM transfers t
+FROM posting_lines t
 WHERE t.reason IN ('po_receipt_provisional', 'so_ship', 'rm_issue_to_wo', 'scrap')
   AND EXISTS (SELECT 1 FROM skus s WHERE s.id = ... AND s.is_commodity);
 ```
@@ -1809,8 +1811,8 @@ Carried from `ledger_inventory_design_spec_v0.md` §17.6 — partial settlements
 - **No reporting in the ledger.** Tier-1, tier-2, or tier-3 — never mixed in the write path.
 - **No browser-direct database access.** API tier is mandatory.
 - **No server-side ID generation in the API tier.** All IDs are `BIGSERIAL` from Postgres or `UUID` from clients (idempotency key) — explicit.
-- **No direct UPDATE of `accounts.debits_total` / `credits_total` from application code.** The `post_transfers` function is the only path.
-- **No deletion of accounts or transfers.** Closed, yes; deleted, no.
+- **No direct UPDATE of `accounts.debits_total` / `credits_total` from application code.** The `post_posting_lines` function is the only path.
+- **No deletion of accounts or posting_lines.** Closed, yes; deleted, no.
 - **No `synchronous_commit = off` on the ledger database.** RPO unacceptable.
 - **No reliance on TigerBeetle features.** If TB is needed, it is added downstream via logical replication.
 
@@ -1839,20 +1841,20 @@ Single Postgres node, well-tuned (NVMe, 64+ GB RAM, modern CPU, `synchronous_com
 
 | Workload pattern | Sustained TPS |
 |------------------|---------------|
-| Pure inserts to `transfers`, batch=100 | 30–60K |
-| `post_transfers` with full validation, batch=10 | 5–15K |
-| `post_transfers` with hot-account contention, no sharding | 500–2K |
+| Pure inserts to `posting_lines`, batch=100 | 30–60K |
+| `post_posting_lines` with full validation, batch=10 | 5–15K |
+| `post_posting_lines` with hot-account contention, no sharding | 500–2K |
 | With 8-way sharding on hot accounts | 4–10K |
 | Read-heavy mix served by replicas | unchanged write side |
 
-Envelope estimates, not benchmarks. Most ERP workloads (10s–100s of transfers/sec sustained, 1–2K peak) live well inside without sharding.
+Envelope estimates, not benchmarks. Most ERP workloads (10s–100s of posting_lines/sec sustained, 1–2K peak) live well inside without sharding.
 
 ### 12.4 Monitoring
 
 - `pg_stat_activity` lock_waits by relation — alert on `accounts` lock_waits > 1% sustained.
 - `pg_stat_database` deadlocks involving ledger tables — alert any.
 - Outbox worker (if present): `state='pending'` rows older than 10s; failed rows immediately.
-- `post_transfers` latency: P50, P99, P99.9.
+- `post_posting_lines` latency: P50, P99, P99.9.
 - Per-account contention heatmap.
 - Reconciliation jobs: daily success, any non-zero invariant alerts immediately.
 - Tier-2 mat view refresh lag (if applicable).
@@ -1864,15 +1866,15 @@ Envelope estimates, not benchmarks. Most ERP workloads (10s–100s of transfers/
 - Network: ledger database in a private subnet; only the API tier reaches it.
 - TLS on all Postgres connections.
 - Authorization: every API call validates (user, action, document) against application RBAC before composing the transfer batch.
-- `transfers` table append-only via the trigger in §1.9; UPDATE/DELETE permissions revoked from all but a documented break-glass DBA role.
+- `posting_lines` table append-only via the trigger in §1.9; UPDATE/DELETE permissions revoked from all but a documented break-glass DBA role.
 - Audit: `posted_by` is mandatory on every transfer; logical replication to a write-once audit store (e.g., S3 Object Lock) for regulated environments.
 
 ## §13. Phasing
 
 **Phase 0 — Schema and write function (~3 weeks):**
-- Tables (accounts, transfers, inventory_reservations, periods, fx_rates, period_snapshots, commodity_receipts, optional outbox).
-- `post_transfers` function.
-- Append-only enforcement on `transfers`.
+- Tables (accounts, posting_lines, inventory_reservations, periods, fx_rates, period_snapshots, commodity_receipts, optional outbox).
+- `post_posting_lines` function.
+- Append-only enforcement on `posting_lines`.
 - Phase 0 invariant tests: per-ledger double-entry, no negative balances, idempotency, deadlock freedom (100 concurrent batches, random subsets, 30 min, zero deadlocks), period-lock enforcement, reservation atomicity.
 - Done when invariant tests pass.
 
@@ -1905,7 +1907,7 @@ Testing the ledger is not one activity — it is three layers, run in order. Ski
 **Purpose.** Discover the system's actual behavior on real hardware before formalizing what to measure. Replace the envelope estimates in §12.3 with measured numbers. Identify the dominant bottleneck (CPU, lock contention, WAL, index maintenance, disk IOPS) so the structured phase targets it.
 
 **Pre-conditions.**
-- Phase 0 schema and `post_transfers` function are implemented and pass invariant tests.
+- Phase 0 schema and `post_posting_lines` function are implemented and pass invariant tests.
 - A representative hardware tier is provisioned (e.g., 8 cores / 32 GB RAM / NVMe; and a second tier of 32 cores / 128 GB RAM for headroom). Cloud equivalents acceptable as long as IO is consistent.
 - `pg_stat_statements`, `auto_explain`, `pg_wait_sampling` extensions installed.
 
@@ -1937,7 +1939,7 @@ Generated by a deterministic script, checked into the repo, regenerable from see
 
 **Tooling.**
 - `pgbench` for raw primitive ops (baseline INSERT/UPDATE/SELECT throughput).
-- Custom harness (Python or Go) that calls `post_transfers` with realistic batch payloads.
+- Custom harness (Python or Go) that calls `post_posting_lines` with realistic batch payloads.
 - `pg_stat_statements` + `auto_explain` for query attribution.
 - `pg_wait_sampling` for fine-grained wait analysis.
 - `pg_buffercache` for hot-page identification.
@@ -1958,7 +1960,7 @@ Generated by a deterministic script, checked into the repo, regenerable from see
 | manufacturing | 50% WO ops (start/op_move/complete), 20% RM issue, 15% PO receipt, 10% scrap, 5% cycle count |
 | distribution | 40% bin_move, 30% TO release/receipt, 20% PO receipt, 10% SO ship |
 | month-end close | reconciliation queries + FX revaluation + period close, large fixture |
-| backfill | bulk COPY into transfers + accounts opening balance |
+| backfill | bulk COPY into posting_lines + accounts opening balance |
 
 Each workload is a script consuming a fixture and producing a measurable load. Mixes are derived from real customer telemetry where possible; otherwise from operational expectations.
 
@@ -1987,7 +1989,7 @@ Each workload is a script consuming a fixture and producing a measurable load. M
 
 **Correctness under load.**
 
-- **Property-based tests.** Generate random valid batches (Hypothesis / fast-check style). Assert per-ledger double-entry holds after each batch; reservations + transfers stay consistent; no torn writes.
+- **Property-based tests.** Generate random valid batches (Hypothesis / fast-check style). Assert per-ledger double-entry holds after each batch; reservations + posting_lines stay consistent; no torn writes.
 - **Fault injection.** Mid-batch backend kill, connection pause, disk-full simulation, replica lag spike. Recover; verify idempotency-key uniqueness, no half-applied state.
 - **Determinism replay.** Capture a batch sequence; replay against a fresh DB; assert identical resulting state.
 
@@ -2004,7 +2006,7 @@ Each workload is a script consuming a fixture and producing a measurable load. M
 
 ### 14.3 Integrated perf testing — application to database
 
-**Purpose.** §14.1 and §14.2 measure the ledger in isolation. Production workloads traverse the API tier, optional outbox, network, and connection pool before reaching `post_transfers`. Integrated testing catches issues that only manifest end-to-end: connection-pool exhaustion, API-tier CPU saturation under fan-out, outbox queue spikes, transaction wrapping anomalies.
+**Purpose.** §14.1 and §14.2 measure the ledger in isolation. Production workloads traverse the API tier, optional outbox, network, and connection pool before reaching `post_posting_lines`. Integrated testing catches issues that only manifest end-to-end: connection-pool exhaustion, API-tier CPU saturation under fan-out, outbox queue spikes, transaction wrapping anomalies.
 
 **Pre-conditions.**
 - API tier deployed in a staging environment matching production topology (N nodes behind a load balancer, pgBouncer/PgCat in front of the DB, optional outbox worker pool).
@@ -2014,7 +2016,7 @@ Each workload is a script consuming a fixture and producing a measurable load. M
 **Layers to instrument.**
 
 ```
-Load generator → API tier → [outbox] → post_transfers → Postgres
+Load generator → API tier → [outbox] → post_posting_lines → Postgres
      │              │            │           │              │
    client P99   API-tier      queue       function       commit
                 latency       depth       latency        latency
@@ -2124,7 +2126,7 @@ The §△ list under v0.2 reduces to a tractable tail.
 - **Double-entry correctness.** Per-ledger invariant test enforces.
 - **Atomicity within a batch.** Postgres transactions.
 - **Idempotent retries.** `idempotency_key UNIQUE` per event.
-- **Append-only audit.** Trigger-blocked UPDATE/DELETE on `transfers`.
+- **Append-only audit.** Trigger-blocked UPDATE/DELETE on `posting_lines`.
 - **Multi-currency support.** Same-currency invariant + FX rates table.
 - **Reservation semantics.** Better than v0.1 — first-class table, not pending-transfer kludge.
 - **WIP modeling.** Same shape; simpler implementation.
@@ -2137,15 +2139,15 @@ The §△ list under v0.2 reduces to a tractable tail.
 
 ### Throughput ceiling
 
-TB sustains 1M+ transfers/sec on a 6-node cluster. Postgres caps at ~50K TPS sustained on a single node (with batching) or hundreds of thousands across a multi-node setup with Citus or similar. If the roadmap genuinely targets >100K TPS, additional engineering is required.
+TB sustains 1M+ posting_lines/sec on a 6-node cluster. Postgres caps at ~50K TPS sustained on a single node (with batching) or hundreds of thousands across a multi-node setup with Citus or similar. If the roadmap genuinely targets >100K TPS, additional engineering is required.
 
 **Mitigation:** the CDC seam (logical replication slot) lets you fan out to a downstream system if the workload changes. The seam is logical replication, not the outbox.
 
 ### Cluster-level immutability by construction
 
-TB provides cluster-level guarantees about transfer immutability stronger than Postgres's row-level immutability. In Postgres, an attacker with database write access can `UPDATE transfers SET amount = ...`. Mitigated by:
-- Strict role-based access (no human has UPDATE on `transfers`).
-- Trigger-enforced "no UPDATE/DELETE on transfers" (raises exception).
+TB provides cluster-level guarantees about transfer immutability stronger than Postgres's row-level immutability. In Postgres, an attacker with database write access can `UPDATE posting_lines SET amount = ...`. Mitigated by:
+- Strict role-based access (no human has UPDATE on `posting_lines`).
+- Trigger-enforced "no UPDATE/DELETE on posting_lines" (raises exception).
 - Append-only audit log via logical replication to a write-once store.
 
 Equivalent to TB in practice if disciplined; not equivalent by construction. A regulated environment with strict immutability requirements may need an external WORM tier.
@@ -2189,15 +2191,15 @@ Decisions that need answers before v0.2 implementation can proceed:
 
 1. ~~**Is TB optionality a hard requirement** (regulatory, organizational, strategic), or a "nice to have" that has been rationalized into the architecture?~~ **Resolved (2026-04-29):** TB optionality is **not a hard requirement**. TigerBeetle remains a *reference model* for behavioral correctness (atomicity, lock semantics, idempotency, append-only invariants) but **not** a parity target the implementation has to shape itself against. Postgres-native ergonomics win where they conflict with TB-shape decisions. The "TB-parity tax" framing in Part III stays as historical context, not as a future-cutover obligation.
 
-2. ~~**What is the realistic 24-month TPS projection** for this workload?~~ **Resolved (2026-04-29):** No fixed TPS target. The project is an **exploration of what's possible with Postgres-native** in place of the v0.1 hybrid Postgres/TigerBeetle design. Goal ordering is **correctness first, performance second**. The implication for the perf baseline (§14.1): we measure to establish a *yardstick*, not to chase a number. Specifically — establish a baseline on the simplest schema before any Phase 1 complexity (customers, work orders, routings, BOMs, alternate cost methods, etc.) is added; subsequent additions get diff'd against the baseline so that "did adding feature X regress throughput?" is answerable. The baseline shipped as `perf_baseline_v0.md` (acct-1ia closed 2026-04-29; outbox shapes G/J/K/L/M added through 2026-04-30 via acct-tyq → acct-yjn). `acct-e8g` (transfers partitioning) and the §14.1 follow-up cost-method workloads (`acct-8gg`) are the remaining downstream items.
+2. ~~**What is the realistic 24-month TPS projection** for this workload?~~ **Resolved (2026-04-29):** No fixed TPS target. The project is an **exploration of what's possible with Postgres-native** in place of the v0.1 hybrid Postgres/TigerBeetle design. Goal ordering is **correctness first, performance second**. The implication for the perf baseline (§14.1): we measure to establish a *yardstick*, not to chase a number. Specifically — establish a baseline on the simplest schema before any Phase 1 complexity (customers, work orders, routings, BOMs, alternate cost methods, etc.) is added; subsequent additions get diff'd against the baseline so that "did adding feature X regress throughput?" is answerable. The baseline shipped as `perf_baseline_v0.md` (acct-1ia closed 2026-04-29; outbox shapes G/J/K/L/M added through 2026-04-30 via acct-tyq → acct-yjn). `acct-e8g` (posting_lines partitioning) and the §14.1 follow-up cost-method workloads (`acct-8gg`) are the remaining downstream items.
 
-3. ~~**Is the outbox load-bearing** in a single-database world?~~ **Originally resolved (Phase 0, 2026-04-27, bd `acct-93b.3`):** No outbox in Phase 0; `post_transfers` is sync, inline. **Re-examined and re-resolved (2026-04-30, bd `acct-0oy`):** Stay sync for now; pivot to shape **L** (pseudo-sync via LISTEN/NOTIFY) deferred to Phase 1+ when contention emerges. The five-shape outbox characterization (G/J/K/L/M) shipped via `acct-tyq` → `acct-hbg` → `acct-dtv` → `acct-yjn` and is documented in `perf_baseline_v0.md` observations 15-17. The original D3 rationale ("sync is dominant by every measure") is **wrong** — under 100-writer contention, L's caller p99 = 547 ms vs F's 8.25 s (15× better) and throughput median is ~1.8× F. The corrected rationale for staying sync is **operational simplicity, not perf superiority**: every Phase 0 test and every Phase 1 fixture is structured around an inline function call, and realistic Phase 1 workflows (per-document transfers, naturally spread across SKUs/locations) don't hit the high-contention regime where L's advantages are load-bearing. We commit to revisiting once Phase 1 produces measured contention — tracked as `acct-c4p` with explicit triggers. The L infrastructure (DrainConfig, listener dispatcher, drain-tx pg_notify with SQLSTATE payload) is already built and benched; the future pivot is additive, not a foundation rewrite.
+3. ~~**Is the outbox load-bearing** in a single-database world?~~ **Originally resolved (Phase 0, 2026-04-27, bd `acct-93b.3`):** No outbox in Phase 0; `post_posting_lines` is sync, inline. **Re-examined and re-resolved (2026-04-30, bd `acct-0oy`):** Stay sync for now; pivot to shape **L** (pseudo-sync via LISTEN/NOTIFY) deferred to Phase 1+ when contention emerges. The five-shape outbox characterization (G/J/K/L/M) shipped via `acct-tyq` → `acct-hbg` → `acct-dtv` → `acct-yjn` and is documented in `perf_baseline_v0.md` observations 15-17. The original D3 rationale ("sync is dominant by every measure") is **wrong** — under 100-writer contention, L's caller p99 = 547 ms vs F's 8.25 s (15× better) and throughput median is ~1.8× F. The corrected rationale for staying sync is **operational simplicity, not perf superiority**: every Phase 0 test and every Phase 1 fixture is structured around an inline function call, and realistic Phase 1 workflows (per-document posting_lines, naturally spread across SKUs/locations) don't hit the high-contention regime where L's advantages are load-bearing. We commit to revisiting once Phase 1 produces measured contention — tracked as `acct-c4p` with explicit triggers. The L infrastructure (DrainConfig, listener dispatcher, drain-tx pg_notify with SQLSTATE payload) is already built and benched; the future pivot is additive, not a foundation rewrite.
 
-4. ~~**Cost method:** standard, WAC, or hybrid?~~ **Resolved (Phase 0, 2026-04-27, bd `acct-93b.4`):** Phase 0 shipped `'standard'` first (migration 0019, `acct-0ig`) then `'wac'` (migration 0021, `acct-uxu`, 2026-04-30). The `cost_method` enum carries `'standard' | 'wac' | 'fifo' | 'lot'`; `skus.cost_method` (default `'standard'`) drives the dispatcher in `post_transfers`. `'fifo'` and `'lot'` branches still raise `P0006 cost_method_not_implemented` — tracked as `acct-8gg` once lot infrastructure is scoped. WAC's pool-balance read uses FOR UPDATE on the matching qty + value accounts (B2 explicitly resolved: read-then-write under lock is safe in PG).
+4. ~~**Cost method:** standard, WAC, or hybrid?~~ **Resolved (Phase 0, 2026-04-27, bd `acct-93b.4`):** Phase 0 shipped `'standard'` first (migration 0019, `acct-0ig`) then `'wac'` (migration 0021, `acct-uxu`, 2026-04-30). The `cost_method` enum carries `'standard' | 'wac' | 'fifo' | 'lot'`; `skus.cost_method` (default `'standard'`) drives the dispatcher in `post_posting_lines`. `'fifo'` and `'lot'` branches still raise `P0006 cost_method_not_implemented` — tracked as `acct-8gg` once lot infrastructure is scoped. WAC's pool-balance read uses FOR UPDATE on the matching qty + value accounts (B2 explicitly resolved: read-then-write under lock is safe in PG).
 
 5. **Reservation lifetime expectations:** are sub-second timeouts ever needed? Drives whether `pg_cron`-based expiry is sufficient or whether `LISTEN/NOTIFY` is needed.
 
-6. **Append-only enforcement model:** trigger-blocked UPDATE/DELETE on transfers (as in §1.9), RBAC-only, or both? Implication for cluster-level immutability claims.
+6. **Append-only enforcement model:** trigger-blocked UPDATE/DELETE on posting_lines (as in §1.9), RBAC-only, or both? Implication for cluster-level immutability claims.
 
 7. **CDC sinks at MVP:** none, search index, OLAP store, all of the above? Drives the tier-3 design timing.
 
@@ -2207,7 +2209,7 @@ Decisions that need answers before v0.2 implementation can proceed:
 
 10. **Per-WO per-op account opt-in:** which SKU families or WO types warrant job-cost grain? (Default: none; opt in when Finance or operations requests.)
 
-11. **Sub-ledger separation:** today every posting flows through a single `post_transfers`. Mainstream ERPs separate sub-ledgers (FI-AR, FI-AP, MM, AA, CO/PP) with sub-ledger-to-GL transfer steps; we don't. Single-`post_transfers` is operationally simpler today (no sub-ledger ↔ GL reconciliation needed; one source of truth) but as scope grows past Phase 2 features (fixed assets, projects, payroll, lot/serial, multi-entity) the dispatcher centralization will become the bottleneck where every cost-method / variance / dispatch branch concentrates. **Question:** when do we split, what constitutes a sub-ledger boundary in our model, and what's the migration shape from one-`post_transfers` to N-sub-ledgers-with-aggregation? Watch item; not yet at the inflection point. Surfaced 2026-05-05 in ERP_RESEARCH.md follow-up architectural review.
+11. **Sub-ledger separation:** today every posting flows through a single `post_posting_lines`. Mainstream ERPs separate sub-ledgers (FI-AR, FI-AP, MM, AA, CO/PP) with sub-ledger-to-GL transfer steps; we don't. Single-`post_posting_lines` is operationally simpler today (no sub-ledger ↔ GL reconciliation needed; one source of truth) but as scope grows past Phase 2 features (fixed assets, projects, payroll, lot/serial, multi-entity) the dispatcher centralization will become the bottleneck where every cost-method / variance / dispatch branch concentrates. **Question:** when do we split, what constitutes a sub-ledger boundary in our model, and what's the migration shape from one-`post_posting_lines` to N-sub-ledgers-with-aggregation? Watch item; not yet at the inflection point. Surfaced 2026-05-05 in ERP_RESEARCH.md follow-up architectural review.
 
 12. **Multi-tenant / single-tenant architecture:** Phase 0/1 ships single-database / single-schema / single-ledger. Mainstream ERPs vary: NetSuite is multi-tenant SaaS (shared infrastructure, per-tenant row separation); SAP S/4HANA Cloud is multi-instance (separate database per tenant); Oracle Cloud is multi-instance with shared services; D365 is multi-instance with separate F&O environments per legal-entity group. **Question:** which model do we target if/when productization happens, and what schema decisions today would make the future split cheaper? Currently every transactional table assumes single-tenant; adding `tenant_id` later is a significant migration. Distinct from but adjacent to acct-3gzh (multi-entity within a single tenant). Watch item; deferred until productization scope is clearer. Surfaced 2026-05-05 in ERP_RESEARCH.md follow-up architectural review.
 
@@ -2231,6 +2233,6 @@ The archived files are preserved as a record of the design evolution; this conso
 Status as of 2026-04-30: items 1-2 and 4 are complete; item 3 is dead (v0.1 abandoned in favor of v0.2 by this consolidated doc). What's left is Phase 1 framing, which Part VII items (5)-(10) shape.
 
 1. ~~**Resolve the gating questions** in Part VII items (1) and (2) explicitly~~ — Done 2026-04-29. v0.2 is the framing.
-2. ~~**Start Phase 0** (Part IV §13).~~ — Done. Schema, `post_transfers` (with WAC dispatcher), reservations, period close, reconciliation, perf baseline (13 shapes), and the conformance harness all shipped under epic `acct-93b`. The three remaining open issues (`acct-0oy`, `acct-e8g`, `acct-8gg`) are P3 and explicitly gated on Phase 1 framing or §14.1 follow-up.
+2. ~~**Start Phase 0** (Part IV §13).~~ — Done. Schema, `post_posting_lines` (with WAC dispatcher), reservations, period close, reconciliation, perf baseline (13 shapes), and the conformance harness all shipped under epic `acct-93b`. The three remaining open issues (`acct-0oy`, `acct-e8g`, `acct-8gg`) are P3 and explicitly gated on Phase 1 framing or §14.1 follow-up.
 3. ~~**If v0.1 proceeds instead:**~~ — Not applicable. v0.1 was abandoned by this consolidated doc.
 4. ~~**Add a conformance test fixture** for the write function.~~ — Done. `tests/data/conformance.json` + `tests/conformance.rs` (107 cases, 11 batch-vs-split tagged).
