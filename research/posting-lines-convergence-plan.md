@@ -412,7 +412,26 @@ Each phase below specifies the 9 fields per the plan: **prerequisites / delivera
 
 **Phase B aggregate — COMPLETE 2026-05-07.** All three sub-issues shipped: B1 (acct-wb75.1.1) folded into the consolidation cutover (`0019`); B2 (acct-wb75.1.2) at `0022`; B3 (acct-wb75.1.3) at `0023`. Phase C is now unblocked.
 
-### §4.C Phase C — `posting_line_inventory` extension
+### §4.C Phase C — `posting_line_inventory` extension ✓ SHIPPED 2026-05-08
+
+**Status.** C0 preflight audit (acct-wb75.2.1) shipped 2026-05-08 as
+`tests/posting_line_inventory_preflight.rs`; clean. C1 (acct-wb75.2.2)
+shipped same day as mig `0024_posting_line_inventory.up.sql` + `tests/
+posting_line_inventory_t1.rs`. Dispatcher chains C-block after B3
+(extension order: B1 sources → B2 currencies → B3 dimensions → C
+inventory). Backfill INNER JOINs `skus` so non-inventory qty postings
+naturally drop out. Recon check #6 (`inventory_extension_missing`)
+mirrors the dispatcher's filter. 694 passed / 0 failed / 9 ignored.
+
+**Design call surfaced during C1 integration.** The plan envisioned
+`product_id NOT NULL` with C0 catching exceptions before backfill. C0's
+synthetic-only probe missed an organic case: by-product disposal_cost
+period-basis postings (`disposal_expense ↔ accrued_disposal_liability`)
+carry `qty = planned_qty` as audit metadata, but neither account has
+an SKU. Resolution: keep `product_id NOT NULL` (preserves the strong
+invariant for real inventory rows); dispatcher and recon defensively
+skip when no SKU resolves. The qty stays in `posting_lines.qty` for
+traceability. Documented in commit d925788.
 
 **Prerequisites.** Phase B complete (especially B3, since `posting_line_inventory` partially overlaps with the 'product' dimension; we want the dimensions extension live first to avoid double-encoding).
 
