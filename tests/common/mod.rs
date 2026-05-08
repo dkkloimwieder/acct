@@ -50,6 +50,7 @@ pub async fn pg_deadlock_count(pool: &PgPool) -> i64 {
 pub async fn reset_to_fixture(pool: &PgPool) {
     sqlx::raw_sql(
         "TRUNCATE TABLE
+            inventory_movements,
             posting_line_sources,
             posting_line_currencies,
             posting_line_dimensions,
