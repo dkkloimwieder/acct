@@ -53,6 +53,7 @@ pub async fn reset_to_fixture(pool: &PgPool) {
             posting_line_sources,
             posting_line_currencies,
             posting_line_dimensions,
+            posting_line_inventory,
             posting_lines_provisional,
             posting_lines,
             inventory_reservations,
