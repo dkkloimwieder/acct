@@ -1,0 +1,2 @@
+-- Best-effort down (project convention).
+-- CREATE OR REPLACE on a wipe-and-reapply rebuilds the prior bodies via mig 0017.
