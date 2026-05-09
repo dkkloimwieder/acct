@@ -1,0 +1,4 @@
+-- Best-effort down (project convention).
+-- CREATE OR REPLACE on a wipe-and-reapply rebuilds the prior bodies via mig 0038.
+-- ALTER TYPE ADD VALUE leaves 'wo_byproduct_credit' on the type — Postgres
+-- has no DROP VALUE; the unused value is harmless.

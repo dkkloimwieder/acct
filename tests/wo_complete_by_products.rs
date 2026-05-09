@@ -485,15 +485,18 @@ async fn partial_complete_no_by_product_until_close() {
 }
 
 // ============================================================
-// 5. WAC parent gate: nrv_credit on WAC parent silently skips
+// 5. WAC parent + nrv_credit fires correctly (acct-nnyl)
 // ============================================================
 //
-// Confirms the acct-nnyl deferral. The wo_by_products row exists but
-// no by-product transfers fire. The WO completes correctly using the
-// WAC running-avg pricing without any by-product interaction.
+// Pre-acct-nnyl: pre-pass gated to standard parent only — by-product
+// silently skipped. Post-fix: gate lifted to admit wac_perpetual /
+// wac_periodic / wac_retroactive parents; by-product value leg uses
+// the new 'wo_byproduct_credit' reason so apply_event flagging skips
+// it. By-product fires at wo_complete; pool balances reflect the
+// nrv_credit reduction.
 
 #[tokio::test]
-async fn wac_parent_nrv_credit_silently_skipped() {
+async fn wac_parent_nrv_credit_fires_correctly() {
     let pool = connect_test_db().await;
     reset_to_fixture(&pool).await;
 
@@ -575,27 +578,53 @@ async fn wac_parent_nrv_credit_silently_skipped() {
     call_wo_start(&pool, &wo_id).await;
     call_wo_complete(&pool, &wo_id, 10).await;
 
-    // WAC parent: by-product silently skipped. wo_by_products row was
-    // snapshotted at start (acct-7t4.2) but pre-pass skipped the value
-    // leg per acct-nnyl gate. By-product fg accounts UNTOUCHED.
+    // WAC parent: by-product now fires at wo_complete. Qty leg adds
+    // 10 to bp_qty; value leg adds unit_value × planned_qty = 50 × 10
+    // = 500 to bp_val (sourced from parent WIP).
     assert_eq!(
-        balance(&pool, bp_qty).await,
-        0,
-        "WAC parent: by-product qty leg silently skipped (acct-nnyl)"
+        balance(&pool, bp_qty).await, 10,
+        "WAC parent: by-product qty leg fires"
     );
-    assert_eq!(balance(&pool, bp_val).await, 0);
+    assert_eq!(
+        balance(&pool, bp_val).await, 500,
+        "WAC parent: by-product value leg fires (50 × 10)"
+    );
 
-    // Parent FG receives full WAC drain. Pool was 100×60=6000 / 100 = 60 per
-    // unit at wo_start. After wo_start the WIP pool gained component drain
-    // of 10×60=600 (one rm_issue at op 10). Pool value 600, qty 10.
-    // wo_complete drains 10×60 = 600 to parent fg.
+    // Parent FG drain reduced by NRV credit: WIP held 10×60=600, NRV
+    // credit drains 500 to bp, leaving 100 to flow to parent FG.
     let parent_fg_val_bal = balance(&pool, parent_fg_val).await;
-    assert_eq!(parent_fg_val_bal, 600);
+    assert_eq!(parent_fg_val_bal, 100, "parent FG = 600 WIP - 500 NRV");
     assert_eq!(balance(&pool, parent_fg_qty).await, 10);
     assert_eq!(balance(&pool, parent_wip_qty).await, 0);
     assert_eq!(balance(&pool, parent_wip_val).await, 0);
 
-    assert_invariants_hold(&pool, "wac_parent_nrv_credit_silently_skipped").await;
+    // The by-product value leg was posted under 'wo_byproduct_credit',
+    // NOT 'wo_complete_v', so the apply_event flagging logic skipped it.
+    let bp_credit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM posting_lines
+          WHERE reason = 'wo_byproduct_credit' AND debit_account_id = $1",
+    )
+    .bind(bp_val)
+    .fetch_one(&pool)
+    .await
+    .expect("count by-product credit posts");
+    assert_eq!(bp_credit_count, 1, "expected 1 wo_byproduct_credit row on bp_val");
+
+    let provisional_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT
+           FROM posting_lines_provisional plp
+           JOIN posting_lines pl ON pl.id = plp.posting_line_id
+          WHERE pl.reason = 'wo_byproduct_credit'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count provisional");
+    assert_eq!(
+        provisional_count, 0,
+        "wo_byproduct_credit must NOT be flagged into posting_lines_provisional"
+    );
+
+    assert_invariants_hold(&pool, "wac_parent_nrv_credit_fires_correctly").await;
 }
 
 // ============================================================
@@ -649,4 +678,232 @@ async fn zero_actual_qty_records_full_yield_variance() {
     assert_eq!(balance(&pool, yield_var).await, 500);
 
     assert_invariants_hold(&pool, "zero_actual_qty_records_full_yield_variance").await;
+}
+
+// ============================================================
+// 7. wac_periodic parent + nrv_credit: close hook does not
+//    re-dispatch the by-product credit (acct-nnyl).
+// ============================================================
+//
+// The acct-nnyl bug shape: by-product value leg used 'wo_complete_v',
+// which apply_event flagged into posting_lines_provisional for
+// wac_periodic / wac_retroactive parents. The period-close hook then
+// recomputed the variance against the parent's final running avg,
+// silently corrupting the NRV value. After the fix the value leg
+// uses 'wo_byproduct_credit' which is NOT in the flag list, so no
+// posting_lines_provisional row is created and the close hook never
+// touches the NRV.
+
+async fn close_period(pool: &PgPool, code: &str) -> serde_json::Value {
+    let pid: i64 = sqlx::query_scalar("SELECT id FROM periods WHERE code = $1")
+        .bind(code)
+        .fetch_one(pool)
+        .await
+        .expect("period");
+    let actor = fresh_uuid(pool).await;
+    sqlx::query_scalar("SELECT close_period($1, $2::UUID, FALSE, FALSE)")
+        .bind(pid)
+        .bind(&actor)
+        .fetch_one(pool)
+        .await
+        .expect("close_period")
+}
+
+async fn scaffold_wac_parent_with_byproduct(
+    pool: &PgPool,
+    suffix: &str,
+    cost_method: &str,
+) -> (String, String, i64, i64, i64, i64) {
+    let parent_code = format!("BPC-{cost_method}-P-{suffix}");
+    let comp_code = format!("BPC-{cost_method}-C-{suffix}");
+    let raw_loc_code = format!("BPC-{cost_method}-R-{suffix}");
+    let fg_loc_code = format!("BPC-{cost_method}-FG-{suffix}");
+
+    let parent_id: String = sqlx::query_scalar(
+        "INSERT INTO skus (code, uom, cost_method)
+         VALUES ($1, 'EA', $2::cost_method) RETURNING id::text",
+    )
+    .bind(&parent_code)
+    .bind(cost_method)
+    .fetch_one(pool)
+    .await
+    .expect("wac sku");
+    let comp_id = one_sku(pool, &comp_code).await;
+    let raw_loc = one_location(pool, &raw_loc_code).await;
+    let fg_loc = one_location(pool, &fg_loc_code).await;
+    set_std_cost(pool, &comp_id, 60).await;
+
+    open_account(pool, "stock_wip", "qty", None,
+        Some(&parent_id), None, None, Some(10), "debit").await;
+    let parent_wip_val = open_account(pool, "inv_value_wip", "value", Some("USD"),
+        Some(&parent_id), None, None, Some(10), "debit").await;
+    open_account(pool, "stock_available", "qty", None,
+        Some(&parent_id), Some(&fg_loc), None, None, "debit").await;
+    let parent_fg_val = open_account(pool, "inv_value_fg", "value", Some("USD"),
+        Some(&parent_id), Some(&fg_loc), None, None, "debit").await;
+    open_account(pool, "stock_consumed", "qty", None,
+        Some(&comp_id), None, None, None, "debit").await;
+    let raw_qty = open_account(pool, "stock_available", "qty", None,
+        Some(&comp_id), Some(&raw_loc), None, None, "debit").await;
+    let raw_val = open_account(pool, "inv_value_raw", "value", Some("USD"),
+        Some(&comp_id), Some(&raw_loc), None, None, "debit").await;
+    let void_qty = account_id_by_kind_currency(pool, "creation_void", None).await;
+    let void_val = account_id_by_kind_currency(pool, "creation_void", Some("USD")).await;
+
+    let posted_by = fresh_uuid(pool).await;
+    let did = fresh_uuid(pool).await;
+    let mint = serde_json::json!([
+        {"reason":"cycle_count_adj","document_kind":"bp_seed","document_id":did,
+         "debit_account_id":raw_qty,"credit_account_id":void_qty,
+         "amount":100,"qty":100,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(pool).await,"posted_by":posted_by},
+        {"reason":"cycle_count_adj","document_kind":"bp_seed","document_id":did,
+         "debit_account_id":raw_val,"credit_account_id":void_val,
+         "amount":6000,"qty":100,"business_date":"2026-04-15",
+         "idempotency_key":fresh_uuid(pool).await,"posted_by":posted_by},
+    ]);
+    sqlx::query("SELECT post_posting_lines($1, FALSE)")
+        .bind(mint).execute(pool).await.expect("seed raw");
+
+    let bom_id = create_bom_header(pool, &parent_code).await;
+    add_bom_item(pool, bom_id, 1, 10, &comp_code, &raw_loc_code, 1, 100.0).await;
+
+    let wo_id: String = sqlx::query_scalar(
+        "INSERT INTO work_orders
+            (wo_no, parent_sku_id, fg_location_id, qty_target, currency, posted_by)
+         VALUES ($1, $2::UUID, $3::UUID, 10, 'USD', $4::UUID) RETURNING id::text",
+    )
+    .bind(format!("BPC-{cost_method}-WO-{suffix}"))
+    .bind(&parent_id)
+    .bind(&fg_loc)
+    .bind(&posted_by)
+    .fetch_one(pool)
+    .await
+    .expect("wo");
+    sqlx::query("INSERT INTO wo_routings (wo_id, routing_op, op_name) VALUES ($1::UUID, 10, 'MILL')")
+        .bind(&wo_id).execute(pool).await.expect("routing");
+
+    let bp_sku = one_sku(pool, &format!("BPC-{cost_method}-O-{suffix}")).await;
+    let (bp_qty, bp_val) = open_byproduct_accounts(pool, &bp_sku, &fg_loc).await;
+    add_bom_by_product(pool, bom_id, 1, &bp_sku, &fg_loc, 1.0, 50, "nrv_credit").await;
+
+    (wo_id, bp_sku, bp_qty, bp_val, parent_wip_val, parent_fg_val)
+}
+
+#[tokio::test]
+async fn wac_periodic_parent_nrv_credit_no_redispatch_at_close() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let (wo_id, _bp_sku, bp_qty, bp_val, _parent_wip_val, parent_fg_val) =
+        scaffold_wac_parent_with_byproduct(&pool, "P1", "wac_periodic").await;
+
+    call_wo_start(&pool, &wo_id).await;
+    call_wo_complete(&pool, &wo_id, 10).await;
+
+    // wo_complete fired by-product: bp gets 10 qty / $500 value;
+    // parent FG drains 600 - 500 = $100.
+    let bp_val_pre = balance(&pool, bp_val).await;
+    let parent_fg_pre = balance(&pool, parent_fg_val).await;
+    assert_eq!(balance(&pool, bp_qty).await, 10);
+    assert_eq!(bp_val_pre, 500);
+    assert_eq!(parent_fg_pre, 100);
+
+    // The 'wo_byproduct_credit' posting must NOT appear in
+    // posting_lines_provisional — that's the load-bearing assertion
+    // for the close-hook acceptance.
+    let prov_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT
+           FROM posting_lines_provisional plp
+           JOIN posting_lines pl ON pl.id = plp.posting_line_id
+          WHERE pl.reason = 'wo_byproduct_credit'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count provisional");
+    assert_eq!(prov_count, 0,
+        "wo_byproduct_credit must not be flagged into posting_lines_provisional");
+
+    // Close the period. wac_periodic_close_hook walks
+    // posting_lines_provisional and recomputes variance for flagged
+    // rows. Since the by-product credit isn't flagged, no variance
+    // is posted against bp_val or parent_wip_val.
+    let _summary = close_period(&pool, "2026-04").await;
+
+    // bp_val and parent_fg_val UNCHANGED across close.
+    assert_eq!(balance(&pool, bp_val).await, bp_val_pre,
+        "bp_val must not be re-dispatched at period close");
+    assert_eq!(balance(&pool, parent_fg_val).await, parent_fg_pre,
+        "parent_fg_val must not be re-dispatched at period close");
+
+    // Sanity: no variance_wac_periodic transfer touches bp_val or
+    // parent_wip_val from the by-product credit.
+    let bp_variance: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM posting_lines pl
+           JOIN accounts a ON a.id IN (pl.debit_account_id, pl.credit_account_id)
+          WHERE a.kind = 'variance_wac_periodic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count variance");
+    assert_eq!(bp_variance, 0,
+        "no variance_wac_periodic transfers expected — by-product credit isn't flagged");
+
+    assert_invariants_hold(&pool, "wac_periodic_parent_nrv_credit_no_redispatch_at_close").await;
+}
+
+// ============================================================
+// 8. wac_retroactive parent + nrv_credit: close hook does not
+//    re-dispatch the by-product credit (acct-nnyl).
+// ============================================================
+//
+// Same shape as #7 but parent is wac_retroactive. The retroactive
+// close hook does chronological replay; without the fix, the
+// by-product credit would replay through the merged value/qty stream
+// and emit a variance.
+
+#[tokio::test]
+async fn wac_retroactive_parent_nrv_credit_no_redispatch_at_close() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let (wo_id, _bp_sku, bp_qty, bp_val, _parent_wip_val, parent_fg_val) =
+        scaffold_wac_parent_with_byproduct(&pool, "R1", "wac_retroactive").await;
+
+    call_wo_start(&pool, &wo_id).await;
+    call_wo_complete(&pool, &wo_id, 10).await;
+
+    let bp_val_pre = balance(&pool, bp_val).await;
+    let parent_fg_pre = balance(&pool, parent_fg_val).await;
+    assert_eq!(balance(&pool, bp_qty).await, 10);
+    assert_eq!(bp_val_pre, 500);
+    assert_eq!(parent_fg_pre, 100);
+
+    let prov_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT
+           FROM posting_lines_provisional plp
+           JOIN posting_lines pl ON pl.id = plp.posting_line_id
+          WHERE pl.reason = 'wo_byproduct_credit'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count provisional");
+    assert_eq!(prov_count, 0);
+
+    let _summary = close_period(&pool, "2026-04").await;
+
+    assert_eq!(balance(&pool, bp_val).await, bp_val_pre);
+    assert_eq!(balance(&pool, parent_fg_val).await, parent_fg_pre);
+
+    let bp_variance: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM posting_lines pl
+           JOIN accounts a ON a.id IN (pl.debit_account_id, pl.credit_account_id)
+          WHERE a.kind = 'variance_wac_retroactive'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count variance");
+    assert_eq!(bp_variance, 0);
+
+    assert_invariants_hold(&pool, "wac_retroactive_parent_nrv_credit_no_redispatch_at_close").await;
 }
