@@ -51,6 +51,8 @@ pub async fn reset_to_fixture(pool: &PgPool) {
     sqlx::raw_sql(
         "TRUNCATE TABLE
             inventory_movements,
+            journal_entry_lines,
+            journal_entries,
             posting_line_sources,
             posting_line_currencies,
             posting_line_dimensions,
