@@ -16,7 +16,6 @@
 //!   - so_shipment_lines.lot_id audit stamp
 //!   - explicit lot pin via p_lines per-line 'lot_id' key
 //!   - multi-WO multi-lot FIFO walk by receipt_date
-//!   - lot_fifo parent + wo_by_products → P0006 at wo_complete
 //!   - 'lot' (legacy) still raises P0006 at wo_start AND so_ship
 //!   - recon checks stay clean
 
@@ -731,85 +730,11 @@ async fn lot_fifo_cogs_amount_equals_sum_lot_events() {
     assert_eq!(cogs_amount, 350); // 7 × $50.
 }
 
-// ============================================================
-// L4.6: lot_fifo parent + by-products → P0006 at wo_complete (out of
-// MVP scope — early-fails per L4 design).
-// ============================================================
-
-#[tokio::test]
-async fn lot_fifo_parent_with_byproducts_raises_p0006_at_wo_complete() {
-    let pool = connect_test_db().await;
-    reset_to_fixture(&pool).await;
-
-    let sf = scaffold_lot_fg(&pool, "6").await;
-
-    // Add a by-product line to the BOM.
-    let bom_id: i64 = sqlx::query_scalar(
-        "SELECT id FROM bom_headers WHERE parent_sku_id = $1::UUID LIMIT 1",
-    )
-    .bind(&sf.parent)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    let bp_sku = fresh_sku(&pool, "BP-LOT-6", "standard").await;
-    let bp_loc = fresh_location(&pool, "BP-LOT-6-LOC").await;
-    set_std_cost(&pool, &bp_sku, 5).await;
-
-    open_account(
-        &pool,
-        "stock_available",
-        "qty",
-        None,
-        Some(&bp_sku),
-        Some(&bp_loc),
-        None,
-        None,
-        "debit",
-    )
-    .await;
-    open_account(
-        &pool,
-        "inv_value_fg",
-        "value",
-        Some("USD"),
-        Some(&bp_sku),
-        Some(&bp_loc),
-        None,
-        None,
-        "debit",
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO bom_by_products
-            (bom_id, by_product_no, output_sku_id, fg_location_id,
-             qty_per_parent, unit_value, treatment, disposal_basis,
-             disposal_vendor_id, disposal_expense_account_kind)
-         VALUES ($1, 1, $2::UUID, $3::UUID, 1, 5, 'nrv_credit', NULL, NULL, NULL)",
-    )
-    .bind(bom_id)
-    .bind(&bp_sku)
-    .bind(&bp_loc)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let wo = create_wo(&pool, "WO-LOT-6", &sf.parent, &sf.fg_loc, 5).await;
-    add_routing(&pool, &wo, 10, "ASSEMBLE").await;
-    call_wo_start(&pool, &wo, "2026-04-15")
-        .await
-        .expect("wo_start (by-products row populated)");
-
-    // wo_complete must early-fail because v_cost_method='lot_fifo' and
-    // wo_by_products has rows.
-    let res = call_wo_complete(&pool, &wo, 5, "2026-04-15").await;
-    let err = res.expect_err("lot_fifo parent + by-products must raise");
-    assert_eq!(
-        err.as_database_error().and_then(|e| e.code()).map(|c| c.into_owned()).as_deref(),
-        Some("P0006"),
-    );
-}
+// (L4.6 lot_fifo parent + by-products → P0006 was REMOVED in acct-fjxp.
+// Behavior is now SUPPORTED for nrv_credit, negligible, and
+// disposal_cost(period). See tests/lot_fifo_byproducts_t1.rs for
+// positive-coverage cases. disposal_cost(inventoriable) still
+// raises P0006 — that's exercised in the new test binary too.)
 
 // ============================================================
 // L4.7: idempotent replay — same idempotency_key returns same doc_id,
