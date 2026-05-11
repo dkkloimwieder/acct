@@ -48,6 +48,7 @@
 mod common;
 
 use common::*;
+use common::psync_runtime;
 use serde_json::json;
 use sqlx::PgPool;
 use std::collections::VecDeque;
@@ -1187,6 +1188,7 @@ async fn do_so_ship(
     rng: &mut u64,
     posted_by: &str,
     business_date: &str,
+    psync: Option<&psync_runtime::Dispatcher>,
 ) -> Outcome {
     let c = &customer_spots[(xorshift(rng) as usize) % customer_spots.len()];
     let qty = 1 + (xorshift(rng) % 20) as i64; // 1..20
@@ -1200,16 +1202,56 @@ async fn do_so_ship(
     }]);
 
     let t0 = Instant::now();
-    let res = sqlx::query(
-        "SELECT post_so_ship($1::UUID, $2, $3::DATE, $4::UUID, $5::UUID, NULL)",
-    )
-    .bind(&c.so_id)
-    .bind(&lines)
-    .bind(business_date)
-    .bind(posted_by)
-    .bind(&key)
-    .execute(pool)
-    .await;
+    let res: Result<(), sqlx::Error> = match psync {
+        None => sqlx::query(
+            "SELECT post_so_ship($1::UUID, $2, $3::DATE, $4::UUID, $5::UUID, NULL)",
+        )
+        .bind(&c.so_id)
+        .bind(&lines)
+        .bind(business_date)
+        .bind(posted_by)
+        .bind(&key)
+        .execute(pool)
+        .await
+        .map(|_| ()),
+        Some(dispatcher) => {
+            // Shape-L path: enqueue, then await rendezvous.
+            let enqueue_res: Result<(String, i64), sqlx::Error> = sqlx::query_as(
+                "SELECT so_shipment_id::text, outbox_id FROM post_so_ship_psync($1::UUID, $2, $3::DATE, $4::UUID, $5::UUID, NULL)",
+            )
+            .bind(&c.so_id)
+            .bind(&lines)
+            .bind(business_date)
+            .bind(posted_by)
+            .bind(&key)
+            .fetch_one(pool)
+            .await;
+
+            match enqueue_res {
+                Err(e) => Err(e),
+                Ok((_doc_id, outbox_id)) => {
+                    if outbox_id < 0 {
+                        // Idempotent replay path — no rendezvous.
+                        Ok(())
+                    } else {
+                        match dispatcher
+                            .wait_for(outbox_id, Duration::from_secs(30))
+                            .await
+                        {
+                            Ok(o) if o.status == "ok" => Ok(()),
+                            Ok(o) => Err(sqlx::Error::Protocol(format!(
+                                "psync drainer reported status={} sqlstate={:?}",
+                                o.status, o.sqlstate
+                            ))),
+                            Err(()) => Err(sqlx::Error::Protocol(
+                                "psync rendezvous timeout".to_string(),
+                            )),
+                        }
+                    }
+                }
+            }
+        }
+    };
     let dur = t0.elapsed();
 
     match res {
@@ -1369,10 +1411,31 @@ async fn phase1_mixed_workload() {
         .ok()
         .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "FALSE"))
         .unwrap_or(false);
+    // acct-c4p: gate shape-L pseudo-sync path for post_so_ship. When
+    // enabled, post_so_ship calls route through post_so_ship_psync +
+    // ledger_outbox + dispatcher rendezvous.
+    let use_psync: bool = env::var("T4_USE_PSYNC")
+        .ok()
+        .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "FALSE"))
+        .unwrap_or(false);
     let duration = Duration::from_secs(duration_secs);
 
-    let pool = connect_test_db_with(n_writers + 8).await;
+    // c4p adds: 1 conn for listener + 1 for drainer when psync mode is on.
+    let extra_conns = if use_psync { 4 } else { 0 };
+    let pool = connect_test_db_with(n_writers + 8 + extra_conns).await;
     reset_to_fixture(&pool).await;
+
+    // acct-c4p: spawn psync runtime if requested. Lives until end of fn
+    // (Drop signals tasks to stop).
+    let psync_runtime = if use_psync {
+        eprintln!("T4-1s6r: T4_USE_PSYNC=1 — spawning shape-L pseudo-sync runtime");
+        Some(psync_runtime::PsyncRuntime::spawn(pool.clone(), "ledger_outbox_done").await)
+    } else {
+        None
+    };
+    let psync_dispatcher = psync_runtime
+        .as_ref()
+        .map(|r| r.dispatcher.clone());
 
     eprintln!(
         "T4-1s6r: setup begin (n_skus={n_skus} n_vendors={n_vendors} n_customers={n_customers} n_wo_skus={n_wo_skus})"
@@ -1460,6 +1523,7 @@ async fn phase1_mixed_workload() {
         let skip_c = skip_count.clone();
         let err_c = err_count.clone();
         let posted_by_w = posted_by.clone();
+        let psync_w = psync_dispatcher.clone();
 
         handles.push(tokio::spawn(async move {
             let nanos = SystemTime::now()
@@ -1516,6 +1580,7 @@ async fn phase1_mixed_workload() {
                             &mut rng,
                             &posted_by_w,
                             business_date,
+                            psync_w.as_ref(),
                         )
                         .await
                     }

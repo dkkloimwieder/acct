@@ -243,6 +243,47 @@ This decomposition does not directly inform `acct-zroo`. Under SERIALIZABLE isol
 
 **Filed:** `acct-3aak-c` follow-up for option (c). Reopening 3aak isn't necessary — (a) is shipped, measured, dispositioned; (c) is a different work item with different schema impact.
 
+### `acct-c4p` measurement (option L pseudo-sync shipped — mig 0070)
+
+**Mig 0070 ships `post_so_ship_psync`** as a parallel SQL entry point that returns `(so_shipment_id, outbox_id)` instead of waiting on `PERFORM post_posting_lines` in-tx. A new Rust runtime (`tests/common/psync_runtime.rs`) provides the Dispatcher + listener + super-batched drainer. The `load_phase1_mixed_workload` harness opts into the shape-L path via `T4_USE_PSYNC=1`, which spawns one PsyncRuntime per run; only `post_so_ship` is routed through it for this MVP — `post_wo_start`, `post_op_move`, `post_customer_invoice`, and everything else stay synchronous.
+
+**Same 32-writer × 600 s rig, `T4_USE_PSYNC=1`:**
+
+| Wrapper | Section | n | p50 | p95 | p99 | max |
+|---|---|---|---:|---:|---:|---:|
+| `post_so_ship_psync` | `setup` | 17 656 | 1 497 | 4 682 | 10 407 | 57 536 |
+| `post_so_ship_psync` | `enqueue` | 17 656 | 61 | 149 | 379 | 9 258 |
+| `post_so_ship_psync` | `followup` | 17 656 | 0 | 0 | 0 | 0 |
+| `post_op_move` | `setup` | 3 381 | 2 596 | 5 702 | 9 635 | 21 513 |
+| `post_op_move` | `post_posting_lines` | 3 381 | 5 264 | 3 034 067 | **9 908 691** | 23 389 023 |
+| `post_op_move` | `followup` | 3 381 | 14 | 26 | 61 | 2 423 |
+| `post_wo_start` | `setup` | 8 790 | 2 761 | 5 722 | 10 420 | 53 329 |
+| `post_wo_start` | `post_posting_lines` | 8 790 | 196 224 | 4 368 723 | **7 406 865** | 11 283 752 |
+| `post_customer_invoice` | `setup` | 12 383 | 2 420 | 7 155 | 13 763 | 47 202 |
+| `post_customer_invoice` | `post_posting_lines` | 12 383 | 1 584 | 13 708 | 22 712 | 47 300 |
+
+(per-op caller-side wall-clock for `so_ship` in this run: p50 17 656 µs / p95 1 052 ms / **p99 2 043 ms** / max 3 976 ms)
+
+**Verdict: shape L delivers a modest per-wrapper win for `so_ship` and a small combined-throughput regression.**
+
+`so_ship` caller p99 dropped from 2 841 ms (h73o sync baseline) → 2 043 ms (**−28 %**). The wrapper itself (setup + enqueue) settles at ~11 ms p99, which means **~2 030 ms of the caller's wait is now spent in the dispatcher rendezvous** — the drainer's super-batched commit + queue wait. That's much smaller than the predicted ~110× drop from the h73o addendum.
+
+**Why the prediction was over-optimistic:** the perf_baseline_v0 shape-L result (547 ms p99 vs 8 250 ms sync, 15× drop) was measured in the **shared-account-contention regime** — 100 writers all hammering one global account. In that regime, sync `post_posting_lines` serializes naturally at the row lock, so shape L's single-drainer doesn't lose anything by serializing too — and gains from super-batched amortization. In the 1s6r workload, writes spread across many (sku, location, customer) partitions; sync `post_posting_lines` runs ~30+ wrappers in parallel and the row-lock contention is only sporadic. Funneling them through one drainer **adds a bottleneck that the parallel sync path didn't have**.
+
+**Combined wrapper p99 actually went UP** (h73o sync 2 902 ms → 3aak 2 973 ms → 3zfj 2 973 ms → c4p psync 3 931 ms). The drainer's batched txs hold account-row locks during their commits, which contend with the other still-synchronous wrappers (`post_op_move`, `post_wo_start`, `post_customer_invoice`). `post_op_move`'s `post_posting_lines` p99 went from 7 038 ms (h73o) → 9 909 ms (psync run) — a 40 % regression. Net: throughput dropped from ~253 ops/s to 183 ops/s (**−28 %**).
+
+**What this proves:**
+1. The shape-L architecture works end-to-end (T1 `tests/so_ship_psync_t1.rs` green; smoke + 600 s perf show correctness).
+2. Shape L is **not a universal fix for transport contention**. It's a fix for **shared-write contention** — situations where the workload converges on a small number of hot rows.
+3. Migrating only one of four hot wrappers makes the picture worse, not better, because the drainer's batched commits contend with the still-synchronous wrappers.
+4. The h73o predicted per-wrapper drops (~110×/420×/640×) assumed in-isolation measurements. Under a mixed-workload, the drainer is the new bottleneck.
+
+**Filed:** the infrastructure ships (mig 0070 + psync_runtime module + T1 + harness opt-in) so that future work targeting **shared-account contention** (commodity provisional settlement, period-close batches, global revenue/cogs hotspotting under volume) has the pattern available. Per-wrapper migration of `post_wo_start` / `post_op_move` / `post_customer_invoice` is **not recommended** based on this measurement — they'd likely make combined p99 worse, not better.
+
+**Surfaces future work needs:**
+- A workload-shape decision tree for whether shape L is the right tool. Filed as `acct-c4p-followup-decision-tree`.
+- Per-wrapper measurement infrastructure to confirm c4p applicability per call-site BEFORE migrating.
+
 ### Re-running this addendum
 
 ```bash
