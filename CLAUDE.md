@@ -153,6 +153,31 @@ These are decisions the consolidated doc commits to. If a task touches one of th
 
   Full audit trail and per-function 7-question walk in `REVIEW.md` at repo root.
 
+## Partition lifecycle (`acct-sbr2`)
+
+Six parent tables ship as `PARTITION BY RANGE` (monthly granularity):
+
+| Table | Partition column | Helper | Cron job | Origin |
+|---|---|---|---|---|
+| `inventory_movements` | `movement_date` | `_create_inventory_movements_partition` | `inventory_movements_partition_rollover` | Phase D (mig 0025) |
+| `cost_layers` | `receipt_date` | `_create_cost_layers_partition` | `cost_layers_partition_rollover` | Phase E1 (mig 0031) |
+| `cost_layer_depletions` | `issue_date` | `_create_cost_layer_depletions_partition` | (shared with `cost_layers`) | Phase E1 (mig 0031) |
+| `inventory_lots` | `receipt_date` | `_create_inventory_lots_partition` | `inventory_lots_partition_rollover` | Phase E2 (mig 0044) |
+| `inventory_lot_events` | `event_date` | `_create_inventory_lot_events_partition` | (shared with `inventory_lots`) | Phase E2 (mig 0044) |
+| `inventory_unit_events` | `event_date` | `_create_inventory_unit_events_partition` | `inventory_unit_events_partition_rollover` | sxl2 (mig 0061) |
+
+Each table's source migration bakes 24 months of partitions at deploy (2026-01 through 2027-12, `WHILE v_d < DATE '2028-01-01'`) and registers a `pg_cron` job at `'0 0 25 * *'` UTC that creates next-month + month-after partitions. Cron blocks are wrapped in `DO ... EXCEPTION WHEN OTHERS THEN RAISE NOTICE` so test/CI databases without `pg_cron` install cleanly (same tolerance pattern as `0011_inventory_reservations`' expiry job).
+
+**Central registry**: `partitioned_tables_registry` (mig 0067) holds one row per partitioned parent — `(table_name, partition_helper_fn, partition_column, cron_job_name, bake_start, bake_end, min_horizon_months, notes)`. `min_horizon_months` defaults to 3, giving the monthly cron one-miss buffer above its 2-month look-ahead. **Adding a new partitioned table is an INSERT into the registry plus its own bake loop + cron block.** Mig-time INSERTs only; the registry is admin-managed config (no append-only trigger).
+
+**Operator escape hatches**:
+- `SELECT _partition_max_upper_bound('<table>')` returns the latest `TO` bound across the parent's child partitions (parses `pg_get_expr(c.relpartbound, c.oid)` via regex — `FOR VALUES FROM ('YYYY-MM-DD') TO ('YYYY-MM-DD')`). Works on registered AND non-registered partitioned tables.
+- `SELECT _extend_partition_horizon('<table>', <months>)` calls the registered helper for the next N months starting from the current max upper bound. Idempotent at the SQL level (helpers use `CREATE TABLE IF NOT EXISTS`).
+
+**Recon signal**: `run_daily_reconciliation` check #15 `partition_horizon_low` fires for any registry row whose `_partition_max_upper_bound(table_name)` is NULL OR less than `current_date + min_horizon_months`. Catches: cron disabled, helper raising, multiple missed cron runs, or a registry row pointing at a renamed/dropped table.
+
+**Out of scope** (file as `acct-sbr2-followup` if a real driver surfaces): archival of old partitions, per-table compression policies, multi-tenant per-tenant partitions, cross-region replication of partitions.
+
 ## Open questions that gate work
 
 Part VII of the consolidated doc lists 10 gating questions. **Q1 (TB optionality), Q2 (TPS projection), Q3 (outbox), Q4 (cost method) are resolved** (see "Load-bearing design decisions" above). The remaining open ones are scope-shaping rather than framing:
