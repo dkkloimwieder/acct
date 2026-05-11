@@ -22,6 +22,10 @@
 //!   P6 — _partition_max_upper_bound works on a non-registered
 //!        partitioned table (walks pg_inherits directly).
 //!   P7 — registry row notes column populated for each row.
+//!   P8 — bake window is continuous and complete for each registered
+//!        table: child partitions inside [bake_start, bake_end) cover
+//!        every month with no gaps and no overlaps. Closes the gap
+//!        left by P2 (which only checks the upper bound). acct-stls.
 
 mod common;
 
@@ -309,6 +313,100 @@ async fn p6_max_upper_bound_works_for_non_registered_partition() {
     assert_eq!(bound.as_deref(), Some("2030-07-01"));
 
     tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn p8_bake_window_is_continuous_and_complete() {
+    let pool = connect_test_db().await;
+    reset_to_fixture(&pool).await;
+
+    let tables = sqlx::query(
+        "SELECT table_name, bake_start::TEXT AS bs, bake_end::TEXT AS be
+           FROM partitioned_tables_registry
+          ORDER BY table_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    for row in tables {
+        let table_name: String = row.get("table_name");
+        let bake_start: String = row.get("bs");
+        let bake_end: String = row.get("be");
+
+        let expected_count: i64 = sqlx::query_scalar(
+            "SELECT (
+                EXTRACT(YEAR  FROM AGE($2::DATE, $1::DATE)) * 12
+              + EXTRACT(MONTH FROM AGE($2::DATE, $1::DATE))
+             )::BIGINT",
+        )
+        .bind(&bake_start)
+        .bind(&bake_end)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let bound_rows = sqlx::query(
+            "WITH parts AS (
+               SELECT regexp_match(
+                        pg_get_expr(c.relpartbound, c.oid),
+                        'FROM \\(''([^'']+)''\\) TO \\(''([^'']+)''\\)'
+                      ) AS m
+                 FROM pg_inherits i
+                 JOIN pg_class    c ON c.oid = i.inhrelid
+                WHERE i.inhparent = $1::regclass
+             )
+             SELECT m[1] AS from_d, m[2] AS to_d
+               FROM parts
+              WHERE m IS NOT NULL
+                AND m[1]::DATE >= $2::DATE
+                AND m[2]::DATE <= $3::DATE
+              ORDER BY m[1]::DATE",
+        )
+        .bind(&table_name)
+        .bind(&bake_start)
+        .bind(&bake_end)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let bounds: Vec<(String, String)> = bound_rows
+            .iter()
+            .map(|r| (r.get::<String, _>("from_d"), r.get::<String, _>("to_d")))
+            .collect();
+
+        assert_eq!(
+            bounds.len() as i64,
+            expected_count,
+            "{table_name}: expected {expected_count} partitions in \
+             [{bake_start}, {bake_end}), got {}",
+            bounds.len()
+        );
+
+        assert_eq!(
+            bounds.first().expect("at least one partition").0,
+            bake_start,
+            "{table_name}: first child FROM bound != bake_start"
+        );
+        assert_eq!(
+            bounds.last().expect("at least one partition").1,
+            bake_end,
+            "{table_name}: last child TO bound != bake_end"
+        );
+
+        for i in 0..bounds.len() - 1 {
+            assert_eq!(
+                bounds[i].1,
+                bounds[i + 1].0,
+                "{table_name}: gap or overlap between partition {} \
+                 (ends {}) and partition {} (starts {})",
+                i,
+                bounds[i].1,
+                i + 1,
+                bounds[i + 1].0
+            );
+        }
+    }
 }
 
 #[tokio::test]
