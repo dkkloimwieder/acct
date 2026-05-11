@@ -227,6 +227,22 @@ For the three transport-dominated wrappers, shape L (pseudo-sync via LISTEN/NOTI
 
 This decomposition does not directly inform `acct-zroo`. Under SERIALIZABLE isolation the same physical wait chains would manifest as 40001 retries rather than long FOR UPDATE waits — the wrapper section budget would shift from "long single call" to "retry-loop of shorter calls" at a throughput cost that this rig can't measure. The transport vs setup distinction is orthogonal to the isolation-level decision.
 
+### `acct-3aak` measurement (option (a) shipped — mig 0069)
+
+**Same 32-writer × 600 s rig, post-mig-0069 (per-invoice JSONB hash-map of the three so_match aggregates + in-flight tracker; FOR UPDATE OF sl preserved per ERP-scope reasoning).**
+
+| Wrapper | Section | n | p50 | p95 | p99 | max |
+|---|---|---|---:|---:|---:|---:|
+| `post_customer_invoice` | `setup` | 14 218 | 71 855 | 1 419 367 | **3 333 209** | 8 381 854 |
+| `post_customer_invoice` | `post_posting_lines` | 14 218 | 1 433 | 3 743 | 6 289 | 22 284 |
+| `post_customer_invoice` | `followup` | 14 218 | 0 | 0 | 0 | 0 |
+
+**Verdict: option (a) was a noise term.** Setup p99 went 3 127 291 µs → 3 333 209 µs (within the rig's natural variance; deadlocks 513 → 548 between the two runs). The per-line `SELECT SUM` aggregates were NOT the dominant cost. p50 stayed flat (68.8 ms → 71.9 ms), p95 stayed flat (1 310 ms → 1 419 ms). The aggregate-batching is independently correct and saves ~3 scans per `so_match` line at the SQL layer, but does not move the p99 needle on its own.
+
+**What dominates the remaining tail** (per plan-3aak decision tree): the `FOR UPDATE OF sl` per-line serialization chain against contemporaneous writers, plus the per-line `SELECT id INTO v_cust_unsettled` indexed lookup inside the LOOP. Both are within `setup`. The lock chain matches the "Setup p99 stays 500-3000ms" branch — option (c) (trigger-maintained materialized per-`so_line` running totals + per-line account-id memoization across the invoice) is the remaining surgical surface.
+
+**Filed:** `acct-3aak-c` follow-up for option (c). Reopening 3aak isn't necessary — (a) is shipped, measured, dispositioned; (c) is a different work item with different schema impact.
+
 ### Re-running this addendum
 
 ```bash

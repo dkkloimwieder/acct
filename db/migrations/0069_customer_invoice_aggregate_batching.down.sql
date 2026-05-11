@@ -1,0 +1,3 @@
+-- Best-effort down (project convention; Phase 0/1 has no production data).
+-- Reverting to the prior CREATE OR REPLACE form (mig 0068 with the
+-- per-line SELECT SUMs) is left as a fresh-DB-then-reapply task.
