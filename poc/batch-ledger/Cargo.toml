@@ -1,0 +1,22 @@
+[package]
+name = "batch-ledger-poc"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "acct-qdp5: 10K TPS batch-ledger PoC in a clean Postgres. Throwaway."
+
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "uuid",
+    "chrono",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
