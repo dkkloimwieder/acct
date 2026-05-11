@@ -1364,6 +1364,11 @@ async fn phase1_mixed_workload() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    // acct-h73o: gate wrapper-section timing aggregate report.
+    let report_timings: bool = env::var("T4_REPORT_TIMINGS")
+        .ok()
+        .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "FALSE"))
+        .unwrap_or(false);
     let duration = Duration::from_secs(duration_secs);
 
     let pool = connect_test_db_with(n_writers + 8).await;
@@ -1422,6 +1427,11 @@ async fn phase1_mixed_workload() {
     .unwrap_or(0);
 
     let deadlocks_before = stat_db_before.4;
+    // acct-h73o: clear instrumentation table so the post-run aggregate
+    // reflects this run only. Cheap; the table is UNLOGGED.
+    let _ = sqlx::query("TRUNCATE _wrapper_section_timings RESTART IDENTITY")
+        .execute(&pool)
+        .await;
     let ok_count = Arc::new(AtomicU64::new(0));
     let skip_count = Arc::new(AtomicU64::new(0));
     let err_count = Arc::new(AtomicU64::new(0));
@@ -1717,6 +1727,44 @@ async fn phase1_mixed_workload() {
             calls, total_ms, mean_ms, q
         );
     }
+
+    if report_timings {
+        // acct-h73o: per-wrapper per-section p50/p95/p99/max (µs).
+        // Decomposes the wrapper p99 tail into setup / post_posting_lines /
+        // followup so we can verdict acct-c4p ROI.
+        let timing_rows: Vec<(String, String, i64, i64, i64, i64, i64)> =
+            sqlx::query_as(
+                "SELECT wrapper_name, section, COUNT(*)::BIGINT AS n,
+                        percentile_disc(0.50) WITHIN GROUP (ORDER BY elapsed_us)::BIGINT,
+                        percentile_disc(0.95) WITHIN GROUP (ORDER BY elapsed_us)::BIGINT,
+                        percentile_disc(0.99) WITHIN GROUP (ORDER BY elapsed_us)::BIGINT,
+                        MAX(elapsed_us)::BIGINT
+                   FROM _wrapper_section_timings
+                  GROUP BY wrapper_name, section
+                  ORDER BY wrapper_name,
+                           CASE section
+                             WHEN 'setup' THEN 1
+                             WHEN 'post_posting_lines' THEN 2
+                             WHEN 'followup' THEN 3
+                           END",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+
+        eprintln!("--- acct-h73o: per-wrapper section decomposition (us) ---");
+        eprintln!(
+            "{:<24} {:<20} {:>9} {:>9} {:>9} {:>10} {:>10}",
+            "wrapper", "section", "n", "p50", "p95", "p99", "max"
+        );
+        for (wrapper, section, n, p50, p95, p99, max) in &timing_rows {
+            eprintln!(
+                "{:<24} {:<20} {:>9} {:>9} {:>9} {:>10} {:>10}",
+                wrapper, section, n, p50, p95, p99, max
+            );
+        }
+    }
+
     eprintln!("============================================================================");
 
     // Deadlocks are surfaced (not asserted == 0). The mixed workload

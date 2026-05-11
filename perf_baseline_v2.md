@@ -172,3 +172,67 @@ For a 30-minute stress run: `T4_DURATION_SECS=1800`.
 - `tests/load_realistic_workload.rs` — shape F (cross-account spread, bin_move only).
 - `tests/load_inflow_workload.rs` — shape N (Slice A PO+AP cycle only).
 - `tests/load_outbox_pseudo_sync.rs` — shape L (the pivot target).
+
+---
+
+## Addendum — wrapper p99 tail decomposition (`acct-h73o`)
+
+**Date:** 2026-05-11
+**Schema:** 68 migrations through `0068_wrapper_instrumentation`
+**bd issue:** acct-h73o
+**Methodology:** Same 32-writer × 600 s rig, same workload mix. UNLOGGED `_wrapper_section_timings` records per-section elapsed µs (3 rows per successful wrapper call) at section boundaries: `setup` (function entry through last lookup) / `post_posting_lines` (the PERFORM call itself) / `followup` (post-PERFORM audit writes + state-machine UPDATEs). Four hottest wrappers instrumented: `post_so_ship`, `post_customer_invoice`, `post_wo_start`, `post_op_move`.
+
+### Per-wrapper decomposition (µs)
+
+| Wrapper | Section | n | p50 | p95 | p99 | max | % of wrapper p99 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `post_so_ship` | `setup` | 22 776 | 1 403 | 4 984 | 23 131 | 1 248 058 | **0.8 %** |
+| `post_so_ship` | `post_posting_lines` | 22 776 | 76 601 | 1 171 886 | **2 812 373** | 5 831 030 | **99.0 %** |
+| `post_so_ship` | `followup` | 22 776 | 708 | 1 161 | 2 312 | 28 189 | 0.1 % |
+| `post_customer_invoice` | `setup` | 15 695 | 68 848 | 1 310 348 | **3 127 291** | 6 351 495 | **99.8 %** |
+| `post_customer_invoice` | `post_posting_lines` | 15 695 | 1 275 | 2 813 | 5 151 | 26 710 | **0.2 %** |
+| `post_customer_invoice` | `followup` | 15 695 | 0 | 0 | 0 | 0 | 0.0 % |
+| `post_wo_start` | `setup` | 11 134 | 2 392 | 5 123 | 10 145 | 64 536 | **0.2 %** |
+| `post_wo_start` | `post_posting_lines` | 11 134 | 9 925 | 2 053 021 | **4 233 112** | 9 325 620 | **99.7 %** |
+| `post_wo_start` | `followup` | 11 134 | 128 | 249 | 559 | 4 415 | 0.0 % |
+| `post_op_move` | `setup` | 4 359 | 2 244 | 5 009 | 11 126 | 32 729 | **0.2 %** |
+| `post_op_move` | `post_posting_lines` | 4 359 | 4 190 | 1 928 872 | **7 038 184** | 19 908 704 | **99.8 %** |
+| `post_op_move` | `followup` | 4 359 | 13 | 24 | 62 | 1 276 | 0.0 % |
+
+### Verdict
+
+**Three of four hot wrappers are >99 % transport-dominated at p99.**
+- `post_so_ship`: 99.0 % transport
+- `post_wo_start`: 99.7 % transport
+- `post_op_move`: 99.8 % transport
+
+**One wrapper (`post_customer_invoice`) is >99.8 % setup-dominated.** The `post_posting_lines` slice within `post_customer_invoice` p99 is only ~5 ms — the 3.1 s tail comes from the per-line work *before* the PERFORM. Root cause is in the body itself: each `so_match` line does `SELECT … FOR UPDATE OF sl` on `sales_order_lines` plus three aggregate SELECTs (`SUM(qty_shipped)` from `so_shipment_lines`, `SUM(qty)` from `customer_invoice_lines`, `SUM(qty_to_ar_unsettled)` from `customer_return_lines`). Under 32-writer concurrency the FOR UPDATE on the same `sales_order_lines` row that a contemporaneous `post_so_ship` is reading creates a serialization chain that the dispatcher's transport-layer fix cannot help.
+
+### `acct-c4p` ROI — confirmed (with caveat)
+
+For the three transport-dominated wrappers, shape L (pseudo-sync via LISTEN/NOTIFY) compresses the slice that dominates p99. Expected per-wrapper p99 improvement once `post_posting_lines` is moved off-thread:
+- `post_so_ship`: 2 812 ms → ~25 ms (setup+followup) — **~110× drop**
+- `post_wo_start`: 4 233 ms → ~10 ms — **~420× drop**
+- `post_op_move`: 7 038 ms → ~11 ms — **~640× drop**
+
+**Combined-wrapper p99 ceiling under c4p alone**: ~3 100 ms (the surviving `post_customer_invoice` setup tail) — i.e. `c4p` alone reduces combined p99 from 2 902 ms to roughly the same number, because the combined-p99 union-tail just shifts from the op_move side to the customer_invoice setup side. **c4p delivers the predicted per-op gain on three wrappers but the combined-wrapper p99 number won't move until `post_customer_invoice`'s setup contention is also fixed.**
+
+`acct-c4p` should claim — the per-wrapper gain is real, deterministic, and concentrated where the workload spends time. But the headline combined-p99 metric in this baseline (2.35 s in the original 1s6r run, 2.90 s in this re-run) is a poor evaluation target for c4p in isolation; report on the per-wrapper p99s instead.
+
+### Filed follow-up
+
+`acct-3aak` (P3) — `post_customer_invoice` setup-side contention: SO-line `FOR UPDATE OF sl` + three aggregate SELECTs hold serialization-relevant locks across the LOOP. The `FOR UPDATE OF sl` is load-bearing — it protects the tolerance check (lines ~779-801 of mig 0018) against a contemporaneous SO-line edit (price renegotiation, qty adjustment, discount, cancellation — all in-scope ERP mutations). Path: (a) **first** batch the three aggregates outside the per-line LOOP (one scan per invoice, not per line) — surgical, no schema change, independently correct; (c) **measure-then-decide** — re-run h73o instrumentation after (a); if setup p99 drops under ~200 ms, stop here; if it stays high, the cross-wrapper lock chain with `post_so_ship` is dominating and materialized per-so_line running totals become the right next step.
+
+### Note on `acct-zroo` (SERIALIZABLE)
+
+This decomposition does not directly inform `acct-zroo`. Under SERIALIZABLE isolation the same physical wait chains would manifest as 40001 retries rather than long FOR UPDATE waits — the wrapper section budget would shift from "long single call" to "retry-loop of shorter calls" at a throughput cost that this rig can't measure. The transport vs setup distinction is orthogonal to the isolation-level decision.
+
+### Re-running this addendum
+
+```bash
+T4_DURATION_SECS=600 T4_WRITERS=32 T4_REPORT_TIMINGS=1 \
+  ./scripts/run-tests.sh --test load_phase1_mixed_workload \
+  --release -- --ignored --nocapture
+```
+
+The `_wrapper_section_timings` table is TRUNCATEd at run start; aggregate is appended to the run's stderr summary when `T4_REPORT_TIMINGS=1`.
