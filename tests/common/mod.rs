@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod outbox_worker;
+pub mod pg_locks_sampler;
 pub mod psync_runtime;
 
 use sqlx::{PgPool, postgres::PgPoolOptions};

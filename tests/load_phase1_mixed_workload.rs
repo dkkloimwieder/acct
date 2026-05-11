@@ -48,6 +48,7 @@
 mod common;
 
 use common::*;
+use common::pg_locks_sampler;
 use common::psync_runtime;
 use serde_json::json;
 use sqlx::PgPool;
@@ -1418,10 +1419,18 @@ async fn phase1_mixed_workload() {
         .ok()
         .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "FALSE"))
         .unwrap_or(false);
+    // acct-8hv2: gate pg_locks contention sampler. When enabled, a
+    // background task polls pg_locks + pg_stat_activity at 100 ms and
+    // emits a sampler report alongside the existing T4 timings.
+    let lock_sample: bool = env::var("T4_LOCK_SAMPLE")
+        .ok()
+        .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "FALSE"))
+        .unwrap_or(false);
     let duration = Duration::from_secs(duration_secs);
 
     // c4p adds: 1 conn for listener + 1 for drainer when psync mode is on.
-    let extra_conns = if use_psync { 4 } else { 0 };
+    // 8hv2 adds: 1 conn for sampler when lock_sample is on.
+    let extra_conns = if use_psync { 4 } else { 0 } + if lock_sample { 1 } else { 0 };
     let pool = connect_test_db_with(n_writers + 8 + extra_conns).await;
     reset_to_fixture(&pool).await;
 
@@ -1495,6 +1504,15 @@ async fn phase1_mixed_workload() {
     let _ = sqlx::query("TRUNCATE _wrapper_section_timings RESTART IDENTITY")
         .execute(&pool)
         .await;
+    // acct-8hv2: spawn pg_locks sampler if requested. Lives until just
+    // before the summary block where we shutdown() to capture the
+    // report. 100 ms = 10 Hz sample rate.
+    let sampler = if lock_sample {
+        eprintln!("T4-1s6r: T4_LOCK_SAMPLE=1 — spawning pg_locks sampler at 100ms");
+        Some(pg_locks_sampler::PgLocksSampler::spawn(pool.clone(), 100).await)
+    } else {
+        None
+    };
     let ok_count = Arc::new(AtomicU64::new(0));
     let skip_count = Arc::new(AtomicU64::new(0));
     let err_count = Arc::new(AtomicU64::new(0));
@@ -1644,6 +1662,13 @@ async fn phase1_mixed_workload() {
     .await
     .unwrap_or((0, 0, 0, 0, 0));
     let deadlocks_after = stat_db_after.4;
+    // acct-8hv2: shutdown sampler now (before summary block) so the
+    // report can be printed alongside h73o decomposition.
+    let sampler_report = if let Some(s) = sampler {
+        Some(s.shutdown().await)
+    } else {
+        None
+    };
     let wal_lsn_after: String = sqlx::query_scalar("SELECT pg_current_wal_lsn()::text")
         .fetch_one(&pool)
         .await
@@ -1828,6 +1853,11 @@ async fn phase1_mixed_workload() {
                 wrapper, section, n, p50, p95, p99, max
             );
         }
+    }
+
+    if let Some(report) = sampler_report.as_ref() {
+        eprintln!();
+        eprint!("{}", report.format());
     }
 
     eprintln!("============================================================================");
