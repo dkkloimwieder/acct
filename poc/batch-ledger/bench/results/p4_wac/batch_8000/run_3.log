@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running tests/bench_p4_wac.rs (target/release/deps/bench_p4_wac-bdffb9d4754806fc)
+
+running 1 test
+test p4_wac_bench ... P4 WAC bench starting: workers=20, pools=20, duration=60s, batch_size=8000
+
+=========== P4 WAC bench (batch_size=8000) ===========
+workers: 20, pools: 20, duration: 60s (wall: 66.68s)
+batches_attempted: 188
+batches_ok:        188
+batches_err:       0
+transfers_ok:      1504000
+throughput: batches=2.8/s, transfers=22556.9/s
+batch-latency (us): p50=6822805 p95=8497932 p99=8744451 p99.9=13242793 max=13242793
+deadlocks delta: 0
+=========================================================
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 66.82s
+
