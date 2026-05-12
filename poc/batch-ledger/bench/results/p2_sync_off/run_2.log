@@ -1,0 +1,20 @@
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running tests/bench_p2_pgledger.rs (target/release/deps/bench_p2_pgledger-5ced3693b8925f62)
+
+running 1 test
+test p2_pgledger_baseline_bench ... P2 bench starting: workers=20, accounts=50, duration=60s, sync_commit_off=true
+
+=========== P2 pgledger baseline ===========
+workers: 20, accounts: 50, duration: 60s (wall: 60.02s)
+attempted: 759259
+ok:        759259
+err:       0
+throughput: attempted=12649.2/s, ok=12649.2/s
+latency (us): p50=1479 p95=2683 p99=3485 p99.9=4880 max=28590
+deadlocks delta: 0
+============================================
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.07s
+
