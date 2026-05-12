@@ -73,15 +73,22 @@ container can load the host-built binary.
        affected cell; post-restart cells now serve from rollup with
        correct values (the M4 loss profile is closed for drained cells).
 7. ✅ `ledger_shmem_recon()` — at quiescence, returns one row per
-       occupied shmem cell at the PoC convention
-       `(period, currency, ledger_kind) = (1, 1, 1)` showing
-       `(account_id, shmem_balance, shmem_qty, ledger_balance, drift)`.
-       Ledger balance computed from `posting_lines` (signed by
-       `accounts.kind`). NULL ledger_balance + NULL drift for orphan
-       shmem cells (no matching `accounts` row). Other-dimension cells
-       filtered out — M8's integration step parameterizes the filter.
-       6 scenarios verified: synchronized (drift=0), shmem-ahead,
-       posting_lines-only, re-sync, orphan, multi-dimension filtering.
+       occupied shmem cell at PoC convention `(1, 1, 1)`. Computes
+       ledger truth via debit-positive convention
+       (`SUM(debits) - SUM(credits)`), matching `post_batch` semantics.
+       Returns `(account_id, shmem_balance, shmem_qty, ledger_balance,
+       drift)`. NULL ledger_balance for orphan cells (no `accounts`
+       row). Multi-dimension cells filtered out (M8 parameterization
+       deferred to acct integration).
+8. ✅ `post_batch_shmem` PoC migration (0013) — drop-in replacement for
+       `post_batch`'s `UPDATE accounts SET balance` path. Inserts
+       posting_lines via the same CTE chain as `post_batch_append_only`,
+       captures fresh vs replay rows in a TEMP TABLE, then iterates
+       fresh rows applying `+amount` on the debit leg and `-amount`
+       on the credit leg via `ledger_apply_balance_delta`. End-to-end
+       verified: 4 envelopes across 4 accounts → recon drift=0;
+       bgworker drains within 1s; replay returns `idempotent_replay`
+       without double-applying.
 
 6. ✅ Lazy-load from rollup at insert. The cold-path `insert_new` now
        SPI-queries `account_balances_rollup` (before acquiring the

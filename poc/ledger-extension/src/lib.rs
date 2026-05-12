@@ -8,9 +8,11 @@
 //! - M4: balance() reader + account_balances_rollup durable projection.
 //! - M5: bgworker drain of dirty shmem cells → rollup.
 //! - M6: lazy-load from rollup on insert.
-//! - **M7 (this commit): `ledger_shmem_recon()` cross-checks shmem
-//!   state vs PoC's `posting_lines` source-of-truth; returns drift
-//!   per cell at quiescence.**
+//! - M7: `ledger_shmem_recon()` cross-checks shmem vs `posting_lines`.
+//! - **M8 (this commit): `post_batch_shmem` integration — drop-in
+//!   replacement for `post_batch`'s `UPDATE accounts SET balance`
+//!   path. Insert posting_lines + per-leg `ledger_apply_balance_delta`.
+//!   Recon shows drift=0 against PoC truth.**
 //! - M6: custom WAL RM + redo for crash recovery.
 //! - M7: recon hook (shmem vs `SUM(posting_lines)` at quiescence).
 //! - M8: integrate with PoC `post_batch`.
@@ -599,25 +601,28 @@ fn ledger_balance_lookup(
 }
 
 /// Cross-check shmem balances against the authoritative ledger
-/// truth (PoC's `posting_lines` table, summed by side per
-/// `accounts.kind`). One row per occupied shmem cell at the PoC
-/// convention `period_id=1, currency_id=1, ledger_kind=1` — other
-/// dimensions are filtered out for M7 because the PoC's `accounts`
-/// table is single-dimension.
+/// truth in the PoC `posting_lines` table. Uses the PoC's
+/// **debit-positive convention** (matching `post_batch`'s `accounts.
+/// balance` semantics): for every account, `ledger_balance =
+/// SUM(debits) - SUM(credits)`. This is consistent with how the M8
+/// `post_batch_shmem` integration applies deltas:
+/// `+amount` on the debit leg, `-amount` on the credit leg.
 ///
-/// `drift = shmem_balance - ledger_balance`. A non-zero drift is
-/// either: (a) a real bug in the apply path; (b) the shmem is ahead
-/// of the rollup *and* a sibling `posting_lines` write hasn't
-/// happened yet for the same delta; or (c) the cell was written via
-/// `ledger_apply_balance_delta` without a sibling `posting_lines`
-/// row in this test scenario. M8's integration step wires the apply
-/// and posting_lines write into one path so (b)/(c) collapse and
-/// only (a) remains as a true alarm.
+/// Returns one row per occupied shmem cell at the PoC convention
+/// `(period_id, currency_id, ledger_kind) = (1, 1, 1)`. Other
+/// dimensions are filtered out — M8/acct integration parameterizes
+/// the filter.
+///
+/// `drift = shmem_balance - ledger_balance`. Drift=0 after a
+/// `post_batch_shmem` call means the extension hot path produced
+/// the same state `post_batch`'s `UPDATE accounts SET balance`
+/// would have. Non-zero drift is a real apply-path bug or a
+/// scenario where shmem and `posting_lines` were written
+/// independently (in which case it's an integration mismatch, not
+/// an extension bug).
 ///
 /// `ledger_balance` is NULL when no matching `accounts` row exists
-/// for the shmem `account_id` — typical when the extension is used
-/// without first creating an account row (the PoC's accounts table
-/// is the join key for ledger truth).
+/// for the shmem `account_id`.
 #[pg_extern]
 fn ledger_shmem_recon() -> TableIterator<
     'static,
@@ -653,16 +658,15 @@ fn ledger_shmem_recon() -> TableIterator<
 
     // Phase 2: ledger lookup per cell. SPI outside the LWLock so the
     // recon doesn't block applies.
-    // SUM(amount BIGINT) returns numeric in Postgres; cast the
-    // overall expression to bigint so SPI can decode as i64.
+    // Debit-positive convention: SUM(debits) - SUM(credits) for ALL
+    // accounts, regardless of accounts.kind. Matches what post_batch
+    // and post_batch_shmem do (accounts.balance and shmem cell store
+    // the same signed value). SUM(amount BIGINT) returns numeric; the
+    // overall expression is cast to bigint so SPI can decode as i64.
     let sql = "SELECT (
-                 CASE WHEN a.kind = 'debit_normal' THEN
-                     COALESCE((SELECT SUM(amount) FROM posting_lines WHERE debit_account_id = a.id), 0)
-                   - COALESCE((SELECT SUM(amount) FROM posting_lines WHERE credit_account_id = a.id), 0)
-                 ELSE
-                     COALESCE((SELECT SUM(amount) FROM posting_lines WHERE credit_account_id = a.id), 0)
-                   - COALESCE((SELECT SUM(amount) FROM posting_lines WHERE debit_account_id = a.id), 0)
-                 END)::bigint
+                   COALESCE((SELECT SUM(amount) FROM posting_lines WHERE debit_account_id = a.id), 0)
+                 - COALESCE((SELECT SUM(amount) FROM posting_lines WHERE credit_account_id = a.id), 0)
+                 )::bigint
                 FROM accounts a WHERE a.id = $1";
 
     let mut out = Vec::with_capacity(cells.len());
