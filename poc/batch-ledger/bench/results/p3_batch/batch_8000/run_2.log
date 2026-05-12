@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running tests/bench_p3_batch_simple.rs (target/release/deps/bench_p3_batch_simple-69fea2ea663436d7)
+
+running 1 test
+test p3_batch_bench ... P3 bench starting: workers=20, accounts=50, duration=60s, batch_size=8000
+
+=========== P3 batch bench (batch_size=8000) ===========
+workers: 20, accounts: 50, duration: 60s (wall: 63.47s)
+batches_attempted: 303
+batches_ok:        303
+batches_err:       0
+transfers_ok:      2424000
+throughput: batches=4.8/s, transfers=38193.3/s
+batch-latency (us): p50=3736067 p95=5466938 p99=5654496 p99.9=5706644 max=5706644
+deadlocks delta: 0
+=============================================================
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 63.66s
+

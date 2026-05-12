@@ -55,6 +55,7 @@ name = "batch-ledger-poc"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "serde_json",
  "sqlx",
  "tokio",
  "uuid",

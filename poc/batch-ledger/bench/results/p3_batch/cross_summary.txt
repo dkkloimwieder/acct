@@ -1,0 +1,7 @@
+=== cross-batch summary (median transfers/s) ===
+batch_size  median tps   
+1           1419.2       
+10          2449.3       
+100         10720.8      
+1000        40610.6      
+8000        42341.3      
