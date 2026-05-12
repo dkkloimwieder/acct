@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running tests/bench_p5_fifo.rs (target/release/deps/bench_p5_fifo-39bf263d5e61ac5d)
+
+running 1 test
+test p5_fifo_bench ... P5 FIFO bench starting: workers=20, pools=20, duration=60s, batch_size=1
+
+=========== P5 FIFO bench (batch_size=1) ===========
+workers: 20, pools: 20, duration: 60s (wall: 60.11s)
+batches_attempted: 12469
+batches_ok:        12469
+batches_err:       0
+transfers_ok:      12469
+throughput: batches=207.4/s, transfers=207.4/s
+batch-latency (us): p50=141215 p95=191898 p99=230350 p99.9=260193 max=373116
+deadlocks delta: 0
+=========================================================
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.22s
+
