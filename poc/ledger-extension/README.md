@@ -72,10 +72,17 @@ container can load the host-built binary.
        wait drained=3 + rollup has rows; new apply re-dirties only the
        affected cell; post-restart cells now serve from rollup with
        correct values (the M4 loss profile is closed for drained cells).
-       Known gap (M6 fixes): first apply after restart on a previously
-       drained cell creates a shmem cell with the delta only, not
-       rollup_balance + delta. M6 will lazy-load from rollup at insert
-       time or via WAL replay.
+6. ✅ Lazy-load from rollup at insert. The cold-path `insert_new` now
+       SPI-queries `account_balances_rollup` (before acquiring the
+       exclusive lock) for the cell's prior durable state; if found,
+       seeds the new shmem bucket with `(rollup_balance + delta,
+       rollup_qty + qty_delta)` and sets `drained_seq = rollup.last_seq`
+       so the bgworker correctly sees the new state as dirty.
+       `APPLY_SEQ.fetch_max(rollup.last_seq)` ensures the new cell's
+       `last_seq` is strictly greater than its `drained_seq`.
+       End-to-end verified: apply (1000) → drain → restart → apply (+50)
+       → shmem cell is 1050 not 50 → next drain writes 1050 to rollup.
+       Closes the only loss profile from M5.
 3. `ledger_apply_balance_delta(...)` C function
 4. `balance(account_id)` SQL reader (shmem-first, durable fallback)
 5. bgworker drain to `account_balances_rollup`

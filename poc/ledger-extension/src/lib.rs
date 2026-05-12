@@ -6,8 +6,9 @@
 //! - M2: shmem hash table + PgLwLock + counters (validated).
 //! - M3: per-bucket atomics + packed u128 key + dual-lock apply (validated).
 //! - M4: balance() reader + account_balances_rollup durable projection.
-//! - **M5 (this commit): bgworker drain of dirty shmem cells → rollup,
-//!   with per-bucket drained_seq watermark + drain_interval_ms GUC.**
+//! - M5: bgworker drain of dirty shmem cells → rollup.
+//! - **M6 (this commit): lazy-load from rollup on insert. Closes the
+//!   post-restart "apply re-creates cell with delta-only" gap.**
 //! - M6: custom WAL RM + redo for crash recovery.
 //! - M7: recon hook (shmem vs `SUM(posting_lines)` at quiescence).
 //! - M8: integrate with PoC `post_batch`.
@@ -375,10 +376,38 @@ fn try_update_existing(
     None
 }
 
-/// Insert a new bucket. Caller MUST hold the exclusive LWLock so no
-/// concurrent inserter can race us into a duplicate slot.
+/// Insert a new bucket, optionally seeded with a prior rollup state.
+/// Caller MUST hold the exclusive LWLock so no concurrent inserter
+/// can race us into a duplicate slot.
+///
+/// `rollup_seed = Some((bal, qty, last_seq))` means a durable row
+/// exists in `account_balances_rollup` from a prior process lifetime
+/// (or a manually-seeded test): the new cell starts at `(bal + delta,
+/// qty + qty_delta)` and `drained_seq` is set to the rollup's
+/// `last_seq`, so the next bgworker tick correctly reports this cell
+/// as dirty (its new `last_seq` is advanced via `APPLY_SEQ.fetch_max`
+/// to ensure `last_seq > drained_seq`).
+///
+/// `rollup_seed = None` means the cell is genuinely new; behave as
+/// pre-M6: `(delta, qty_delta)` initial values, `drained_seq = 0`.
 #[inline]
-fn insert_new(table: &HashTable, key: u128, amount_delta: i64, qty_delta: i64) -> u64 {
+fn insert_new_seeded(
+    table: &HashTable,
+    key: u128,
+    rollup_seed: Option<(i64, i64, u64)>,
+    amount_delta: i64,
+    qty_delta: i64,
+) -> u64 {
+    let (init_balance, init_qty, init_drained_seq) = match rollup_seed {
+        Some((bal, qty, last_seq)) => {
+            // Bump global APPLY_SEQ above rollup's watermark so the
+            // next_seq() call below produces last_seq > drained_seq.
+            APPLY_SEQ.get().fetch_max(last_seq, Ordering::AcqRel);
+            (bal + amount_delta, qty + qty_delta, last_seq)
+        }
+        None => (amount_delta, qty_delta, 0),
+    };
+
     let start = slot_for(key);
     let key_hi = (key >> 64) as u64;
     let key_lo = key as u64;
@@ -388,10 +417,11 @@ fn insert_new(table: &HashTable, key: u128, amount_delta: i64, qty_delta: i64) -
         if b.occupied.load(Ordering::Relaxed) == 0 {
             b.key_hi.store(key_hi, Ordering::Relaxed);
             b.key_lo.store(key_lo, Ordering::Relaxed);
-            b.balance.store(amount_delta, Ordering::Relaxed);
-            b.qty.store(qty_delta, Ordering::Relaxed);
+            b.balance.store(init_balance, Ordering::Relaxed);
+            b.qty.store(init_qty, Ordering::Relaxed);
             let seq = next_seq();
             b.last_seq.store(seq, Ordering::Relaxed);
+            b.drained_seq.store(init_drained_seq, Ordering::Relaxed);
             b.occupied.store(1, Ordering::Release);
             OCCUPIED_COUNT.get().fetch_add(1, Ordering::AcqRel);
             return seq;
@@ -401,6 +431,33 @@ fn insert_new(table: &HashTable, key: u128, amount_delta: i64, qty_delta: i64) -
         "ledger_apply_balance_delta: hash table full (capacity {})",
         N_BUCKETS
     );
+}
+
+/// SPI lookup against `account_balances_rollup`. Returns `None` on
+/// "no row," missing table, or any SPI error — callers treat that as
+/// "no prior state" and the new cell starts at delta-only.
+fn lookup_rollup_seed(
+    account_id: i64,
+    period_id: i32,
+    currency_id: i16,
+    ledger_kind: i16,
+) -> Option<(i64, i64, u64)> {
+    let res = Spi::get_three_with_args::<i64, i64, i64>(
+        "SELECT balance, qty, last_seq
+           FROM account_balances_rollup
+          WHERE account_id = $1 AND period_id = $2
+            AND currency_id = $3 AND ledger_kind = $4",
+        &[
+            account_id.into(),
+            period_id.into(),
+            currency_id.into(),
+            ledger_kind.into(),
+        ],
+    );
+    match res {
+        Ok((Some(bal), Some(qty), Some(seq))) => Some((bal, qty, seq as u64)),
+        _ => None,
+    }
 }
 
 // ── SQL surface ───────────────────────────────────────────────────────
@@ -483,13 +540,19 @@ fn ledger_apply_balance_delta(
             return seq as i64;
         }
     }
+
+    // M6: cell not in shmem. Look up rollup BEFORE taking exclusive lock
+    // so the rare lazy-load path doesn't lengthen the lock hold time. A
+    // concurrent inserter racing us between SPI lookup and exclusive
+    // acquire is harmless — re-probe inside exclusive catches it and
+    // routes through the update path; our SPI result is discarded.
+    let rollup_seed = lookup_rollup_seed(account_id, period_id, currency_id, ledger_kind);
+
     let table = HASH_TABLE.exclusive();
-    // Re-probe inside exclusive: a concurrent inserter may have placed
-    // this key while we were upgrading.
     if let Some(seq) = try_update_existing(&table, key, amount_delta, qty_delta) {
         return seq as i64;
     }
-    insert_new(&table, key, amount_delta, qty_delta) as i64
+    insert_new_seeded(&table, key, rollup_seed, amount_delta, qty_delta) as i64
 }
 
 /// Read the cell at (`account_id`, `period_id`, `currency_id`,
