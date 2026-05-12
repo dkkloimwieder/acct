@@ -50,6 +50,18 @@ async fn fan_out_bench() {
         .await
         .expect("truncate");
 
+    // If we're benching the shmem path, ensure the extension is loaded
+    // and wipe both the shmem hash and its durable rollup so prior runs
+    // don't pollute the measurement.
+    if fn_name.contains("shmem") {
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS ledger_extension")
+            .execute(&pool).await.expect("create ext");
+        sqlx::query("TRUNCATE account_balances_rollup")
+            .execute(&pool).await.expect("trunc rollup");
+        sqlx::query("SELECT ledger_shmem_reset()")
+            .execute(&pool).await.expect("shmem reset");
+    }
+
     // Bulk-seed accounts: alternating debit/credit kinds.
     sqlx::query(
         "INSERT INTO accounts (code, currency, kind)
