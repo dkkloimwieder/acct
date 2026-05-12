@@ -54,6 +54,13 @@ container can load the host-built binary.
        Concurrency verified: 8 workers × 100 updates on shared cell →
        balance=8000 no lost updates; 8 × 30 distinct inserts → 240 cells
        no duplicates; 8 × 1 same-key insert race → 1 cell.
+4. ✅ `account_balances_rollup` durable projection table + `balance(...)`
+       SQL reader implementing shmem-first / rollup-fallback / none.
+       6 scenarios validated: both empty (none), rollup-only (rollup),
+       both-present (shmem wins), shmem-only (shmem), key-not-in-either-
+       dimension (none), per-dimension mixing across cells. Post-restart
+       verified: shmem-only cells lost; rollup-backed cells survive
+       (M5 + M6 close that loss profile).
 3. `ledger_apply_balance_delta(...)` C function
 4. `balance(account_id)` SQL reader (shmem-first, durable fallback)
 5. bgworker drain to `account_balances_rollup`

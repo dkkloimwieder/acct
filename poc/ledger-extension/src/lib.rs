@@ -4,9 +4,9 @@
 //!
 //! - M1: pgrx scaffolding + host→container CREATE EXTENSION (validated).
 //! - M2: shmem hash table + PgLwLock + counters (validated).
-//! - **M3 (this commit): per-bucket atomics + packed u128 key + dual-lock
-//!   `ledger_apply_balance_delta` hot path.**
-//! - M4: SQL reader `balance(account_id)` (shmem-first, durable fallback).
+//! - M3: per-bucket atomics + packed u128 key + dual-lock apply (validated).
+//! - **M4 (this commit): `balance()` SQL reader + `account_balances_rollup`
+//!   durable projection table; shmem-first / rollup-fallback semantics.**
 //! - M5: bgworker drain to `account_balances_rollup`.
 //! - M6: custom WAL RM + redo for crash recovery.
 //! - M7: recon hook (shmem vs `SUM(posting_lines)` at quiescence).
@@ -298,6 +298,88 @@ fn ledger_shmem_reset() {
     OCCUPIED_COUNT.get().store(0, Ordering::Release);
     APPLY_SEQ.get().store(0, Ordering::Release);
 }
+
+// ── M4: durable rollup table + balance() reader ───────────────────────
+//
+// `account_balances_rollup` is the eventually-consistent durable
+// projection. M5's bgworker will write to it; M4 leaves it as a plain
+// table that callers (and tests) can populate manually.
+//
+// `balance(account_id, period_id, currency_id, ledger_kind)` consults
+// shmem first via `ledger_balance_lookup`, then falls back to the
+// rollup, then returns zeros + source='none'. The source label lets
+// callers and tests reason about freshness.
+//
+// Semantic note for M5+ — currently shmem cells hold the full running
+// total (every apply since CREATE EXTENSION / PG start). When the
+// bgworker lands, the contract is "shmem stays authoritative as long
+// as it has the cell; rollup is the write-through copy lagging the
+// shmem state." If shmem is missing the cell (post-restart, pre-WAL-
+// recovery), rollup is authoritative. The `balance()` selection logic
+// in this file already implements that contract correctly.
+pgrx::extension_sql!(
+    r#"
+    CREATE TABLE account_balances_rollup (
+        account_id  BIGINT NOT NULL,
+        period_id   INT NOT NULL,
+        currency_id SMALLINT NOT NULL,
+        ledger_kind SMALLINT NOT NULL,
+        balance     BIGINT NOT NULL DEFAULT 0,
+        qty         BIGINT NOT NULL DEFAULT 0,
+        last_seq    BIGINT NOT NULL DEFAULT 0,
+        drained_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        PRIMARY KEY (account_id, period_id, currency_id, ledger_kind)
+    );
+
+    CREATE FUNCTION balance(
+        p_account_id BIGINT,
+        p_period_id INT,
+        p_currency_id SMALLINT,
+        p_ledger_kind SMALLINT
+    ) RETURNS TABLE(balance BIGINT, qty BIGINT, last_seq BIGINT, source TEXT) AS $body$
+    DECLARE
+        s_balance BIGINT;
+        s_qty BIGINT;
+        s_last_seq BIGINT;
+    BEGIN
+        SELECT lookup.balance, lookup.qty, lookup.last_seq
+          INTO s_balance, s_qty, s_last_seq
+          FROM ledger_balance_lookup(p_account_id, p_period_id, p_currency_id, p_ledger_kind) lookup;
+
+        IF s_balance IS NOT NULL THEN
+            balance := s_balance;
+            qty := s_qty;
+            last_seq := s_last_seq;
+            source := 'shmem';
+            RETURN NEXT;
+            RETURN;
+        END IF;
+
+        SELECT r.balance, r.qty, r.last_seq
+          INTO balance, qty, last_seq
+          FROM account_balances_rollup r
+         WHERE r.account_id = p_account_id
+           AND r.period_id = p_period_id
+           AND r.currency_id = p_currency_id
+           AND r.ledger_kind = p_ledger_kind;
+
+        IF FOUND THEN
+            source := 'rollup';
+            RETURN NEXT;
+            RETURN;
+        END IF;
+
+        balance := 0;
+        qty := 0;
+        last_seq := 0;
+        source := 'none';
+        RETURN NEXT;
+    END;
+    $body$ LANGUAGE plpgsql STABLE;
+    "#,
+    name = "rollup_schema",
+    requires = [ledger_balance_lookup],
+);
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]

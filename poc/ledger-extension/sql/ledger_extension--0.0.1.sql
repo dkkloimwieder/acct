@@ -41,6 +41,71 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/lib.rs:320
+-- requires:
+--   ledger_balance_lookup
+
+
+    CREATE TABLE account_balances_rollup (
+        account_id  BIGINT NOT NULL,
+        period_id   INT NOT NULL,
+        currency_id SMALLINT NOT NULL,
+        ledger_kind SMALLINT NOT NULL,
+        balance     BIGINT NOT NULL DEFAULT 0,
+        qty         BIGINT NOT NULL DEFAULT 0,
+        last_seq    BIGINT NOT NULL DEFAULT 0,
+        drained_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        PRIMARY KEY (account_id, period_id, currency_id, ledger_kind)
+    );
+
+    CREATE FUNCTION balance(
+        p_account_id BIGINT,
+        p_period_id INT,
+        p_currency_id SMALLINT,
+        p_ledger_kind SMALLINT
+    ) RETURNS TABLE(balance BIGINT, qty BIGINT, last_seq BIGINT, source TEXT) AS $body$
+    DECLARE
+        s_balance BIGINT;
+        s_qty BIGINT;
+        s_last_seq BIGINT;
+    BEGIN
+        SELECT lookup.balance, lookup.qty, lookup.last_seq
+          INTO s_balance, s_qty, s_last_seq
+          FROM ledger_balance_lookup(p_account_id, p_period_id, p_currency_id, p_ledger_kind) lookup;
+
+        IF s_balance IS NOT NULL THEN
+            balance := s_balance;
+            qty := s_qty;
+            last_seq := s_last_seq;
+            source := 'shmem';
+            RETURN NEXT;
+            RETURN;
+        END IF;
+
+        SELECT r.balance, r.qty, r.last_seq
+          INTO balance, qty, last_seq
+          FROM account_balances_rollup r
+         WHERE r.account_id = p_account_id
+           AND r.period_id = p_period_id
+           AND r.currency_id = p_currency_id
+           AND r.ledger_kind = p_ledger_kind;
+
+        IF FOUND THEN
+            source := 'rollup';
+            RETURN NEXT;
+            RETURN;
+        END IF;
+
+        balance := 0;
+        qty := 0;
+        last_seq := 0;
+        source := 'none';
+        RETURN NEXT;
+    END;
+    $body$ LANGUAGE plpgsql STABLE;
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/lib.rs:195
 -- ledger_extension::ledger_extension_version
 CREATE  FUNCTION "ledger_extension_version"() RETURNS TEXT /* &str */
