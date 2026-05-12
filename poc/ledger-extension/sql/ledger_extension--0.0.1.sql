@@ -7,7 +7,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:529
+-- src/lib.rs:538
 -- ledger_extension::ledger_apply_balance_delta
 CREATE  FUNCTION "ledger_apply_balance_delta"(
 	"account_id" bigint, /* i64 */
@@ -23,7 +23,7 @@ AS 'MODULE_PATHNAME', 'ledger_apply_balance_delta_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:563
+-- src/lib.rs:572
 -- ledger_extension::ledger_balance_lookup
 CREATE  FUNCTION "ledger_balance_lookup"(
 	"account_id" bigint, /* i64 */
@@ -41,7 +41,7 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:721
+-- src/lib.rs:730
 -- requires:
 --   ledger_balance_lookup
 
@@ -106,7 +106,7 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:467
+-- src/lib.rs:476
 -- ledger_extension::ledger_extension_version
 CREATE  FUNCTION "ledger_extension_version"() RETURNS TEXT /* &str */
 STRICT
@@ -115,7 +115,7 @@ AS 'MODULE_PATHNAME', 'ledger_extension_version_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:482
+-- src/lib.rs:491
 -- ledger_extension::ledger_shmem_apply_seq
 CREATE  FUNCTION "ledger_shmem_apply_seq"() RETURNS bigint /* i64 */
 STRICT
@@ -124,7 +124,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_apply_seq_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:472
+-- src/lib.rs:481
 -- ledger_extension::ledger_shmem_capacity
 CREATE  FUNCTION "ledger_shmem_capacity"() RETURNS bigint /* i64 */
 STRICT
@@ -133,7 +133,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_capacity_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:489
+-- src/lib.rs:498
 -- ledger_extension::ledger_shmem_dirty_count
 CREATE  FUNCTION "ledger_shmem_dirty_count"() RETURNS bigint /* i64 */
 STRICT
@@ -142,7 +142,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_dirty_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:507
+-- src/lib.rs:516
 -- ledger_extension::ledger_shmem_drained_count
 CREATE  FUNCTION "ledger_shmem_drained_count"() RETURNS bigint /* i64 */
 STRICT
@@ -151,7 +151,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_drained_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:477
+-- src/lib.rs:486
 -- ledger_extension::ledger_shmem_occupied
 CREATE  FUNCTION "ledger_shmem_occupied"() RETURNS bigint /* i64 */
 STRICT
@@ -160,7 +160,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_occupied_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:624
+-- src/lib.rs:633
 -- ledger_extension::ledger_shmem_recon
 CREATE  FUNCTION "ledger_shmem_recon"() RETURNS TABLE (
 	"account_id" bigint,  /* i64 */
@@ -175,7 +175,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_recon_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:687
+-- src/lib.rs:696
 -- ledger_extension::ledger_shmem_reset
 CREATE  FUNCTION "ledger_shmem_reset"() RETURNS void
 STRICT

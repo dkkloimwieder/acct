@@ -89,6 +89,13 @@ container can load the host-built binary.
        verified: 4 envelopes across 4 accounts → recon drift=0;
        bgworker drains within 1s; replay returns `idempotent_replay`
        without double-applying.
+9. ✅ Bench validation (`bench/results-shmem-apply.md`). 3×60s
+       replicates at fan-in (50 accts) and fan-out (5000 accts):
+       fan-in 31K → **67K tps (2.16×)** over mutable `post_batch`;
+       fan-out 7.8K → **43.5K tps (5.55×)**. Latency p99 at fan-out
+       drops 9.6s → 708ms (13×). Zero deadlocks across 18 runs.
+       N_BUCKETS bumped 4096→16384 to fit the 5K fan-out workload
+       (production needs GUC sizing — future hardening).
 
 6. ✅ Lazy-load from rollup at insert. The cold-path `insert_new` now
        SPI-queries `account_balances_rollup` (before acquiring the

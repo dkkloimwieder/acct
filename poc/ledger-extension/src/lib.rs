@@ -9,10 +9,10 @@
 //! - M5: bgworker drain of dirty shmem cells → rollup.
 //! - M6: lazy-load from rollup on insert.
 //! - M7: `ledger_shmem_recon()` cross-checks shmem vs `posting_lines`.
-//! - **M8 (this commit): `post_batch_shmem` integration — drop-in
-//!   replacement for `post_batch`'s `UPDATE accounts SET balance`
-//!   path. Insert posting_lines + per-leg `ledger_apply_balance_delta`.
-//!   Recon shows drift=0 against PoC truth.**
+//! - M8: `post_batch_shmem` integration; recon drift=0.
+//! - **M9 (this commit): bench validation. Fan-in 2.16× over mutable
+//!   `post_batch`; fan-out 5.55× over mutable. Fan-out N_BUCKETS
+//!   bumped 4096→16384 to handle 5K-account load.**
 //! - M6: custom WAL RM + redo for crash recovery.
 //! - M7: recon hook (shmem vs `SUM(posting_lines)` at quiescence).
 //! - M8: integrate with PoC `post_batch`.
@@ -72,7 +72,14 @@ use std::time::Duration;
 
 pgrx::pg_module_magic!();
 
-pub const N_BUCKETS: usize = 4096;
+// 16384 slots × 64-byte cache-aligned bucket = 1 MiB shmem.
+// Sized so the fan-out PoC bench (5000 accounts) lands at a sub-30%
+// load factor with comfortable headroom. Open-addressing probes
+// degrade past ~70% load, so this caps useful capacity at ~11K cells.
+// Future: GUC-driven sizing via RequestAddinShmemSpace + ShmemInitStruct
+// (M3 used a const because pgrx's pg_shmem_init! can't size against a
+// runtime GUC — the Bucket array shape must be known at compile time).
+pub const N_BUCKETS: usize = 16384;
 
 /// One slot. Cache-line aligned so concurrent shared-lock updates to
 /// different buckets don't false-share. AtomicU8/U64/I64 are all
