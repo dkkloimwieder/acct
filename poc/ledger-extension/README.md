@@ -43,12 +43,17 @@ container can load the host-built binary.
 
 1. ✅ scaffolding + host→container install validated end-to-end
 2. ✅ shmem hash (4096 slots, open addressing) + `PgLwLock` +
-       `PgAtomic<u64>` occupied counter + apply_seq counter; SQL surface:
-       `ledger_shmem_capacity()`, `ledger_shmem_occupied()`,
-       `ledger_shmem_apply_seq()`, `ledger_balance_set(key,bal,qty)`,
-       `ledger_balance_get(key)`, `ledger_shmem_reset()`.
-       Cross-backend + cross-DB visibility verified. PG restart wipes shmem
-       (M6 adds WAL recovery).
+       `PgAtomic<u64>` occupied counter + apply_seq counter.
+       Cross-backend + cross-DB visibility verified.
+3. ✅ Per-bucket atomics (AtomicU8/U64/I64) + packed u128 key
+       (account_id<<64 | period_id<<32 | currency_id<<16 | ledger_kind<<8)
+       + dual-lock hot path (SHARED for updates, EXCLUSIVE for inserts
+       with re-probe). SQL surface:
+       `ledger_apply_balance_delta(account_id, period_id, currency_id,
+       ledger_kind, amount_delta, qty_delta)` and `ledger_balance_lookup`.
+       Concurrency verified: 8 workers × 100 updates on shared cell →
+       balance=8000 no lost updates; 8 × 30 distinct inserts → 240 cells
+       no duplicates; 8 × 1 same-key insert race → 1 cell.
 3. `ledger_apply_balance_delta(...)` C function
 4. `balance(account_id)` SQL reader (shmem-first, durable fallback)
 5. bgworker drain to `account_balances_rollup`
