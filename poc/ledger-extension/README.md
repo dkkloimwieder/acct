@@ -108,13 +108,28 @@ container can load the host-built binary.
        End-to-end verified: apply (1000) → drain → restart → apply (+50)
        → shmem cell is 1050 not 50 → next drain writes 1050 to rollup.
        Closes the only loss profile from M5.
-3. `ledger_apply_balance_delta(...)` C function
-4. `balance(account_id)` SQL reader (shmem-first, durable fallback)
-5. bgworker drain to `account_balances_rollup`
-6. Custom WAL RM + redo
-7. Recon hook (shmem vs `SUM(posting_lines)` at quiescence)
-8. Integration with PoC `post_batch` apply path
-9. Bench validation vs `bench_fan_in` / `bench_fan_out` / `bench_wac_fan`
+
+## M10 hardening (epic acct-tpqw)
+
+M10.A1 ✅ (acct-2733, 2026-05-12) — confirmed the rollback correctness
+gap. Test `poc/batch-ledger/tests/rollback_correctness_t1.rs` runs two
+probes: V1 minimal `BEGIN; apply; ROLLBACK;` retains the delta in shmem;
+V2 INSERT-posting-line + apply + ROLLBACK leaves drift=+1000 against an
+empty posting_lines table. M10 Track A (A2 XactCallback + SubXactCallback,
+B4-prep seqlock, B4 WAC integration) is correctly scoped to fix the
+divergence. The test's assertion polarity flips after A2 ships — drift=0
+becomes the regression-net assertion for "rollback unwinds shmem
+correctly."
+
+Remaining M10 sub-issues (open):
+- acct-4e91 — A2 XactCallback + SubXactCallback + PENDING_STACK (~1 day)
+- acct-zo4t — B4-prep seqlock for WAC-grade torn-read prevention (~0.5 day)
+- acct-n4mo — B4 post_batch_wac_shmem + bench (~2-3 days)
+- acct-w88b — D1 INVARIANTS.md catalog + pin unpinned (~4 hours)
+- acct-jjqc / nn31 / 713c — B1/B2/B3 multi-dimension scenarios
+- acct-j0nh / jh9k — B6/B7 backpressure + load-factor curves
+- acct-mii6 — B8 concurrent accounts table activity
+- acct-3ee2 / 3ovt / e5gl / vd74 / 7eph / plle — C1-C6 error handling
 
 Stop at each milestone, surface, wait for direction (per
 `treat-proceed-as-scoped-to-the-specific-item`).
