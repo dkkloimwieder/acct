@@ -7,8 +7,10 @@
 //! - M3: per-bucket atomics + packed u128 key + dual-lock apply (validated).
 //! - M4: balance() reader + account_balances_rollup durable projection.
 //! - M5: bgworker drain of dirty shmem cells → rollup.
-//! - **M6 (this commit): lazy-load from rollup on insert. Closes the
-//!   post-restart "apply re-creates cell with delta-only" gap.**
+//! - M6: lazy-load from rollup on insert.
+//! - **M7 (this commit): `ledger_shmem_recon()` cross-checks shmem
+//!   state vs PoC's `posting_lines` source-of-truth; returns drift
+//!   per cell at quiescence.**
 //! - M6: custom WAL RM + redo for crash recovery.
 //! - M7: recon hook (shmem vs `SUM(posting_lines)` at quiescence).
 //! - M8: integrate with PoC `post_batch`.
@@ -594,6 +596,88 @@ fn ledger_balance_lookup(
         }
     }
     TableIterator::new(vec![(None, None, None)])
+}
+
+/// Cross-check shmem balances against the authoritative ledger
+/// truth (PoC's `posting_lines` table, summed by side per
+/// `accounts.kind`). One row per occupied shmem cell at the PoC
+/// convention `period_id=1, currency_id=1, ledger_kind=1` — other
+/// dimensions are filtered out for M7 because the PoC's `accounts`
+/// table is single-dimension.
+///
+/// `drift = shmem_balance - ledger_balance`. A non-zero drift is
+/// either: (a) a real bug in the apply path; (b) the shmem is ahead
+/// of the rollup *and* a sibling `posting_lines` write hasn't
+/// happened yet for the same delta; or (c) the cell was written via
+/// `ledger_apply_balance_delta` without a sibling `posting_lines`
+/// row in this test scenario. M8's integration step wires the apply
+/// and posting_lines write into one path so (b)/(c) collapse and
+/// only (a) remains as a true alarm.
+///
+/// `ledger_balance` is NULL when no matching `accounts` row exists
+/// for the shmem `account_id` — typical when the extension is used
+/// without first creating an account row (the PoC's accounts table
+/// is the join key for ledger truth).
+#[pg_extern]
+fn ledger_shmem_recon() -> TableIterator<
+    'static,
+    (
+        name!(account_id, i64),
+        name!(shmem_balance, i64),
+        name!(shmem_qty, i64),
+        name!(ledger_balance, Option<i64>),
+        name!(drift, Option<i64>),
+    ),
+> {
+    // Phase 1: snapshot occupied cells under SHARED lock.
+    let mut cells: Vec<(i64, i64, i64)> = Vec::new();
+    {
+        let table = HASH_TABLE.share();
+        for i in 0..N_BUCKETS {
+            let b = &table.buckets[i];
+            if b.occupied.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let key_hi = b.key_hi.load(Ordering::Acquire);
+            let key_lo = b.key_lo.load(Ordering::Acquire);
+            let bal = b.balance.load(Ordering::Acquire);
+            let qty = b.qty.load(Ordering::Acquire);
+            let key = ((key_hi as u128) << 64) | (key_lo as u128);
+            let (account_id, period_id, currency_id, ledger_kind) = unpack_key(key);
+            if period_id != 1 || currency_id != 1 || ledger_kind != 1 {
+                continue;
+            }
+            cells.push((account_id, bal, qty));
+        }
+    }
+
+    // Phase 2: ledger lookup per cell. SPI outside the LWLock so the
+    // recon doesn't block applies.
+    // SUM(amount BIGINT) returns numeric in Postgres; cast the
+    // overall expression to bigint so SPI can decode as i64.
+    let sql = "SELECT (
+                 CASE WHEN a.kind = 'debit_normal' THEN
+                     COALESCE((SELECT SUM(amount) FROM posting_lines WHERE debit_account_id = a.id), 0)
+                   - COALESCE((SELECT SUM(amount) FROM posting_lines WHERE credit_account_id = a.id), 0)
+                 ELSE
+                     COALESCE((SELECT SUM(amount) FROM posting_lines WHERE credit_account_id = a.id), 0)
+                   - COALESCE((SELECT SUM(amount) FROM posting_lines WHERE debit_account_id = a.id), 0)
+                 END)::bigint
+                FROM accounts a WHERE a.id = $1";
+
+    let mut out = Vec::with_capacity(cells.len());
+    for (account_id, shmem_balance, shmem_qty) in cells {
+        let res = Spi::get_one_with_args::<i64>(sql, &[account_id.into()]);
+        match res {
+            Ok(Some(lb)) => {
+                let drift = shmem_balance - lb;
+                out.push((account_id, shmem_balance, shmem_qty, Some(lb), Some(drift)));
+            }
+            _ => out.push((account_id, shmem_balance, shmem_qty, None, None)),
+        }
+    }
+
+    TableIterator::new(out)
 }
 
 /// Wipe the table. Useful for tests and benchmarking baselines. Takes

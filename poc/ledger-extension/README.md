@@ -72,6 +72,17 @@ container can load the host-built binary.
        wait drained=3 + rollup has rows; new apply re-dirties only the
        affected cell; post-restart cells now serve from rollup with
        correct values (the M4 loss profile is closed for drained cells).
+7. ✅ `ledger_shmem_recon()` — at quiescence, returns one row per
+       occupied shmem cell at the PoC convention
+       `(period, currency, ledger_kind) = (1, 1, 1)` showing
+       `(account_id, shmem_balance, shmem_qty, ledger_balance, drift)`.
+       Ledger balance computed from `posting_lines` (signed by
+       `accounts.kind`). NULL ledger_balance + NULL drift for orphan
+       shmem cells (no matching `accounts` row). Other-dimension cells
+       filtered out — M8's integration step parameterizes the filter.
+       6 scenarios verified: synchronized (drift=0), shmem-ahead,
+       posting_lines-only, re-sync, orphan, multi-dimension filtering.
+
 6. ✅ Lazy-load from rollup at insert. The cold-path `insert_new` now
        SPI-queries `account_balances_rollup` (before acquiring the
        exclusive lock) for the cell's prior durable state; if found,
