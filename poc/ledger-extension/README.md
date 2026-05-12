@@ -21,17 +21,27 @@ poc/ledger-extension/
 
 Path A (host build, container load) — what this PoC uses:
 
-1. Build the `.so` on the host against PG18 dev headers.
-2. Copy `.so` + `.control` + `*.sql` into the running container's extension
-   dir (typically `/usr/lib/postgresql/18/lib/` + `/usr/share/postgresql/18/extension/`).
-3. `CREATE EXTENSION ledger_extension;` from a `psql` session.
+```
+cargo build --release --features pg18 --no-default-features \
+    --manifest-path poc/ledger-extension/Cargo.toml
+cargo pgrx schema pg18 \
+    --manifest-path poc/ledger-extension/Cargo.toml \
+    --out poc/ledger-extension/sql/ledger_extension--0.0.1.sql
+bash poc/ledger-extension/scripts/install-into-container.sh
+psql 'postgres://acct:acct_dev@localhost:5111/acct_poc' \
+    -c 'CREATE EXTENSION ledger_extension;'
+```
 
-Both `acct` (port 5111 main DB) and `acct_poc` (PoC DB) are in the same
-container, so a single install reaches both.
+Both `acct` (port 5111 main DB) and `acct_poc` (PoC DB) live in the same
+container (`acct-postgres`), so a single `docker cp` reaches both.
+
+ABI compatibility: host glibc 2.42, container glibc 2.41. The .so requires
+at most GLIBC_2.34 (verified via `objdump -T | grep GLIBC`), so the
+container can load the host-built binary.
 
 ## Milestones
 
-1. ✅ scaffolding (this commit)
+1. ✅ scaffolding + host→container install validated end-to-end
 2. shmem hash + LWLock tranche
 3. `ledger_apply_balance_delta(...)` C function
 4. `balance(account_id)` SQL reader (shmem-first, durable fallback)
