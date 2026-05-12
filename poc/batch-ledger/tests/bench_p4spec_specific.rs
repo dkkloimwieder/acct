@@ -53,7 +53,7 @@ async fn p4spec_specific_bench() {
 
     // Pre-seed via direct INSERT (faster than going through post_batch_specific).
     // Need enough units that 90%-issue workload at ~50K tps × 30s won't drain a pool.
-    let units_per_pool = 100_000_usize;
+    let units_per_pool = env_or::<usize>("POC_BENCH_UNITS_PER_POOL", 100_000);
     eprintln!("Pre-seeding {} units per pool × {} pools = {} total units (direct INSERT)...",
         units_per_pool, pool_ids.len(), units_per_pool * pool_ids.len());
     for pid in &pool_ids {
