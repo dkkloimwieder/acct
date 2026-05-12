@@ -61,6 +61,21 @@ container can load the host-built binary.
        dimension (none), per-dimension mixing across cells. Post-restart
        verified: shmem-only cells lost; rollup-backed cells survive
        (M5 + M6 close that loss profile).
+5. ✅ `ledger_drain` bgworker — connects via SPI to `ledger.drain_database`
+       (default `acct_poc`), wakes every `ledger.drain_interval_ms`
+       (default 100ms), walks shmem under SHARED lock to gather cells
+       where `last_seq > drained_seq`, UPSERTs each into the rollup
+       table, then CAS-max bumps `drained_seq` per success. Three new
+       SQL functions: `ledger_shmem_dirty_count()`,
+       `ledger_shmem_drained_count()`, plus `drained_seq` field per
+       bucket. End-to-end verified: applies → dirty=3 → after 100ms
+       wait drained=3 + rollup has rows; new apply re-dirties only the
+       affected cell; post-restart cells now serve from rollup with
+       correct values (the M4 loss profile is closed for drained cells).
+       Known gap (M6 fixes): first apply after restart on a previously
+       drained cell creates a shmem cell with the delta only, not
+       rollup_balance + delta. M6 will lazy-load from rollup at insert
+       time or via WAL replay.
 3. `ledger_apply_balance_delta(...)` C function
 4. `balance(account_id)` SQL reader (shmem-first, durable fallback)
 5. bgworker drain to `account_balances_rollup`

@@ -5,9 +5,9 @@
 //! - M1: pgrx scaffolding + host→container CREATE EXTENSION (validated).
 //! - M2: shmem hash table + PgLwLock + counters (validated).
 //! - M3: per-bucket atomics + packed u128 key + dual-lock apply (validated).
-//! - **M4 (this commit): `balance()` SQL reader + `account_balances_rollup`
-//!   durable projection table; shmem-first / rollup-fallback semantics.**
-//! - M5: bgworker drain to `account_balances_rollup`.
+//! - M4: balance() reader + account_balances_rollup durable projection.
+//! - **M5 (this commit): bgworker drain of dirty shmem cells → rollup,
+//!   with per-bucket drained_seq watermark + drain_interval_ms GUC.**
 //! - M6: custom WAL RM + redo for crash recovery.
 //! - M7: recon hook (shmem vs `SUM(posting_lines)` at quiescence).
 //! - M8: integrate with PoC `post_batch`.
@@ -55,10 +55,15 @@
 
 #![allow(unexpected_cfgs)]
 
+use pgrx::bgworkers::{
+    BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags,
+};
 use pgrx::prelude::*;
 use pgrx::shmem::PGRXSharedMemory;
-use pgrx::{PgAtomic, PgLwLock, pg_shmem_init};
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PgAtomic, PgLwLock, Spi, pg_shmem_init};
+use std::ffi::CString;
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::time::Duration;
 
 pgrx::pg_module_magic!();
 
@@ -75,7 +80,14 @@ pub struct Bucket {
     pub key_lo: AtomicU64,
     pub balance: AtomicI64,
     pub qty: AtomicI64,
+    /// Monotone APPLY_SEQ value stamped by the last apply that mutated
+    /// this cell. M5's bgworker compares it to `drained_seq` to find
+    /// dirty cells.
     pub last_seq: AtomicU64,
+    /// Highest `last_seq` value the bgworker has successfully UPSERTed
+    /// into `account_balances_rollup`. A cell is dirty when
+    /// `last_seq > drained_seq`.
+    pub drained_seq: AtomicU64,
 }
 
 unsafe impl PGRXSharedMemory for Bucket {}
@@ -100,11 +112,212 @@ static HASH_TABLE: PgLwLock<HashTable> = unsafe { PgLwLock::new(c"ledger_hash_ta
 static OCCUPIED_COUNT: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"ledger_occupied_count") };
 static APPLY_SEQ: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"ledger_apply_seq") };
 
+// M5 — bgworker drain configuration.
+static DRAIN_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
+static DRAIN_DATABASE: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"acct_poc"));
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     pg_shmem_init!(HASH_TABLE);
     pg_shmem_init!(OCCUPIED_COUNT);
     pg_shmem_init!(APPLY_SEQ);
+
+    GucRegistry::define_int_guc(
+        c"ledger.drain_interval_ms",
+        c"Bgworker drain wake interval (ms)",
+        c"How often the ledger drain bgworker wakes to copy dirty shmem cells to account_balances_rollup",
+        &DRAIN_INTERVAL_MS,
+        10,
+        3_600_000,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_string_guc(
+        c"ledger.drain_database",
+        c"Database the bgworker connects to via SPI",
+        c"Bgworker connects to a single database; the rollup table must exist there",
+        &DRAIN_DATABASE,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+
+    BackgroundWorkerBuilder::new("ledger_drain")
+        .set_function("ledger_drain_main")
+        .set_library("ledger_extension")
+        .set_argument(None)
+        .set_start_time(BgWorkerStartTime::ConsistentState)
+        .set_restart_time(Some(Duration::from_secs(1)))
+        .enable_spi_access()
+        .load();
+}
+
+// ── M5: bgworker drain ────────────────────────────────────────────────
+
+/// Bgworker entrypoint. Connects to the configured database via SPI,
+/// then loops: wait `drain_interval_ms` on the latch, run one drain
+/// tick wrapped in a transaction. Exits cleanly on SIGTERM.
+///
+/// `#[unsafe(no_mangle)]` is required because PG's bgworker launcher
+/// looks the function up via `dlsym` against the exact name passed to
+/// `set_function("ledger_drain_main")`. pgrx's `#[pg_guard]` only
+/// auto-exports `_PG_init`.
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn ledger_drain_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(
+        SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM,
+    );
+    let dbname = DRAIN_DATABASE
+        .get()
+        .and_then(|c| c.into_string().ok())
+        .unwrap_or_else(|| "acct_poc".to_string());
+    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+
+    loop {
+        let interval = DRAIN_INTERVAL_MS.get().max(10) as u64;
+        let alive = BackgroundWorker::wait_latch(Some(Duration::from_millis(interval)));
+        if !alive {
+            break;
+        }
+        // Each tick is its own transaction so a failed UPSERT doesn't
+        // leave the worker in an uncommitted state.
+        BackgroundWorker::transaction(|| {
+            do_drain_tick();
+        });
+    }
+}
+
+/// One drain pass. Three phases under best-effort consistency:
+///
+/// 1. Walk all buckets under SHARED lock, gather (key, balance, qty,
+///    last_seq) tuples where `last_seq > drained_seq`. Re-read
+///    last_seq after the data reads; if it changed, skip this cell
+///    (next tick will catch the new state).
+/// 2. UPSERT each dirty cell into `account_balances_rollup` via SPI.
+///    The `WHERE last_seq < EXCLUDED.last_seq` guard defends against
+///    out-of-order delivery (defensive — the bgworker is currently
+///    the only writer).
+/// 3. CAS-max each successfully-upserted cell's `drained_seq` up to
+///    the captured `last_seq`. Subsequent applies will bump `last_seq`
+///    above this watermark and become eligible for the next tick.
+fn do_drain_tick() {
+    let mut dirty: Vec<(i64, i32, i16, i16, i64, i64, u64, u128)> = Vec::new();
+    {
+        let table = HASH_TABLE.share();
+        for i in 0..N_BUCKETS {
+            let b = &table.buckets[i];
+            if b.occupied.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let last_pre = b.last_seq.load(Ordering::Acquire);
+            let drained = b.drained_seq.load(Ordering::Acquire);
+            if last_pre <= drained {
+                continue;
+            }
+            let key_hi = b.key_hi.load(Ordering::Acquire);
+            let key_lo = b.key_lo.load(Ordering::Acquire);
+            let bal = b.balance.load(Ordering::Acquire);
+            let qty = b.qty.load(Ordering::Acquire);
+            let last_post = b.last_seq.load(Ordering::Acquire);
+            if last_post != last_pre {
+                continue;
+            }
+            let key = ((key_hi as u128) << 64) | (key_lo as u128);
+            let (account_id, period_id, currency_id, ledger_kind) = unpack_key(key);
+            dirty.push((
+                account_id,
+                period_id,
+                currency_id,
+                ledger_kind as i16,
+                bal,
+                qty,
+                last_pre,
+                key,
+            ));
+        }
+    }
+    if dirty.is_empty() {
+        return;
+    }
+
+    let sql = "INSERT INTO account_balances_rollup
+                (account_id, period_id, currency_id, ledger_kind,
+                 balance, qty, last_seq, drained_at)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, clock_timestamp())
+              ON CONFLICT (account_id, period_id, currency_id, ledger_kind)
+              DO UPDATE SET balance = EXCLUDED.balance,
+                            qty = EXCLUDED.qty,
+                            last_seq = EXCLUDED.last_seq,
+                            drained_at = EXCLUDED.drained_at
+                WHERE account_balances_rollup.last_seq < EXCLUDED.last_seq";
+    let mut succeeded: Vec<(u128, u64)> = Vec::with_capacity(dirty.len());
+    for (a, p, c, l, bal, qty, last, key) in &dirty {
+        let res = Spi::run_with_args(
+            sql,
+            &[
+                (*a).into(),
+                (*p).into(),
+                (*c).into(),
+                (*l).into(),
+                (*bal).into(),
+                (*qty).into(),
+                (*last as i64).into(),
+            ],
+        );
+        if res.is_ok() {
+            succeeded.push((*key, *last));
+        } else {
+            // Rollup table missing in this DB, or transient error.
+            // Don't propagate — next tick re-tries. (Bgworker restarts
+            // on uncaught error per `set_restart_time(1s)`.)
+            log!("ledger_drain: upsert failed for ({a}, {p}, {c}, {l})");
+        }
+    }
+
+    let table = HASH_TABLE.share();
+    for (key, last) in &succeeded {
+        stamp_drained(&table, *key, *last);
+    }
+}
+
+#[inline]
+const fn unpack_key(key: u128) -> (i64, i32, i16, i16) {
+    let account_id = (key >> 64) as u64 as i64;
+    let period_id = (((key >> 32) & 0xFFFF_FFFF) as u32) as i32;
+    let currency_id = (((key >> 16) & 0xFFFF) as u16) as i16;
+    let ledger_kind = (((key >> 8) & 0xFF) as u8) as i16;
+    (account_id, period_id, currency_id, ledger_kind)
+}
+
+fn stamp_drained(table: &HashTable, key: u128, last_seq: u64) {
+    let start = slot_for(key);
+    let key_hi = (key >> 64) as u64;
+    let key_lo = key as u64;
+    for probe in 0..N_BUCKETS {
+        let idx = (start + probe) & (N_BUCKETS - 1);
+        let b = &table.buckets[idx];
+        if b.occupied.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if b.key_hi.load(Ordering::Acquire) == key_hi
+            && b.key_lo.load(Ordering::Acquire) == key_lo
+        {
+            let mut cur = b.drained_seq.load(Ordering::Acquire);
+            while cur < last_seq {
+                match b.drained_seq.compare_exchange(
+                    cur,
+                    last_seq,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return,
+                    Err(actual) => cur = actual,
+                }
+            }
+            return;
+        }
+    }
 }
 
 #[inline]
@@ -212,6 +425,44 @@ fn ledger_shmem_apply_seq() -> i64 {
     APPLY_SEQ.get().load(Ordering::Acquire) as i64
 }
 
+/// Count of occupied cells whose `last_seq > drained_seq` —
+/// pending bgworker drain.
+#[pg_extern]
+fn ledger_shmem_dirty_count() -> i64 {
+    let table = HASH_TABLE.share();
+    let mut n: i64 = 0;
+    for i in 0..N_BUCKETS {
+        let b = &table.buckets[i];
+        if b.occupied.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        if b.last_seq.load(Ordering::Acquire) > b.drained_seq.load(Ordering::Acquire) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Count of occupied cells already drained to rollup at their current
+/// `last_seq` watermark.
+#[pg_extern]
+fn ledger_shmem_drained_count() -> i64 {
+    let table = HASH_TABLE.share();
+    let mut n: i64 = 0;
+    for i in 0..N_BUCKETS {
+        let b = &table.buckets[i];
+        if b.occupied.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        let last = b.last_seq.load(Ordering::Acquire);
+        let drained = b.drained_seq.load(Ordering::Acquire);
+        if drained > 0 && last == drained {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// The hot-path apply. Adds (`amount_delta`, `qty_delta`) to the cell
 /// keyed by (`account_id`, `period_id`, `currency_id`, `ledger_kind`),
 /// creating the cell with the deltas as initial values if absent.
@@ -294,6 +545,7 @@ fn ledger_shmem_reset() {
         b.balance.store(0, Ordering::Relaxed);
         b.qty.store(0, Ordering::Relaxed);
         b.last_seq.store(0, Ordering::Relaxed);
+        b.drained_seq.store(0, Ordering::Relaxed);
     }
     OCCUPIED_COUNT.get().store(0, Ordering::Release);
     APPLY_SEQ.get().store(0, Ordering::Release);
