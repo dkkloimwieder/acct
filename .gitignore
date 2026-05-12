@@ -6,6 +6,9 @@
 
 # Rust
 /target/
+poc/batch-ledger/target/
+poc/ledger-extension/target/
+poc/ledger-extension/Cargo.lock
 
 # Local env (use .env.example as template)
 .env

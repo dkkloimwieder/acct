@@ -1,0 +1,5 @@
+comment = 'acct-sw4i: shared-memory ledger balance rollup with bgworker drain'
+default_version = '0.0.1'
+module_pathname = '$libdir/ledger_extension'
+relocatable = false
+superuser = true
