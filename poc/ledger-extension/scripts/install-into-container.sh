@@ -20,6 +20,10 @@ SO_SRC="$CRATE_DIR/target/release/libledger_extension.so"
 CONTROL_SRC="$CRATE_DIR/ledger_extension.control"
 SQL_SRC="$CRATE_DIR/sql/ledger_extension--0.0.1.sql"
 
+echo "==> rebuilding release .so + schema bindings"
+(cd "$CRATE_DIR" && cargo build --release --features pg18 --no-default-features)
+(cd "$CRATE_DIR" && cargo pgrx schema pg18 --out "$SQL_SRC")
+
 if [ ! -f "$SO_SRC" ]; then
     echo "missing $SO_SRC — run: cargo build --release --features pg18 --no-default-features"
     exit 1

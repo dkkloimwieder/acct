@@ -42,7 +42,13 @@ container can load the host-built binary.
 ## Milestones
 
 1. ✅ scaffolding + host→container install validated end-to-end
-2. shmem hash + LWLock tranche
+2. ✅ shmem hash (4096 slots, open addressing) + `PgLwLock` +
+       `PgAtomic<u64>` occupied counter + apply_seq counter; SQL surface:
+       `ledger_shmem_capacity()`, `ledger_shmem_occupied()`,
+       `ledger_shmem_apply_seq()`, `ledger_balance_set(key,bal,qty)`,
+       `ledger_balance_get(key)`, `ledger_shmem_reset()`.
+       Cross-backend + cross-DB visibility verified. PG restart wipes shmem
+       (M6 adds WAL recovery).
 3. `ledger_apply_balance_delta(...)` C function
 4. `balance(account_id)` SQL reader (shmem-first, durable fallback)
 5. bgworker drain to `account_balances_rollup`

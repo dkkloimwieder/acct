@@ -7,11 +7,75 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:21
+-- src/lib.rs:160
+-- ledger_extension::ledger_balance_get
+CREATE  FUNCTION "ledger_balance_get"(
+	"key" bigint /* i64 */
+) RETURNS TABLE (
+	"balance" bigint,  /* core::option::Option<i64> */
+	"qty" bigint,  /* core::option::Option<i64> */
+	"last_seq" bigint  /* core::option::Option<i64> */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_balance_get_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:129
+-- ledger_extension::ledger_balance_set
+CREATE  FUNCTION "ledger_balance_set"(
+	"key" bigint, /* i64 */
+	"balance" bigint, /* i64 */
+	"qty" bigint /* i64 */
+) RETURNS bool /* bool */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_balance_set_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:106
 -- ledger_extension::ledger_extension_version
 CREATE  FUNCTION "ledger_extension_version"() RETURNS TEXT /* &str */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_extension_version_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:121
+-- ledger_extension::ledger_shmem_apply_seq
+CREATE  FUNCTION "ledger_shmem_apply_seq"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_shmem_apply_seq_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:111
+-- ledger_extension::ledger_shmem_capacity
+CREATE  FUNCTION "ledger_shmem_capacity"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_shmem_capacity_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:116
+-- ledger_extension::ledger_shmem_occupied
+CREATE  FUNCTION "ledger_shmem_occupied"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_shmem_occupied_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:181
+-- ledger_extension::ledger_shmem_reset
+CREATE  FUNCTION "ledger_shmem_reset"() RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_shmem_reset_wrapper';
 /* </end connected objects> */
 

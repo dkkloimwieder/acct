@@ -6,6 +6,7 @@ publish = false
 description = "acct-sw4i: pgrx extension prototype — shared-memory balance rollup + bgworker drain"
 
 [lib]
+name = "ledger_extension"
 crate-type = ["cdylib", "lib"]
 
 [[bin]]
