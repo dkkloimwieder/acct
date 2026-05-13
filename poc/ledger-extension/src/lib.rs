@@ -70,8 +70,13 @@ use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PgAtomic, PgLwLock, Sp
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CString, c_void};
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
+
+// acct-zo4t / M10.B4-prep — atomic 128-bit pair for (balance, qty).
+// Single 16-byte load returns a real coupled snapshot; writers CAS-loop.
+// Cf. seqlock_torn_read_t1::t2_torn_read_probe (falsification gate).
+use portable_atomic::AtomicU128;
 
 pgrx::pg_module_magic!();
 
@@ -85,16 +90,26 @@ pgrx::pg_module_magic!();
 pub const N_BUCKETS: usize = 16384;
 
 /// One slot. Cache-line aligned so concurrent shared-lock updates to
-/// different buckets don't false-share. AtomicU8/U64/I64 are all
+/// different buckets don't false-share. AtomicU8/U64/U128 are all
 /// zero-init valid, so `mem::zeroed()` gives a valid empty bucket.
+///
+/// `balance_qty` packs `(balance as i64) << 64 | (qty as i64 as u64)`
+/// into a single AtomicU128 so readers observe a real coupled pair
+/// (acct-zo4t). Helpers `pack_bal_qty` / `unpack_bal_qty` convert.
+/// Pre-zo4t this was `balance: AtomicI64, qty: AtomicI64` — separate
+/// loads were torn-readable under concurrent SHARED-LWLock writers
+/// (the M9 lock-free hot path's race).
 #[repr(C, align(64))]
 pub struct Bucket {
     pub occupied: AtomicU8,
     pub _pad0: [u8; 7],
     pub key_hi: AtomicU64,
     pub key_lo: AtomicU64,
-    pub balance: AtomicI64,
-    pub qty: AtomicI64,
+    /// 16-byte aligned; Rust inserts implicit 8-byte pad before this
+    /// field (offset 32 from struct base). Cache-line layout: header
+    /// (24) + pad (8) + balance_qty (16) + last_seq (8) + drained_seq
+    /// (8) = 64 bytes.
+    pub balance_qty: AtomicU128,
     /// Monotone APPLY_SEQ value stamped by the last apply that mutated
     /// this cell. M5's bgworker compares it to `drained_seq` to find
     /// dirty cells.
@@ -103,6 +118,44 @@ pub struct Bucket {
     /// into `account_balances_rollup`. A cell is dirty when
     /// `last_seq > drained_seq`.
     pub drained_seq: AtomicU64,
+}
+
+/// Pack a signed `(balance, qty)` pair into a single u128.
+/// High 64 bits = balance (reinterpreted i64→u64), low 64 = qty.
+#[inline]
+const fn pack_bal_qty(balance: i64, qty: i64) -> u128 {
+    ((balance as u64 as u128) << 64) | (qty as u64 as u128)
+}
+
+/// Unpack a u128 back to `(balance, qty)`.
+#[inline]
+const fn unpack_bal_qty(packed: u128) -> (i64, i64) {
+    let balance = (packed >> 64) as u64 as i64;
+    let qty = packed as u64 as i64;
+    (balance, qty)
+}
+
+/// CAS-loop fetch_add equivalent for the packed (balance, qty) atom.
+/// Lock-free: one writer always makes progress per CAS round. Returns
+/// the new (balance, qty) post-add.
+#[inline]
+fn balance_qty_fetch_add(slot: &AtomicU128, amount_delta: i64, qty_delta: i64) -> (i64, i64) {
+    let mut cur = slot.load(Ordering::Acquire);
+    loop {
+        let (bal, q) = unpack_bal_qty(cur);
+        let new_bal = bal.wrapping_add(amount_delta);
+        let new_q = q.wrapping_add(qty_delta);
+        let new_packed = pack_bal_qty(new_bal, new_q);
+        match slot.compare_exchange_weak(
+            cur,
+            new_packed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return (new_bal, new_q),
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 unsafe impl PGRXSharedMemory for Bucket {}
@@ -232,8 +285,9 @@ fn do_drain_tick() {
             }
             let key_hi = b.key_hi.load(Ordering::Acquire);
             let key_lo = b.key_lo.load(Ordering::Acquire);
-            let bal = b.balance.load(Ordering::Acquire);
-            let qty = b.qty.load(Ordering::Acquire);
+            // Atomic 128-bit load — (balance, qty) is a real coupled
+            // snapshot from one real instant (acct-zo4t).
+            let (bal, qty) = unpack_bal_qty(b.balance_qty.load(Ordering::Acquire));
             let last_post = b.last_seq.load(Ordering::Acquire);
             if last_post != last_pre {
                 continue;
@@ -380,8 +434,9 @@ fn try_update_existing(
         if b.key_hi.load(Ordering::Acquire) == key_hi
             && b.key_lo.load(Ordering::Acquire) == key_lo
         {
-            b.balance.fetch_add(amount_delta, Ordering::AcqRel);
-            b.qty.fetch_add(qty_delta, Ordering::AcqRel);
+            // CAS-loop on the packed (balance, qty). Atomic 128-bit RMW
+            // — readers observing this cell get a real coupled pair.
+            balance_qty_fetch_add(&b.balance_qty, amount_delta, qty_delta);
             let seq = next_seq();
             b.last_seq.store(seq, Ordering::Release);
             return Some(seq);
@@ -431,8 +486,10 @@ fn insert_new_seeded(
         if b.occupied.load(Ordering::Relaxed) == 0 {
             b.key_hi.store(key_hi, Ordering::Relaxed);
             b.key_lo.store(key_lo, Ordering::Relaxed);
-            b.balance.store(init_balance, Ordering::Relaxed);
-            b.qty.store(init_qty, Ordering::Relaxed);
+            // Single atomic store of the packed pair; caller holds
+            // EXCLUSIVE so no concurrent inserter contends.
+            b.balance_qty
+                .store(pack_bal_qty(init_balance, init_qty), Ordering::Relaxed);
             let seq = next_seq();
             b.last_seq.store(seq, Ordering::Relaxed);
             b.drained_seq.store(init_drained_seq, Ordering::Relaxed);
@@ -987,9 +1044,12 @@ fn ledger_balance_lookup(
         if b.key_hi.load(Ordering::Acquire) == key_hi
             && b.key_lo.load(Ordering::Acquire) == key_lo
         {
+            // Single atomic 128-bit load — (balance, qty) is a real
+            // coupled snapshot (acct-zo4t).
+            let (bal, qty) = unpack_bal_qty(b.balance_qty.load(Ordering::Acquire));
             return TableIterator::new(vec![(
-                Some(b.balance.load(Ordering::Acquire)),
-                Some(b.qty.load(Ordering::Acquire)),
+                Some(bal),
+                Some(qty),
                 Some(b.last_seq.load(Ordering::Acquire) as i64),
             )]);
         }
@@ -1042,8 +1102,9 @@ fn ledger_shmem_recon() -> TableIterator<
             }
             let key_hi = b.key_hi.load(Ordering::Acquire);
             let key_lo = b.key_lo.load(Ordering::Acquire);
-            let bal = b.balance.load(Ordering::Acquire);
-            let qty = b.qty.load(Ordering::Acquire);
+            // Single atomic 128-bit load — coupled (balance, qty)
+            // observation (acct-zo4t).
+            let (bal, qty) = unpack_bal_qty(b.balance_qty.load(Ordering::Acquire));
             let key = ((key_hi as u128) << 64) | (key_lo as u128);
             let (account_id, period_id, currency_id, ledger_kind) = unpack_key(key);
             if period_id != 1 || currency_id != 1 || ledger_kind != 1 {
@@ -1090,8 +1151,7 @@ fn ledger_shmem_reset() {
         b.occupied.store(0, Ordering::Relaxed);
         b.key_hi.store(0, Ordering::Relaxed);
         b.key_lo.store(0, Ordering::Relaxed);
-        b.balance.store(0, Ordering::Relaxed);
-        b.qty.store(0, Ordering::Relaxed);
+        b.balance_qty.store(0, Ordering::Relaxed);
         b.last_seq.store(0, Ordering::Relaxed);
         b.drained_seq.store(0, Ordering::Relaxed);
     }

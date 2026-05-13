@@ -245,7 +245,7 @@ period), acct-713c (B3 ledger_kind). Not in D1 scope.
 
 ---
 
-## I11 — Reader sees consistent `(balance, qty)` pair (TORN-READ GAP)
+## I11 — Reader sees consistent `(balance, qty)` pair
 
 **Statement.** A reader observing a bucket sees a `(balance, qty)` pair
 that existed at some single moment — not a torn pair where balance is
@@ -256,15 +256,36 @@ torn read could compute against `balance_new / qty_old`, producing an
 incorrect unit cost that propagates into both ledger amount and any
 audit-field snapshot. This is the AP9 / R7 class of bug.
 
-**Currently violated.** Each atomic load is independent. A concurrent
-`balance.fetch_add` + `qty.fetch_add` between the reader's two loads
-is racy.
+**Enforced by.** Single atomic 128-bit field `Bucket::balance_qty`
+(acct-zo4t / M10.B4-prep). `pack_bal_qty(balance, qty)` stores
+`balance` in the high 64 bits and `qty` in the low 64. Writers use a
+CAS-loop (`balance_qty_fetch_add`) — lock-free, one writer makes
+progress per round. Readers do a single `balance_qty.load(Acquire)` +
+`unpack_bal_qty`, returning a real coupled snapshot from one
+instant. Linearizable across multi-writer SHARED-LWLock concurrency
+(the M9 lock-free hot path's regime).
 
-**Fix.** acct-zo4t (B4-prep) adds a seqlock — even=stable, odd=writing
-— on `Bucket`. Writer bumps seq before+after the `(balance, qty)`
-writes; reader retries on odd or changed seq.
+Implementation note: x86_64 builds enable `target-feature=+cmpxchg16b`
+via `.cargo/config.toml` so `portable_atomic::AtomicU128` is genuinely
+lock-free (one `lock cmpxchg16b` instruction, not a spinlock fallback).
 
-**Pinned by.** acct-zo4t — not in D1 scope.
+**Why this over textbook seqlock.** The standard `seq.fetch_add` →
+write → `seq.fetch_add` pattern assumes writes are mutually exclusive.
+Under M9's lock-free SHARED-LWLock with concurrent atomic `fetch_add`
+writers, two writers can interleave such that a reader observes
+`s_pre == s_post` between W1's `balance.fetch_add` and W1's
+`qty.fetch_add` (W2's enter-increment having pushed seq back to even).
+AtomicU128 packs the pair so the writer's RMW is one atomic operation
+with no observable mid-state; the seqlock's premise is sidestepped
+rather than emulated.
+
+**Pinned by.** `tests/seqlock_torn_read_t1.rs`:
+- T1 single-writer correctness
+- **T2 torn-read probe** (load-bearing falsification gate;
+  pre-B4-prep observable torn read in ~15s, post-B4-prep 0 torn
+  reads across millions of observations).
+- T3 8-writer composition (lost-update absence)
+- T5 16-writer + 16-reader pathology bounded-time
 
 ---
 
@@ -489,7 +510,12 @@ Reserved IDs for invariants surfaced by remaining M10 sub-issues:
 | I23 | Panic during apply releases LWLock guard cleanly | acct-plle (C6) |
 | I24 | GUC `drain_interval_ms` reloads on SIGHUP without restart | acct-vd74 (C4) |
 | I25 | Recon under concurrent writes returns coherent rows | acct-7eph (C5) |
-| I26 | Reader sees consistent (balance, qty) pair (seqlock pattern) | acct-zo4t (B4-prep) |
+
+**Note on I26.** The placeholder reserved for B4-prep ("seqlock
+pattern") was retired when acct-zo4t shipped via `AtomicU128` (single
+atomic 128-bit field, not a seqlock retry-loop). The substantive
+invariant lives at I11 above. The seqlock placeholder is intentionally
+not renumbered or repurposed.
 
 Update this table as each sub-issue ships.
 

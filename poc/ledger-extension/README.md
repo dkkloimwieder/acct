@@ -143,8 +143,24 @@ flipped from "KNOWN GAP" to enforced form.
 A2 perf delta vs M9 documented in
 [`bench/results-shmem-apply-A2.md`](../../batch-ledger/bench/results-shmem-apply-A2.md).
 
+M10.B4-prep ✅ (acct-zo4t, 2026-05-13) — atomic 128-bit `(balance, qty)`
+pair on `Bucket`. Replaces separate `AtomicI64` fields with a single
+`portable_atomic::AtomicU128`; writers CAS-loop (lock-free), readers do
+one atomic 128-bit load + unpack. Closes the I11 torn-read gap so WAC's
+`unit_cost = pool_value / pool_qty` always divides coupled values.
+Chosen over the textbook seqlock pattern: under M9's lock-free SHARED-
+LWLock with concurrent `fetch_add` writers, the standard seqlock can be
+defeated by two writers interleaving their `seq.fetch_add` enters such
+that a reader's `s_pre == s_post` check spuriously passes; AtomicU128
+sidesteps this by making the pair RMW one atomic op. Falsified pre-fix
+by `tests/seqlock_torn_read_t1.rs::t2_torn_read_probe` (captured
+torn read `(balance=38022000, qty=38021)` within 15s); post-fix passes
+0 torn reads / >100K observations. INVARIANTS.md I11 flipped from
+"TORN-READ GAP" to enforced; T1/T2/T3/T5 pinned. Bench delta vs M9
+documented in
+[`bench/results-shmem-apply-B4prep.md`](../../batch-ledger/bench/results-shmem-apply-B4prep.md).
+
 Remaining M10 sub-issues (open):
-- acct-zo4t — B4-prep seqlock for WAC-grade torn-read prevention (~0.5 day)
 - acct-n4mo — B4 post_batch_wac_shmem + bench (~2-3 days)
 - acct-jjqc / nn31 / 713c — B1/B2/B3 multi-dimension scenarios
 - acct-j0nh / jh9k — B6/B7 backpressure + load-factor curves

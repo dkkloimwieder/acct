@@ -20,6 +20,11 @@ pg_test = []
 
 [dependencies]
 pgrx = "=0.16.0"
+# acct-zo4t / M10.B4-prep — AtomicU128 for atomic (balance, qty) pair
+# reads. std::sync::atomic::AtomicU128 is not yet on stable Rust;
+# portable_atomic provides a real lock-free implementation on x86_64
+# (cmpxchg16b) and aarch64 (ldxp/stxp).
+portable-atomic = { version = "1", default-features = false, features = ["require-cas"] }
 
 [dev-dependencies]
 pgrx-tests = "=0.16.0"

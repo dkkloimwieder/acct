@@ -1,0 +1,19 @@
+# acct-zo4t / M10.B4-prep — enable cmpxchg16b on x86_64 so
+# portable_atomic::AtomicU128 is genuinely lock-free (one cmpxchg16b
+# instruction, not a global spinlock fallback). cmpxchg16b is in all
+# x86_64 CPUs since 2011 (Intel Core 2 and later, AMD Phenom and
+# later); the conservative Rust x86_64 baseline omits it for backward
+# compatibility. Our deployment is single-host Docker on modern x86_64;
+# requiring cmpxchg16b is safe.
+#
+# Mirrored target line for the gnu-libc and musl variants so both
+# work-trees and CI matrices resolve consistently.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+cmpxchg16b"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+cmpxchg16b"]
+
+[target.aarch64-unknown-linux-gnu]
+# aarch64 has native 128-bit atomics (LDXP/STXP); no extra feature needed.
