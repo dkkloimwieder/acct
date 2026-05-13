@@ -513,7 +513,16 @@ fn try_update_existing(
             // — readers observing this cell get a real coupled pair.
             balance_qty_fetch_add(&b.balance_qty, amount_delta, qty_delta);
             let seq = next_seq();
-            b.last_seq.store(seq, Ordering::Release);
+            // fetch_max not store: two writers racing on this cell each
+            // pull a monotone seq from next_seq(), but their last_seq
+            // stores are not ordered with the global APPLY_SEQ increment.
+            // A plain store can land out-of-order (T2's seq=11 stored,
+            // then T1's seq=10 stored), leaving last_seq trailing
+            // APPLY_SEQ. The drain would briefly see the cell as "clean"
+            // at the stale watermark even though APPLY_SEQ moved past.
+            // fetch_max guarantees last_seq only ever moves forward per
+            // cell regardless of inter-thread reordering.
+            b.last_seq.fetch_max(seq, Ordering::AcqRel);
             return Some(seq);
         }
     }

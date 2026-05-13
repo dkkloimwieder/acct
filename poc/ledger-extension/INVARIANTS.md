@@ -32,10 +32,17 @@ cells are dirty. A non-monotonic `last_seq` (e.g., a stale apply
 overwriting a newer one) would cause drain to skip real updates, and the
 durable rollup would drift behind shmem indefinitely.
 
-**Enforced by.** `next_seq()` (`src/lib.rs:355`) does
-`APPLY_SEQ.fetch_add(1, AcqRel) + 1`. Per-cell stores happen via
-`b.last_seq.store(seq, Release)` after fetch_add (`src/lib.rs:383`,
-`:434`). Reset path zeroes both atomics (`src/lib.rs:705`, `:709`).
+**Enforced by.** `next_seq()` does `APPLY_SEQ.fetch_add(1, AcqRel) + 1`.
+Per-cell updates use `b.last_seq.fetch_max(seq, AcqRel)` in
+`try_update_existing` — `fetch_max` not `store`, because under SHARED
+two writers can race the CAS-RMW on `balance_qty` and pull seqs from
+the global counter in one order but reach the per-cell store in the
+other order. A plain `store` would let `last_seq` regress relative to
+`APPLY_SEQ`, briefly making a dirty cell look clean to the drain.
+`fetch_max` guarantees per-cell `last_seq` only advances regardless of
+inter-thread reordering. `insert_new_seeded` is called under EXCLUSIVE
+(no race), so plain `store` is correct there. Reset path zeroes both
+atomics.
 
 **Pinned by.** `tests/invariants_t1.rs::i1_seq_monotonicity` (this
 issue) — samples `ledger_shmem_apply_seq()` across many applies; asserts
