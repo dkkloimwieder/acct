@@ -160,6 +160,26 @@ torn read `(balance=38022000, qty=38021)` within 15s); post-fix passes
 documented in
 [`bench/results-shmem-apply-B4prep.md`](../../batch-ledger/bench/results-shmem-apply-B4prep.md).
 
+M10.B4 ✅ (acct-n4mo, 2026-05-13) — `post_batch_wac_shmem` (mig 0014)
+applies WAC perpetual via the shmem hot path with the AtomicU128
+coupled-read guarantee. Pool snapshot at batch start comes from
+`ledger_balance_lookup`; per-leg apply carries (amount, qty) into
+`ledger_apply_balance_delta`. The in-batch running-avg map (HC3) is
+preserved; cross-batch within one txn doesn't RYW (A2 limitation),
+one-batch-per-txn pinned by `tests/wac_shmem_correctness_t1.rs`
+(T1 receipt+issue / T2 cross-batch via shmem / T3 in-batch running
+avg / T4 idempotent replay / T5 8-writer fan-in coupled writes).
+mig 0015 adds `post_batch_wac` as a stable mutable baseline (mig
+0006's body installed under a separate name — `post_batch` itself
+is mig 0010's PAC body now). Headline: **fan-in 2.24× / fan-out
+2.65×** vs mutable WAC, p99 -46%/-52%, zero deadlocks, recon
+drift=0 across 5001 cells. Fan-out's lift is below the acct-togd
+projection (27-38% of the 7-10× target) — the plpgsql FOR LOOP is
+the new ceiling, not lock contention. A future `ledger_apply_batch(jsonb)`
+entry point could push per-envelope work into Rust; filed as
+followup. Bench details in
+[`bench/results-shmem-wac.md`](../../batch-ledger/bench/results-shmem-wac.md).
+
 ## Durability boundary (acct-e5gl)
 
 The `account_balances_rollup` table is the durability watermark.

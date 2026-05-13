@@ -44,6 +44,11 @@ async fn wac_fan_bench() {
     let batch_size = env_or::<usize>("POC_BENCH_BATCH_SIZE", 1000);
     let issue_pct = env_or::<u32>("POC_BENCH_ISSUE_PCT", 0);
     let shape = std::env::var("POC_BENCH_SHAPE").unwrap_or_else(|_| "fan_in".to_string());
+    // POC_BENCH_FUNCTION routes to a specific SQL fn — "post_batch" (default,
+    // mutable WAC via mig 0006) or "post_batch_wac_shmem" (mig 0014, shmem
+    // apply). Same envelope shape; the bench harness doesn't care which
+    // applies.
+    let bench_fn = std::env::var("POC_BENCH_FUNCTION").unwrap_or_else(|_| "post_batch".to_string());
     let url = std::env::var("POC_DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
 
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -56,6 +61,24 @@ async fn wac_fan_bench() {
         .execute(&pool)
         .await
         .expect("truncate");
+
+    if bench_fn == "post_batch_wac_shmem" {
+        // Shmem path: also flush the durable rollup + shmem hash so M6
+        // lazy-load can't pick up stale (account_id, balance, qty) from
+        // a prior run that happened to land on the same BIGSERIAL ID.
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS ledger_extension")
+            .execute(&pool)
+            .await
+            .expect("ext");
+        sqlx::query("TRUNCATE account_balances_rollup RESTART IDENTITY")
+            .execute(&pool)
+            .await
+            .expect("rollup truncate");
+        sqlx::query("SELECT ledger_shmem_reset()")
+            .execute(&pool)
+            .await
+            .expect("shmem reset");
+    }
 
     // Seed external counter-party accounts (one debit_normal AP-style, one credit_normal COGS-style).
     let ap_id: i64 = sqlx::query_scalar(
@@ -95,11 +118,13 @@ async fn wac_fan_bench() {
     let wall_start = Instant::now();
 
     let mut handles = Vec::with_capacity(workers);
+    let q_call = format!("SELECT * FROM {}($1)", bench_fn);
     for wi in 0..workers {
         let s = stats.clone();
         let p = pool.clone();
         let p_pool = pool_ids.clone();
         let shape = shape.clone();
+        let q_call = q_call.clone();
         handles.push(tokio::spawn(async move {
             let mut samples_ns: Vec<u64> = Vec::with_capacity(50_000);
             let mut rng: u64 = (wi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
@@ -144,7 +169,7 @@ async fn wac_fan_bench() {
                 let envelopes_value = Value::Array(envelopes);
                 s.batches_attempted.fetch_add(1, Ordering::Relaxed);
                 let t0 = Instant::now();
-                let res = sqlx::query("SELECT * FROM post_batch($1)")
+                let res = sqlx::query(&q_call)
                     .bind(envelopes_value)
                     .execute(&p)
                     .await;
@@ -180,7 +205,7 @@ async fn wac_fan_bench() {
             all_samples[idx] / 1_000
         }
     };
-    eprintln!("\n========= WAC fan bench (shape={shape}, pools={pools_count}, issue_pct={issue_pct}, batch={batch_size}) =========");
+    eprintln!("\n========= WAC fan bench (fn={bench_fn}, shape={shape}, pools={pools_count}, issue_pct={issue_pct}, batch={batch_size}) =========");
     eprintln!("workers: {workers}, duration: {duration_secs}s (wall: {wall_secs:.2}s)");
     eprintln!("batches_attempted: {attempted}");
     eprintln!("batches_ok:        {ok}");
