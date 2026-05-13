@@ -1904,6 +1904,581 @@ fn ledger_dispatch_fifo_batch(
     TableIterator::new(rows)
 }
 
+/// acct-vh5y — FIFO pre-F probe: inline-no-shmem `fifo_apply_batch_inline`.
+///
+/// Isolates the dispatcher+CTE-wrapper cost (mig 0022) from the durable-WAL
+/// cost. One Rust `pg_extern` does EVERYTHING: parse → FOR UPDATE accounts →
+/// fetch cost_layers → FIFO walk in Rust HashMap → SPI multi-row INSERTs +
+/// UPDATEs → return per-envelope status. No plpgsql wrapper. No CTE chain.
+///
+/// Comparison points:
+/// - mig 0020 mutable (plpgsql FOR LOOP + jsonb_set + multi-CTE INSERTs): 793 tps fan-out.
+/// - mig 0022 maximal-L (Rust dispatcher + 7-CTE plpgsql wrapper): 46 tps fan-out.
+/// - This function (Rust everything, no wrapper): ? tps fan-out.
+///
+/// If ? approaches or exceeds mutable's 793 tps, the wrapper was the L-accounts
+/// regression and durable-WAL is the ceiling. If ? stays near 46, something
+/// else is dominant (probably WAL itself).
+///
+/// Scope deliberately omits transfer support (correctness tests + bench only
+/// use fifo_receipt + fifo_issue). qty is always non-null.
+#[pg_extern]
+fn fifo_apply_batch_inline(
+    envelopes: pgrx::JsonB,
+) -> TableIterator<
+    'static,
+    (
+        name!(envelope_idx, i32),
+        name!(status, String),
+        name!(posting_line_id, Option<i64>),
+        name!(error_code, Option<String>),
+        name!(error_message, Option<String>),
+    ),
+> {
+    let arr = match envelopes.0.as_array() {
+        Some(a) => a,
+        None => pgrx::error!("fifo_apply_batch_inline: envelopes must be a JSONB array"),
+    };
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        FifoReceipt,
+        FifoIssue,
+    }
+    struct Parsed {
+        envelope_idx: i32,
+        kind: Kind,
+        debit: i64,
+        credit: i64,
+        qty: i64,
+        unit_cost: Option<i64>,
+        idempotency_key: String,
+        business_date: String,
+    }
+
+    // Pass 1: parse + validate.
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(arr.len());
+    for (idx, env) in arr.iter().enumerate() {
+        let obj = match env.as_object() {
+            Some(o) => o,
+            None => pgrx::error!(
+                "fifo_apply_batch_inline: envelope[{}] is not an object",
+                idx
+            ),
+        };
+        let kind_str = obj
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("fifo_receipt");
+        let kind = match kind_str {
+            "fifo_receipt" => Kind::FifoReceipt,
+            "fifo_issue" => Kind::FifoIssue,
+            other => pgrx::error!(
+                "fifo_apply_batch_inline: envelope[{}] unsupported kind '{}' (probe omits transfer)",
+                idx,
+                other
+            ),
+        };
+        let envelope_idx = obj
+            .get("envelope_idx")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(idx as i64) as i32;
+        let debit = obj
+            .get("debit_account_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "fifo_apply_batch_inline: envelope[{}] missing debit_account_id",
+                    idx
+                )
+            });
+        let credit = obj
+            .get("credit_account_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "fifo_apply_batch_inline: envelope[{}] missing credit_account_id",
+                    idx
+                )
+            });
+        let qty = obj.get("qty").and_then(|v| v.as_i64()).unwrap_or_else(|| {
+            pgrx::error!(
+                "fifo_apply_batch_inline: envelope[{}] missing qty",
+                idx
+            )
+        });
+        if qty <= 0 {
+            pgrx::error!(
+                "fifo_apply_batch_inline: envelope[{}] qty must be > 0",
+                idx
+            );
+        }
+        let unit_cost = obj.get("unit_cost").and_then(|v| v.as_i64());
+        if kind == Kind::FifoReceipt && unit_cost.unwrap_or(0) <= 0 {
+            pgrx::error!(
+                "fifo_apply_batch_inline: envelope[{}] fifo_receipt missing/invalid unit_cost",
+                idx
+            );
+        }
+        let idempotency_key = obj
+            .get("idempotency_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "fifo_apply_batch_inline: envelope[{}] missing idempotency_key",
+                    idx
+                )
+            })
+            .to_string();
+        let business_date = obj
+            .get("business_date")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "fifo_apply_batch_inline: envelope[{}] missing business_date",
+                    idx
+                )
+            })
+            .to_string();
+        parsed.push(Parsed {
+            envelope_idx,
+            kind,
+            debit,
+            credit,
+            qty,
+            unit_cost,
+            idempotency_key,
+            business_date,
+        });
+    }
+
+    // Phase 1: replay detection. SELECT existing posting_lines by idempotency_key.
+    let idemp_keys: Vec<String> = parsed.iter().map(|p| p.idempotency_key.clone()).collect();
+    let replay_map: HashMap<String, i64> = Spi::connect(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![idemp_keys.clone().into()];
+        let tup = client
+            .select(
+                "SELECT idempotency_key::TEXT AS k, id FROM posting_lines \
+                 WHERE idempotency_key = ANY($1::text[]::uuid[])",
+                None,
+                &args,
+            )
+            .expect("inline: replay SELECT");
+        let mut m: HashMap<String, i64> = HashMap::new();
+        for row in tup {
+            let k: String = row["k"].value().unwrap().unwrap();
+            let id: i64 = row["id"].value().unwrap().unwrap();
+            m.insert(k, id);
+        }
+        m
+    });
+
+    // Phase 2: FOR UPDATE on all touched accounts. ORDER BY id for deadlock-free
+    // acquisition.
+    let mut all_acct_ids: Vec<i64> = parsed
+        .iter()
+        .flat_map(|p| [p.debit, p.credit])
+        .collect();
+    all_acct_ids.sort_unstable();
+    all_acct_ids.dedup();
+    Spi::connect_mut(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![all_acct_ids.clone().into()];
+        client
+            .update(
+                "SELECT id FROM accounts WHERE id = ANY($1::bigint[]) \
+                 ORDER BY id FOR UPDATE",
+                None,
+                &args,
+            )
+            .expect("inline: FOR UPDATE accounts");
+    });
+
+    // Phase 3: fetch active cost_layers for all touched issue-pools (non-replay).
+    let mut issue_pools: Vec<i64> = parsed
+        .iter()
+        .filter(|p| {
+            p.kind == Kind::FifoIssue && !replay_map.contains_key(&p.idempotency_key)
+        })
+        .map(|p| p.credit)
+        .collect();
+    issue_pools.sort_unstable();
+    issue_pools.dedup();
+
+    struct LayerRec {
+        sentinel: Option<i32>,
+        layer_id: Option<i64>,
+        qty_remaining: i64,
+        unit_cost: i64,
+    }
+    let mut pool_layers: HashMap<i64, Vec<LayerRec>> = HashMap::new();
+
+    if !issue_pools.is_empty() {
+        let fetched: Vec<(i64, i64, i64, i64)> = Spi::connect(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![issue_pools.clone().into()];
+            let tup = client
+                .select(
+                    "SELECT cl.pool_account_id, cl.id, cl.qty_remaining, cl.unit_cost \
+                     FROM cost_layers cl \
+                     WHERE cl.pool_account_id = ANY($1::bigint[]) AND cl.qty_remaining > 0 \
+                     ORDER BY cl.pool_account_id, cl.receipt_date, cl.id",
+                    None,
+                    &args,
+                )
+                .expect("inline: SELECT cost_layers");
+            let mut rows: Vec<(i64, i64, i64, i64)> = Vec::new();
+            for row in tup {
+                rows.push((
+                    row["pool_account_id"].value().unwrap().unwrap(),
+                    row["id"].value().unwrap().unwrap(),
+                    row["qty_remaining"].value().unwrap().unwrap(),
+                    row["unit_cost"].value().unwrap().unwrap(),
+                ));
+            }
+            rows
+        });
+        for (pid, lid, qr, uc) in fetched {
+            pool_layers
+                .entry(pid)
+                .or_insert_with(Vec::new)
+                .push(LayerRec {
+                    sentinel: None,
+                    layer_id: Some(lid),
+                    qty_remaining: qr,
+                    unit_cost: uc,
+                });
+        }
+    }
+
+    // Phase 4: fetch currencies for all touched accounts.
+    let currency_map: HashMap<i64, String> = Spi::connect(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![all_acct_ids.clone().into()];
+        let tup = client
+            .select(
+                "SELECT id, currency::TEXT AS c FROM accounts WHERE id = ANY($1::bigint[])",
+                None,
+                &args,
+            )
+            .expect("inline: SELECT currency");
+        let mut m: HashMap<i64, String> = HashMap::new();
+        for row in tup {
+            let id: i64 = row["id"].value().unwrap().unwrap();
+            let c: String = row["c"].value().unwrap().unwrap();
+            m.insert(id, c);
+        }
+        m
+    });
+
+    // Phase 5: walk envelopes (non-replays), build INSERT payloads.
+    // posting_lines:
+    let mut pl_debit: Vec<i64> = Vec::new();
+    let mut pl_credit: Vec<i64> = Vec::new();
+    let mut pl_amount: Vec<i64> = Vec::new();
+    let mut pl_currency: Vec<String> = Vec::new();
+    let mut pl_idemp: Vec<String> = Vec::new();
+    let mut pl_bdate: Vec<String> = Vec::new();
+    let mut pl_qty: Vec<i64> = Vec::new();
+    // cost_layers (new from receipts):
+    let mut nl_idemp: Vec<String> = Vec::new(); // receipt envelope's idempotency_key — used to look up posting_line.id
+    let mut nl_sentinel: Vec<i32> = Vec::new();
+    let mut nl_pool: Vec<i64> = Vec::new();
+    let mut nl_qty: Vec<i64> = Vec::new();
+    let mut nl_uc: Vec<i64> = Vec::new();
+    let mut nl_bdate: Vec<String> = Vec::new();
+    // cost_layer_depletions:
+    let mut dp_issue_idemp: Vec<String> = Vec::new();
+    let mut dp_layer_real: Vec<Option<i64>> = Vec::new(); // None when sentinel
+    let mut dp_sentinel: Vec<Option<i32>> = Vec::new();
+    let mut dp_qty: Vec<i64> = Vec::new();
+    let mut dp_cost: Vec<i64> = Vec::new();
+    // pre-existing layer drains:
+    let mut ld_layer_id: Vec<i64> = Vec::new();
+    let mut ld_drain: Vec<i64> = Vec::new();
+    // balance deltas:
+    let mut bal_deltas: HashMap<i64, (i64, i64)> = HashMap::new(); // account_id → (balance_delta, qty_delta)
+    let mut next_sentinel: i32 = -1;
+
+    let mut accum_drain: HashMap<i64, i64> = HashMap::new();
+
+    for p in &parsed {
+        if replay_map.contains_key(&p.idempotency_key) {
+            continue;
+        }
+        let currency = currency_map.get(&p.debit).cloned().unwrap_or_else(|| {
+            pgrx::error!(
+                "inline: envelope_idx={} debit_account_id={} has no currency in accounts",
+                p.envelope_idx,
+                p.debit
+            )
+        });
+        match p.kind {
+            Kind::FifoReceipt => {
+                let uc = p.unit_cost.expect("validated");
+                let amt = p.qty.saturating_mul(uc);
+                let sentinel = next_sentinel;
+                next_sentinel -= 1;
+                pool_layers
+                    .entry(p.debit)
+                    .or_insert_with(Vec::new)
+                    .push(LayerRec {
+                        sentinel: Some(sentinel),
+                        layer_id: None,
+                        qty_remaining: p.qty,
+                        unit_cost: uc,
+                    });
+                pl_debit.push(p.debit);
+                pl_credit.push(p.credit);
+                pl_amount.push(amt);
+                pl_currency.push(currency);
+                pl_idemp.push(p.idempotency_key.clone());
+                pl_bdate.push(p.business_date.clone());
+                pl_qty.push(p.qty);
+                nl_idemp.push(p.idempotency_key.clone());
+                nl_sentinel.push(sentinel);
+                nl_pool.push(p.debit);
+                nl_qty.push(p.qty);
+                nl_uc.push(uc);
+                nl_bdate.push(p.business_date.clone());
+                let e = bal_deltas.entry(p.debit).or_insert((0, 0));
+                e.0 += amt;
+                e.1 += p.qty;
+                let e = bal_deltas.entry(p.credit).or_insert((0, 0));
+                e.0 -= amt;
+            }
+            Kind::FifoIssue => {
+                let pool_id = p.credit;
+                let layers = pool_layers.entry(pool_id).or_insert_with(Vec::new);
+                let mut remaining = p.qty;
+                let mut total_cost: i64 = 0;
+                for layer in layers.iter_mut() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if layer.qty_remaining == 0 {
+                        continue;
+                    }
+                    let take = remaining.min(layer.qty_remaining);
+                    let cost = take.saturating_mul(layer.unit_cost);
+                    dp_issue_idemp.push(p.idempotency_key.clone());
+                    dp_layer_real.push(layer.layer_id);
+                    dp_sentinel.push(layer.sentinel);
+                    dp_qty.push(take);
+                    dp_cost.push(cost);
+                    if let Some(lid) = layer.layer_id {
+                        *accum_drain.entry(lid).or_insert(0) += take;
+                    }
+                    layer.qty_remaining -= take;
+                    total_cost = total_cost.saturating_add(cost);
+                    remaining -= take;
+                }
+                if remaining > 0 {
+                    pgrx::error!(
+                        "fifo_apply_batch_inline: envelope[{}] fifo_issue short by {} units (pool {} exhausted)",
+                        p.envelope_idx,
+                        remaining,
+                        pool_id
+                    );
+                }
+                pl_debit.push(p.debit);
+                pl_credit.push(p.credit);
+                pl_amount.push(total_cost);
+                pl_currency.push(currency);
+                pl_idemp.push(p.idempotency_key.clone());
+                pl_bdate.push(p.business_date.clone());
+                pl_qty.push(p.qty);
+                let e = bal_deltas.entry(p.debit).or_insert((0, 0));
+                e.0 += total_cost;
+                let e = bal_deltas.entry(p.credit).or_insert((0, 0));
+                e.0 -= total_cost;
+                e.1 -= p.qty;
+            }
+        }
+    }
+    for (lid, d) in accum_drain.into_iter() {
+        ld_layer_id.push(lid);
+        ld_drain.push(d);
+    }
+
+    // Phase 6: INSERT posting_lines.
+    let new_pl_map: HashMap<String, i64> = if pl_idemp.is_empty() {
+        HashMap::new()
+    } else {
+        Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![
+                pl_debit.clone().into(),
+                pl_credit.clone().into(),
+                pl_amount.clone().into(),
+                pl_currency.clone().into(),
+                pl_idemp.clone().into(),
+                pl_bdate.clone().into(),
+                pl_qty.clone().into(),
+            ];
+            let tup = client
+                .update(
+                    "INSERT INTO posting_lines \
+                       (debit_account_id, credit_account_id, amount, currency, \
+                        idempotency_key, business_date, qty) \
+                     SELECT u.debit, u.credit, u.amount, u.curr, u.idemp::uuid, u.bdate::date, u.qty \
+                     FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], \
+                                 $4::text[], $5::text[], $6::text[], $7::bigint[]) \
+                              AS u(debit, credit, amount, curr, idemp, bdate, qty) \
+                     RETURNING id, idempotency_key::TEXT AS k",
+                    None,
+                    &args,
+                )
+                .expect("inline: INSERT posting_lines");
+            let mut m: HashMap<String, i64> = HashMap::new();
+            for row in tup {
+                let id: i64 = row["id"].value().unwrap().unwrap();
+                let k: String = row["k"].value().unwrap().unwrap();
+                m.insert(k, id);
+            }
+            m
+        })
+    };
+
+    // Phase 7: INSERT new cost_layers, build sentinel→real_id map.
+    let mut sentinel_map: HashMap<i32, i64> = HashMap::new();
+    if !nl_sentinel.is_empty() {
+        // Look up posting_line ids for receipts.
+        let nl_pl_ids: Vec<i64> = nl_idemp
+            .iter()
+            .map(|k| {
+                *new_pl_map.get(k).unwrap_or_else(|| {
+                    pgrx::error!("inline: receipt idempotency_key '{}' not found in new_pl_map", k)
+                })
+            })
+            .collect();
+        Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![
+                nl_pool.clone().into(),
+                nl_qty.clone().into(),
+                nl_uc.clone().into(),
+                nl_bdate.clone().into(),
+                nl_pl_ids.clone().into(),
+                nl_sentinel.clone().into(),
+            ];
+            let tup = client
+                .update(
+                    "WITH inserted AS ( \
+                       INSERT INTO cost_layers \
+                         (pool_account_id, qty_remaining, unit_cost, receipt_date, \
+                          receipt_posting_line_id) \
+                       SELECT u.pool, u.qty, u.uc, u.bdate::date, u.pl \
+                       FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::text[], $5::bigint[], $6::int[]) \
+                            WITH ORDINALITY AS u(pool, qty, uc, bdate, pl, sentinel, ord) \
+                       ORDER BY u.ord \
+                       RETURNING id, receipt_posting_line_id \
+                     ) \
+                     SELECT i.id, u.sentinel \
+                     FROM inserted i \
+                     JOIN unnest($1::bigint[], $5::bigint[], $6::int[]) WITH ORDINALITY \
+                            AS u(pool, pl, sentinel, ord) ON u.pl = i.receipt_posting_line_id",
+                    None,
+                    &args,
+                )
+                .expect("inline: INSERT cost_layers");
+            for row in tup {
+                let id: i64 = row["id"].value().unwrap().unwrap();
+                let s: i32 = row["sentinel"].value().unwrap().unwrap();
+                sentinel_map.insert(s, id);
+            }
+        });
+    }
+
+    // Resolve depletion sentinels.
+    let dp_layer_id: Vec<i64> = dp_layer_real
+        .iter()
+        .zip(dp_sentinel.iter())
+        .map(|(real, sent)| {
+            if let Some(r) = real {
+                *r
+            } else if let Some(s) = sent {
+                *sentinel_map.get(s).unwrap_or_else(|| {
+                    pgrx::error!("inline: depletion sentinel {} not resolved", s)
+                })
+            } else {
+                pgrx::error!("inline: depletion row has neither real layer_id nor sentinel")
+            }
+        })
+        .collect();
+    let dp_issue_pl_ids: Vec<i64> = dp_issue_idemp
+        .iter()
+        .map(|k| {
+            *new_pl_map.get(k).unwrap_or_else(|| {
+                pgrx::error!("inline: issue idempotency_key '{}' not found in new_pl_map", k)
+            })
+        })
+        .collect();
+
+    // Phase 8: INSERT cost_layer_depletions.
+    if !dp_layer_id.is_empty() {
+        Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![
+                dp_layer_id.clone().into(),
+                dp_issue_pl_ids.clone().into(),
+                dp_qty.clone().into(),
+                dp_cost.clone().into(),
+            ];
+            client
+                .update(
+                    "INSERT INTO cost_layer_depletions \
+                       (layer_id, issue_posting_line_id, qty_consumed, cost_amount) \
+                     SELECT u.lid, u.pl, u.qty, u.cost \
+                     FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[]) \
+                              AS u(lid, pl, qty, cost)",
+                    None,
+                    &args,
+                )
+                .expect("inline: INSERT cost_layer_depletions");
+        });
+    }
+
+    // Phase 9: UPDATE cost_layers SET qty_remaining for pre-existing drained layers.
+    if !ld_layer_id.is_empty() {
+        Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![
+                ld_layer_id.clone().into(),
+                ld_drain.clone().into(),
+            ];
+            client
+                .update(
+                    "UPDATE cost_layers SET qty_remaining = qty_remaining - u.d \
+                     FROM unnest($1::bigint[], $2::bigint[]) AS u(id, d) \
+                     WHERE cost_layers.id = u.id",
+                    None,
+                    &args,
+                )
+                .expect("inline: UPDATE cost_layers");
+        });
+    }
+
+    // Phase 10: balance + qty updates via stage_apply (shmem path, matching
+    // mig 0022 maximal-L). Same target as the existing dispatcher so T1-T5
+    // shmem assertions route through unchanged.
+    for (account_id, (dbal, dqty)) in bal_deltas.iter() {
+        stage_apply(*account_id, 1, 1, 1, *dbal, *dqty);
+    }
+
+    // Phase 11: build per-envelope results.
+    let results: Vec<(i32, String, Option<i64>, Option<String>, Option<String>)> = parsed
+        .iter()
+        .map(|p| {
+            let pl_id = replay_map
+                .get(&p.idempotency_key)
+                .copied()
+                .or_else(|| new_pl_map.get(&p.idempotency_key).copied());
+            let status = if replay_map.contains_key(&p.idempotency_key) {
+                "idempotent_replay".to_string()
+            } else {
+                "committed".to_string()
+            };
+            (p.envelope_idx, status, pl_id, None, None)
+        })
+        .collect();
+
+    TableIterator::new(results)
+}
+
 /// Read the cell at (`account_id`, `period_id`, `currency_id`,
 /// `ledger_kind`). Returns one row of NULLs if absent. Takes the SHARED
 /// LWLock; concurrent appliers can proceed without blocking the reader.

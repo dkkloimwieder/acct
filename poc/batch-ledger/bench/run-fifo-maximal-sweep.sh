@@ -48,17 +48,19 @@ run_cell() {
     done
 }
 
-run_cell fanin_fifo_mutable   post_batch_fifo            fan_in  1
-run_cell fanin_fifo_maximal   post_batch_fifo_maximal    fan_in  1
-run_cell fanout_fifo_mutable  post_batch_fifo            fan_out 5000
-run_cell fanout_fifo_maximal  post_batch_fifo_maximal    fan_out 5000
+run_cell fanin_fifo_mutable   post_batch_fifo                  fan_in  1
+run_cell fanin_fifo_maximal   post_batch_fifo_maximal          fan_in  1
+run_cell fanin_fifo_inline    post_batch_fifo_maximal_inline   fan_in  1
+run_cell fanout_fifo_mutable  post_batch_fifo                  fan_out 5000
+run_cell fanout_fifo_maximal  post_batch_fifo_maximal          fan_out 5000
+run_cell fanout_fifo_inline   post_batch_fifo_maximal_inline   fan_out 5000
 
 echo
 echo "==> aggregating"
 {
     printf "%-25s | %3s | %8s | %8s | %8s\n" "scenario" "run" "tps" "p50_ms" "p99_ms"
     echo "--------------------------+-----+----------+----------+---------"
-    for sub in fanin_fifo_mutable fanin_fifo_maximal fanout_fifo_mutable fanout_fifo_maximal; do
+    for sub in fanin_fifo_mutable fanin_fifo_maximal fanin_fifo_inline fanout_fifo_mutable fanout_fifo_maximal fanout_fifo_inline; do
         if [ ! -d "$OUT_DIR/$sub" ]; then continue; fi
         i=1
         for log in "$OUT_DIR/$sub"/run_*.log; do

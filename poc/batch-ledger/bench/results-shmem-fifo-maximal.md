@@ -176,6 +176,96 @@ F is the only path forward.
 
 ---
 
+# Addendum 2026-05-13 #2: acct-vh5y inline-no-shmem probe + pure-INSERT ceiling
+
+**Result reframes the F debate. Inline gives 12× lift over mutable from a
+~1-day change. F-shmem (acct-e9tf) buys the remaining 5.5× to ceiling.**
+
+## What inline does
+
+Mig 0023 exposes `fifo_apply_batch_inline` (Rust pg_extern) as
+`post_batch_fifo_maximal_inline`. ONE Rust function does everything: parse
+envelopes, FOR UPDATE accounts.id, fetch cost_layers via SPI, FIFO walk in
+Rust HashMap, multi-row INSERT posting_lines / cost_layers /
+cost_layer_depletions / UPDATE cost_layers, stage_apply balance/qty to
+shmem. No plpgsql wrapper. No 7-CTE chain. No TableIterator marshaling 7K
+rows out to plpgsql.
+
+Identical correctness contract to mig 0022 (5/5 T1-T5 green on the
+adapted `tests/fifo_apply_batch_inline_t1.rs`).
+
+## Headline numbers (1-replicate fan-out, 20w × 60s × batch=1000, 70/30)
+
+| Path | tps fan-out | vs mutable | vs ceiling |
+|---|---:|---:|---:|
+| mutable (mig 0020)        |    793 |     1× |  1.5% |
+| maximal-L (mig 0022)      |     46 |  0.06× | 0.087% |
+| **inline (mig 0023)**     | **9,487** | **12×** | **18%** |
+| **PURE INSERT CEILING**   | **52,832** | **66.6×** | **100%** |
+
+p99 batch wall: inline 2.4s vs mig 0022 432s (180× better). Ceiling p99:
+582ms.
+
+## Pure-INSERT ceiling methodology
+
+`tests/bench_fifo_inserts_only_ceiling.rs`. No FIFO logic, no reads, no
+plpgsql, no Rust pg_extern. Three multi-row sqlx INSERTs per batch:
+
+- 1000 rows into `posting_lines`
+- 300 rows into `cost_layers` (receipts; `receipt_posting_line_id` NULL)
+- 700 rows into `cost_layer_depletions` (issues; FK to 10K pre-seeded
+  posting_lines + 10K pre-seeded cost_layers, picked round-robin)
+
+20 writers × 60s. The number 52,832 envelopes/s = 105,665 row-writes/s.
+Each batch commits in ~400ms (p50); 20 workers × (1 / 0.4s) ≈ 50 batches/s
+≈ 50K envelopes/s — pretty much matches measurement.
+
+The ceiling is bounded by **WAL + index updates + FK validation** for that
+row volume. Any FIFO design's per-batch CPU pays on top of this; the ceiling
+is "infinite CPU but the same writes."
+
+## Architectural read
+
+The inline path lands at **18% of the ceiling**. Compare:
+- Mutable: 1.5% of ceiling. plpgsql FOR LOOP + O(N²) jsonb_set was the cost.
+- Mig 0022: 0.087%. The dispatcher+CTE wrapper was a 17× regression below
+  even mutable, dominating everything else.
+- Inline: 18%. Eliminating the wrapper recovers an absolute majority of the
+  remaining gap; per-batch CPU is no longer the bottleneck.
+
+**Ceiling has 5.5× headroom against inline.** That headroom is exclusively
+durable-write cost — the cost_layers INSERTs + cost_layer_depletions INSERTs
++ cost_layers UPDATEs that have to land in WAL synchronously with
+posting_lines. F-shmem (acct-e9tf) targets exactly this: move cost_layers
+state into shmem, drain to durable via bgworker, per-batch durable writes
+drop from ~2000 rows to ~1000 (posting_lines only).
+
+F's realistic ceiling: inline × ~3-4× = 30-40K tps fan-out. Approaches WAC
+shmem's 43.5K. ~10-14 day investment for the remaining 3-4×.
+
+The 12× already in hand from inline is the architectural win. F's remaining
+lift is real but diminishing-returns.
+
+## Recommendation
+
+Ship inline as the production FIFO maximal path. acct-e9tf F-shmem is now
+a value judgement: is going from 9.5K → ~35K tps fan-out worth 10-14 days
+for the codebase? Depends on whether realistic FIFO ERP workloads exceed
+9.5K tps per backend.
+
+## Files
+
+- This document: `poc/batch-ledger/bench/results-shmem-fifo-maximal.md`
+- Mig 0023 (inline; current production candidate): `poc/batch-ledger/db/migrations/0023_fifo_apply_batch_inline.up.sql`
+- Mig 0022 (L-accounts; superseded): `poc/batch-ledger/db/migrations/0022_post_batch_fifo_maximal_l_accounts.up.sql`
+- Mig 0021 (cost_layers FOR UPDATE; superseded): `poc/batch-ledger/db/migrations/0021_post_batch_fifo_maximal.up.sql`
+- Mig 0020 (mutable; production-comparable reference): `poc/batch-ledger/db/migrations/0020_post_batch_fifo_named.up.sql`
+- Extension fn: `poc/ledger-extension/src/lib.rs::fifo_apply_batch_inline`
+- Correctness tests (5/5 green): `poc/batch-ledger/tests/fifo_apply_batch_inline_t1.rs`
+- Ceiling bench: `poc/batch-ledger/tests/bench_fifo_inserts_only_ceiling.rs`
+
+---
+
 # Addendum 2026-05-13: acct-t59i L-accounts measurement
 
 **Outcome: another regression — L-accounts is 8-17× slower than mutable.
