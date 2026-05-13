@@ -179,6 +179,11 @@ unsafe impl PGRXSharedMemory for HashTable {}
 static HASH_TABLE: PgLwLock<HashTable> = unsafe { PgLwLock::new(c"ledger_hash_table") };
 static OCCUPIED_COUNT: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"ledger_occupied_count") };
 static APPLY_SEQ: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"ledger_apply_seq") };
+// acct-3ee2: counter for the rare post-pre_commit hash-full race.
+// Should stay 0 in production; non-zero signals a workload that's
+// pushing N_BUCKETS and needs sizing.
+static LEDGER_SHMEM_INSERT_FAILURES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"ledger_shmem_insert_failures") };
 
 // M5 — bgworker drain configuration.
 static DRAIN_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
@@ -190,6 +195,7 @@ pub extern "C-unwind" fn _PG_init() {
     pg_shmem_init!(HASH_TABLE);
     pg_shmem_init!(OCCUPIED_COUNT);
     pg_shmem_init!(APPLY_SEQ);
+    pg_shmem_init!(LEDGER_SHMEM_INSERT_FAILURES);
 
     GucRegistry::define_int_guc(
         c"ledger.drain_interval_ms",
@@ -470,6 +476,18 @@ fn try_update_existing(
 ///
 /// `rollup_seed = None` means the cell is genuinely new; behave as
 /// pre-M6: `(delta, qty_delta)` initial values, `drained_seq = 0`.
+/// Returns `Some(seq)` on success, `None` when the hash table has no
+/// empty slot within `N_BUCKETS` probes (table is full).
+///
+/// Pre-`acct-3ee2` this raised `error!()` on overflow. That signature
+/// was load-bearing for the synchronous-apply hot path, where the
+/// caller's transaction would abort cleanly. Post-A2 the apply runs
+/// inside `xact_commit` — the user transaction has already committed
+/// in the durable sense, so an error here would be logged but the
+/// commit can't be undone. The graceful contract is to return None
+/// and let the commit callback emit a WARNING; the `xact_pre_commit`
+/// hook is the load-bearing capacity gate (it runs PRE_COMMIT, where
+/// raising `error!` properly aborts the tx).
 #[inline]
 fn insert_new_seeded(
     table: &HashTable,
@@ -477,7 +495,7 @@ fn insert_new_seeded(
     rollup_seed: Option<(i64, i64, u64)>,
     amount_delta: i64,
     qty_delta: i64,
-) -> u64 {
+) -> Option<u64> {
     let (init_balance, init_qty, init_drained_seq) = match rollup_seed {
         Some((bal, qty, last_seq)) => {
             // Bump global APPLY_SEQ above rollup's watermark so the
@@ -506,13 +524,10 @@ fn insert_new_seeded(
             b.drained_seq.store(init_drained_seq, Ordering::Relaxed);
             b.occupied.store(1, Ordering::Release);
             OCCUPIED_COUNT.get().fetch_add(1, Ordering::AcqRel);
-            return seq;
+            return Some(seq);
         }
     }
-    error!(
-        "ledger_apply_balance_delta: hash table full (capacity {})",
-        N_BUCKETS
-    );
+    None
 }
 
 /// SPI lookup against `account_balances_rollup`. Returns `None` on
@@ -759,13 +774,32 @@ fn xact_commit() {
             if try_update_existing(&table, key, entry.amount_delta, entry.qty_delta).is_some() {
                 continue;
             }
-            insert_new_seeded(
+            if insert_new_seeded(
                 &table,
                 key,
                 entry.rollup_seed,
                 entry.amount_delta,
                 entry.qty_delta,
-            );
+            )
+            .is_none()
+            {
+                // acct-3ee2 — hash table full at commit time. The
+                // pre_commit hook should have caught this; reaching
+                // here means a concurrent backend's commit pushed
+                // OCCUPIED_COUNT past N_BUCKETS between our
+                // pre_commit projection and now. Log + count;
+                // can't raise `error!` here because the tx is
+                // already committed in PG's durable sense.
+                LEDGER_SHMEM_INSERT_FAILURES
+                    .get()
+                    .fetch_add(1, Ordering::AcqRel);
+                pgrx::warning!(
+                    "ledger_xact_commit: hash table full at insert (post-pre_commit race); \
+                     cell skipped, recon will flag drift. key_hi={:#x} key_lo={:#x}",
+                    (key >> 64) as u64,
+                    key as u64
+                );
+            }
         }
     }
 }
@@ -945,6 +979,18 @@ fn ledger_shmem_occupied() -> i64 {
 #[pg_extern]
 fn ledger_shmem_apply_seq() -> i64 {
     APPLY_SEQ.get().load(Ordering::Acquire) as i64
+}
+
+/// acct-3ee2: count of commit-time hash-full failures. Expected to
+/// stay 0 in production — `xact_pre_commit` is the load-bearing
+/// capacity gate. Non-zero values signal a workload that pushed
+/// `N_BUCKETS` between pre-commit projection and commit, suggesting
+/// the table is sized too tightly.
+#[pg_extern]
+fn ledger_shmem_insert_failure_count() -> i64 {
+    LEDGER_SHMEM_INSERT_FAILURES
+        .get()
+        .load(Ordering::Acquire) as i64
 }
 
 /// Count of occupied cells whose `last_seq > drained_seq` —
@@ -1276,6 +1322,7 @@ fn ledger_shmem_reset() {
     }
     OCCUPIED_COUNT.get().store(0, Ordering::Release);
     APPLY_SEQ.get().store(0, Ordering::Release);
+    LEDGER_SHMEM_INSERT_FAILURES.get().store(0, Ordering::Release);
 }
 
 // ── M4: durable rollup table + balance() reader ───────────────────────
