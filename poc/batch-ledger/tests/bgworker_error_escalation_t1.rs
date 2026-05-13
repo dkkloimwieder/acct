@@ -70,6 +70,11 @@ async fn pool() -> sqlx::PgPool {
     )
     .execute(&p)
     .await;
+    let _ = sqlx::query(
+        "ALTER TABLE IF EXISTS account_balances_rollup_t3_hidden RENAME TO account_balances_rollup"
+    )
+    .execute(&p)
+    .await;
     p
 }
 
@@ -229,4 +234,172 @@ async fn t2_clean_baseline_keeps_counters_zero() {
     .await
     .expect("rollup");
     assert_eq!(bal, Some(50), "T2: clean drain should land balance=50");
+}
+
+/// T3 — multi-cell outage probe (acct-fy5t investigation record).
+///
+/// **Investigation outcome (2026-05-13): cascade hypothesis FALSIFIED.**
+///
+/// The original concern: when `do_drain_tick`'s first SPI call raises
+/// ERROR (missing rollup table), PG's error handler runs `AbortTransaction`
+/// internally before the longjmp reaches `PgTryBuilder`. The surrounding
+/// `BackgroundWorker::transaction`'s txn is now in `TBLOCK_ABORT` state.
+/// Subsequent SPI calls in the SAME TICK (subsequent loop iterations)
+/// should get `ERRCODE_IN_FAILED_SQL_TRANSACTION` ("current transaction
+/// is aborted, commands ignored") — also caught by `PgTryBuilder`, also
+/// counted as failures. Hypothesis: N dirty cells → N failures recorded
+/// per outage tick, but only the FIRST cell's failure has any
+/// information (root cause); the rest are noise.
+///
+/// **Empirical finding from this probe + docker logs**: every per-cell
+/// failure during an outage tick logs `ERRCODE_UNDEFINED_TABLE`
+/// ("relation does not exist") — the root error code, not the cascade
+/// code. pgrx's `Spi::run_with_args` is isolating each call from the
+/// cascade, most likely via an internal subxact whose rollback scopes
+/// the abort. Confirmation: a vanilla psql session shows the cascade
+/// behaviour clearly (`BEGIN; SELECT FROM nonexistent_table; SELECT 1;
+/// ROLLBACK` — second SELECT returns `25P02`), so the cascade IS a
+/// real PG behaviour in general; pgrx is shielding the bgworker tick
+/// from it.
+///
+/// **What's still true**:
+/// - `total_failures` increments by N (one per dirty cell) per outage
+///   tick. Accurate but verbose — operator dashboards show inflated
+///   failure counts during outages.
+/// - `consecutive_fails` increments by 1 per tick regardless of N
+///   (`do_drain_tick` line 437-438). Escalation pacing is correct.
+/// - Recovery path works: after the rollup is restored, the next
+///   clean tick resets `consecutive_fails` to 0 (`t1_sustained_outage`
+///   covers this).
+///
+/// **Decision (acct-fy5t closed as negative result)**: no code change
+/// to bgworker. A pre-flight check (`SELECT 1 FROM
+/// account_balances_rollup LIMIT 0` at tick start, short-circuit on
+/// failure) would reduce log volume and `total_failures` inflation
+/// 50→1 per outage tick, but it's a noise reducer not a correctness
+/// fix and was deemed not worth the complexity at PoC scale.
+///
+/// **Probe shape preserved as regression net**: the test pins the
+/// current per-cell-independent-failure behaviour (every cell counts
+/// as its own failure, ratio ≈ N). If a future refactor causes only
+/// the FIRST cell's failure to be counted per tick (e.g., the
+/// noise-reducer fix DOES get shipped under a re-opened acct-fy5t),
+/// `total_failures ≈ consecutive_fails` and the test's ratio
+/// assertion below would change. The test is the falsification
+/// record; the ratio expectation captures today's state.
+#[tokio::test]
+async fn t3_multi_cell_cascade_probe() {
+    let p = pool().await;
+    sqlx::query("SELECT ledger_shmem_reset()")
+        .execute(&p)
+        .await
+        .expect("reset");
+
+    let n: i64 = 50;
+    let base = unique_offset();
+
+    // Phase 1 (baseline): apply N deltas with a clean rollup. Wait
+    // for drain. Verify all N cells land. Establishes that the
+    // bgworker CAN process N cells per tick.
+    for i in 0..n {
+        apply(&p, base + i, 100 + i).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let drained_baseline: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM account_balances_rollup
+          WHERE account_id BETWEEN $1 AND $2
+            AND period_id = 1 AND currency_id = 1 AND ledger_kind = 1",
+    )
+    .bind(base)
+    .bind(base + n - 1)
+    .fetch_one(&p)
+    .await
+    .expect("baseline count");
+    eprintln!(
+        "T3 baseline: {drained_baseline}/{n} cells drained cleanly with rollup intact"
+    );
+    assert_eq!(
+        drained_baseline, n,
+        "T3 baseline must drain all N cells before the outage scenario \
+         is interpretable; got {drained_baseline}/{n}"
+    );
+
+    // Reset shmem + counters for the outage scenario.
+    sqlx::query("SELECT ledger_shmem_reset()")
+        .execute(&p)
+        .await
+        .expect("reset 2");
+    let consec_pre = consec(&p).await;
+    let total_pre = total_fail(&p).await;
+    assert_eq!(consec_pre, 0, "T3 pre-outage: consec must be 0");
+    assert_eq!(total_pre, 0, "T3 pre-outage: total_failures must be 0");
+
+    // Phase 2 (outage): rename the rollup table BEFORE applying so the
+    // bgworker can't even probe it. Apply N distinct deltas. Wait.
+    sqlx::query(
+        "ALTER TABLE account_balances_rollup RENAME TO account_balances_rollup_t3_hidden",
+    )
+    .execute(&p)
+    .await
+    .expect("rename out");
+
+    let outage_base = unique_offset();
+    for i in 0..n {
+        apply(&p, outage_base + i, 1000 + i).await;
+    }
+
+    // Sleep enough for several ticks at the 100ms default cadence.
+    // 500ms = ~5 ticks; the threshold-warn fires at tick 5.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let c = consec(&p).await;
+    let t = total_fail(&p).await;
+
+    // Restore the rollup table immediately so subsequent test runs and
+    // concurrent test binaries aren't affected.
+    sqlx::query(
+        "ALTER TABLE account_balances_rollup_t3_hidden RENAME TO account_balances_rollup",
+    )
+    .execute(&p)
+    .await
+    .expect("rename back");
+
+    let ratio = if c == 0 { 0.0 } else { t as f64 / c as f64 };
+    eprintln!(
+        "T3 OUTAGE READINGS: consecutive_fails={c}, total_failures={t}, \
+         N_dirty_cells_seeded={n}, ratio (total/consec)={ratio:.2}"
+    );
+
+    assert!(
+        c >= 1,
+        "T3: at least one consecutive_fails increment expected during outage; got {c}"
+    );
+    assert!(
+        t >= c,
+        "T3: total_failures ({t}) must be at least consecutive_fails ({c})"
+    );
+
+    // Regression net pinning today's per-cell-independent-failure
+    // behaviour. The ratio (total_failures / consecutive_fails) should
+    // be approximately N (the dirty cell count) — every cell records
+    // as its own failure each outage tick. Floor at N/2 to tolerate
+    // timing-edge ticks that may have caught only a partial cell
+    // population (the first outage tick can race with the apply
+    // commits; some cells may not be dirty yet at its read).
+    //
+    // If a future refactor ships the pre-flight short-circuit (see
+    // acct-fy5t close note), this assertion will need to flip to
+    // `ratio < N/4` or similar — that's the intended signal that the
+    // bgworker behaviour materially changed.
+    let half_n = (n / 2) as f64;
+    assert!(
+        ratio >= half_n,
+        "T3 regression net: expected ratio >= N/2 ({half_n:.1}) under current \
+         per-cell-independent-failure behaviour; got {ratio:.2}. If you saw \
+         this fire, either (a) bgworker behaviour changed (someone added a \
+         pre-flight short-circuit?) — update the assertion AND the docstring, \
+         or (b) the test is flaky on the outage-window boundary — increase \
+         the sleep window."
+    );
 }
