@@ -51,7 +51,7 @@ async fn t1_layout_constants() {
     let cap: i64 = row.get("cap");
     let ml: i64 = row.get("ml");
     assert_eq!(cap, 16384, "fifo_arena_capacity");
-    assert_eq!(ml, 64, "fifo_max_layers");
+    assert_eq!(ml, 256, "fifo_max_layers");
 }
 
 #[tokio::test]

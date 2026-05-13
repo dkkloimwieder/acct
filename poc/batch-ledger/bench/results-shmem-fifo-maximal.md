@@ -553,3 +553,134 @@ the recommended production path until coalescing (sub 3) ships.
   + `fifo::do_fifo_drain_tick` (sub 4)
 - Sub 4 T1 tests (4/0): `poc/batch-ledger/tests/fifo_drain_t1.rs`
 - Raw bench logs: `/tmp/poc-ylmo-bench/`
+
+---
+
+# Addendum 2026-05-13 #4: MAX_LAYERS=256 + lazy-seed bug fix + mixed-flow regime
+
+**Outcome: F-shmem holds at 40.8K tps fan-out under realistic 70/30
+issue/receipt mix. Same as pure-issue (41.2K). Lift over inline:
+3.4×; over mutable: 52×.**
+
+## What changed
+
+1. **MAX_LAYERS bumped 64 → 256.** Arena grew from ~42 MB to ~117 MB
+   (still modest for a high-perf ledger). Headroom for bursty receipt
+   workloads — a typical PO-match day burst of 100-200 receipts now
+   fits comfortably without overflow.
+
+2. **Lazy-seed bug fix (Phase 6).** Originally Phase 6 queued a cell
+   for lazy-seed only when the batch contained at least one `fifo_issue`
+   envelope. Cells whose first batch was receipt-only got `seeded=1`
+   stamped without ever loading durable `cost_layers` into the ring.
+   Subsequent issues on that pool then saw only the post-bench-start
+   receipts, missed the bench-pre-seeded durable layers, and reported
+   "fifo_issue short by N units (pool X exhausted in shmem ring)" —
+   even though `cost_layers` had 5 layers × 1M qty per pool of headroom.
+   Fix: Phase 6 queues seed for any first-touch cell regardless of
+   envelope kind. Lazy-seed runs in Phase 8 before any envelope apply,
+   so durable layers land in the ring HEAD before this batch's
+   receipts append at the tail — strict FIFO order preserved.
+
+3. **Coalescing (sub 3 / acct-b8ub) reframed.** Coalescing merges two
+   oldest layers' qty + weighted-avg unit_cost — that's NOT strict
+   FIFO at per-unit grain (merged layers post averaged cost). The
+   correct alternative for overflow handling is **spill-to-durable**:
+   when the ring hits MAX_LAYERS, future receipts go directly to
+   `cost_layers` (skip shmem) and issues that walk past the in-memory
+   range fall through to SPI. Preserves strict FIFO; pays slow-path
+   cost only on overflow. Sub 3 is now under review pending a
+   workload driver that actually exceeds 256 (PO-match-day burst
+   simulator etc).
+
+## Methodology (v2)
+
+Same as addendum #3 except:
+
+- 9 cells now (4 anchor 1-rep + 3 F 3-rep = 15 runs).
+- Two workload shapes: **pure-issue (100/0)** and **mixed (70/30)**.
+- Mixed shape on fan-out ONLY. Fan-in concentrates 4-20 workers all
+  on one cell; at 20w × 60s × 30% receipts ≈ 360K receipts on a
+  single ring → cap blown regardless of value (256 or 1024 or 4096).
+  Fan-in mixed is a pathological shape; sub 3 territory.
+- Mixed shape pre-seeds with `LAYER_QTY=1_000_000` (1M/layer);
+  pure-issue uses `1_000_000_000` (1B/layer) — enough that no layer
+  ever fully drains on either shape.
+- `POC_BENCH_LAYER_QTY` added as bench-harness env-var.
+
+## Headline numbers (v2, 20 workers × 60s × batch=1000, batches_err=0
+   across all 15 runs)
+
+### Pure issue (100/0)
+
+| Scenario | run 1 | run 2 | run 3 | median |
+|---|---:|---:|---:|---:|
+| fan-in mutable   | 13,834 |   —    |   —    | **13,834** |
+| fan-in inline    | 24,907 |   —    |   —    | **24,907** |
+| **fan-in F**     | **30,380** | **31,365** | **32,792** | **31,365** |
+| fan-out mutable  |    757 |   —    |   —    | **757** |
+| fan-out inline   | 13,838 |   —    |   —    | **13,838** |
+| **fan-out F**    | **41,152** | **41,565** | **40,984** | **41,152** |
+
+### Mixed (70/30) — fan-out only
+
+| Scenario | run 1 | run 2 | run 3 | median |
+|---|---:|---:|---:|---:|
+| fan-out mutable_70  |    783 |   —    |   —    |    **783** |
+| fan-out inline_70   | 11,845 |   —    |   —    | **11,845** |
+| **fan-out F_70**    | **40,534** | **40,824** | **41,142** | **40,824** |
+
+### p99 batch latency (ms)
+
+| Scenario | F median p99 | inline | mutable |
+|---|---:|---:|---:|
+| fan-in pure-issue   |  936 |  1,059 |  1,580 |
+| fan-out pure-issue  |  675 |  1,731 | 26,960 |
+| fan-out mixed       |  691 |  1,945 | 29,588 |
+
+### Deltas vs inline / mutable (medians)
+
+| Scenario | F tps | vs inline | vs mutable |
+|---|---:|---:|---:|
+| fan-in 100/0  | 31,365 |  1.26×  |   2.27× |
+| fan-out 100/0 | 41,152 |  2.97×  |  54.4×  |
+| fan-out 70/30 | 40,824 |  **3.44×** |  **52.1×** |
+
+F's win **survives the realistic mix** (40.8K vs 41.2K at pure-issue
+— within 1% — and 3.44× over inline at 70/30 vs 2.97× at 100/0).
+Inline degrades at 70/30 because of the extra `cost_layers INSERT`
+on the apply path per receipt; F-shmem stages those layers into the
+ring and lets the bgworker handle `qty_remaining` UPSERTs out-of-band.
+
+### Zero failures across all 15 runs
+
+`batches_err=0` for every cell. No deadlocks. No "fifo_issue short"
+errors. No `pending_drain` overflow falls into inline. Stable across
+3 replicates per F cell (max-min variance < 8%).
+
+## What's still gated on sub 3 (coalescing / spill-to-durable)
+
+- **Fan-in mixed shape.** 20 writers concentrating all receipts on
+  one ring will fill the cap at any reasonable value. This is the
+  natural workload for sub 3 territory.
+- **Sustained net-receipt-positive flow per pool.** A small set of
+  hot pools receiving many sustained receipts (e.g., a single-vendor
+  bulk receiving operation) can exceed 256 over a multi-minute run
+  on fan-out too. The bench's i.i.d. uniform-receipt-target shape
+  hides this; real workloads concentrate on a smaller set.
+
+## Files updated for v2
+
+- Bench harness: `poc/batch-ledger/tests/bench_fifo_fan.rs`
+  - new `POC_BENCH_LAYER_QTY` env var
+  - first-2 errors logged so a regression surfaces without
+    digging through the err counter
+  - F-shmem routing now triggers `fifo_arena_reset()` before runs
+- Sweep driver: `poc/batch-ledger/bench/run-fifo-F-sweep.sh`
+  - per-cell ISSUE_PCT and LAYER_QTY (was global env vars)
+  - 9 cells across both workload shapes
+- Extension: `poc/ledger-extension/src/fifo.rs`
+  - `MAX_LAYERS = 256`
+  - Phase 6 lazy-seed filter dropped (covers receipt-only first-touch)
+  - `fifo_arena_reset()` (bench/test helper) added
+- Lwlock T1 cap assertion updated to 256.

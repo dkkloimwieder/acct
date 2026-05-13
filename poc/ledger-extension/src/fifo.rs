@@ -60,10 +60,20 @@ use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
 /// compile-time-sized struct).
 pub const FIFO_N_BUCKETS: usize = 16384;
 
-/// Maximum layers per cell. 64 keeps each bucket at 1088 bytes
-/// (16-byte Layer × 64 = 1024 bytes payload + 64-byte header). Total
-/// arena = 17 MB. Coalescing on insert kicks in at this cap (sub 3).
-pub const MAX_LAYERS: usize = 64;
+/// Maximum layers per cell. At 256 layers × 24-byte Layer = 6144 bytes
+/// payload per cell + 64-byte header + 1024-byte pending_drain = ~7232
+/// bytes per cell (padded to next 64-byte cache line = 7296 bytes).
+/// 16384 buckets = ~117 MB arena.
+///
+/// Sized for bursty-receipt ERP workloads: a typical PO match day adds
+/// ~100-200 receipts per pool in a burst, then sustained issues drain
+/// the ring back down between bursts. 256 layers = ~50% headroom above
+/// the burst size. Sustained net-receipt-positive flow eventually
+/// overflows regardless of cap — overflow handling is structural:
+/// either spill-to-durable (preserves FIFO order; slow path on
+/// post-ring layers) or coalescing (sub 3 / acct-b8ub; sacrifices
+/// strict FIFO semantics — under review pending workload driver).
+pub const MAX_LAYERS: usize = 256;
 
 /// Max pending-drain entries per cell between bgworker ticks (sub 4 /
 /// acct-0450). Each entry is 16 bytes (layer_id + qty_consumed); the
@@ -990,17 +1000,26 @@ pub fn fifo_apply_batch_maximal(
         }
     }
 
-    // Phase 6 — lazy-seed scan: cells that have at least one issue
-    // envelope AND seeded==0. SPI-fetch ordered active layers per pool.
+    // Phase 6 — lazy-seed scan: cells with seeded==0 that this batch
+    // will touch (receipt OR issue). SPI-fetch ordered active layers
+    // per pool.
+    //
+    // Originally the filter required `kind == FifoIssue` on the
+    // theory that receipts don't need to know existing layers. That
+    // missed a case: if a cell's FIRST batch is receipt-only, Phase 8
+    // unconditionally stamps `seeded=1` even though no durable seed
+    // ran — durable cost_layers rows from prior sessions / bench
+    // pre-seed are silently abandoned, and the next batch's issue
+    // sees an under-populated ring → "fifo_issue short" against a
+    // durable pool that actually has plenty. Queueing seed on any
+    // first-touch (regardless of kind) ensures durable layers land
+    // in the ring HEAD before the receipts append at the tail.
     let mut cells_needing_seed: Vec<(usize, i64)> = Vec::new(); // (cell_idx, pool_account_id)
     {
         let arena = FIFO_ARENA.share();
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for (i, p) in parsed.iter().enumerate() {
             if replay_map.contains_key(&p.idempotency_key) {
-                continue;
-            }
-            if p.kind != Kind::FifoIssue {
                 continue;
             }
             let cell = env_cell[i].unwrap();
