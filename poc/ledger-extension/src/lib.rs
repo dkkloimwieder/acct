@@ -248,6 +248,17 @@ pub extern "C-unwind" fn ledger_drain_main(_arg: pg_sys::Datum) {
         if !alive {
             break;
         }
+        // acct-vd74 (M10.C4): when SIGHUP is delivered, the signal
+        // handler latches `GOT_SIGHUP` and wakes `wait_latch`. Without
+        // calling `ProcessConfigFile(PGC_SIGHUP)` here, the bgworker
+        // would keep using stale `DRAIN_INTERVAL_MS` (and `DRAIN_DATABASE`
+        // would be ignored even at restart). pgrx exposes `sighup_received`
+        // as a one-shot flag.
+        if BackgroundWorker::sighup_received() {
+            unsafe {
+                pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
+            }
+        }
         // Each tick is its own transaction so a failed UPSERT doesn't
         // leave the worker in an uncommitted state.
         BackgroundWorker::transaction(|| {
