@@ -1,129 +1,175 @@
 # acct-lhgh — `post_batch_fifo_maximal`: FIFO dispatch fully in Rust
 
+**Outcome: structural regression vs mutable, NOT a lift. Follow-up paths
+`acct-t59i` (L-accounts) and `acct-nosj` (F shmem-LayerArena) carry the
+design space forward.**
+
 Mirrors `acct-2g9w` (`results-shmem-wac-maximal.md`) for FIFO. Pushes
-the per-pool FIFO layer walk + depletion dispatch from plpgsql into a
-Rust `#[pg_extern]` (`ledger_dispatch_fifo_batch`). Mig 0009's per-pool
-`jsonb_set` over the layer list collapses to a HashMap<i64, Vec<LayerRec>>
-in Rust, with one SPI fetch under FOR UPDATE at batch start.
+the per-pool FIFO layer walk + depletion dispatch into a Rust
+`#[pg_extern]` (`ledger_dispatch_fifo_batch`) + single-CTE SQL wrapper
+(mig 0021). The hypothesis was that the WAC maximal lift pattern would
+transfer (5-13× fan-out, 1.3× fan-in) by replacing mig 0020's O(N²)
+`jsonb_set` work with a `HashMap<i64, Vec<LayerRec>>` walk.
 
-The FIFO mutable baseline is dominated by O(N²) jsonb cost on the
-per-pool layer list — every layer mutation rewrites the entire JSONB
-array via `jsonb_set`. At batch=1000 × 70% issue × 5 layers per touched
-pool, that's ~3,500 jsonb_set calls per batch. The Rust dispatcher
-replaces this with in-place Vec mutation; the wrapper splits the
-TableIterator output into legs + depletions via CTEs.
-
-This document holds the mutable-baseline row populated by Sub 1
-(`acct-jqr4`). The maximal row is filled by Sub 3 (`acct-oqje`) after
-Sub 2 (`acct-m6q3`) ships the Rust dispatcher and SQL wrapper.
+Bench falsified the hypothesis. **The new design is 8-18× SLOWER than
+mutable** at both shapes.
 
 ## Methodology
 
-Identical to `acct-2g9w` (`results-shmem-wac-maximal.md`):
+Identical to `acct-2g9w`'s sweep:
 
 - PG 18.3 in `acct-postgres`, tuned conf.
-- 20 workers × batch=1000 × 60s × **3 replicates with 15s gaps** (Sub 3).
-  Sub 1 captures a single confirmation probe.
-- Fresh `TRUNCATE posting_lines, accounts, cost_layers, cost_layer_depletions`
-  RESTART IDENTITY CASCADE at the start of each cell.
-- **70% issue / 30% receipt** — heavier than acct-2g9w's 0% issue (which
-  exercised qty-leg only). FIFO's layer walk is on the **issue** path,
-  so issue-heavy mix is what stresses the dispatcher.
+- 20 workers × batch=1000 × 60s × 3 replicates with 15s gaps between
+  runs (within-cell). Fanin maximal run 3 was extended to 612s wall
+  due to the per-batch latency being far longer than the 60s deadline
+  drain window.
+- Fresh `TRUNCATE posting_lines, accounts, cost_layers,
+  cost_layer_depletions RESTART IDENTITY CASCADE` at the start of each
+  cell. Rollup truncated too via the test harness.
+- **70% issue / 30% receipt** — FIFO's expensive path is the issue
+  walk, not the receipt. Issue-heavy mix stresses the per-layer
+  contention.
 - Fan-in: 1 hot pool, 20 writers contend on shared `cost_layers` row
   locks (FOR UPDATE inside `_fifo_walk_layers`).
-- Fan-out: 5000 pools, writers spread across distinct pools — distinct
-  layer chains, less contention.
-- Each pool pre-seeded with 5 layers × 1M qty = 5M qty/pool so workers
-  cannot drain layers during a 60s run.
+- Fan-out: 5000 pools, writers spread across distinct pools — but
+  because each batch's 1000 envelopes pick pools randomly across all
+  5000, by birthday paradox virtually every active pool is touched
+  per batch.
+- Pools pre-seeded with 5 layers × 1M qty each = 5M qty/pool so
+  workers cannot drain layers during a 60s run.
+
+Cell 4 (fan-out maximal) was stopped at run 1/3 after the regression
+pattern became unambiguous; run 1 alone (609s wall) was sufficient to
+characterize.
 
 ## Per-run throughput (tps, posting_lines successfully inserted/s)
 
 | Scenario | run 1 | run 2 | run 3 | median |
 |---|---|---|---|---|
-| fan-in mutable (mig 0020) — Sub 1 probe |   330 | _TBD_ | _TBD_ | **~330** |
-| fan-in maximal (mig 0021)               | _TBD_ | _TBD_ | _TBD_ | **TBD**  |
-| fan-out mutable (mig 0020) — Sub 1 probe |  686 | _TBD_ | _TBD_ | **~686** |
-| fan-out maximal (mig 0021)              | _TBD_ | _TBD_ | _TBD_ | **TBD**  |
-
-**Sub 1 confirmation probe** (single 60s run, 2026-05-13, tip 7455924
-+ uncommitted mig 0020): fan-in 330 tps, fan-out 686 tps. Both within
-±11% of the state-memo numbers (305 / 620). Captured as the mutable
-baseline for the maximal lift calculation in Sub 3.
+| fan-in mutable (mig 0020)            |   313 |   312 |   313 | **313** |
+| fan-in maximal (mig 0021)            |    36 |    36 |    36 | **36**  |
+| fan-out mutable (mig 0020)           |   631 |   573 |   640 | **631** |
+| fan-out maximal (mig 0021) — 1 run   |    34 | (stop)| (stop)| **34**  |
 
 ## Per-run p99 latency (ms)
 
 | Scenario | run 1 | run 2 | run 3 | median |
 |---|---|---|---|---|
-| fan-in mutable          | 96,876 | _TBD_ | _TBD_ | **~96,876** |
-| fan-in maximal          |  _TBD_ | _TBD_ | _TBD_ | **TBD** |
-| fan-out mutable         | 33,567 | _TBD_ | _TBD_ | **~33,567** |
-| fan-out maximal         |  _TBD_ | _TBD_ | _TBD_ | **TBD** |
+| fan-in mutable         | 106,266 | 104,513 | 104,686 | **104,686** |
+| fan-in maximal         | 607,970 | 607,620 | 611,840 | **607,970** |
+| fan-out mutable        |  33,567 |  41,510 |  35,420 |  **35,420** |
+| fan-out maximal — 1 run|       — |       — |       — |  **~608,000** |
 
-## Comparison context (for reference)
+(Maximal p99 latency is approximate — 600s+ per batch reflects that 20
+writers queue serially on the FOR-UPDATE'd cost_layers rows; each
+writer holds locks for its full batch duration, so per-worker wall time
+≈ 600s for the worker that arrives last in the queue.)
 
-FIFO mutable is 75-80× slower than WAC mutable at the same shape, and
-the gap is larger at fan-in (the contended pool's layer list is the
-hot O(N²) JSONB target):
+## Headline deltas (medians, vs mutable baseline)
 
-| Method        | fan-in tps | fan-out tps |
-|---|---:|---:|
-| FIFO mutable (mig 0020) — measured today |   330 |    686 |
-| WAC mutable  (mig 0006) — `acct-2g9w`    | 25,045 |  4,341 |
-| WAC maximal  (mig 0019) — `acct-2g9w`    | 71,683 | 59,331 |
+| Shape | Mutable tps | Maximal tps | Lift vs mutable | Δ p99 |
+|---|---:|---:|---:|---:|
+| fan-in  |  313 |  **36**  | **-89% (8.7× slower)** | +480% (107s → 608s) |
+| fan-out |  631 |  **34**  | **-95% (18.6× slower)** | +1620% (35s → 608s) |
 
-The WAC mutable→maximal lift was 2.86× / 13.67×. FIFO's structural
-ceiling differs: the dispatcher win is per-envelope cost reduction,
-but FOR UPDATE on shared `cost_layers` rows STILL serializes
-fan-in workers identically. Fan-in lift will be modest;
-fan-out lift should approach the WAC band (5-13×) because per-pool
-layer walks are independent.
+**Zero deadlocks** across all measured cells. The serialization is
+correctness-preserving — just enormously expensive.
 
-## Headline deltas (Sub 3 to fill)
+## Root cause
 
-| Shape | mutable tps | maximal tps | Lift | mutable p99 | maximal p99 | Δ p99 |
-|---|---:|---:|---:|---:|---:|---:|
-| fan-in  |   330 | _TBD_ | _TBD_ | 96,876 ms | _TBD_ | _TBD_ |
-| fan-out |   686 | _TBD_ | _TBD_ | 33,567 ms | _TBD_ | _TBD_ |
+The maximal dispatcher pre-fetches all active layers under `FOR UPDATE`
+on `cost_layers` for every issue-pool touched by the batch. This is
+necessary for correctness: without the row lock, two concurrent issues
+on the same pool could both read layer 1 with `qty_remaining=100`, both
+decide to consume 50, and both decrement it to 50 — a 50-qty leak.
 
-## What Sub 2 + Sub 3 will validate
+Lock cardinality comparison:
 
-1. **Fan-out is the load-bearing shape for FIFO too.** mig 0020's
-   per-envelope plpgsql `jsonb_set` on per-pool layer lists is O(N²)
-   in layers touched per pool per batch. Eliminating it in Rust
-   produces an N²-vs-N collapse. acct-2g9w hit 5.24× at fan-out for
-   WAC; FIFO target band is similar.
+| Function | What gets FOR UPDATE'd | Typical row count per batch |
+|---|---|---|
+| mutable (mig 0020) | `accounts.id` for pool + AP + COGS | **~3 rows** |
+| maximal (mig 0021) | `cost_layers` rows for issue-pools × active layers | **~5 × 700 = 3,500 rows** (fan-out) |
 
-2. **Fan-in lift will be modest.** At 1 hot pool × 20 writers, FOR
-   UPDATE on the shared `cost_layers` rows serializes writers. The
-   dispatcher reduces per-envelope cost but doesn't reduce row-lock
-   contention. Expected lift band: 1.2-2×.
+Per-batch lock acquisition cost scales ~1000× between the two. The
+Rust HashMap walk + set-based CTE INSERT win (~3× faster per envelope
+in absolute work) is drowned by the lock acquisition overhead.
 
-3. **p99 latency collapse on fan-out should be dramatic.** mig 0020
-   holds the txn open for ~50ms/envelope under contention (jsonb_set
-   compounding); the Rust dispatcher does the same work in ~5ms/
-   envelope. Combined with per-batch CTE consolidation (no temp
-   table), transaction-hold time should drop ~10×.
+Under fan-in (1 pool, 5 layers, 20 writers), all writers queue on the
+same 5 rows. Per-batch wall ≈ 30s (per-batch work is fast under SHARED
+view, but FOR UPDATE serializes them so each writer waits for the
+queue ahead). Throughput collapses to 1/(queue_depth) of mutable.
 
-4. **Zero deadlocks across the sweep.** FIFO uses row-level FOR
-   UPDATE on `cost_layers` ordered by `(pool_account_id, receipt_date,
-   id)`, deterministic across writers.
+Under fan-out, despite 5000 pools, the random pool picker means each
+batch of 1000 envelopes touches ~700 unique pools, and 20 writers
+collectively touch most of the 5000 pools — so FOR UPDATE locks
+~3,500 layer rows per batch and writers still serialize heavily.
 
-## Memory bound (out of Sub 2 / Sub 3 scope; tracked in `acct-16kr`)
+## What this validates and what it doesn't
 
-The Rust dispatcher allocates `HashMap<i64, Vec<LayerRec>>` on the
-PG backend's heap. At 48 B per LayerRec, the soft cap derived from
-work_mem (64 MB × 0.5 = 32 MB) gives ~670K layers per batch. For
-the bench config (5 pre-seeded layers per pool × up to 5000 pools
-= 25K layers fetched per batch), well within budget. Adversarial
-testing (10K+ layers per pool, 100+ pools touched per batch) is
-the `acct-16kr` epic's domain.
+- **Validates**: the Rust dispatcher + set-based CTE pipeline itself is
+  correct (5/5 correctness tests pass: T1 cross-batch, T2 oldest-first,
+  T3 in-batch sentinel resolution, T4 idempotent replay, T5 8-writer
+  fan-in coupled writes; `recon drift=0`).
+- **Does NOT validate**: the design choice to do row-level FOR UPDATE
+  on `cost_layers`. That choice was necessary to preserve correctness
+  WITHOUT relying on account-level serialization (mutable's mechanism)
+  or moving state into shmem (acct-2g9w's mechanism for WAC).
+
+## The architectural realization
+
+WAC's per-pool state is **scalar** (running avg = value + qty), which
+fits a single shmem cell with AtomicU128 CAS — lock-free updates at
+hot rows. FIFO's per-pool state is an **ordered list of layers** which
+does NOT fit a single fixed-size shmem cell. The natural FIFO shape
+fundamentally differs from WAC's.
+
+Two viable paths surface:
+
+### `acct-t59i` — L-accounts (smaller-scope cleanup)
+
+Move serialization from `cost_layers` row locks to `accounts.id`
+account-row locks at the SQL wrapper level. Mirrors mig 0020 mutable's
+serialization model exactly — no new correctness contract introduced
+(any FIFO write necessarily touches the pool account, and Postgres'
+row-level lock enforces serialization). Keeps the Rust dispatcher +
+set-based CTE pipeline; drops `FOR UPDATE` from the dispatcher's SPI.
+
+Expected: should approach WAC-shape lift since per-batch Rust work
+remains, only the lock overhead is reduced.
+
+Scope: half a day. One migration (replaces mig 0021 with a v2 body).
+
+### `acct-nosj` — F shmem-LayerArena (architectural shift)
+
+New shmem region: variable-length per-pool layer queues, slab-allocated
+LayerRecs, per-pool head/tail pointers + queue_lock. A2-compliant
+staging via PENDING_STACK extension. Bgworker drain to durable
+`cost_layers`. Lazy-load on PG restart.
+
+Mirrors `acct-sw4i`'s WAC shmem-native approach, adapted for FIFO's
+ordered-list shape.
+
+Scope: 10-14 days, 9 sub-issues filed at claim time.
+
+## Recommendation
+
+L-accounts first (half day). If it matches mutable correctness AND
+exceeds its perf meaningfully, F becomes optional. If L-accounts only
+caps at the account-lock-serialization ceiling (no meaningful lift),
+F is the only path forward.
 
 ## Files
 
-- Mig 0020 (Sub 1 — mutable baseline, this run): `poc/batch-ledger/db/migrations/0020_post_batch_fifo_named.up.sql`
-- Bench harness (Sub 1): `poc/batch-ledger/tests/bench_fifo_fan.rs`
-- Extension dispatcher (Sub 2): `poc/ledger-extension/src/lib.rs` (`ledger_dispatch_fifo_batch`)
-- Mig 0021 (Sub 2 — maximal wrapper): `poc/batch-ledger/db/migrations/0021_post_batch_fifo_maximal.up.sql`
-- Correctness tests (Sub 2): `poc/batch-ledger/tests/fifo_shmem_correctness_maximal_t1.rs`
-- Bench sweep (Sub 3): `poc/batch-ledger/bench/run-fifo-maximal-sweep.sh`
+- Bench harness: `poc/batch-ledger/tests/bench_fifo_fan.rs`
+- Bench sweep driver: `poc/batch-ledger/bench/run-fifo-maximal-sweep.sh`
+- Mig 0020 (mutable baseline): `poc/batch-ledger/db/migrations/0020_post_batch_fifo_named.up.sql`
+- Mig 0021 (maximal, current regression-bearing): `poc/batch-ledger/db/migrations/0021_post_batch_fifo_maximal.up.sql`
+- Extension dispatcher: `poc/ledger-extension/src/lib.rs::ledger_dispatch_fifo_batch`
+- Correctness tests (5/5 green): `poc/batch-ledger/tests/fifo_shmem_correctness_maximal_t1.rs`
+- Raw bench logs: `/tmp/poc-oqje-bench/`
 - This document: `poc/batch-ledger/bench/results-shmem-fifo-maximal.md`
+
+## Follow-ups
+
+- `acct-t59i` — L-accounts: wrapper FOR UPDATE accounts.id; drop FOR UPDATE on cost_layers. P3.
+- `acct-nosj` — F: shmem-cached LayerArena. P3. Blocked-on acct-t59i (gates on whether L's measurement justifies F's scope).
