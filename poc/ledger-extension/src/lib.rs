@@ -1080,6 +1080,30 @@ fn ledger_balance_lookup(
 ///
 /// `ledger_balance` is NULL when no matching `accounts` row exists
 /// for the shmem `account_id`.
+///
+/// # Concurrency semantics
+///
+/// Phase 1 walks occupied buckets under SHARED LWLock and per-cell
+/// loads `balance_qty` as a single 128-bit atomic (acct-zo4t /
+/// M10.B4-prep). Each row's `(shmem_balance, shmem_qty)` is therefore
+/// a real coupled snapshot from one instant — never a torn pair
+/// (I11). Different rows in one recon call may reflect different
+/// instants; the function reports per-cell consistency, not cross-cell
+/// linearizability.
+///
+/// Phase 2 (SPI lookup of `ledger_balance`) runs outside the LWLock,
+/// after Phase 1 snapshots. A concurrent applier between Phase 1 and
+/// Phase 2 can mutate the cell, but does NOT affect the recon row —
+/// the row carries the Phase 1 snapshot verbatim.
+///
+/// Best practice: call at quiescence for fully-comparable
+/// `(shmem, ledger)` pairs. Under load, individual rows are coherent
+/// `(balance, qty)` snapshots but `drift` may reflect mid-batch
+/// transient states.
+///
+/// **Pinned by** `poc/batch-ledger/tests/recon_under_load_t1.rs`:
+/// R1 (concurrent-writer torn-read absence) and R2 (post-quiescence
+/// exactness).
 #[pg_extern]
 fn ledger_shmem_recon() -> TableIterator<
     'static,
