@@ -65,6 +65,16 @@ pub const FIFO_N_BUCKETS: usize = 16384;
 /// arena = 17 MB. Coalescing on insert kicks in at this cap (sub 3).
 pub const MAX_LAYERS: usize = 64;
 
+/// Max pending-drain entries per cell between bgworker ticks (sub 4 /
+/// acct-0450). Each entry is 16 bytes (layer_id + qty_consumed); the
+/// ring is fixed-size for shmem allocation and 64 keeps the per-cell
+/// overhead at 1 KiB. At default drain cadence (100 ms) and realistic
+/// FIFO workloads (single-digit layers consumed per issue), 64 is
+/// comfortable headroom. Overflow falls back to inline UPDATE in
+/// `fifo_apply_batch_maximal` Phase 9e — pending_drain stays the fast
+/// path; inline is the safety net.
+pub const PENDING_DRAIN_CAP: usize = 64;
+
 // ── data layout ──────────────────────────────────────────────────────
 
 /// One FIFO layer (cost layer in the ring buffer).
@@ -94,12 +104,35 @@ pub struct Layer {
 
 unsafe impl PGRXSharedMemory for Layer {}
 
+/// One pending drain entry — staged by `fifo_apply_batch_maximal` Phase 8
+/// when an issue consumes from a layer. The bgworker (sub 4 / acct-0450)
+/// snapshots + clears these every tick and bulk-UPSERTs the cumulative
+/// drains into `cost_layers.qty_remaining`. Same-layer entries do NOT
+/// dedupe in shmem (CPU under cell-lock); the drain UPSERT aggregates
+/// via `SUM` per layer_id.
+///
+/// 16 bytes, 8-byte aligned. `PENDING_DRAIN_CAP=64` per cell = 1 KiB
+/// per-cell pending area.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct PendingDrain {
+    pub layer_id: i64,
+    pub qty_consumed: i64,
+}
+
+unsafe impl PGRXSharedMemory for PendingDrain {}
+
 /// Ring-buffer fields protected by the cell's per-cell LWLock.
 /// Lives behind an `UnsafeCell` inside `FifoBucket` so the apply path
 /// can obtain `&mut RingFields` without violating Rust's aliasing rules
 /// (the cell LWLock is the runtime exclusion mechanism). Atomic
 /// fields stay outside this struct because they're touched lock-free
 /// by probe / drain / recon paths.
+///
+/// `pending_drain` + `pending_drain_n` (sub 4 / acct-0450): same lock
+/// discipline as `layers` + `n_layers`. Apply phase pushes via
+/// `push_pending_drain` under EXCLUSIVE; bgworker snapshots + resets to
+/// 0 also under EXCLUSIVE; readers DO NOT touch this without the lock.
 #[repr(C)]
 pub struct RingFields {
     /// Oldest layer index. Walks `(head + 1) % MAX_LAYERS` as layers
@@ -107,8 +140,12 @@ pub struct RingFields {
     pub head: u16,
     /// Number of valid layers. Tail = `(head + n_layers) % MAX_LAYERS`.
     pub n_layers: u16,
-    pub _pad: [u8; 4],
+    /// Number of valid pending_drain entries; tail = `pending_drain_n`.
+    /// Drained-to-disk by the bgworker; reset to 0 after snapshot.
+    pub pending_drain_n: u16,
+    pub _pad: [u8; 2],
     pub layers: [Layer; MAX_LAYERS],
+    pub pending_drain: [PendingDrain; PENDING_DRAIN_CAP],
 }
 
 impl Default for RingFields {
@@ -372,6 +409,11 @@ pub fn acquire_fifo_cell(idx: usize, mode: FifoCellMode) -> FifoCellGuard {
 pub fn init() {
     pg_shmem_init!(FIFO_ARENA);
     pg_shmem_init!(FIFO_CELL_TRANCHE = ());
+    // sub 4 (acct-0450) — FIFO drain observability counters.
+    pg_shmem_init!(FIFO_DRAIN_CONSECUTIVE_FAILS);
+    pg_shmem_init!(FIFO_DRAIN_TOTAL_FAILURES);
+    pg_shmem_init!(FIFO_DRAIN_TICKS_TOTAL);
+    pg_shmem_init!(FIFO_DRAIN_ROWS_TOTAL);
 }
 
 // ── SQL-callable test surface ────────────────────────────────────────
@@ -455,7 +497,30 @@ pub fn fifo_test_cell_lock_addr(idx: i64) -> i64 {
 
 use crate::{next_seq, stage_apply};
 use pgrx::Spi;
+use pgrx::PgAtomic;
 use std::collections::{BTreeMap, HashMap};
+
+// ── sub 4 (acct-0450) — FIFO drain observability ─────────────────────
+//
+// Mirrors the WAC drain counters in lib.rs. _CONSECUTIVE resets on the
+// first clean tick after a failure run; _TOTAL never resets without
+// `fifo_arena_reset`. Drain emits `warning!` when _CONSECUTIVE crosses
+// FIFO_DRAIN_WARN_AFTER (5 ticks = 500 ms at the default 100 ms
+// cadence — matches the WAC threshold).
+
+pub(crate) static FIFO_DRAIN_CONSECUTIVE_FAILS: PgAtomic<
+    std::sync::atomic::AtomicU64,
+> = unsafe { PgAtomic::new(c"fifo_drain_consecutive_fails") };
+pub(crate) static FIFO_DRAIN_TOTAL_FAILURES: PgAtomic<
+    std::sync::atomic::AtomicU64,
+> = unsafe { PgAtomic::new(c"fifo_drain_total_failures") };
+pub(crate) static FIFO_DRAIN_TICKS_TOTAL: PgAtomic<
+    std::sync::atomic::AtomicU64,
+> = unsafe { PgAtomic::new(c"fifo_drain_ticks_total") };
+pub(crate) static FIFO_DRAIN_ROWS_TOTAL: PgAtomic<
+    std::sync::atomic::AtomicU64,
+> = unsafe { PgAtomic::new(c"fifo_drain_rows_total") };
+const FIFO_DRAIN_WARN_AFTER: u64 = 5;
 
 /// Pack a (cost_book, product, location) tuple into the cell key. For
 /// the PoC schema (one account per pool, no cost-book / product /
@@ -563,6 +628,40 @@ pub struct ConsumeResult {
     /// > 0 if the ring couldn't satisfy the requested qty. Caller
     /// surfaces as a P0006-style error.
     pub shortage: i64,
+}
+
+/// Stage a `(layer_id, qty_consumed)` entry into the cell's
+/// pending_drain ring (sub 4 / acct-0450). **Caller MUST hold the
+/// cell's LWLock EXCLUSIVE.** Returns `false` on overflow
+/// (PENDING_DRAIN_CAP reached); caller falls back to inline UPDATE.
+#[inline]
+pub fn push_pending_drain(ring: &mut RingFields, layer_id: i64, qty_consumed: i64) -> bool {
+    if ring.pending_drain_n as usize >= PENDING_DRAIN_CAP {
+        return false;
+    }
+    let tail = ring.pending_drain_n as usize;
+    ring.pending_drain[tail] = PendingDrain {
+        layer_id,
+        qty_consumed,
+    };
+    ring.pending_drain_n += 1;
+    true
+}
+
+/// Snapshot + reset the cell's pending_drain ring. **Caller MUST hold
+/// the cell's LWLock EXCLUSIVE.** Returns the entries that were
+/// staged since the last snapshot. Used by the bgworker drain.
+#[inline]
+pub fn drain_pending_into(ring: &mut RingFields, out: &mut Vec<PendingDrain>) {
+    let n = ring.pending_drain_n as usize;
+    if n == 0 {
+        return;
+    }
+    out.reserve(n);
+    for i in 0..n {
+        out.push(ring.pending_drain[i]);
+    }
+    ring.pending_drain_n = 0;
 }
 
 /// Walk the ring from head and consume `qty` units in FIFO order.
@@ -999,7 +1098,13 @@ pub fn fifo_apply_batch_maximal(
     let mut dp_issue_idemp: Vec<String> = Vec::new();
     let mut dp_qty: Vec<i64> = Vec::new();
     let mut dp_cost: Vec<i64> = Vec::new();
-    // pre-existing layer drains (UPDATE qty_remaining):
+    // pre-existing layer drains (UPDATE qty_remaining) — INLINE
+    // FALLBACK only. sub 4 (acct-0450): the default path stages drains
+    // into the cell's `pending_drain` ring inside the cell lock; the
+    // bgworker UPDATEs cost_layers.qty_remaining at drain_interval_ms
+    // cadence. If `push_pending_drain` overflows
+    // (PENDING_DRAIN_CAP reached between drain ticks), the overflow
+    // entries fall back here for inline UPDATE in Phase 9e.
     let mut accum_drain: HashMap<i64, i64> = HashMap::new();
     // balance + qty deltas (stage_apply):
     let mut bal_deltas: HashMap<i64, (i64, i64)> = HashMap::new();
@@ -1101,7 +1206,17 @@ pub fn fifo_apply_batch_maximal(
                             dp_issue_idemp.push(p.idempotency_key.clone());
                             dp_qty.push(slice.qty_consumed);
                             dp_cost.push(slice.qty_consumed.saturating_mul(slice.unit_cost));
-                            *accum_drain.entry(slice.layer_id).or_insert(0) += slice.qty_consumed;
+                            // sub 4: stage drain into pending_drain ring
+                            // under cell lock. Overflow → inline fallback.
+                            let staged = push_pending_drain(
+                                ring,
+                                slice.layer_id,
+                                slice.qty_consumed,
+                            );
+                            if !staged {
+                                *accum_drain.entry(slice.layer_id).or_insert(0) +=
+                                    slice.qty_consumed;
+                            }
                         }
                         pl_debit.push(p.debit);
                         pl_credit.push(p.credit);
@@ -1275,9 +1390,14 @@ pub fn fifo_apply_batch_maximal(
         });
     }
 
-    // Phase 9e — UPDATE cost_layers SET qty_remaining for drained
-    // layers. (For sub 2, do this inline so durable state matches
-    // shmem; sub 4 will move this into the bgworker.)
+    // Phase 9e — INLINE FALLBACK for pending_drain overflow.
+    // sub 4 (acct-0450): the steady-state path stages drains into the
+    // per-cell pending_drain ring; the `ledger_drain` bgworker flushes
+    // those to `cost_layers.qty_remaining` at `drain_interval_ms`
+    // cadence. `accum_drain` here contains only the entries that
+    // OVERFLOWED `PENDING_DRAIN_CAP` between drain ticks — the
+    // safety net so a rare burst doesn't lose audit-state coherence.
+    // Empty `accum_drain` is the common case post-sub-4.
     if !accum_drain.is_empty() {
         let ld_id: Vec<i64> = accum_drain.keys().copied().collect();
         let ld_drain: Vec<i64> = ld_id.iter().map(|id| accum_drain[id]).collect();
@@ -1319,4 +1439,276 @@ pub fn fifo_apply_batch_maximal(
         .collect();
 
     TableIterator::new(results)
+}
+
+// ── sub 4 (acct-0450) — FIFO bgworker drain ──────────────────────────
+
+/// One FIFO drain pass. Called from `ledger_drain_main` after the WAC
+/// drain. Half-α architecture: durable `cost_layers` INSERTs +
+/// `cost_layer_depletions` INSERTs stay inline on the apply path; only
+/// `UPDATE cost_layers SET qty_remaining` moves here.
+///
+/// Flow:
+///
+/// 1. Walk all FIFO buckets under `FIFO_ARENA.share()`; gather the
+///    cell indices that are dirty (`last_seq > drained_seq`). Read
+///    `last_seq` lock-free; do NOT touch `pending_drain` here (that
+///    requires the cell LWLock).
+/// 2. For each dirty cell: acquire the cell LWLock EXCLUSIVE briefly,
+///    snapshot `pending_drain` into a local vec, reset
+///    `pending_drain_n` to 0, capture the post-lock `last_seq`,
+///    release. The brief EXCLUSIVE hold is the only synchronization
+///    with apply writers.
+/// 3. Aggregate all snapshots: `HashMap<layer_id, sum_qty_consumed>`.
+/// 4. Bulk SPI `UPDATE cost_layers SET qty_remaining = qty_remaining -
+///    sum_qty_consumed` via UNNEST. Wrapped in `PgTryBuilder` so a
+///    missing table / schema-error logs+counts but doesn't crash the
+///    tick.
+/// 5. CAS-stamp each successfully-drained cell's `drained_seq` up to
+///    its captured `last_seq`.
+///
+/// Cells with `pending_drain_n == 0` at snapshot are still stamped:
+/// `last_seq > drained_seq` can be true because of receipts (which
+/// don't pend any drain) — we still want to clear the dirty bit so
+/// the cell isn't re-scanned every tick.
+pub(crate) fn do_fifo_drain_tick() {
+    // Phase 1 — lock-free dirty scan.
+    let mut dirty_cells: Vec<usize> = Vec::new();
+    {
+        let arena = FIFO_ARENA.share();
+        for i in 0..FIFO_N_BUCKETS {
+            let b = &arena.buckets[i];
+            if b.occupied.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let last_pre = b.last_seq.load(Ordering::Acquire);
+            let drained = b.drained_seq.load(Ordering::Acquire);
+            if last_pre <= drained {
+                continue;
+            }
+            dirty_cells.push(i);
+        }
+    }
+    if dirty_cells.is_empty() {
+        return;
+    }
+
+    FIFO_DRAIN_TICKS_TOTAL
+        .get()
+        .fetch_add(1, Ordering::AcqRel);
+
+    // Phase 2 — per-cell brief EXCLUSIVE: snapshot + reset.
+    // Carries (cell_idx, captured_last_seq, drained_entries) per cell.
+    let mut snapshots: Vec<(usize, u64, Vec<PendingDrain>)> =
+        Vec::with_capacity(dirty_cells.len());
+    {
+        let arena = FIFO_ARENA.share();
+        for &cell_idx in &dirty_cells {
+            let _guard = acquire_fifo_cell(cell_idx, FifoCellMode::Exclusive);
+            let b = &arena.buckets[cell_idx];
+            // SAFETY: cell LWLock held EXCLUSIVE; sole writer of ring.
+            let ring = unsafe { ring_mut(b) };
+            let mut entries: Vec<PendingDrain> = Vec::new();
+            drain_pending_into(ring, &mut entries);
+            let last_seq = b.last_seq.load(Ordering::Acquire);
+            snapshots.push((cell_idx, last_seq, entries));
+            // guard releases here.
+        }
+    }
+
+    // Phase 3 — aggregate per layer_id across all cells (same-layer
+    // multiple-cell deltas don't happen in the PoC schema, but the
+    // SUM is cheap insurance).
+    let mut per_layer: HashMap<i64, i64> = HashMap::new();
+    for (_cell, _seq, entries) in &snapshots {
+        for e in entries {
+            *per_layer.entry(e.layer_id).or_insert(0) += e.qty_consumed;
+        }
+    }
+
+    // Phase 4 — bulk UPDATE cost_layers via UNNEST.
+    let mut failed_this_tick: u64 = 0;
+    let mut last_err: Option<String> = None;
+    let rows_updated = per_layer.len() as u64;
+    if !per_layer.is_empty() {
+        let ld_id: Vec<i64> = per_layer.keys().copied().collect();
+        let ld_drain: Vec<i64> = ld_id.iter().map(|id| per_layer[id]).collect();
+        let outcome: Result<(), String> = pgrx::PgTryBuilder::new(|| {
+            let args: Vec<pgrx::datum::DatumWithOid> =
+                vec![ld_id.clone().into(), ld_drain.clone().into()];
+            // Consume the SpiTupleTable inside the connect_mut closure
+            // so its lifetime stays bounded by the client borrow.
+            Spi::connect_mut(|client| {
+                client
+                    .update(
+                        "UPDATE cost_layers SET qty_remaining = qty_remaining - u.d \
+                         FROM unnest($1::bigint[], $2::bigint[]) AS u(id, d) \
+                         WHERE cost_layers.id = u.id",
+                        None,
+                        &args,
+                    )
+                    .map(|_| ())
+                    .map_err(|e| format!("{e}"))
+            })
+        })
+        .catch_others(|caught| Err(format!("{caught:?}")))
+        .execute();
+
+        match outcome {
+            Ok(()) => {
+                FIFO_DRAIN_ROWS_TOTAL
+                    .get()
+                    .fetch_add(rows_updated, Ordering::AcqRel);
+            }
+            Err(e) => {
+                failed_this_tick = ld_id.len() as u64;
+                last_err = Some(e.clone());
+                log!(
+                    "fifo_drain: UPDATE cost_layers failed for {} layers: {e}",
+                    ld_id.len()
+                );
+            }
+        }
+    }
+
+    // Phase 5 — stamp drained_seq on every dirty cell whose UPDATE
+    // succeeded. If the UPDATE failed, leave drained_seq alone so the
+    // next tick re-snapshots. Cells with empty pending_drain at
+    // snapshot still get stamped — they were dirty for non-drain
+    // reasons (e.g., pure-receipt last_seq bump) and we don't want to
+    // re-scan them every tick.
+    if failed_this_tick == 0 {
+        let arena = FIFO_ARENA.share();
+        for (cell_idx, last_seq, _entries) in &snapshots {
+            let b = &arena.buckets[*cell_idx];
+            let mut cur = b.drained_seq.load(Ordering::Acquire);
+            while cur < *last_seq {
+                match b.drained_seq.compare_exchange(
+                    cur,
+                    *last_seq,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+    } else {
+        // Re-stage the snapshots we already drained (entries are gone
+        // from the ring — push them BACK into pending_drain so next
+        // tick retries). This is the only path where the bgworker
+        // mutates pending_drain without snapshotting it first; gated
+        // on the UPDATE having failed so the ring isn't double-counted.
+        let arena = FIFO_ARENA.share();
+        for (cell_idx, _seq, entries) in &snapshots {
+            if entries.is_empty() {
+                continue;
+            }
+            let _guard = acquire_fifo_cell(*cell_idx, FifoCellMode::Exclusive);
+            let b = &arena.buckets[*cell_idx];
+            let ring = unsafe { ring_mut(b) };
+            for e in entries {
+                // Best-effort: if the ring overfilled during this
+                // tick (apply path pushed more entries after our
+                // snapshot), drop the overflow — caller's inline
+                // fallback already handled overflow on the apply
+                // side, and the durable UPDATE will catch up next
+                // tick when the apply path overflows again.
+                let _ = push_pending_drain(ring, e.layer_id, e.qty_consumed);
+            }
+        }
+    }
+
+    // Phase 6 — escalation counters.
+    if failed_this_tick > 0 {
+        FIFO_DRAIN_TOTAL_FAILURES
+            .get()
+            .fetch_add(failed_this_tick, Ordering::AcqRel);
+        let prev = FIFO_DRAIN_CONSECUTIVE_FAILS
+            .get()
+            .fetch_add(1, Ordering::AcqRel);
+        let now = prev + 1;
+        if now == FIFO_DRAIN_WARN_AFTER {
+            pgrx::warning!(
+                "fifo_drain: {now} consecutive ticks with SPI errors \
+                 (this tick: {failed_this_tick} layer rows failed of {} total); \
+                 last error: {}. Check that `cost_layers` exists in the \
+                 target DB and the bgworker has access.",
+                rows_updated,
+                last_err.as_deref().unwrap_or("<none>")
+            );
+        }
+    } else {
+        FIFO_DRAIN_CONSECUTIVE_FAILS
+            .get()
+            .store(0, Ordering::Release);
+    }
+}
+
+// ── SQL surface for sub 4 testing ────────────────────────────────────
+
+/// Force one FIFO drain pass. Useful for tests that want to flush
+/// `pending_drain` rings to `cost_layers.qty_remaining` deterministically
+/// rather than waiting `drain_interval_ms`. NOT for production use.
+#[pg_extern]
+pub fn fifo_force_drain_tick() -> bool {
+    do_fifo_drain_tick();
+    true
+}
+
+/// Returns the cell's pending_drain count (under SHARED-only read of
+/// FIFO_ARENA; the field is read without acquiring the cell lock
+/// because pending_drain_n is u16 atomic on the wire — under TSO and
+/// AcqRel mutators on the writer side the read is racy but
+/// monotonic-bounded by `[0, PENDING_DRAIN_CAP]`. Tests can rely on
+/// this for "approximately N pending after Phase 8" assertions.).
+///
+/// Returns -1 if cell idx is out of range. Implementation note: we
+/// take the cell lock SHARED briefly to get a consistent read of
+/// `pending_drain_n`, then release. This isn't the production
+/// observability shape (which would expose an atomic) but it's fine
+/// for the test surface.
+#[pg_extern]
+pub fn fifo_pending_drain_n(idx: i64) -> i64 {
+    if (idx as usize) >= FIFO_N_BUCKETS {
+        return -1;
+    }
+    let _guard = acquire_fifo_cell(idx as usize, FifoCellMode::Shared);
+    let arena = FIFO_ARENA.share();
+    let b = &arena.buckets[idx as usize];
+    // SAFETY: SHARED lock held; readers of pending_drain_n must not
+    // race a writer. Apply path takes EXCLUSIVE for writes; SHARED is
+    // sufficient for read.
+    let ring = unsafe { ring_ref(b) };
+    ring.pending_drain_n as i64
+}
+
+/// Returns the total number of rows the FIFO drain has UPDATEd since
+/// last reset. Counter is process-lifetime; reset only via
+/// `fifo_arena_reset` (sub-6 territory).
+#[pg_extern]
+pub fn fifo_drain_rows_total() -> i64 {
+    FIFO_DRAIN_ROWS_TOTAL
+        .get()
+        .load(Ordering::Acquire) as i64
+}
+
+/// Returns the total number of FIFO drain ticks that touched at least
+/// one dirty cell. Lock-free reader.
+#[pg_extern]
+pub fn fifo_drain_ticks_total() -> i64 {
+    FIFO_DRAIN_TICKS_TOTAL
+        .get()
+        .load(Ordering::Acquire) as i64
+}
+
+/// Returns the number of consecutive ticks the FIFO drain SPI UPDATE
+/// has failed. Zero in steady state; non-zero signals durable-write
+/// trouble (missing table / RLS / etc.).
+#[pg_extern]
+pub fn fifo_drain_consecutive_failures() -> i64 {
+    FIFO_DRAIN_CONSECUTIVE_FAILS
+        .get()
+        .load(Ordering::Acquire) as i64
 }

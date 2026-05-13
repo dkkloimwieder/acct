@@ -321,6 +321,12 @@ pub extern "C-unwind" fn ledger_drain_main(_arg: pg_sys::Datum) {
         // leave the worker in an uncommitted state.
         BackgroundWorker::transaction(|| {
             do_drain_tick();
+            // acct-0450 — sub 4: FIFO arena drain. Bulk-UPDATEs
+            // cost_layers.qty_remaining from each dirty cell's
+            // pending_drain ring. Same tick transaction as the WAC
+            // rollup drain; either both succeed or the tick rolls back
+            // and retries next interval.
+            fifo::do_fifo_drain_tick();
         });
     }
 }

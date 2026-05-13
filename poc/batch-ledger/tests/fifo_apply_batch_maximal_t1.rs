@@ -278,6 +278,14 @@ async fn t2_cross_batch_fifo_ordering() {
     let depl_sum = sum_depl_cost_for_pl(&p, issue_pl_id).await;
     assert_eq!(depl_sum, expected_cost, "T2: SUM(depl cost) = pl.amount");
 
+    // sub 4 (acct-0450): force a drain tick so cost_layers.qty_remaining
+    // reflects shmem. Without this, qty_remaining lags by up to
+    // drain_interval_ms.
+    sqlx::query("SELECT fifo_force_drain_tick()")
+        .execute(&p)
+        .await
+        .expect("force drain");
+
     // Layer residuals: oldest fully drained, next layer partial, newest untouched.
     let layers: Vec<(i64, i64, i64)> = sqlx::query(
         "SELECT id, qty_remaining, unit_cost FROM cost_layers \
