@@ -41,7 +41,7 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1180
+-- src/lib.rs:1288
 -- requires:
 --   ledger_balance_lookup
 
@@ -160,7 +160,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_occupied_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1083
+-- src/lib.rs:1107
 -- ledger_extension::ledger_shmem_recon
 CREATE  FUNCTION "ledger_shmem_recon"() RETURNS TABLE (
 	"account_id" bigint,  /* i64 */
@@ -175,11 +175,55 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_recon_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1147
+-- src/lib.rs:1255
 -- ledger_extension::ledger_shmem_reset
 CREATE  FUNCTION "ledger_shmem_reset"() RETURNS void
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_shmem_reset_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:1189
+-- ledger_extension::ledger_test_panic_after_fetch_add
+CREATE  FUNCTION "ledger_test_panic_after_fetch_add"(
+	"account_id" bigint, /* i64 */
+	"period_id" INT, /* i32 */
+	"currency_id" smallint, /* i16 */
+	"ledger_kind" smallint, /* i16 */
+	"amount_delta" bigint, /* i64 */
+	"qty_delta" bigint /* i64 */
+) RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_test_panic_after_fetch_add_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:1219
+-- ledger_extension::ledger_test_panic_before_fetch_add
+CREATE  FUNCTION "ledger_test_panic_before_fetch_add"(
+	"account_id" bigint, /* i64 */
+	"period_id" INT, /* i32 */
+	"currency_id" smallint, /* i16 */
+	"ledger_kind" smallint /* i16 */
+) RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_test_panic_before_fetch_add_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:1238
+-- ledger_extension::ledger_test_panic_in_exclusive
+CREATE  FUNCTION "ledger_test_panic_in_exclusive"(
+	"account_id" bigint, /* i64 */
+	"period_id" INT, /* i32 */
+	"currency_id" smallint, /* i16 */
+	"ledger_kind" smallint /* i16 */
+) RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_test_panic_in_exclusive_wrapper';
 /* </end connected objects> */
 

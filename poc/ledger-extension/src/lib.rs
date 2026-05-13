@@ -1166,6 +1166,90 @@ fn ledger_shmem_recon() -> TableIterator<
     TableIterator::new(out)
 }
 
+// ── M10.C6 (acct-plle) — panic cleanup test helpers ──────────────────
+//
+// These functions deliberately panic at well-defined moments so a Rust
+// test can verify that pgrx's `#[pg_guard]` panic catcher:
+//   1. Converts the panic into a clean SQL ERROR (no backend crash).
+//   2. Releases the LWLock guard via Drop on the unwind path — i.e.,
+//      subsequent operations proceed without deadlocking.
+//
+// They are plain `#[pg_extern]` (not `#[cfg(test)]`) because the
+// extension .so is installed into a live PG and called over SQL from
+// the test binary. Naming convention `ledger_test_panic_*` makes the
+// test-only purpose explicit. They are NOT load-bearing for the
+// non-test apply path.
+
+/// Acquire SHARED lock, mutate the cell at `(account_id, period_id,
+/// currency_id, ledger_kind)` via the same path the post-A2 commit
+/// callback uses (insert if absent, fetch_add if present), then panic
+/// AFTER the mutation. Verifies: (a) mutation persists (atomic write
+/// already landed), (b) LWLock guard drops on unwind, (c) the SQL
+/// ERROR is reported with the panic message.
+#[pg_extern]
+fn ledger_test_panic_after_fetch_add(
+    account_id: i64,
+    period_id: i32,
+    currency_id: i16,
+    ledger_kind: i16,
+    amount_delta: i64,
+    qty_delta: i64,
+) -> i64 {
+    let key = pack_key(account_id, period_id, currency_id, ledger_kind as u8);
+    {
+        let table = HASH_TABLE.share();
+        // Mutate if cell exists; if absent, escalate to EXCLUSIVE so
+        // the test scenario is deterministic (caller usually pre-seeds).
+        if try_update_existing(&table, key, amount_delta, qty_delta).is_none() {
+            drop(table);
+            let table = HASH_TABLE.exclusive();
+            if try_update_existing(&table, key, amount_delta, qty_delta).is_none() {
+                insert_new_seeded(&table, key, None, amount_delta, qty_delta);
+            }
+        }
+    }
+    panic!(
+        "ledger_test_panic_after_fetch_add: deliberate panic after mutation \
+         on (account_id={account_id}, period_id={period_id})"
+    );
+}
+
+/// Acquire SHARED lock, panic BEFORE any mutation. Verifies the
+/// LWLock guard drops on unwind even when nothing was modified.
+#[pg_extern]
+fn ledger_test_panic_before_fetch_add(
+    account_id: i64,
+    period_id: i32,
+    currency_id: i16,
+    ledger_kind: i16,
+) -> i64 {
+    let _key = pack_key(account_id, period_id, currency_id, ledger_kind as u8);
+    let _table = HASH_TABLE.share();
+    panic!(
+        "ledger_test_panic_before_fetch_add: deliberate panic before any mutation \
+         on (account_id={account_id})"
+    );
+}
+
+/// Acquire EXCLUSIVE lock, then panic immediately. Verifies the
+/// exclusive guard drops on unwind — load-bearing because if it didn't,
+/// ALL subsequent applies (which take SHARED) would deadlock against
+/// the leaked EXCLUSIVE.
+#[pg_extern]
+fn ledger_test_panic_in_exclusive(
+    account_id: i64,
+    period_id: i32,
+    currency_id: i16,
+    ledger_kind: i16,
+) -> i64 {
+    let _key = pack_key(account_id, period_id, currency_id, ledger_kind as u8);
+    let _table = HASH_TABLE.exclusive();
+    panic!(
+        "ledger_test_panic_in_exclusive: deliberate panic holding EXCLUSIVE \
+         on (account_id={account_id})"
+    );
+}
+
 /// Wipe the table. Useful for tests and benchmarking baselines. Takes
 /// the exclusive lock for the duration.
 #[pg_extern]
