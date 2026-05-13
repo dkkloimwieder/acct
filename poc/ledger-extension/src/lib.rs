@@ -522,7 +522,7 @@ fn slot_for(key: u128) -> usize {
 }
 
 #[inline]
-fn next_seq() -> u64 {
+pub(crate) fn next_seq() -> u64 {
     APPLY_SEQ.get().fetch_add(1, Ordering::AcqRel) + 1
 }
 
@@ -1000,7 +1000,7 @@ fn subxact_abort_sub() {
 /// Same-key applies within one (sub)transaction are collapsed into a
 /// single pending entry (deltas summed). SubXact START pushes a fresh
 /// frame; COMMIT_SUB merges into parent; ABORT_SUB discards.
-fn stage_apply(
+pub(crate) fn stage_apply(
     account_id: i64,
     period_id: i32,
     currency_id: i16,

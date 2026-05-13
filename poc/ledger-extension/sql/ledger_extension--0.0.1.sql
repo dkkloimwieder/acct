@@ -24,7 +24,24 @@ AS 'MODULE_PATHNAME', 'fifo_apply_batch_inline_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:337
+-- src/fifo.rs:645
+-- ledger_extension::fifo::fifo_apply_batch_maximal
+CREATE  FUNCTION "fifo_apply_batch_maximal"(
+	"envelopes" jsonb /* pgrx::datum::json::JsonB */
+) RETURNS TABLE (
+	"envelope_idx" INT,  /* i32 */
+	"status" TEXT,  /* alloc::string::String */
+	"posting_line_id" bigint,  /* core::option::Option<i64> */
+	"error_code" TEXT,  /* core::option::Option<alloc::string::String> */
+	"error_message" TEXT  /* core::option::Option<alloc::string::String> */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'fifo_apply_batch_maximal_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/fifo.rs:386
 -- ledger_extension::fifo::fifo_arena_capacity
 CREATE  FUNCTION "fifo_arena_capacity"() RETURNS bigint /* i64 */
 STRICT
@@ -33,7 +50,7 @@ AS 'MODULE_PATHNAME', 'fifo_arena_capacity_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:344
+-- src/fifo.rs:393
 -- ledger_extension::fifo::fifo_max_layers
 CREATE  FUNCTION "fifo_max_layers"() RETURNS bigint /* i64 */
 STRICT
@@ -42,7 +59,7 @@ AS 'MODULE_PATHNAME', 'fifo_max_layers_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:354
+-- src/fifo.rs:403
 -- ledger_extension::fifo::fifo_test_acquire_release
 CREATE  FUNCTION "fifo_test_acquire_release"(
 	"idx" bigint, /* i64 */
@@ -54,7 +71,7 @@ AS 'MODULE_PATHNAME', 'fifo_test_acquire_release_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:372
+-- src/fifo.rs:421
 -- ledger_extension::fifo::fifo_test_acquire_two_sorted
 CREATE  FUNCTION "fifo_test_acquire_two_sorted"(
 	"idx_a" bigint, /* i64 */
@@ -66,7 +83,7 @@ AS 'MODULE_PATHNAME', 'fifo_test_acquire_two_sorted_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:399
+-- src/fifo.rs:448
 -- ledger_extension::fifo::fifo_test_cell_lock_addr
 CREATE  FUNCTION "fifo_test_cell_lock_addr"(
 	"idx" bigint /* i64 */

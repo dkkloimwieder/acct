@@ -69,64 +69,88 @@ pub const MAX_LAYERS: usize = 64;
 
 /// One FIFO layer (cost layer in the ring buffer).
 ///
+/// Fields:
+/// - `qty`: remaining quantity in this layer (mutated by issue).
+/// - `unit_cost`: per-unit cost at receipt time (immutable post-push).
+/// - `layer_id`: PK of the corresponding `cost_layers` row. Pre-allocated
+///   via `nextval('cost_layers_id_seq')` BEFORE the cell lock is taken
+///   (sub 2) so the apply path doesn't need post-INSERT sentinel resolution.
+///   For lazy-seeded layers (loaded from cost_layers in pre-scan), this
+///   is the existing row's id.
+///
 /// `unit_cost` is BIGINT to match `posting_lines.amount` / `cost_layers`
-/// integer-money convention in acct's production schema. 16-byte
-/// alignment so 4 layers fit in a single 64-byte cache line; the ring
-/// buffer is contiguous so a walk over n_layers consecutive layers
-/// scans sequential memory.
-#[repr(C, align(16))]
+/// integer-money convention in acct's production schema.
+///
+/// 24 bytes raw, 8-byte aligned. 64 layers per bucket = 1536 bytes
+/// ring buffer. Bucket header 64 bytes + ring 1536 = 1600 bytes per
+/// bucket. 16384 buckets = 25.6 MB arena.
+#[repr(C, align(8))]
 #[derive(Copy, Clone, Default, Debug)]
 pub struct Layer {
     pub qty: i64,
     pub unit_cost: i64,
+    pub layer_id: i64,
 }
 
 unsafe impl PGRXSharedMemory for Layer {}
+
+/// Ring-buffer fields protected by the cell's per-cell LWLock.
+/// Lives behind an `UnsafeCell` inside `FifoBucket` so the apply path
+/// can obtain `&mut RingFields` without violating Rust's aliasing rules
+/// (the cell LWLock is the runtime exclusion mechanism). Atomic
+/// fields stay outside this struct because they're touched lock-free
+/// by probe / drain / recon paths.
+#[repr(C)]
+pub struct RingFields {
+    /// Oldest layer index. Walks `(head + 1) % MAX_LAYERS` as layers
+    /// fully consume.
+    pub head: u16,
+    /// Number of valid layers. Tail = `(head + n_layers) % MAX_LAYERS`.
+    pub n_layers: u16,
+    pub _pad: [u8; 4],
+    pub layers: [Layer; MAX_LAYERS],
+}
+
+impl Default for RingFields {
+    fn default() -> Self {
+        // SAFETY: u16/i64/padding all valid as zero.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+unsafe impl PGRXSharedMemory for RingFields {}
 
 /// One FIFO arena slot. Cache-line aligned (`align(64)`) so concurrent
 /// SHARED-lock probes against different buckets don't false-share.
 ///
 /// Two atomicity domains live in this struct:
 ///
-/// - **Atomic fields** (`occupied`, `key_hi`, `key_lo`, `last_seq`,
-///   `drained_seq`): read lock-free by probe, recon, and drain paths.
-///   Mirrors the WAC `Bucket` layout.
-/// - **LWLock-protected fields** (`head`, `n_layers`, `layers[...]`):
-///   mutated only by an apply holding this cell's per-cell LWLock
-///   EXCLUSIVE (or read-snapshotted under SHARED). Sub 2's apply path
-///   enforces.
+/// - **Atomic fields** (`occupied`, `seeded`, `key_hi`, `key_lo`,
+///   `last_seq`, `drained_seq`): read lock-free by probe, recon, and
+///   drain paths. Mirrors the WAC `Bucket` layout.
+/// - **LWLock-protected `RingFields`** (`head`, `n_layers`, `layers`):
+///   mutated via `ring_mut` only by code holding this cell's per-cell
+///   LWLock EXCLUSIVE. Wrapped in `UnsafeCell` so the cast to
+///   `&mut RingFields` is sound under Rust aliasing rules.
 ///
-/// Memory layout (offsets are illustrative for x86_64 / Linux):
+/// `occupied` vs `seeded` semantics:
+/// - `occupied = 0` → cell is empty; probe walks past it.
+/// - `occupied = 1, seeded = 0` → cell was inserted (key reserved) but
+///   no layers yet loaded from durable `cost_layers`. First issue
+///   triggers lazy-seed.
+/// - `occupied = 1, seeded = 1` → ring is authoritative for layer
+///   state. Subsequent issues walk shmem; durable `cost_layers` is the
+///   audit trail (drift-detected by recon).
 ///
-/// ```text
-///   0   AtomicU8  occupied            (1)
-///   1   [u8; 1]   _pad0               (1)
-///   2   u16       head                (2)  // cell-lock protected
-///   4   u16       n_layers            (2)  // cell-lock protected
-///   6   [u8; 2]   _pad1               (2)
-///   8   AtomicU64 key_hi              (8)
-///  16   AtomicU64 key_lo              (8)
-///  24   AtomicU64 last_seq            (8)
-///  32   AtomicU64 drained_seq         (8)
-///  40   [u8; 24]  _pad2               (24) // pad to 64-byte header
-///  64   [Layer; MAX_LAYERS] layers    (1024 at MAX_LAYERS=64)
-/// 1088  (struct end, 64-byte aligned)
-/// ```
-///
-/// Total: 1088 bytes per bucket at `MAX_LAYERS=64`. 16384 buckets =
-/// 17 MB arena.
+/// Header layout fits in 64 bytes; the 1544-byte `RingFields` follows.
 #[repr(C, align(64))]
 pub struct FifoBucket {
     pub occupied: AtomicU8,
-    pub _pad0: [u8; 1],
-    /// Ring-buffer head index. Oldest layer lives at `layers[head]`.
-    /// **Protected by this cell's LWLock.**
-    pub head: u16,
-    /// Ring-buffer occupancy. Tail (next push position) =
-    /// `(head + n_layers) % MAX_LAYERS`. **Protected by this cell's
-    /// LWLock.**
-    pub n_layers: u16,
-    pub _pad1: [u8; 2],
+    /// Lazy-seed flag. `0` = ring empty / unseeded; `1` = ring is the
+    /// authoritative layer state for this cell. Transition gated by
+    /// the cell's EXCLUSIVE LWLock during sub 2's apply phase.
+    pub seeded: AtomicU8,
+    pub _pad0: [u8; 6],
     pub key_hi: AtomicU64,
     pub key_lo: AtomicU64,
     /// Monotone seq stamped by the last apply that mutated this cell's
@@ -136,11 +160,36 @@ pub struct FifoBucket {
     /// Highest `last_seq` value the bgworker has UPSERTed to durable
     /// `cost_layers`. Dirty iff `last_seq > drained_seq`.
     pub drained_seq: AtomicU64,
-    pub _pad2: [u8; 24],
-    pub layers: [Layer; MAX_LAYERS],
+    pub _pad1: [u8; 24],
+    /// Cell-lock-protected ring buffer. Access ONLY via `ring_mut`
+    /// while holding this cell's LWLock EXCLUSIVE.
+    pub ring: UnsafeCell<RingFields>,
 }
 
+// SAFETY: `UnsafeCell<RingFields>` opts out of Sync. We assert it by
+// hand because the cell LWLock is the actual exclusion mechanism; the
+// type-level !Sync is too conservative for the shmem use case.
+unsafe impl Sync for FifoBucket {}
 unsafe impl PGRXSharedMemory for FifoBucket {}
+
+/// SAFETY: caller MUST hold cell's LWLock EXCLUSIVE. Returns a unique
+/// `&mut RingFields` valid for the lifetime of the borrow. Multiple
+/// concurrent EXCLUSIVE holders is prevented by PG's LWLock; multiple
+/// SHARED holders should NOT call this (they'd UB-race a writer).
+#[inline]
+pub unsafe fn ring_mut(bucket: &FifoBucket) -> &mut RingFields {
+    // UnsafeCell::get returns *mut T; the caller's LWLock guarantees
+    // unique access.
+    unsafe { &mut *bucket.ring.get() }
+}
+
+/// SAFETY: caller MUST hold cell's LWLock SHARED or EXCLUSIVE. Returns
+/// a `&RingFields` for read-only snapshot (sub 4 drain, sub 6 recon).
+#[inline]
+#[allow(dead_code)]
+pub unsafe fn ring_ref(bucket: &FifoBucket) -> &RingFields {
+    unsafe { &*bucket.ring.get() }
+}
 
 /// FIFO arena — the buckets array. Wrapped in `PgLwLock` for table-wide
 /// insert serialization (occupied 0→1 transitions). Hot-path probes /
@@ -400,4 +449,874 @@ pub fn fifo_test_acquire_two_sorted(idx_a: i64, idx_b: i64) -> bool {
 pub fn fifo_test_cell_lock_addr(idx: i64) -> i64 {
     let ptr = cell_lock_ptr(idx as usize);
     ptr as usize as i64
+}
+
+// ── arena helpers (sub 2) ─────────────────────────────────────────────
+
+use crate::{next_seq, stage_apply};
+use pgrx::Spi;
+use std::collections::{BTreeMap, HashMap};
+
+/// Pack a (cost_book, product, location) tuple into the cell key. For
+/// the PoC schema (one account per pool, no cost-book / product /
+/// location dimensions yet), use `pack_fifo_key_poc` which puts the
+/// pool_account_id in the upper 64 bits.
+#[inline]
+pub const fn pack_fifo_key_poc(pool_account_id: i64) -> u128 {
+    (pool_account_id as u64 as u128) << 64
+}
+
+/// splitmix64-mixed hash over both u128 halves, masked to the bucket
+/// count. Avoids cluster-on-sequential-account-ids pathologies.
+#[inline]
+pub fn slot_for_fifo(key: u128) -> usize {
+    let mut z = (key as u64) ^ ((key >> 64) as u64);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    (z as usize) & (FIFO_N_BUCKETS - 1)
+}
+
+/// Probe (read-only) for `key` in the FIFO arena. Returns the cell
+/// index on hit, `None` on miss (empty bucket terminates the probe
+/// chain). Caller must hold `FIFO_ARENA.share()`.
+#[inline]
+pub fn probe_fifo_cell(arena: &FifoArena, key: u128) -> Option<usize> {
+    let start = slot_for_fifo(key);
+    let key_hi = (key >> 64) as u64;
+    let key_lo = key as u64;
+    for probe in 0..FIFO_N_BUCKETS {
+        let idx = (start + probe) & (FIFO_N_BUCKETS - 1);
+        let b = &arena.buckets[idx];
+        if b.occupied.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        if b.key_hi.load(Ordering::Acquire) == key_hi
+            && b.key_lo.load(Ordering::Acquire) == key_lo
+        {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Insert (or find) `key` in the FIFO arena. Caller MUST hold
+/// `FIFO_ARENA.exclusive()` so no concurrent inserter races us. Returns
+/// the cell index on success, `None` if the table is full.
+///
+/// Newly inserted cells have `occupied=1, seeded=0` — the apply path's
+/// cell-lock critical section detects `seeded==0` and triggers the
+/// lazy-seed push.
+#[inline]
+pub fn insert_fifo_cell(arena: &FifoArena, key: u128) -> Option<usize> {
+    let start = slot_for_fifo(key);
+    let key_hi = (key >> 64) as u64;
+    let key_lo = key as u64;
+    for probe in 0..FIFO_N_BUCKETS {
+        let idx = (start + probe) & (FIFO_N_BUCKETS - 1);
+        let b = &arena.buckets[idx];
+        if b.occupied.load(Ordering::Relaxed) == 0 {
+            b.key_hi.store(key_hi, Ordering::Relaxed);
+            b.key_lo.store(key_lo, Ordering::Relaxed);
+            b.occupied.store(1, Ordering::Release);
+            // seeded stays 0 by default — apply path lazy-seeds.
+            return Some(idx);
+        }
+        if b.key_hi.load(Ordering::Relaxed) == key_hi
+            && b.key_lo.load(Ordering::Relaxed) == key_lo
+        {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Push a layer to the tail of the ring. **Caller MUST hold the cell's
+/// LWLock EXCLUSIVE.** Returns `false` if the ring is full
+/// (MAX_LAYERS reached); sub 3 (acct-b8ub) adds coalescing.
+#[inline]
+pub fn push_layer(ring: &mut RingFields, layer: Layer) -> bool {
+    if ring.n_layers as usize >= MAX_LAYERS {
+        return false;
+    }
+    let tail = (ring.head as usize + ring.n_layers as usize) % MAX_LAYERS;
+    ring.layers[tail] = layer;
+    ring.n_layers += 1;
+    true
+}
+
+/// One consumed slice from an issue walk.
+#[derive(Copy, Clone, Debug)]
+pub struct ConsumedSlice {
+    pub layer_id: i64,
+    pub qty_consumed: i64,
+    pub unit_cost: i64,
+}
+
+/// Result of an issue consumption walk.
+pub struct ConsumeResult {
+    /// Sum of `qty_consumed * unit_cost` over `consumed`.
+    pub total_cost: i64,
+    /// One entry per layer touched, in head-to-tail order. Drives the
+    /// bulk-INSERT into `cost_layer_depletions`.
+    pub consumed: Vec<ConsumedSlice>,
+    /// > 0 if the ring couldn't satisfy the requested qty. Caller
+    /// surfaces as a P0006-style error.
+    pub shortage: i64,
+}
+
+/// Walk the ring from head and consume `qty` units in FIFO order.
+/// **Caller MUST hold the cell's LWLock EXCLUSIVE.**
+#[inline]
+pub fn consume_from_head(ring: &mut RingFields, qty: i64) -> ConsumeResult {
+    let mut remaining = qty;
+    let mut total_cost: i64 = 0;
+    let mut consumed: Vec<ConsumedSlice> = Vec::new();
+    while remaining > 0 && ring.n_layers > 0 {
+        let head_idx = ring.head as usize;
+        let layer = ring.layers[head_idx];
+        let take = remaining.min(layer.qty);
+        total_cost = total_cost.saturating_add(take.saturating_mul(layer.unit_cost));
+        consumed.push(ConsumedSlice {
+            layer_id: layer.layer_id,
+            qty_consumed: take,
+            unit_cost: layer.unit_cost,
+        });
+        if take == layer.qty {
+            // fully consumed; advance head
+            ring.head = ((ring.head as usize + 1) % MAX_LAYERS) as u16;
+            ring.n_layers -= 1;
+        } else {
+            ring.layers[head_idx].qty -= take;
+        }
+        remaining -= take;
+    }
+    ConsumeResult {
+        total_cost,
+        consumed,
+        shortage: remaining,
+    }
+}
+
+/// Get a shared reference to bucket `idx`. Caller may hold
+/// `FIFO_ARENA.share()`; atomic fields are touched via Atomic*
+/// methods. The ring-protected fields require the cell LWLock; use
+/// `ring_mut` to enter that critical section.
+#[inline]
+fn bucket(arena: &FifoArena, idx: usize) -> &FifoBucket {
+    &arena.buckets[idx]
+}
+
+// ── fifo_apply_batch_maximal pg_extern ────────────────────────────────
+
+/// Sub 2 — synchronous-apply FIFO batch function. The F-shmem path:
+/// layer state lives in the FIFO arena, not in `cost_layers`.
+/// Durable `cost_layers` + `cost_layer_depletions` are written inline
+/// as the audit trail; the bgworker (sub 4) keeps them current with
+/// `qty_remaining`.
+///
+/// Flow (per design):
+///
+/// 1. Parse envelopes.
+/// 2. Replay-detect (SPI; no locks).
+/// 3. Probe cells under `FIFO_ARENA.share()`. Hits get cell_idx;
+///    misses go to step 4.
+/// 4. If any misses: `FIFO_ARENA.exclusive()`, re-probe + insert
+///    missing keys. Drop EXCLUSIVE.
+/// 5. Pre-allocate `layer_id` values for receipt envelopes via
+///    `nextval('cost_layers_id_seq')` (SPI; no cell locks).
+/// 6. Lazy-seed scan: for each cell with at least one issue envelope
+///    AND `seeded == 0`, SPI-fetch active `cost_layers` rows into a
+///    local cache. (No cell locks held.)
+/// 7. Group envelopes by cell_idx in `BTreeMap` (auto-sorted).
+/// 8. Apply phase: for each cell in sorted order, acquire cell
+///    EXCLUSIVE, push lazy-seeded layers if `seeded == 0`, then apply
+///    each envelope (push for receipts, consume for issues). Stamp
+///    `last_seq`. Release.
+/// 9. Bulk INSERTs (SPI; no cell locks): posting_lines via UNNEST,
+///    cost_layers via UNNEST with explicit pre-alloc ids,
+///    cost_layer_depletions via UNNEST, UPDATE cost_layers
+///    qty_remaining for pre-existing drained layers.
+/// 10. `stage_apply` for balance/qty deltas (existing shmem path).
+/// 11. Return per-envelope results.
+///
+/// Scope (matches `fifo_apply_batch_inline`): only `fifo_receipt` /
+/// `fifo_issue` kinds; transfers excluded. `qty` always non-null.
+#[pg_extern]
+pub fn fifo_apply_batch_maximal(
+    envelopes: pgrx::JsonB,
+) -> TableIterator<
+    'static,
+    (
+        name!(envelope_idx, i32),
+        name!(status, String),
+        name!(posting_line_id, Option<i64>),
+        name!(error_code, Option<String>),
+        name!(error_message, Option<String>),
+    ),
+> {
+    let arr = match envelopes.0.as_array() {
+        Some(a) => a,
+        None => pgrx::error!("fifo_apply_batch_maximal: envelopes must be a JSONB array"),
+    };
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        FifoReceipt,
+        FifoIssue,
+    }
+    struct Parsed {
+        envelope_idx: i32,
+        kind: Kind,
+        debit: i64,
+        credit: i64,
+        qty: i64,
+        unit_cost: Option<i64>,
+        idempotency_key: String,
+        business_date: String,
+    }
+
+    // Phase 1 — parse + validate.
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(arr.len());
+    for (idx, env) in arr.iter().enumerate() {
+        let obj = match env.as_object() {
+            Some(o) => o,
+            None => pgrx::error!(
+                "fifo_apply_batch_maximal: envelope[{}] is not an object",
+                idx
+            ),
+        };
+        let kind_str = obj
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("fifo_receipt");
+        let kind = match kind_str {
+            "fifo_receipt" => Kind::FifoReceipt,
+            "fifo_issue" => Kind::FifoIssue,
+            other => pgrx::error!(
+                "fifo_apply_batch_maximal: envelope[{}] unsupported kind '{}'",
+                idx,
+                other
+            ),
+        };
+        let envelope_idx = obj
+            .get("envelope_idx")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(idx as i64) as i32;
+        let debit = obj
+            .get("debit_account_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "fifo_apply_batch_maximal: envelope[{}] missing debit_account_id",
+                    idx
+                )
+            });
+        let credit = obj
+            .get("credit_account_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "fifo_apply_batch_maximal: envelope[{}] missing credit_account_id",
+                    idx
+                )
+            });
+        let qty = obj.get("qty").and_then(|v| v.as_i64()).unwrap_or_else(|| {
+            pgrx::error!("fifo_apply_batch_maximal: envelope[{}] missing qty", idx)
+        });
+        if qty <= 0 {
+            pgrx::error!(
+                "fifo_apply_batch_maximal: envelope[{}] qty must be > 0",
+                idx
+            );
+        }
+        let unit_cost = obj.get("unit_cost").and_then(|v| v.as_i64());
+        if kind == Kind::FifoReceipt && unit_cost.unwrap_or(0) <= 0 {
+            pgrx::error!(
+                "fifo_apply_batch_maximal: envelope[{}] fifo_receipt missing/invalid unit_cost",
+                idx
+            );
+        }
+        let idempotency_key = obj
+            .get("idempotency_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "fifo_apply_batch_maximal: envelope[{}] missing idempotency_key",
+                    idx
+                )
+            })
+            .to_string();
+        let business_date = obj
+            .get("business_date")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "fifo_apply_batch_maximal: envelope[{}] missing business_date",
+                    idx
+                )
+            })
+            .to_string();
+        parsed.push(Parsed {
+            envelope_idx,
+            kind,
+            debit,
+            credit,
+            qty,
+            unit_cost,
+            idempotency_key,
+            business_date,
+        });
+    }
+
+    // Phase 2 — replay detect via SPI (no locks).
+    let idemp_keys: Vec<String> = parsed.iter().map(|p| p.idempotency_key.clone()).collect();
+    let replay_map: HashMap<String, i64> = Spi::connect(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![idemp_keys.clone().into()];
+        let tup = client
+            .select(
+                "SELECT idempotency_key::TEXT AS k, id FROM posting_lines \
+                 WHERE idempotency_key = ANY($1::text[]::uuid[])",
+                None,
+                &args,
+            )
+            .expect("maximal: replay SELECT");
+        let mut m: HashMap<String, i64> = HashMap::new();
+        for row in tup {
+            let k: String = row["k"].value().unwrap().unwrap();
+            let id: i64 = row["id"].value().unwrap().unwrap();
+            m.insert(k, id);
+        }
+        m
+    });
+
+    // Phase 3 — for each non-replay envelope, identify the FIFO pool
+    // (receipt debit; issue credit) and compute the cell key. Probe.
+    let mut env_pool: Vec<Option<i64>> = vec![None; parsed.len()];
+    let mut env_cell: Vec<Option<usize>> = vec![None; parsed.len()];
+    let mut pool_to_cell: HashMap<i64, usize> = HashMap::new();
+    let mut missing_pools: Vec<i64> = Vec::new();
+    {
+        let arena = FIFO_ARENA.share();
+        for (i, p) in parsed.iter().enumerate() {
+            if replay_map.contains_key(&p.idempotency_key) {
+                continue;
+            }
+            let pool_account_id = match p.kind {
+                Kind::FifoReceipt => p.debit,
+                Kind::FifoIssue => p.credit,
+            };
+            env_pool[i] = Some(pool_account_id);
+            if let Some(&cell) = pool_to_cell.get(&pool_account_id) {
+                env_cell[i] = Some(cell);
+                continue;
+            }
+            let key = pack_fifo_key_poc(pool_account_id);
+            match probe_fifo_cell(&arena, key) {
+                Some(cell) => {
+                    env_cell[i] = Some(cell);
+                    pool_to_cell.insert(pool_account_id, cell);
+                }
+                None => {
+                    if !missing_pools.contains(&pool_account_id) {
+                        missing_pools.push(pool_account_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 4 — if any pools missed, take EXCLUSIVE + re-probe + insert.
+    if !missing_pools.is_empty() {
+        let arena = FIFO_ARENA.exclusive();
+        for pool_account_id in &missing_pools {
+            let key = pack_fifo_key_poc(*pool_account_id);
+            let cell = insert_fifo_cell(&arena, key).unwrap_or_else(|| {
+                pgrx::error!(
+                    "fifo_apply_batch_maximal: FIFO arena full inserting pool_account_id={}",
+                    pool_account_id
+                )
+            });
+            pool_to_cell.insert(*pool_account_id, cell);
+        }
+        // Backfill env_cell for envelopes whose pool was in missing_pools.
+        for (i, p) in parsed.iter().enumerate() {
+            if env_cell[i].is_some() {
+                continue;
+            }
+            if let Some(pool) = env_pool[i] {
+                env_cell[i] = pool_to_cell.get(&pool).copied();
+            }
+            // replays: env_pool[i] is None; env_cell stays None.
+            let _ = p; // unused
+        }
+    }
+
+    // Phase 5 — pre-alloc layer_ids for non-replay receipts via SPI.
+    let n_receipts = parsed
+        .iter()
+        .filter(|p| {
+            p.kind == Kind::FifoReceipt && !replay_map.contains_key(&p.idempotency_key)
+        })
+        .count();
+    let layer_ids: Vec<i64> = if n_receipts > 0 {
+        Spi::connect(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![(n_receipts as i64).into()];
+            let tup = client
+                .select(
+                    "SELECT nextval('cost_layers_id_seq')::bigint AS lid \
+                     FROM generate_series(1, $1::bigint)",
+                    None,
+                    &args,
+                )
+                .expect("maximal: nextval pre-alloc");
+            let mut v: Vec<i64> = Vec::with_capacity(n_receipts);
+            for row in tup {
+                v.push(row["lid"].value().unwrap().unwrap());
+            }
+            v
+        })
+    } else {
+        Vec::new()
+    };
+    // Map each receipt envelope to its pre-allocated id.
+    let mut env_layer_id: Vec<Option<i64>> = vec![None; parsed.len()];
+    {
+        let mut k = 0usize;
+        for (i, p) in parsed.iter().enumerate() {
+            if p.kind == Kind::FifoReceipt && !replay_map.contains_key(&p.idempotency_key) {
+                env_layer_id[i] = Some(layer_ids[k]);
+                k += 1;
+            }
+        }
+    }
+
+    // Phase 6 — lazy-seed scan: cells that have at least one issue
+    // envelope AND seeded==0. SPI-fetch ordered active layers per pool.
+    let mut cells_needing_seed: Vec<(usize, i64)> = Vec::new(); // (cell_idx, pool_account_id)
+    {
+        let arena = FIFO_ARENA.share();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (i, p) in parsed.iter().enumerate() {
+            if replay_map.contains_key(&p.idempotency_key) {
+                continue;
+            }
+            if p.kind != Kind::FifoIssue {
+                continue;
+            }
+            let cell = env_cell[i].unwrap();
+            if !seen.insert(cell) {
+                continue;
+            }
+            let b = &arena.buckets[cell];
+            if b.seeded.load(Ordering::Acquire) == 0 {
+                cells_needing_seed.push((cell, env_pool[i].unwrap()));
+            }
+        }
+    }
+
+    struct SeedLayer {
+        layer_id: i64,
+        qty_remaining: i64,
+        unit_cost: i64,
+    }
+    let mut seed_cache: HashMap<usize, Vec<SeedLayer>> = HashMap::new();
+    if !cells_needing_seed.is_empty() {
+        let pool_ids: Vec<i64> = cells_needing_seed.iter().map(|(_, p)| *p).collect();
+        let fetched: Vec<(i64, i64, i64, i64)> = Spi::connect(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![pool_ids.clone().into()];
+            let tup = client
+                .select(
+                    "SELECT cl.pool_account_id, cl.id, cl.qty_remaining, cl.unit_cost \
+                     FROM cost_layers cl \
+                     WHERE cl.pool_account_id = ANY($1::bigint[]) AND cl.qty_remaining > 0 \
+                     ORDER BY cl.pool_account_id, cl.receipt_date, cl.id",
+                    None,
+                    &args,
+                )
+                .expect("maximal: SELECT cost_layers for seed");
+            let mut v: Vec<(i64, i64, i64, i64)> = Vec::new();
+            for row in tup {
+                v.push((
+                    row["pool_account_id"].value().unwrap().unwrap(),
+                    row["id"].value().unwrap().unwrap(),
+                    row["qty_remaining"].value().unwrap().unwrap(),
+                    row["unit_cost"].value().unwrap().unwrap(),
+                ));
+            }
+            v
+        });
+        // Bucket by cell_idx.
+        let pool_to_cell_map: HashMap<i64, usize> = cells_needing_seed
+            .iter()
+            .map(|(c, p)| (*p, *c))
+            .collect();
+        for (pid, lid, qr, uc) in fetched {
+            if let Some(&cell) = pool_to_cell_map.get(&pid) {
+                seed_cache.entry(cell).or_insert_with(Vec::new).push(SeedLayer {
+                    layer_id: lid,
+                    qty_remaining: qr,
+                    unit_cost: uc,
+                });
+            }
+        }
+        // Ensure every cell in cells_needing_seed has a (possibly empty) entry.
+        for (cell, _) in &cells_needing_seed {
+            seed_cache.entry(*cell).or_insert_with(Vec::new);
+        }
+    }
+
+    // Phase 7 — group envelopes by cell_idx in sorted order.
+    let mut cells_to_envelopes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, p) in parsed.iter().enumerate() {
+        if replay_map.contains_key(&p.idempotency_key) {
+            continue;
+        }
+        let cell = env_cell[i].unwrap();
+        cells_to_envelopes.entry(cell).or_default().push(i);
+    }
+
+    // Result + INSERT payload accumulators.
+    let mut env_total_cost: Vec<Option<i64>> = vec![None; parsed.len()];
+    // posting_lines:
+    let mut pl_debit: Vec<i64> = Vec::new();
+    let mut pl_credit: Vec<i64> = Vec::new();
+    let mut pl_amount: Vec<i64> = Vec::new();
+    let mut pl_currency: Vec<String> = Vec::new(); // resolved post-apply
+    let mut pl_idemp: Vec<String> = Vec::new();
+    let mut pl_bdate: Vec<String> = Vec::new();
+    let mut pl_qty: Vec<i64> = Vec::new();
+    let mut pl_env_idx: Vec<usize> = Vec::new(); // parallel; for env_idx lookup
+    // cost_layers (new from receipts):
+    let mut nl_id: Vec<i64> = Vec::new();
+    let mut nl_pool: Vec<i64> = Vec::new();
+    let mut nl_qty: Vec<i64> = Vec::new();
+    let mut nl_uc: Vec<i64> = Vec::new();
+    let mut nl_bdate: Vec<String> = Vec::new();
+    let mut nl_idemp: Vec<String> = Vec::new(); // for receipt_posting_line_id lookup
+    // cost_layer_depletions:
+    let mut dp_layer_id: Vec<i64> = Vec::new();
+    let mut dp_issue_idemp: Vec<String> = Vec::new();
+    let mut dp_qty: Vec<i64> = Vec::new();
+    let mut dp_cost: Vec<i64> = Vec::new();
+    // pre-existing layer drains (UPDATE qty_remaining):
+    let mut accum_drain: HashMap<i64, i64> = HashMap::new();
+    // balance + qty deltas (stage_apply):
+    let mut bal_deltas: HashMap<i64, (i64, i64)> = HashMap::new();
+
+    // Phase 8 — sorted cell-lock acquisition + apply.
+    {
+        let arena = FIFO_ARENA.share();
+        for (&cell_idx, env_indices) in &cells_to_envelopes {
+            let _guard = acquire_fifo_cell(cell_idx, FifoCellMode::Exclusive);
+            let b = bucket(&arena, cell_idx);
+            // SAFETY: cell LWLock held EXCLUSIVE; sole writer of ring.
+            let ring = unsafe { ring_mut(b) };
+
+            // Lazy-seed if needed (under cell lock so transition is atomic).
+            if b.seeded.load(Ordering::Acquire) == 0 {
+                if let Some(seeds) = seed_cache.get(&cell_idx) {
+                    for s in seeds {
+                        let ok = push_layer(
+                            ring,
+                            Layer {
+                                qty: s.qty_remaining,
+                                unit_cost: s.unit_cost,
+                                layer_id: s.layer_id,
+                            },
+                        );
+                        if !ok {
+                            pgrx::error!(
+                                "fifo_apply_batch_maximal: lazy-seed overflow at cell {} \
+                                 (>{} layers in durable cost_layers; coalescing is sub 3)",
+                                cell_idx,
+                                MAX_LAYERS
+                            );
+                        }
+                    }
+                }
+                b.seeded.store(1, Ordering::Release);
+            }
+
+            // Apply envelopes in original envelope order within the cell.
+            for &i in env_indices.iter() {
+                let p = &parsed[i];
+                match p.kind {
+                    Kind::FifoReceipt => {
+                        let uc = p.unit_cost.expect("validated");
+                        let lid = env_layer_id[i].expect("pre-allocated");
+                        let amt = p.qty.saturating_mul(uc);
+                        let ok = push_layer(
+                            ring,
+                            Layer {
+                                qty: p.qty,
+                                unit_cost: uc,
+                                layer_id: lid,
+                            },
+                        );
+                        if !ok {
+                            pgrx::error!(
+                                "fifo_apply_batch_maximal: envelope[{}] receipt overflowed cell {} \
+                                 (MAX_LAYERS={}; coalescing is sub 3)",
+                                p.envelope_idx,
+                                cell_idx,
+                                MAX_LAYERS
+                            );
+                        }
+                        env_total_cost[i] = Some(amt);
+                        pl_debit.push(p.debit);
+                        pl_credit.push(p.credit);
+                        pl_amount.push(amt);
+                        pl_currency.push(String::new()); // filled post-apply
+                        pl_idemp.push(p.idempotency_key.clone());
+                        pl_bdate.push(p.business_date.clone());
+                        pl_qty.push(p.qty);
+                        pl_env_idx.push(i);
+                        nl_id.push(lid);
+                        nl_pool.push(p.debit);
+                        nl_qty.push(p.qty);
+                        nl_uc.push(uc);
+                        nl_bdate.push(p.business_date.clone());
+                        nl_idemp.push(p.idempotency_key.clone());
+                        let e = bal_deltas.entry(p.debit).or_insert((0, 0));
+                        e.0 += amt;
+                        e.1 += p.qty;
+                        let e = bal_deltas.entry(p.credit).or_insert((0, 0));
+                        e.0 -= amt;
+                    }
+                    Kind::FifoIssue => {
+                        let res = consume_from_head(ring, p.qty);
+                        if res.shortage > 0 {
+                            pgrx::error!(
+                                "fifo_apply_batch_maximal: envelope[{}] fifo_issue short by {} units \
+                                 (pool {} exhausted in shmem ring)",
+                                p.envelope_idx,
+                                res.shortage,
+                                p.credit
+                            );
+                        }
+                        env_total_cost[i] = Some(res.total_cost);
+                        for slice in &res.consumed {
+                            dp_layer_id.push(slice.layer_id);
+                            dp_issue_idemp.push(p.idempotency_key.clone());
+                            dp_qty.push(slice.qty_consumed);
+                            dp_cost.push(slice.qty_consumed.saturating_mul(slice.unit_cost));
+                            *accum_drain.entry(slice.layer_id).or_insert(0) += slice.qty_consumed;
+                        }
+                        pl_debit.push(p.debit);
+                        pl_credit.push(p.credit);
+                        pl_amount.push(res.total_cost);
+                        pl_currency.push(String::new()); // filled post-apply
+                        pl_idemp.push(p.idempotency_key.clone());
+                        pl_bdate.push(p.business_date.clone());
+                        pl_qty.push(p.qty);
+                        pl_env_idx.push(i);
+                        let e = bal_deltas.entry(p.debit).or_insert((0, 0));
+                        e.0 += res.total_cost;
+                        let e = bal_deltas.entry(p.credit).or_insert((0, 0));
+                        e.0 -= res.total_cost;
+                        e.1 -= p.qty;
+                    }
+                }
+            }
+
+            // Stamp last_seq for drain.
+            let seq = next_seq();
+            b.last_seq.fetch_max(seq, Ordering::AcqRel);
+            // guard drops here, releasing the cell lock.
+        }
+    }
+
+    // Phase 9a — resolve currencies for all touched accounts.
+    let mut all_acct_ids: Vec<i64> = parsed
+        .iter()
+        .flat_map(|p| [p.debit, p.credit])
+        .collect();
+    all_acct_ids.sort_unstable();
+    all_acct_ids.dedup();
+    let currency_map: HashMap<i64, String> = Spi::connect(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![all_acct_ids.clone().into()];
+        let tup = client
+            .select(
+                "SELECT id, currency::TEXT AS c FROM accounts WHERE id = ANY($1::bigint[])",
+                None,
+                &args,
+            )
+            .expect("maximal: SELECT currency");
+        let mut m: HashMap<i64, String> = HashMap::new();
+        for row in tup {
+            let id: i64 = row["id"].value().unwrap().unwrap();
+            let c: String = row["c"].value().unwrap().unwrap();
+            m.insert(id, c);
+        }
+        m
+    });
+    // Fill pl_currency now that the map is resolved.
+    for (i_pl, env_idx) in pl_env_idx.iter().enumerate() {
+        let p = &parsed[*env_idx];
+        let c = currency_map.get(&p.debit).cloned().unwrap_or_else(|| {
+            pgrx::error!(
+                "maximal: envelope[{}] debit_account_id={} has no currency",
+                p.envelope_idx,
+                p.debit
+            )
+        });
+        pl_currency[i_pl] = c;
+    }
+
+    // Phase 9b — INSERT posting_lines.
+    let new_pl_map: HashMap<String, i64> = if pl_idemp.is_empty() {
+        HashMap::new()
+    } else {
+        Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![
+                pl_debit.clone().into(),
+                pl_credit.clone().into(),
+                pl_amount.clone().into(),
+                pl_currency.clone().into(),
+                pl_idemp.clone().into(),
+                pl_bdate.clone().into(),
+                pl_qty.clone().into(),
+            ];
+            let tup = client
+                .update(
+                    "INSERT INTO posting_lines \
+                       (debit_account_id, credit_account_id, amount, currency, \
+                        idempotency_key, business_date, qty) \
+                     SELECT u.debit, u.credit, u.amount, u.curr, u.idemp::uuid, u.bdate::date, u.qty \
+                     FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], \
+                                 $4::text[], $5::text[], $6::text[], $7::bigint[]) \
+                              AS u(debit, credit, amount, curr, idemp, bdate, qty) \
+                     RETURNING id, idempotency_key::TEXT AS k",
+                    None,
+                    &args,
+                )
+                .expect("maximal: INSERT posting_lines");
+            let mut m: HashMap<String, i64> = HashMap::new();
+            for row in tup {
+                let id: i64 = row["id"].value().unwrap().unwrap();
+                let k: String = row["k"].value().unwrap().unwrap();
+                m.insert(k, id);
+            }
+            m
+        })
+    };
+
+    // Phase 9c — INSERT new cost_layers (receipts) with explicit ids.
+    if !nl_id.is_empty() {
+        let nl_pl_ids: Vec<i64> = nl_idemp
+            .iter()
+            .map(|k| {
+                *new_pl_map.get(k).unwrap_or_else(|| {
+                    pgrx::error!(
+                        "maximal: receipt idempotency_key '{}' missing from posting_lines INSERT",
+                        k
+                    )
+                })
+            })
+            .collect();
+        Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![
+                nl_id.clone().into(),
+                nl_pool.clone().into(),
+                nl_qty.clone().into(),
+                nl_uc.clone().into(),
+                nl_bdate.clone().into(),
+                nl_pl_ids.clone().into(),
+            ];
+            client
+                .update(
+                    "INSERT INTO cost_layers \
+                       (id, pool_account_id, qty_remaining, unit_cost, receipt_date, \
+                        receipt_posting_line_id) \
+                     SELECT u.lid, u.pool, u.qty, u.uc, u.bdate::date, u.pl \
+                     FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::text[], $6::bigint[]) \
+                              AS u(lid, pool, qty, uc, bdate, pl)",
+                    None,
+                    &args,
+                )
+                .expect("maximal: INSERT cost_layers");
+        });
+    }
+
+    // Phase 9d — INSERT cost_layer_depletions. `dp_cost` was computed
+    // per-slice during the apply phase from `slice.unit_cost` captured
+    // out of the ring; no post-hoc SPI lookup needed.
+    if !dp_layer_id.is_empty() {
+        let dp_issue_pl_ids: Vec<i64> = dp_issue_idemp
+            .iter()
+            .map(|k| {
+                *new_pl_map.get(k).unwrap_or_else(|| {
+                    pgrx::error!(
+                        "maximal: issue idempotency_key '{}' missing from posting_lines INSERT",
+                        k
+                    )
+                })
+            })
+            .collect();
+        Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![
+                dp_layer_id.clone().into(),
+                dp_issue_pl_ids.clone().into(),
+                dp_qty.clone().into(),
+                dp_cost.clone().into(),
+            ];
+            client
+                .update(
+                    "INSERT INTO cost_layer_depletions \
+                       (layer_id, issue_posting_line_id, qty_consumed, cost_amount) \
+                     SELECT u.lid, u.pl, u.qty, u.cost \
+                     FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[]) \
+                              AS u(lid, pl, qty, cost)",
+                    None,
+                    &args,
+                )
+                .expect("maximal: INSERT cost_layer_depletions");
+        });
+    }
+
+    // Phase 9e — UPDATE cost_layers SET qty_remaining for drained
+    // layers. (For sub 2, do this inline so durable state matches
+    // shmem; sub 4 will move this into the bgworker.)
+    if !accum_drain.is_empty() {
+        let ld_id: Vec<i64> = accum_drain.keys().copied().collect();
+        let ld_drain: Vec<i64> = ld_id.iter().map(|id| accum_drain[id]).collect();
+        Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> =
+                vec![ld_id.clone().into(), ld_drain.clone().into()];
+            client
+                .update(
+                    "UPDATE cost_layers SET qty_remaining = qty_remaining - u.d \
+                     FROM unnest($1::bigint[], $2::bigint[]) AS u(id, d) \
+                     WHERE cost_layers.id = u.id",
+                    None,
+                    &args,
+                )
+                .expect("maximal: UPDATE cost_layers");
+        });
+    }
+
+    // Phase 10 — stage_apply balance/qty deltas (existing shmem path).
+    for (account_id, (dbal, dqty)) in bal_deltas.iter() {
+        stage_apply(*account_id, 1, 1, 1, *dbal, *dqty);
+    }
+
+    // Phase 11 — build per-envelope results.
+    let results: Vec<(i32, String, Option<i64>, Option<String>, Option<String>)> = parsed
+        .iter()
+        .map(|p| {
+            let pl_id = replay_map
+                .get(&p.idempotency_key)
+                .copied()
+                .or_else(|| new_pl_map.get(&p.idempotency_key).copied());
+            let status = if replay_map.contains_key(&p.idempotency_key) {
+                "idempotent_replay".to_string()
+            } else {
+                "committed".to_string()
+            };
+            (p.envelope_idx, status, pl_id, None, None)
+        })
+        .collect();
+
+    TableIterator::new(results)
 }
