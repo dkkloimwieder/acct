@@ -211,6 +211,24 @@ pub extern "C-unwind" fn _PG_init() {
     pg_shmem_init!(LEDGER_DRAIN_CONSECUTIVE_FAILS);
     pg_shmem_init!(LEDGER_DRAIN_TOTAL_FAILURES);
 
+    // acct-17vr: register XactCallback + SubXactCallback unconditionally
+    // at postmaster init. Each forked backend inherits the callback list,
+    // so callbacks fire from the very first transaction event regardless
+    // of whether `ledger_apply_balance_delta` is ever called. Eliminates
+    // the lazy-registration edge case where the first apply happens
+    // inside an already-open subxact (we'd miss its SUBXACT_EVENT_START_SUB
+    // and on RELEASE would conflate subxact deltas into the top frame).
+    // Cost: a no-op callback dispatch per transaction in every backend
+    // even when the ledger is untouched. PG callback dispatch walks a
+    // short static list; the no-op branch is a tiny match arm.
+    unsafe {
+        pg_sys::RegisterXactCallback(Some(ledger_xact_callback), std::ptr::null_mut());
+        pg_sys::RegisterSubXactCallback(
+            Some(ledger_subxact_callback),
+            std::ptr::null_mut(),
+        );
+    }
+
     GucRegistry::define_int_guc(
         c"ledger.drain_interval_ms",
         c"Bgworker drain wake interval (ms)",
@@ -684,13 +702,14 @@ thread_local! {
     /// top-level transaction; subxacts push/pop. Initialized lazily
     /// (the const initializer below runs at thread_local first-access
     /// per backend).
+    ///
+    /// XactCallback + SubXactCallback are registered once in `_PG_init`
+    /// (acct-17vr) so the callback path is wired up before any backend
+    /// transaction begins. Frame management on this stack is still
+    /// lazy: backends that never call `ledger_apply_balance_delta`
+    /// keep the stack empty and the callbacks become no-ops.
     static PENDING_STACK: RefCell<Vec<HashMap<u128, PendingEntry>>> =
         const { RefCell::new(Vec::new()) };
-
-    /// Whether this backend has registered XactCallback + SubXactCallback
-    /// with PG. Callbacks are registered exactly once per backend on
-    /// first apply.
-    static REGISTERED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// Read-only probe. Returns true if a cell for `key` exists in shmem.
@@ -716,31 +735,16 @@ fn cell_exists(table: &HashTable, key: u128) -> bool {
 
 /// Ensure PENDING_STACK has at least one frame (the top-level txn
 /// frame). Called before any push/insert.
+///
+/// Callbacks are registered in `_PG_init` (acct-17vr); frame setup
+/// here is the only remaining lazy step. SubXactCallback events
+/// arriving before the first apply find an empty stack and skip
+/// safely (push/pop guards check `is_empty()`).
 fn ensure_top_frame() {
     PENDING_STACK.with(|s| {
         let mut stack = s.borrow_mut();
         if stack.is_empty() {
             stack.push(HashMap::new());
-        }
-    });
-}
-
-/// Lazy registration: install XactCallback + SubXactCallback exactly
-/// once per backend.
-fn ensure_callbacks_registered() {
-    REGISTERED.with(|reg| {
-        if !*reg.borrow() {
-            unsafe {
-                pg_sys::RegisterXactCallback(
-                    Some(ledger_xact_callback),
-                    std::ptr::null_mut(),
-                );
-                pg_sys::RegisterSubXactCallback(
-                    Some(ledger_subxact_callback),
-                    std::ptr::null_mut(),
-                );
-            }
-            *reg.borrow_mut() = true;
         }
     });
 }
@@ -984,7 +988,6 @@ fn stage_apply(
     amount_delta: i64,
     qty_delta: i64,
 ) {
-    ensure_callbacks_registered();
     ensure_top_frame();
     let key = pack_key(account_id, period_id, currency_id, ledger_kind as u8);
 

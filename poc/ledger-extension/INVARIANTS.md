@@ -213,7 +213,19 @@ STAGES `(amount_delta, qty_delta, captured_rollup_seed)` into a
 per-backend `PENDING_STACK`. The XactCallback Commit hook applies
 staged deltas; Abort hook discards. SubXactCallback handles
 SAVEPOINT (`START_SUB` pushes frame; `COMMIT_SUB` merges into parent;
-`ABORT_SUB` pops). `src/lib.rs`: `stage_apply`,
+`ABORT_SUB` pops).
+
+Per acct-17vr (2026-05-13), both callbacks are registered in
+`_PG_init` at postmaster startup. Backends inherit the registration
+across fork, so the callback path is wired from the first transaction
+event in any backend's lifetime. This eliminates a latent edge case
+where a backend's first `ledger_apply_balance_delta` call happened
+inside an already-open subxact: the lazy registration would miss
+that subxact's `SUBXACT_EVENT_START_SUB` and stage into the top-frame.
+The existing defensive `is_empty()` guards in `subxact_*` callbacks
+masked the symptom for simple cases, but the structural invariant is
+now: every START_SUB pushes a frame, every COMMIT_SUB / ABORT_SUB
+pops one. `src/lib.rs`: `_PG_init` (registration), `stage_apply`,
 `ledger_xact_callback`, `ledger_subxact_callback`, `xact_commit`,
 `xact_abort`, `subxact_*`.
 
@@ -221,7 +233,8 @@ SAVEPOINT (`START_SUB` pushes frame; `COMMIT_SUB` merges into parent;
 unwind), V2 (recon stays clean after rollback), V3 (commit applies).
 Plus `tests/transactional_t1.rs` T2 (savepoint nesting), T3
 (cross-backend isolation), T5 (multi-cell collapse), T6 (drain
-isolation from staged), T7 (RYW limitation pinned).
+isolation from staged), T7 (RYW limitation pinned), T8 (first apply
+mid-subxact — acct-17vr regression net).
 
 ---
 

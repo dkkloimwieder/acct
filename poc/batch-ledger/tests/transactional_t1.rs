@@ -16,6 +16,10 @@
 //!   an in-flight transaction does not observe staged deltas.
 //! - **t7_ryw_limitation** — within-txn `ledger_balance_lookup`
 //!   returns PRE-staging value (documented limitation).
+//! - **t8_first_apply_mid_subxact_acct_17vr** — fresh backend with
+//!   first apply inside an already-open subxact discards on ROLLBACK
+//!   TO and merges on RELEASE (pins acct-17vr's _PG_init callback
+//!   registration).
 //!
 //! Test isolation strategy mirrors `rollback_correctness_t1.rs`: high
 //! synthetic keys derived from a per-test UUID so concurrent test
@@ -590,5 +594,178 @@ async fn t7_ryw_limitation() {
         post,
         Some(pre_bal + 999),
         "T7 post-commit: expected pre+999={}", pre_bal + 999
+    );
+}
+
+/// T8 — first-apply mid-subxact (acct-17vr regression net).
+///
+/// The bug being pinned: before acct-17vr, XactCallback and
+/// SubXactCallback were registered lazily on the first
+/// `ledger_apply_balance_delta` call. If that first call happened
+/// inside an already-open subxact, the SUBXACT_EVENT_START_SUB event
+/// for the subxact had already fired BEFORE the callback registered,
+/// so the extension never pushed a child frame. The apply staged
+/// into the top-level frame. On ROLLBACK TO, the discard was
+/// correctly done (callback unregistered → no child frame to pop;
+/// the top-frame apply persists). On RELEASE, the merge-to-parent
+/// was a no-op (no child frame), so the apply also persisted. Either
+/// way: a subxact rollback that SHOULD discard the apply would not.
+///
+/// Post-acct-17vr, callbacks are registered in `_PG_init`. The
+/// subxact's START_SUB fires from the moment the backend is alive,
+/// so a child frame exists by the time the first apply lands inside
+/// the subxact. ROLLBACK TO discards correctly.
+///
+/// Test shape (each must be on a single backend so the per-backend
+/// PENDING_STACK state is observable):
+/// ```text
+/// -- Fresh backend (no prior apply in this session) --
+/// BEGIN;
+///   SAVEPOINT s;
+///     SELECT ledger_apply_balance_delta(...);  -- first apply EVER
+///   ROLLBACK TO s;
+/// COMMIT;
+/// -- expected: balance unchanged from pre
+/// ```
+///
+/// The pool is sized to 1 connection and used in sequence so we can
+/// guarantee the first apply on this connection happens inside the
+/// subxact. Even though parallel test binaries may have warmed up
+/// other backends, this backend (from this pool) is fresh.
+#[tokio::test]
+async fn t8_first_apply_mid_subxact_acct_17vr() {
+    // Separate pools per scenario so each acquires a guaranteed-fresh
+    // PG backend (sqlx opens new connections on first acquire). Pool A
+    // is for the rollback scenario, B for release. A read-pool is used
+    // for lookups outside the scenarios to avoid pool exhaustion.
+    let pool_a = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url())
+        .await
+        .expect("connect pool_a");
+    let pool_b = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url())
+        .await
+        .expect("connect pool_b");
+    let pool_read = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db_url())
+        .await
+        .expect("connect pool_read");
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS ledger_extension")
+        .execute(&pool_read)
+        .await
+        .expect("create ext");
+
+    let acct_rollback = synthetic_offset();
+    let acct_release = synthetic_offset();
+    let period: i32 = 8_008;
+
+    let pre_rb: i64 = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT balance FROM ledger_balance_lookup($1::bigint, $2::int, 1::smallint, 1::smallint)",
+    )
+    .bind(acct_rollback)
+    .bind(period)
+    .fetch_one(&pool_read)
+    .await
+    .expect("pre rb")
+    .unwrap_or(0);
+
+    let pre_rel: i64 = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT balance FROM ledger_balance_lookup($1::bigint, $2::int, 1::smallint, 1::smallint)",
+    )
+    .bind(acct_release)
+    .bind(period)
+    .fetch_one(&pool_read)
+    .await
+    .expect("pre rel")
+    .unwrap_or(0);
+
+    // Scenario A: fresh backend (pool_a's first acquire), first apply
+    // inside an already-open subxact, then ROLLBACK TO. Without
+    // acct-17vr the apply would survive (lazy SubXactCallback would
+    // miss the open subxact's START_SUB and stage into the top frame
+    // that ROLLBACK TO doesn't touch); with the fix it discards.
+    {
+        let mut conn = pool_a.acquire().await.expect("acquire pool_a");
+        sqlx::query("BEGIN").execute(&mut *conn).await.expect("begin a");
+        sqlx::query("SAVEPOINT s_a")
+            .execute(&mut *conn)
+            .await
+            .expect("savepoint s_a");
+        sqlx::query(
+            "SELECT ledger_apply_balance_delta($1::bigint, $2::int, 1::smallint, 1::smallint, 777, 0)",
+        )
+        .bind(acct_rollback)
+        .bind(period)
+        .execute(&mut *conn)
+        .await
+        .expect("apply in subxact a");
+        sqlx::query("ROLLBACK TO SAVEPOINT s_a")
+            .execute(&mut *conn)
+            .await
+            .expect("rollback to s_a");
+        sqlx::query("COMMIT").execute(&mut *conn).await.expect("commit a");
+    }
+
+    let post_rb: i64 = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT balance FROM ledger_balance_lookup($1::bigint, $2::int, 1::smallint, 1::smallint)",
+    )
+    .bind(acct_rollback)
+    .bind(period)
+    .fetch_one(&pool_read)
+    .await
+    .expect("post rb")
+    .unwrap_or(0);
+
+    assert_eq!(
+        post_rb, pre_rb,
+        "T8 ROLLBACK TO: subxact apply must discard on rollback, even when it's the \
+         backend's FIRST ever apply. Without acct-17vr (lazy SubXactCallback \
+         registration), the SUBXACT_EVENT_START_SUB would be missed and the apply \
+         would survive into the top-level frame. expected={pre_rb} got={post_rb}"
+    );
+
+    // Scenario B: separate fresh backend (pool_b), first apply inside
+    // an already-open subxact, then RELEASE. Apply must merge into
+    // parent and survive COMMIT.
+    {
+        let mut conn = pool_b.acquire().await.expect("acquire pool_b");
+        sqlx::query("BEGIN").execute(&mut *conn).await.expect("begin b");
+        sqlx::query("SAVEPOINT s_b")
+            .execute(&mut *conn)
+            .await
+            .expect("savepoint s_b");
+        sqlx::query(
+            "SELECT ledger_apply_balance_delta($1::bigint, $2::int, 1::smallint, 1::smallint, 333, 0)",
+        )
+        .bind(acct_release)
+        .bind(period)
+        .execute(&mut *conn)
+        .await
+        .expect("apply in subxact b");
+        sqlx::query("RELEASE SAVEPOINT s_b")
+            .execute(&mut *conn)
+            .await
+            .expect("release s_b");
+        sqlx::query("COMMIT").execute(&mut *conn).await.expect("commit b");
+    }
+
+    let post_rel: i64 = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT balance FROM ledger_balance_lookup($1::bigint, $2::int, 1::smallint, 1::smallint)",
+    )
+    .bind(acct_release)
+    .bind(period)
+    .fetch_one(&pool_read)
+    .await
+    .expect("post rel")
+    .unwrap_or(0);
+
+    assert_eq!(
+        post_rel,
+        pre_rel + 333,
+        "T8 RELEASE: subxact apply must merge to parent on release. expected={} got={post_rel}",
+        pre_rel + 333
     );
 }
