@@ -160,12 +160,51 @@ torn read `(balance=38022000, qty=38021)` within 15s); post-fix passes
 documented in
 [`bench/results-shmem-apply-B4prep.md`](../../batch-ledger/bench/results-shmem-apply-B4prep.md).
 
+## Durability boundary (acct-e5gl)
+
+The `account_balances_rollup` table is the durability watermark.
+`last_seq` on a rollup row is the highest sequence number durably
+persisted to disk for that `(account_id, period_id, currency_id,
+ledger_kind)` cell. Applies above this watermark live only in shmem
+and are LOST on a PG-wide crash or restart.
+
+Recovery semantics:
+
+- **Clean PG shutdown / restart**: shmem is wiped; bgworker re-launches;
+  M6 lazy-load seeds each newly-touched cell from the rollup row's
+  `(balance, qty, last_seq)`. Applies that drained pre-shutdown are
+  visible; applies that hadn't drained are lost.
+- **SIGKILL of the bgworker**: `set_restart_time(Duration::from_secs(1))`
+  re-launches it within ~2s. Shmem state is preserved (bgworker doesn't
+  own shmem); the new worker resumes draining at the next tick.
+- **Clean SIGTERM of the bgworker** (`pg_terminate_backend`): treated
+  as exit-code-0 by PG; the worker is **deregistered without restart**.
+  To re-create it, restart the postmaster or DROP + CREATE EXTENSION.
+
+WAL-level durability for in-shmem applies is OUT OF SCOPE for M10.
+A future milestone could add a custom `RmgrData` entry for delta WAL
+records with redo on recovery; that's tracked separately (no bd
+issue yet — file as M11+ work if a customer driver appears).
+
+Probed by `poc/batch-ledger/tests/crash_recovery_t1.rs` (T1 SIGTERM
+clean-shutdown contract; T2 SIGKILL auto-restart via set_restart_time;
+T3 postmaster restart documents the loss profile). All three tests
+are `#[ignore]`'d because crash injection is destructive to
+concurrent test binaries.
+
+M10 sub-issues shipped (C-track complete):
+- ✅ acct-7eph — C5 recon under concurrent writes
+- ✅ acct-plle — C6 panic cleanup verification
+- ✅ acct-vd74 — C4 GUC SIGHUP reload (real fix: ProcessConfigFile)
+- ✅ acct-3ee2 — C1 hash-full as recoverable contract
+- ✅ acct-3ovt — C2 bgworker SPI error escalation (real fix: PgTryBuilder)
+- ✅ acct-e5gl — C3 crash recovery (SIGTERM/SIGKILL/postmaster restart)
+
 Remaining M10 sub-issues (open):
-- acct-n4mo — B4 post_batch_wac_shmem + bench (~2-3 days)
+- acct-n4mo — B4 post_batch_wac_shmem + bench (~2-3 days; load-bearing)
 - acct-jjqc / nn31 / 713c — B1/B2/B3 multi-dimension scenarios
 - acct-j0nh / jh9k — B6/B7 backpressure + load-factor curves
 - acct-mii6 — B8 concurrent accounts table activity
-- acct-3ee2 / 3ovt / e5gl / vd74 / 7eph / plle — C1-C6 error handling
 
 Stop at each milestone, surface, wait for direction (per
 `treat-proceed-as-scoped-to-the-specific-item`).
