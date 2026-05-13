@@ -50,6 +50,15 @@ AS 'MODULE_PATHNAME', 'fifo_arena_capacity_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/fifo.rs:1728
+-- ledger_extension::fifo::fifo_arena_reset
+CREATE  FUNCTION "fifo_arena_reset"() RETURNS bool /* bool */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'fifo_arena_reset_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/fifo.rs:1709
 -- ledger_extension::fifo::fifo_drain_consecutive_failures
 CREATE  FUNCTION "fifo_drain_consecutive_failures"() RETURNS bigint /* i64 */

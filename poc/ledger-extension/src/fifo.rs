@@ -1712,3 +1712,35 @@ pub fn fifo_drain_consecutive_failures() -> i64 {
         .get()
         .load(Ordering::Acquire) as i64
 }
+
+/// Reset every FIFO arena cell back to empty. Intended for **bench
+/// setup or test teardown only** — there is no synchronization with
+/// concurrent apply paths. The caller guarantees no
+/// `fifo_apply_batch_maximal` is in flight (single-threaded bench
+/// setup phase; quiescent test).
+///
+/// Acquires `FIFO_ARENA.exclusive()` to serialize against insertions
+/// and probes that take `share()`, but DOES NOT take cell LWLocks —
+/// quiescence is the load-bearing precondition. Wipes occupied,
+/// seeded, key, last_seq, drained_seq, and the ring state
+/// (head/n_layers/pending_drain_n). Layer/pending_drain arrays are
+/// not zeroed; n=0 makes them unreachable.
+#[pg_extern]
+pub fn fifo_arena_reset() -> bool {
+    let arena = FIFO_ARENA.exclusive();
+    for i in 0..FIFO_N_BUCKETS {
+        let b = &arena.buckets[i];
+        b.occupied.store(0, Ordering::Relaxed);
+        b.seeded.store(0, Ordering::Relaxed);
+        b.key_hi.store(0, Ordering::Relaxed);
+        b.key_lo.store(0, Ordering::Relaxed);
+        b.last_seq.store(0, Ordering::Relaxed);
+        b.drained_seq.store(0, Ordering::Relaxed);
+        // SAFETY: caller-guaranteed quiescence (no concurrent apply).
+        let ring = unsafe { ring_mut(b) };
+        ring.head = 0;
+        ring.n_layers = 0;
+        ring.pending_drain_n = 0;
+    }
+    true
+}

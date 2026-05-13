@@ -39,6 +39,10 @@ async fn fifo_fan_bench() {
     let duration_secs = env_or::<u64>("POC_BENCH_DURATION_SECS", 60);
     let batch_size = env_or::<usize>("POC_BENCH_BATCH_SIZE", 1000);
     let issue_pct = env_or::<u32>("POC_BENCH_ISSUE_PCT", 70);
+    // Per-layer pre-seed qty. F-shmem (mig 0024) caps MAX_LAYERS=64;
+    // 100/0 issue-pct workloads need each layer fat enough to outlast
+    // the run. Default unchanged so prior sweeps reproduce.
+    let layer_qty = env_or::<i64>("POC_BENCH_LAYER_QTY", 1_000_000);
     let shape = std::env::var("POC_BENCH_SHAPE").unwrap_or_else(|_| "fan_in".to_string());
     let bench_fn =
         std::env::var("POC_BENCH_FUNCTION").unwrap_or_else(|_| "post_batch_fifo".to_string());
@@ -57,7 +61,13 @@ async fn fifo_fan_bench() {
     .await
     .expect("truncate");
 
-    if bench_fn.ends_with("_shmem") || bench_fn.ends_with("_maximal") {
+    let bench_fn_lc = bench_fn.to_lowercase();
+    let is_f_shmem = bench_fn_lc.ends_with("_maximal_f");
+    if bench_fn.ends_with("_shmem")
+        || bench_fn.ends_with("_maximal")
+        || bench_fn.ends_with("_inline")
+        || is_f_shmem
+    {
         sqlx::query("CREATE EXTENSION IF NOT EXISTS ledger_extension")
             .execute(&pool)
             .await
@@ -70,6 +80,18 @@ async fn fifo_fan_bench() {
             .execute(&pool)
             .await
             .expect("shmem reset");
+        if is_f_shmem {
+            // sub 4 (acct-0450): FIFO arena retains layer state across
+            // bench cells; TRUNCATE wipes cost_layers but the ring
+            // still references vanished ids. Reset before the next
+            // cell otherwise the bgworker tries to UPDATE missing
+            // rows and the apply path lazy-seeds against the wrong
+            // pool_account_id.
+            sqlx::query("SELECT fifo_arena_reset()")
+                .execute(&pool)
+                .await
+                .expect("fifo arena reset");
+        }
     }
 
     let ap_id: i64 = sqlx::query_scalar(
@@ -106,7 +128,7 @@ async fn fifo_fan_bench() {
                 "kind": "fifo_receipt",
                 "debit_account_id": pid,
                 "credit_account_id": ap_id,
-                "qty": 1_000_000_i64,
+                "qty": layer_qty,
                 "unit_cost": 100_i64 + layer_no * 10,
                 "idempotency_key": Uuid::new_v4().to_string(),
                 "business_date": format!("2026-05-{:02}", 1 + layer_no),
@@ -201,8 +223,13 @@ async fn fifo_fan_bench() {
                         s.transfers_ok
                             .fetch_add(batch_size as u64, Ordering::Relaxed);
                     }
-                    Err(_) => {
-                        s.batches_err.fetch_add(1, Ordering::Relaxed);
+                    Err(e) => {
+                        let prev = s.batches_err.fetch_add(1, Ordering::Relaxed);
+                        // Log a sample of errors so a regression doesn't
+                        // hide silently behind the err counter.
+                        if prev < 2 {
+                            eprintln!("worker {wi} batch err #{prev}: {e}");
+                        }
                     }
                 }
             }
