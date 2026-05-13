@@ -1160,6 +1160,80 @@ fn ledger_apply_balance_delta(
     0
 }
 
+/// acct-r8xv (M10 followup) — batch entry point. Takes a JSONB array of
+/// pre-computed legs; stages all of them via the same A2 PENDING_STACK
+/// path as `ledger_apply_balance_delta`, but with ONE cross-boundary
+/// call per batch instead of one per leg.
+///
+/// Envelope shape (short keys to minimize JSONB size):
+/// ```json
+/// [
+///   {"a": 123, "amt":  1000, "qty": 100},
+///   {"a": 124, "amt": -1000, "qty":   0}
+/// ]
+/// ```
+///
+/// Optional per-leg dimension keys (default to the PoC convention 1):
+///   `"p"` period_id (i32), `"c"` currency_id (i16), `"k"` ledger_kind (i16).
+///
+/// Returns the number of legs staged. Errors raise via `pgrx::error!`
+/// before staging anything (atomicity: a malformed envelope aborts the
+/// whole batch, the caller's txn rolls back, no partial state leaks).
+#[pg_extern]
+fn ledger_apply_batch(envelopes: pgrx::JsonB) -> i64 {
+    let arr = match envelopes.0.as_array() {
+        Some(a) => a,
+        None => pgrx::error!("ledger_apply_batch: envelopes must be a JSONB array"),
+    };
+
+    // Two-pass: validate everything first, then stage. Avoids partial
+    // PENDING_STACK pollution if a malformed envelope appears mid-batch.
+    // (The caller's txn would roll back via xact_abort, but doing it
+    // up-front keeps the failure mode crisp.)
+    let mut parsed: Vec<(i64, i32, i16, i16, i64, i64)> = Vec::with_capacity(arr.len());
+    for (idx, env) in arr.iter().enumerate() {
+        let obj = match env.as_object() {
+            Some(o) => o,
+            None => pgrx::error!(
+                "ledger_apply_batch: envelope[{}] is not an object",
+                idx
+            ),
+        };
+        let get_i64 = |k: &str| -> i64 {
+            match obj.get(k).and_then(|v| v.as_i64()) {
+                Some(v) => v,
+                None => pgrx::error!(
+                    "ledger_apply_batch: envelope[{}] missing/invalid integer key '{}'",
+                    idx,
+                    k
+                ),
+            }
+        };
+        let get_i64_or = |k: &str, default: i64| -> i64 {
+            obj.get(k).and_then(|v| v.as_i64()).unwrap_or(default)
+        };
+        let account_id = get_i64("a");
+        let period_id = get_i64_or("p", 1) as i32;
+        let currency_id = get_i64_or("c", 1) as i16;
+        let ledger_kind = get_i64_or("k", 1) as i16;
+        let amount_delta = get_i64("amt");
+        let qty_delta = get_i64("qty");
+        parsed.push((
+            account_id,
+            period_id,
+            currency_id,
+            ledger_kind,
+            amount_delta,
+            qty_delta,
+        ));
+    }
+
+    for (a, p, c, k, amt, qty) in &parsed {
+        stage_apply(*a, *p, *c, *k, *amt, *qty);
+    }
+    parsed.len() as i64
+}
+
 /// Read the cell at (`account_id`, `period_id`, `currency_id`,
 /// `ledger_kind`). Returns one row of NULLs if absent. Takes the SHARED
 /// LWLock; concurrent appliers can proceed without blocking the reader.
