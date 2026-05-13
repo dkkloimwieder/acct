@@ -171,5 +171,137 @@ F is the only path forward.
 
 ## Follow-ups
 
-- `acct-t59i` — L-accounts: wrapper FOR UPDATE accounts.id; drop FOR UPDATE on cost_layers. P3.
+- `acct-t59i` — L-accounts: wrapper FOR UPDATE accounts.id; drop FOR UPDATE on cost_layers. P3. **CLOSED 2026-05-13: no lift — see addendum below.**
 - `acct-nosj` — F: shmem-cached LayerArena. P3. Blocked-on acct-t59i (gates on whether L's measurement justifies F's scope).
+
+---
+
+# Addendum 2026-05-13: acct-t59i L-accounts measurement
+
+**Outcome: another regression — L-accounts is 8-17× slower than mutable.
+The dispatcher + set-based CTE design is fundamentally heavier per batch
+than mutable's plpgsql FOR LOOP + jsonb_set, even with lock cardinality
+matched.**
+
+## What L-accounts changed
+
+- Mig 0022 supersedes mig 0021's body. LANGUAGE switches sql → plpgsql.
+- Wrapper-top `PERFORM ... FOR UPDATE ORDER BY accounts.id` over all
+  account ids touched by the batch (debit + credit, both sides).
+  Mirrors mig 0020 mutable's serialization model exactly.
+- `ledger_dispatch_fifo_batch` SPI swap: `client.update` → `client.select`;
+  `Spi::connect_mut` → `Spi::connect`; `FOR UPDATE` stripped from the
+  cost_layers SELECT.
+
+Correctness preserved: tests/fifo_shmem_correctness_maximal_t1.rs **5/5
+green** (T1 cross-batch, T2 oldest-first, T3 in-batch sentinel, T4
+idempotent replay, T5 8-writer fan-in coupled writes; recon drift=0).
+
+## Bench results (3 replicates × 60s; 11/12 runs — fan-out maximal-L cell 4 killed mid-run-3 because the pattern was unambiguous at 2/3)
+
+### Throughput (tps)
+
+| Scenario | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| fan-in mutable (mig 0020)        | 367.6 | 370.2 | 370.4 | **370** |
+| fan-in maximal-L (mig 0022)      |  46.4 |  46.4 |  46.8 |  **46** |
+| fan-out mutable (mig 0020)       | 793.4 | 793.6 | 792.2 | **793** |
+| fan-out maximal-L (mig 0022) — 2 |  46.3 |  46.2 | (kill)|  **46** |
+
+### p99 batch latency (ms)
+
+| Scenario | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| fan-in mutable        |  87,073 |  87,904 |  89,013 |  **87,904** |
+| fan-in maximal-L      | 431,649 | 432,466 | 429,493 | **431,649** |
+| fan-out mutable       |  29,270 |  29,609 |  29,237 |  **29,270** |
+| fan-out maximal-L     | 432,605 | 434,720 |  (kill) | **433,663** |
+
+### Headline deltas (medians, vs mutable baseline)
+
+| Shape | Mutable tps | Maximal-L tps | Lift vs mutable | Note |
+|---|---:|---:|---:|---|
+| fan-in  | 370 |  **46** | **-88% (8.0× slower)**  | Marginal improvement vs mig 0021 (36 tps → 46 tps; +28%) |
+| fan-out | 793 |  **46** | **-94% (17.2× slower)** | Marginal improvement vs mig 0021 (34 tps → 46 tps; +35%) |
+
+Zero deadlocks. Serialization is correct — just slow.
+
+## Root cause: dispatcher + CTE per-batch cost dominates, NOT lock cardinality
+
+Comparing mig 0020 (mutable) to mig 0022 (maximal-L) under the SAME
+lock cardinality (FOR UPDATE on ~3 accounts.id rows per batch):
+
+- mig 0020 per-batch wall (1000 envelopes, serialized through one pool):
+  ~2.7s (fan-in tps 370 ÷ 1 effective writer + queue depth).
+- mig 0022 per-batch wall: ~21.5s.
+
+So **per-batch CPU cost is ~8× higher** for maximal-L than mutable, even
+with identical serialization. The Rust dispatcher + set-based CTE chain
+(parse JSONB, SPI fetch, HashMap walk, 7+ chained CTEs with sentinel
+resolution and bilateral drain bookkeeping) costs MORE per batch than
+mig 0020's plpgsql FOR LOOP + jsonb_set + TEMP TABLE inserts — despite
+mig 0020's O(N²) jsonb_set work.
+
+Where the cost concentrates (hypothesized, not profiled):
+
+1. plpgsql `RETURN QUERY WITH (...)` invoking a `#[pg_extern]` SETOF
+   function inside a CTE — TableIterator row materialization is not
+   free, and each row crosses Rust→PG plan-tree boundary.
+2. The 7+ CTE chain (input, existing, non_replay_input, dispatched,
+   legs, depls, inserted_pl, in_batch_drain, inserted_layers,
+   sentinel_map, resolved_depls, inserted_dep, pre_existing_drain,
+   updated_layers) forces large intermediate result-set materialization.
+3. Multiple JOINs on `idempotency_key` (UUID) across inserted_pl,
+   non_replay_input, sentinel_map increase hash-join + memory cost.
+
+mig 0020's plpgsql FOR LOOP does its work in tight in-memory state
+without crossing extension/SQL boundaries per row.
+
+## Implications
+
+**The WAC maximal pattern (acct-2g9w's 5.55× lift) does not transfer to
+FIFO at all.**
+
+WAC's per-pool state is scalar (running avg in a single shmem cell, CAS
+fetch_add). FIFO's per-pool state is an ordered list of layers — even
+with the Rust dispatcher in place, the wire-protocol cost of streaming
+~7K rows back to plpgsql + chaining them through CTEs to land in
+durable tables overwhelms any algorithmic win from going from O(N²)
+jsonb_set to O(N) HashMap walks.
+
+The architectural read for `acct-nosj` (F shmem-LayerArena):
+
+- F's value proposition WAS the lock-free hot path against shmem-resident
+  per-pool layer queues, mirroring acct-2g9w's WAC win.
+- BUT: even shmem-native FIFO writes still need to drain to durable
+  `cost_layers` rows eventually — bgworker drain is bottleneck-bound.
+- The drain still moves the same ~7K rows/batch through the SQL plane.
+  Unless the *durable side* can be eliminated for the hot path, the
+  per-batch cost ceiling may not budge much from mig 0022's level.
+- Mig 0020 mutable's ~793 tps fan-out / ~370 tps fan-in is the realistic
+  FIFO ceiling under the current durable-row-per-leg-and-depletion model.
+
+## Recommendation
+
+**Keep mig 0020 mutable as the production FIFO path.** No follow-up F
+unless workload reality demands it. The 793 tps fan-out / 370 tps fan-in
+is unlikely to be the bottleneck for any realistic FIFO ERP workload
+(period close + commodity provisional are the only known high-volume
+FIFO surfaces; both batch-bound rather than tps-bound).
+
+If F is pursued anyway, projections should be revised DOWN — the
+"5-13× lift over mutable" hypothesis from F's claim-time design is
+NOT supported by maximal-L's evidence. Realistic F ceiling, assuming
+shmem-native ordered-list ops are 2-5× faster than dispatcher round-trip,
+is roughly mutable-parity to ~2× mutable. That's a ~10-14 day investment
+for ~mutable to 2× mutable. Probably not worth it.
+
+## Files
+
+- This document: `poc/batch-ledger/bench/results-shmem-fifo-maximal.md`
+- Mig 0022 (L-accounts; current): `poc/batch-ledger/db/migrations/0022_post_batch_fifo_maximal_l_accounts.up.sql`
+- Mig 0021 (cost_layers FOR UPDATE; superseded): `poc/batch-ledger/db/migrations/0021_post_batch_fifo_maximal.up.sql`
+- Mig 0020 (mutable; production reference): `poc/batch-ledger/db/migrations/0020_post_batch_fifo_named.up.sql`
+- Extension dispatcher: `poc/ledger-extension/src/lib.rs::ledger_dispatch_fifo_batch`
+- Correctness tests (5/5 green on mig 0022): `poc/batch-ledger/tests/fifo_shmem_correctness_maximal_t1.rs`
+- Raw bench logs: `/tmp/poc-oqje-bench/` (now contains BOTH mig 0021 numbers from acct-oqje run and mig 0022 numbers from acct-t59i run — same directory, different code under test on different days)

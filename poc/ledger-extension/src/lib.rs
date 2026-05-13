@@ -1552,8 +1552,12 @@ fn ledger_dispatch_wac_batch(
 ///   per consumed layer). Each carries EITHER layer_sentinel (in-batch
 ///   new layer) OR layer_id (pre-existing).
 ///
-/// One SPI fetch under FOR UPDATE at batch start locks all active
-/// layers for every touched issue-pool. Locks held until txn commit.
+/// One SPI fetch (plain SELECT, no row lock) reads all active layers
+/// for every touched issue-pool. Serialization happens at the wrapper
+/// level via FOR UPDATE on the touched accounts.id rows — see
+/// post_batch_fifo_maximal (mig 0022). Within that serialized region
+/// the cost_layers snapshot is internally consistent for the duration
+/// of the wrapper's txn.
 ///
 /// Like `ledger_dispatch_wac_batch`: replays are pre-filtered by the
 /// SQL wrapper before the dispatcher is invoked; every envelope here
@@ -1714,22 +1718,18 @@ fn ledger_dispatch_fifo_batch(
 
     if !issue_pools.is_empty() {
         // ORDER BY ensures deterministic FIFO order across multiple
-        // active layers per pool. FOR UPDATE locks layer rows until
-        // commit — concurrent issues on overlapping pools serialize on
-        // these row locks (acceptable; matches mig 0020 semantics).
+        // active layers per pool. No FOR UPDATE here — serialization
+        // happens at the wrapper level via FOR UPDATE on accounts.id
+        // before this dispatcher is invoked (mig 0022 L-accounts).
         let sql = "SELECT cl.pool_account_id, cl.id, cl.qty_remaining, cl.unit_cost \
                    FROM cost_layers cl \
                    WHERE cl.pool_account_id = ANY($1::bigint[]) AND cl.qty_remaining > 0 \
-                   ORDER BY cl.pool_account_id, cl.receipt_date, cl.id \
-                   FOR UPDATE";
-        let fetched: Vec<(i64, i64, i64, i64)> = Spi::connect_mut(|client| {
+                   ORDER BY cl.pool_account_id, cl.receipt_date, cl.id";
+        let fetched: Vec<(i64, i64, i64, i64)> = Spi::connect(|client| {
             let args: Vec<pgrx::datum::DatumWithOid> = vec![issue_pools.clone().into()];
-            // `update()` (not `select()`) marks the SPI connection as mutable
-            // so FOR UPDATE is permitted. We're still issuing a SELECT — the
-            // "mutability" here is about row-locking, not row-writing.
             let tup = client
-                .update(sql, None, &args)
-                .expect("fifo_dispatch SPI fetch cost_layers FOR UPDATE");
+                .select(sql, None, &args)
+                .expect("fifo_dispatch SPI fetch cost_layers");
             let mut rows: Vec<(i64, i64, i64, i64)> = Vec::new();
             for row in tup {
                 let pid: i64 = row["pool_account_id"].value().unwrap().unwrap();
