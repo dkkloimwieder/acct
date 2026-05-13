@@ -581,6 +581,28 @@ apply return.
 
 ---
 
+## Deployment notes
+
+### Lock-free `AtomicU128` on aarch64 (acct-dav7)
+
+The `Bucket.balance_qty` field is `portable_atomic::AtomicU128`. Lock-
+freedom is what gives readers a coupled `(balance, qty)` pair under
+concurrent SHARED-LWLock writers (I11 / acct-zo4t).
+
+| Architecture | Requirement | Lock-free? |
+|---|---|---|
+| x86_64 | `cmpxchg16b` (Nehalem 2008+) — already in `.cargo/config.toml` `target-features = "+cmpxchg16b"` | Yes |
+| aarch64 | LSE atomics (Armv8.1-A+) — `RUSTFLAGS="-C target-feature=+lse"` or `target-cpu` that implies LSE | Yes |
+| aarch64 (Armv8.0) | No LSE | **No — falls back to global lock**. Throughput regresses. |
+
+Bench host today is x86_64; aarch64 production deployment is not
+in scope but documented for the eventual move. The crate's
+`rust-version = "1.87"` pin matches the bench host toolchain;
+portable_atomic 1.x + edition 2024 + pgrx 0.16 all support 1.85+,
+so 1.85 is the actual floor — 1.87 is a stricter dev-host check.
+
+---
+
 ## Rules for adding/changing invariants
 
 1. **Lead with the predicate, not the implementation.** "balance and

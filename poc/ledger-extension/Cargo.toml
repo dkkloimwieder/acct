@@ -2,6 +2,12 @@
 name = "ledger-extension"
 version = "0.0.1"
 edition = "2024"
+# MSRV: pgrx 0.16 + edition 2024 + portable_atomic AtomicU128 with
+# AcqRel ordering all land on stable 1.85+. Pinning to 1.87 to match
+# the toolchain the bench host ships and to allow `cargo build` to
+# fail fast on under-versioned dev hosts. See INVARIANTS.md "Deployment
+# notes" for the aarch64 LSE caveat on lock-free AtomicU128.
+rust-version = "1.87"
 publish = false
 description = "acct-sw4i: pgrx extension prototype — shared-memory balance rollup + bgworker drain"
 

@@ -99,6 +99,16 @@ pub const N_BUCKETS: usize = 16384;
 /// Pre-zo4t this was `balance: AtomicI64, qty: AtomicI64` — separate
 /// loads were torn-readable under concurrent SHARED-LWLock writers
 /// (the M9 lock-free hot path's race).
+///
+/// **No deletion path.** Accounts are not removed from a ledger;
+/// probe chains in this open-addressing table grow monotonically
+/// over a backend's lifetime (modulo `ledger_shmem_reset()` which
+/// wipes the entire table). There is no `remove`, `unlink`, or
+/// tombstone helper. If you need to reset bucket state, use
+/// `ledger_shmem_reset()` for the whole table. Per-cell deletion
+/// would require tombstones to preserve probe-chain integrity
+/// (acct-layd-style accounting), and we'd rather assert "no
+/// deletion" than build the machinery.
 #[repr(C, align(64))]
 pub struct Bucket {
     pub occupied: AtomicU8,
@@ -1371,30 +1381,103 @@ fn ledger_shmem_recon() -> TableIterator<
         }
     }
 
-    // Phase 2: ledger lookup per cell. SPI outside the LWLock so the
-    // recon doesn't block applies.
+    // Phase 2 (acct-dav7 #7): one SPI call instead of N. Pass cells as
+    // three parallel bigint[] arrays + a LEFT JOIN against an aggregation
+    // CTE over posting_lines. The N-SPI version (one query per cell) cost
+    // a planner+executor round-trip × cell count; with 5001 cells in the
+    // B4 bench's post-sweep state, recon was visibly slow even though
+    // correctness was clean.
+    //
     // Debit-positive convention: SUM(debits) - SUM(credits) for ALL
-    // accounts, regardless of accounts.kind. Matches what post_batch
-    // and post_batch_shmem do (accounts.balance and shmem cell store
-    // the same signed value). SUM(amount BIGINT) returns numeric; the
-    // overall expression is cast to bigint so SPI can decode as i64.
-    let sql = "SELECT (
-                   COALESCE((SELECT SUM(amount) FROM posting_lines WHERE debit_account_id = a.id), 0)
-                 - COALESCE((SELECT SUM(amount) FROM posting_lines WHERE credit_account_id = a.id), 0)
-                 )::bigint
-                FROM accounts a WHERE a.id = $1";
-
-    let mut out = Vec::with_capacity(cells.len());
-    for (account_id, shmem_balance, shmem_qty) in cells {
-        let res = Spi::get_one_with_args::<i64>(sql, &[account_id.into()]);
-        match res {
-            Ok(Some(lb)) => {
-                let drift = shmem_balance - lb;
-                out.push((account_id, shmem_balance, shmem_qty, Some(lb), Some(drift)));
-            }
-            _ => out.push((account_id, shmem_balance, shmem_qty, None, None)),
-        }
+    // accounts, regardless of accounts.kind. Matches what post_batch and
+    // post_batch_shmem do (accounts.balance and shmem cell store the
+    // same signed value).
+    //
+    // Account-existence semantics preserved from the per-cell version:
+    // if a shmem cell's account_id has NO row in `accounts`, the
+    // ledger_balance + drift columns return NULL ("can't verify because
+    // the account doesn't exist") rather than 0 ("ledger balance is
+    // zero"). The `acct_exists` CTE + CASE branches enforce this.
+    if cells.is_empty() {
+        return TableIterator::new(Vec::new());
     }
+
+    let account_ids: Vec<i64> = cells.iter().map(|(a, _, _)| *a).collect();
+    let shmem_balances: Vec<i64> = cells.iter().map(|(_, b, _)| *b).collect();
+    let shmem_qtys: Vec<i64> = cells.iter().map(|(_, _, q)| *q).collect();
+
+    let sql = "
+        WITH cells_in AS (
+            SELECT account_id, shmem_balance, shmem_qty
+              FROM unnest($1::bigint[], $2::bigint[], $3::bigint[])
+                AS u(account_id, shmem_balance, shmem_qty)
+        ),
+        acct_exists AS (
+            SELECT id FROM accounts WHERE id = ANY($1::bigint[])
+        ),
+        debits AS (
+            SELECT debit_account_id, SUM(amount) AS s
+              FROM posting_lines
+             WHERE debit_account_id = ANY($1::bigint[])
+             GROUP BY debit_account_id
+        ),
+        credits AS (
+            SELECT credit_account_id, SUM(amount) AS s
+              FROM posting_lines
+             WHERE credit_account_id = ANY($1::bigint[])
+             GROUP BY credit_account_id
+        )
+        SELECT c.account_id,
+               c.shmem_balance,
+               c.shmem_qty,
+               CASE WHEN a.id IS NOT NULL
+                    THEN (COALESCE(d.s, 0) - COALESCE(cr.s, 0))::bigint
+                    ELSE NULL
+               END AS ledger_balance,
+               CASE WHEN a.id IS NOT NULL
+                    THEN (c.shmem_balance - (COALESCE(d.s, 0) - COALESCE(cr.s, 0)))::bigint
+                    ELSE NULL
+               END AS drift
+        FROM cells_in c
+        LEFT JOIN acct_exists a ON a.id = c.account_id
+        LEFT JOIN debits d      ON d.debit_account_id  = c.account_id
+        LEFT JOIN credits cr    ON cr.credit_account_id = c.account_id
+        ORDER BY c.account_id
+    ";
+
+    let out: Vec<(i64, i64, i64, Option<i64>, Option<i64>)> =
+        pgrx::PgTryBuilder::new(|| {
+            Spi::connect(|client| {
+                let args: Vec<pgrx::datum::DatumWithOid> = vec![
+                    account_ids.clone().into(),
+                    shmem_balances.clone().into(),
+                    shmem_qtys.clone().into(),
+                ];
+                let tup = client
+                    .select(sql, None, &args)
+                    .expect("recon Phase 2 SPI select");
+                let mut rows = Vec::with_capacity(cells.len());
+                for row in tup {
+                    let a: i64 = row["account_id"].value().unwrap().unwrap();
+                    let sb: i64 = row["shmem_balance"].value().unwrap().unwrap();
+                    let sq: i64 = row["shmem_qty"].value().unwrap().unwrap();
+                    let lb: Option<i64> = row["ledger_balance"].value().unwrap();
+                    let dr: Option<i64> = row["drift"].value().unwrap();
+                    rows.push((a, sb, sq, lb, dr));
+                }
+                rows
+            })
+        })
+        .catch_others(|_| {
+            // SPI error path: fall back to per-cell NULLs so recon still
+            // emits one row per cell (matches the legacy fallback shape
+            // where any per-cell SPI failure produced (None, None)).
+            cells
+                .iter()
+                .map(|(a, sb, sq)| (*a, *sb, *sq, None::<i64>, None::<i64>))
+                .collect()
+        })
+        .execute();
 
     TableIterator::new(out)
 }
@@ -1485,6 +1568,33 @@ fn ledger_test_panic_in_exclusive(
 
 /// Wipe the table. Useful for tests and benchmarking baselines. Takes
 /// the exclusive lock for the duration.
+///
+/// **Does NOT clear per-backend `PENDING_STACK`.** Reset wipes shmem
+/// (buckets, OCCUPIED_COUNT, APPLY_SEQ, failure counters) but leaves
+/// every backend's thread-local staging stack untouched. If a test
+/// or benchmark interleaves `stage_apply` with `reset()` in the same
+/// transaction — e.g.:
+///
+/// ```sql
+/// BEGIN;
+///   SELECT ledger_apply_balance_delta(...);  -- stages into PENDING_STACK
+///   SELECT ledger_shmem_reset();             -- wipes shmem only
+/// COMMIT;                                    -- xact_commit re-populates
+///                                            -- from the staged delta
+/// ```
+///
+/// the commit-time `xact_commit` callback drains `PENDING_STACK` and
+/// re-creates the cell the reset just zeroed. The behaviour is
+/// correct (staged work is committed) but surprises tests that
+/// assume reset means "empty everything." Reset BEFORE any staging
+/// in the same txn, or AFTER the txn that staged commits. Better
+/// still, do reset at the start of a test fixture before any apply
+/// runs.
+///
+/// `account_balances_rollup` (the durable SQL table) is also NOT
+/// cleared by `reset()`; subsequent applies trigger M6 lazy-load
+/// which seeds new cells from rollup state. Tests that want a truly
+/// clean slate must `TRUNCATE account_balances_rollup` separately.
 #[pg_extern]
 fn ledger_shmem_reset() {
     let table = HASH_TABLE.exclusive();
