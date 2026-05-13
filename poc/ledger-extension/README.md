@@ -121,11 +121,19 @@ divergence. The test's assertion polarity flips after A2 ships — drift=0
 becomes the regression-net assertion for "rollback unwinds shmem
 correctly."
 
+M10.D1 ✅ (acct-w88b, 2026-05-12) — invariant catalog landed at
+[`INVARIANTS.md`](INVARIANTS.md) (18 active + 7 placeholders for
+in-flight sub-issues). Five previously-unpinned invariants (I1 seq
+monotonicity, I2 drained ≤ last_seq, I4 OCCUPIED_COUNT consistency,
+I13 bgworker per-DB scope, I14 reset completeness) now have explicit
+pinning tests in `poc/batch-ledger/tests/invariants_t1.rs`. Future
+M10 sub-issues update INVARIANTS.md as they pin new invariants
+(I19-I25 reserved).
+
 Remaining M10 sub-issues (open):
 - acct-4e91 — A2 XactCallback + SubXactCallback + PENDING_STACK (~1 day)
 - acct-zo4t — B4-prep seqlock for WAC-grade torn-read prevention (~0.5 day)
 - acct-n4mo — B4 post_batch_wac_shmem + bench (~2-3 days)
-- acct-w88b — D1 INVARIANTS.md catalog + pin unpinned (~4 hours)
 - acct-jjqc / nn31 / 713c — B1/B2/B3 multi-dimension scenarios
 - acct-j0nh / jh9k — B6/B7 backpressure + load-factor curves
 - acct-mii6 — B8 concurrent accounts table activity
