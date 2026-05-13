@@ -80,6 +80,11 @@ use portable_atomic::AtomicU128;
 
 pgrx::pg_module_magic!();
 
+// acct-e9tf — FIFO maximal F (revised). Lives in its own module so the
+// WAC (M1-M10) and FIFO (sub 1+) primitives stay structurally separate
+// even when they share `_PG_init` wiring.
+mod fifo;
+
 // 16384 slots × 64-byte cache-aligned bucket = 1 MiB shmem.
 // Sized so the fan-out PoC bench (5000 accounts) lands at a sub-30%
 // load factor with comfortable headroom. Open-addressing probes
@@ -220,6 +225,11 @@ pub extern "C-unwind" fn _PG_init() {
     pg_shmem_init!(LEDGER_SHMEM_INSERT_FAILURES);
     pg_shmem_init!(LEDGER_DRAIN_CONSECUTIVE_FAILS);
     pg_shmem_init!(LEDGER_DRAIN_TOTAL_FAILURES);
+
+    // acct-e9tf — FIFO arena + per-cell LWLock tranche. Rides the same
+    // shmem_request_hook / shmem_startup_hook chain that the WAC
+    // pg_shmem_init!() calls above wire up.
+    fifo::init();
 
     // acct-17vr: register XactCallback + SubXactCallback unconditionally
     // at postmaster init. Each forked backend inherits the callback list,
