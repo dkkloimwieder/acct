@@ -178,7 +178,7 @@ drift=0 after A2 (acct-4e91) ships.
 
 ---
 
-## I8 — Rollback unwinds shmem (KNOWN GAP, A2 fixes)
+## I8 — Rollback unwinds shmem, COMMIT applies
 
 **Statement.** After `BEGIN; ledger_apply_balance_delta(...); ROLLBACK;`,
 the shmem cell does NOT retain the applied delta. After
@@ -188,18 +188,20 @@ the shmem cell does NOT retain the applied delta. After
 transaction silently leaves shmem drifted from the ledger. Recon picks
 it up but the discrepancy is structurally inevitable, not exceptional.
 
-**Currently violated.** Confirmed 2026-05-12 by acct-2733 / M10.A1 via
-V1 + V2 probes in `tests/rollback_correctness_t1.rs`.
+**Enforced by.** A2 (acct-4e91, 2026-05-13). `ledger_apply_balance_delta`
+STAGES `(amount_delta, qty_delta, captured_rollup_seed)` into a
+per-backend `PENDING_STACK`. The XactCallback Commit hook applies
+staged deltas; Abort hook discards. SubXactCallback handles
+SAVEPOINT (`START_SUB` pushes frame; `COMMIT_SUB` merges into parent;
+`ABORT_SUB` pops). `src/lib.rs`: `stage_apply`,
+`ledger_xact_callback`, `ledger_subxact_callback`, `xact_commit`,
+`xact_abort`, `subxact_*`.
 
-**Fix.** acct-4e91 (M10.A2) introduces `RegisterXactCallback` for
-PreCommit/Commit/Abort and `RegisterSubXactCallback` for savepoints,
-plus a per-backend `PENDING_STACK` and `REGISTERED` flag. Applies
-stage into the top of the stack; commit hook drains; rollback hook
-discards.
-
-**Pinned by.** Currently `tests/rollback_correctness_t1.rs` (asserts
-the bug exists). Post-A2, the polarity flips and the same file becomes
-the regression net for "rollback unwinds shmem correctly."
+**Pinned by.** `tests/rollback_correctness_t1.rs` V1 (minimal rollback
+unwind), V2 (recon stays clean after rollback), V3 (commit applies).
+Plus `tests/transactional_t1.rs` T2 (savepoint nesting), T3
+(cross-backend isolation), T5 (multi-cell collapse), T6 (drain
+isolation from staged), T7 (RYW limitation pinned).
 
 ---
 
@@ -429,21 +431,94 @@ than `init_drained_seq`.
 
 ---
 
+## I19 — Same-key applies within one (sub)transaction collapse
+
+**Statement.** Two or more `ledger_apply_balance_delta` calls against
+the same packed key within a single (sub)transaction produce exactly
+one shmem mutation at COMMIT, with the deltas summed.
+
+**Why.** Without collapse, repeated applies on the same cell would
+cause multiple LWLock acquisitions + atomic fetch_adds at commit
+time. The PoC's `post_batch_shmem` doesn't typically same-key-apply,
+but BOM rollup workloads and future intercompany matching would.
+
+**Enforced by.** `stage_apply` (`src/lib.rs`) — checks
+`PENDING_STACK[top]` for an existing entry first; if present, sums
+deltas and returns. Otherwise creates a new entry. SubXact COMMIT_SUB
+merges popped frame into parent via `merge_entry`, summing same-key
+deltas across frames.
+
+**Pinned by.** `tests/transactional_t1.rs::t5_multi_cell_collapse` —
+three applies, two distinct keys; asserts post-commit balances reflect
+summed deltas and APPLY_SEQ advances by N-distinct-keys, not N-calls.
+
+---
+
+## I20 — Subtransaction rollback discards only its own frame
+
+**Statement.** `ROLLBACK TO SAVEPOINT s` discards the deltas staged
+since `SAVEPOINT s` without affecting deltas staged before. `RELEASE
+SAVEPOINT s` merges the released subtxn's deltas into its parent,
+preserving them for the eventual COMMIT.
+
+**Why.** Standard PG transactional semantics: clients use savepoints
+for error recovery. If the extension's staging didn't respect
+subxact boundaries, a `ROLLBACK TO` would either lose pre-savepoint
+work or fail to discard the inner work.
+
+**Enforced by.** `ledger_subxact_callback` dispatches `START_SUB` →
+push fresh frame, `COMMIT_SUB` → pop + merge into parent,
+`ABORT_SUB` → pop + discard. `src/lib.rs`: `subxact_start_sub`,
+`subxact_commit_sub`, `subxact_abort_sub`.
+
+**Pinned by.** `tests/transactional_t1.rs::t2_savepoint_nesting` —
+the canonical example `(+100, savepoint s1, +50, savepoint s2, +20,
+rollback to s2, release s1, commit)` asserts post-commit balance =
+pre + 150.
+
+---
+
 ## Future invariants (placeholder slots)
 
-Reserved IDs for invariants surfaced by M10 sub-issues:
+Reserved IDs for invariants surfaced by remaining M10 sub-issues:
 
 | # | Tentative statement | Tracking issue |
 |---|---|---|
-| I19 | Per-cell apply via XactCallback is atomic with PG commit | acct-4e91 (A2) |
-| I20 | SubXact rollback discards only the aborted savepoint's deltas | acct-4e91 (A2) |
 | I21 | Hash-full returns recoverable -1 sentinel, not panic | acct-3ee2 (C1) |
 | I22 | Bgworker survives SPI errors via consecutive-failure counter | acct-3ovt (C2) |
 | I23 | Panic during apply releases LWLock guard cleanly | acct-plle (C6) |
 | I24 | GUC `drain_interval_ms` reloads on SIGHUP without restart | acct-vd74 (C4) |
 | I25 | Recon under concurrent writes returns coherent rows | acct-7eph (C5) |
+| I26 | Reader sees consistent (balance, qty) pair (seqlock pattern) | acct-zo4t (B4-prep) |
 
 Update this table as each sub-issue ships.
+
+---
+
+## A2 supplementary notes
+
+**Eager rollup_seed capture.** SPI (used by `lookup_rollup_seed`) is
+only safe in user-transaction context, not in commit callbacks. The
+staging path captures the rollup seed eagerly when the cell is
+missing from shmem at apply time, storing it alongside the delta.
+At commit, if the cell now exists (another backend's commit raced
+in), the captured seed is unused (we fall through to
+`try_update_existing`). If the cell still doesn't exist, the seed
+feeds `insert_new_seeded`. This preserves M6 lazy-load behavior.
+
+**RYW limitation.** Within a transaction, after staging an apply,
+the cell's shmem state is PRE-staging. Reads via
+`ledger_balance_lookup` or `balance()` return the unmutated value
+until COMMIT fires. The PoC integration (`post_batch_shmem`) doesn't
+RYW within a txn; this is non-load-bearing for current workloads.
+Pinned by `tests/transactional_t1.rs::t7_ryw_limitation`. A future
+RYW-requiring caller would need a TX-local sidecar cache.
+
+**`ledger_apply_balance_delta` return value.** Pre-A2 returned the
+new `last_seq`. Post-A2 returns `0` — apply is staging, no seq yet.
+Callers should query `ledger_balance_lookup` AFTER commit to observe
+the committed `last_seq`. Existing PoC code does not rely on the
+apply return.
 
 ---
 

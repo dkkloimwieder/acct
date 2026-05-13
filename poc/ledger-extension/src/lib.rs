@@ -10,13 +10,14 @@
 //! - M6: lazy-load from rollup on insert.
 //! - M7: `ledger_shmem_recon()` cross-checks shmem vs `posting_lines`.
 //! - M8: `post_batch_shmem` integration; recon drift=0.
-//! - **M9 (this commit): bench validation. Fan-in 2.16× over mutable
-//!   `post_batch`; fan-out 5.55× over mutable. Fan-out N_BUCKETS
-//!   bumped 4096→16384 to handle 5K-account load.**
-//! - M6: custom WAL RM + redo for crash recovery.
-//! - M7: recon hook (shmem vs `SUM(posting_lines)` at quiescence).
-//! - M8: integrate with PoC `post_batch`.
-//! - M9: bench validation vs fan-in / fan-out / WAC-fan shapes.
+//! - M9: bench validation. Fan-in 2.16× over mutable `post_batch`;
+//!   fan-out 5.55× over mutable. N_BUCKETS bumped 4096→16384.
+//! - M10.A1: confirmed rollback correctness gap (acct-2733).
+//! - M10.D1: INVARIANTS.md catalog + pin tests (acct-w88b).
+//! - **M10.A2 (this commit): deferred-apply via XactCallback +
+//!   SubXactCallback. `ledger_apply_balance_delta` now STAGES into
+//!   a per-backend PENDING_STACK; commit applies, rollback discards.
+//!   SAVEPOINT support via SubXactCallback. (acct-4e91)**
 //!
 //! ## M3 concurrency design
 //!
@@ -66,7 +67,9 @@ use pgrx::bgworkers::{
 use pgrx::prelude::*;
 use pgrx::shmem::PGRXSharedMemory;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PgAtomic, PgLwLock, Spi, pg_shmem_init};
-use std::ffi::CString;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ffi::{CString, c_void};
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -471,6 +474,389 @@ fn lookup_rollup_seed(
     }
 }
 
+// ── M10.A2: deferred-apply via XactCallback + SubXactCallback ─────────
+//
+// Pre-A2, `ledger_apply_balance_delta` mutated shmem synchronously. A
+// `BEGIN; apply; ROLLBACK;` left the delta in shmem — the bug confirmed
+// by `tests/rollback_correctness_t1.rs` (M10.A1).
+//
+// A2 makes the apply transactional. Each call STAGES `(amount_delta,
+// qty_delta, captured_rollup_seed)` into a per-backend thread-local
+// PENDING_STACK. The actual shmem mutation happens in the Commit
+// callback. Abort callback discards. SubXact callbacks support
+// SAVEPOINT / ROLLBACK TO semantics: START_SUB pushes a fresh frame;
+// COMMIT_SUB merges into parent; ABORT_SUB discards.
+//
+// Eager rollup_seed capture: SPI to `account_balances_rollup` is only
+// safe in user-transaction context, not in commit callbacks. So when
+// the staging path notices a cell missing from shmem at apply time, it
+// captures the rollup seed eagerly and stores it alongside the delta.
+// At commit time, the apply re-probes shmem under SHARED/EXCLUSIVE; if
+// the cell has appeared (another backend's commit raced in), it does
+// fetch_add and the captured seed is unused.
+//
+// Same-key collapse: PENDING_STACK[top] is a HashMap keyed by packed
+// u128; subsequent applies to the same key sum deltas. SubXact COMMIT
+// merges the popped frame into its parent, summing same-key deltas
+// again.
+//
+// RYW LIMITATION: in-txn `ledger_balance_lookup` returns PRE-apply
+// state because the cell isn't mutated until Commit. Existing PoC
+// integration (`post_batch_shmem`) does not RYW within a txn; no
+// load-bearing impact.
+
+#[derive(Clone, Copy, Default, Debug)]
+struct PendingEntry {
+    amount_delta: i64,
+    qty_delta: i64,
+    /// Captured eagerly when no cell existed in shmem at apply time. Used
+    /// by `insert_new_seeded` if the cell still doesn't exist at commit.
+    rollup_seed: Option<(i64, i64, u64)>,
+    /// Set after the first apply did its rollup_seed lookup. Prevents
+    /// repeat SPI on collapse + subxact-merge paths.
+    rollup_seed_captured: bool,
+}
+
+thread_local! {
+    /// Per-backend pending deltas. Vec of frames: index 0 is the
+    /// top-level transaction; subxacts push/pop. Initialized lazily
+    /// (the const initializer below runs at thread_local first-access
+    /// per backend).
+    static PENDING_STACK: RefCell<Vec<HashMap<u128, PendingEntry>>> =
+        const { RefCell::new(Vec::new()) };
+
+    /// Whether this backend has registered XactCallback + SubXactCallback
+    /// with PG. Callbacks are registered exactly once per backend on
+    /// first apply.
+    static REGISTERED: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Read-only probe. Returns true if a cell for `key` exists in shmem.
+#[inline]
+fn cell_exists(table: &HashTable, key: u128) -> bool {
+    let start = slot_for(key);
+    let key_hi = (key >> 64) as u64;
+    let key_lo = key as u64;
+    for probe in 0..N_BUCKETS {
+        let idx = (start + probe) & (N_BUCKETS - 1);
+        let b = &table.buckets[idx];
+        if b.occupied.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        if b.key_hi.load(Ordering::Acquire) == key_hi
+            && b.key_lo.load(Ordering::Acquire) == key_lo
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Ensure PENDING_STACK has at least one frame (the top-level txn
+/// frame). Called before any push/insert.
+fn ensure_top_frame() {
+    PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        if stack.is_empty() {
+            stack.push(HashMap::new());
+        }
+    });
+}
+
+/// Lazy registration: install XactCallback + SubXactCallback exactly
+/// once per backend.
+fn ensure_callbacks_registered() {
+    REGISTERED.with(|reg| {
+        if !*reg.borrow() {
+            unsafe {
+                pg_sys::RegisterXactCallback(
+                    Some(ledger_xact_callback),
+                    std::ptr::null_mut(),
+                );
+                pg_sys::RegisterSubXactCallback(
+                    Some(ledger_subxact_callback),
+                    std::ptr::null_mut(),
+                );
+            }
+            *reg.borrow_mut() = true;
+        }
+    });
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn ledger_xact_callback(
+    event: pg_sys::XactEvent::Type,
+    _arg: *mut c_void,
+) {
+    match event {
+        pg_sys::XactEvent::XACT_EVENT_PRE_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_PRE_COMMIT => xact_pre_commit(),
+        pg_sys::XactEvent::XACT_EVENT_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_COMMIT => xact_commit(),
+        pg_sys::XactEvent::XACT_EVENT_ABORT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => xact_abort(),
+        _ => {}
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn ledger_subxact_callback(
+    event: pg_sys::SubXactEvent::Type,
+    _my_subid: pg_sys::SubTransactionId,
+    _parent_subid: pg_sys::SubTransactionId,
+    _arg: *mut c_void,
+) {
+    match event {
+        pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => subxact_start_sub(),
+        pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => subxact_commit_sub(),
+        pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => subxact_abort_sub(),
+        _ => {}
+    }
+}
+
+/// PreCommit: count distinct new keys that would require insert_new
+/// at commit time. If `current_occupied + new_keys > N_BUCKETS`, raise
+/// `error!` — PG aborts the COMMIT cleanly.
+fn xact_pre_commit() {
+    // Collect new keys from all frames (defensive; subxact callbacks
+    // should have merged everything into frame 0 by this point).
+    let new_keys: Vec<u128> = PENDING_STACK.with(|s| {
+        let stack = s.borrow();
+        let mut keys: Vec<u128> = Vec::new();
+        for frame in stack.iter() {
+            for &key in frame.keys() {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys
+    });
+
+    if new_keys.is_empty() {
+        return;
+    }
+
+    let mut new_inserts = 0usize;
+    {
+        let table = HASH_TABLE.share();
+        for key in &new_keys {
+            if !cell_exists(&table, *key) {
+                new_inserts += 1;
+            }
+        }
+    }
+
+    if new_inserts > 0 {
+        let current = OCCUPIED_COUNT.get().load(Ordering::Acquire) as usize;
+        if current + new_inserts > N_BUCKETS {
+            error!(
+                "ledger_xact_pre_commit: hash table would overflow at commit \
+                 (occupied={current}, new_keys={new_inserts}, cap={N_BUCKETS})"
+            );
+        }
+    }
+}
+
+/// Commit: apply all staged deltas. Two-pass: SHARED for existing
+/// cells, EXCLUSIVE for inserts.
+///
+/// MUST succeed. Any error here will be reported by PG but the
+/// transaction has already committed in the durable sense — the user
+/// SQL state is the source of truth, shmem just lags. The PreCommit
+/// hook is responsible for catching capacity overflow; commit-phase
+/// errors should be vanishingly rare (race against reset, OOM).
+fn xact_commit() {
+    let entries = drain_pending_stack();
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut needs_insert: Vec<(u128, PendingEntry)> = Vec::new();
+    {
+        let table = HASH_TABLE.share();
+        for (key, entry) in entries {
+            if try_update_existing(&table, key, entry.amount_delta, entry.qty_delta).is_some() {
+                continue;
+            }
+            needs_insert.push((key, entry));
+        }
+    }
+
+    if !needs_insert.is_empty() {
+        let table = HASH_TABLE.exclusive();
+        for (key, entry) in needs_insert {
+            // Re-probe under EXCLUSIVE: a concurrent backend's commit
+            // may have created the cell since our SHARED-probe miss.
+            if try_update_existing(&table, key, entry.amount_delta, entry.qty_delta).is_some() {
+                continue;
+            }
+            insert_new_seeded(
+                &table,
+                key,
+                entry.rollup_seed,
+                entry.amount_delta,
+                entry.qty_delta,
+            );
+        }
+    }
+}
+
+/// Abort: discard all staged deltas. Reset stack to a single empty
+/// frame. Idempotent across nested aborts because PG only fires
+/// XACT_EVENT_ABORT at top-level rollback.
+fn xact_abort() {
+    PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        stack.clear();
+        stack.push(HashMap::new());
+    });
+}
+
+/// Take all pending frames, merge into one map collapsing same-key
+/// deltas, leave a fresh empty top-level frame.
+fn drain_pending_stack() -> HashMap<u128, PendingEntry> {
+    PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let mut merged: HashMap<u128, PendingEntry> = HashMap::new();
+        for frame in stack.drain(..) {
+            for (key, entry) in frame {
+                merge_entry(&mut merged, key, entry);
+            }
+        }
+        stack.push(HashMap::new());
+        merged
+    })
+}
+
+fn merge_entry(map: &mut HashMap<u128, PendingEntry>, key: u128, entry: PendingEntry) {
+    map.entry(key)
+        .and_modify(|e| {
+            e.amount_delta = e.amount_delta.saturating_add(entry.amount_delta);
+            e.qty_delta = e.qty_delta.saturating_add(entry.qty_delta);
+            // First captured seed wins — represents the durable state at
+            // earliest staging time, which is what insert_new_seeded
+            // would have used for a then-missing cell.
+            if !e.rollup_seed_captured {
+                e.rollup_seed = entry.rollup_seed;
+                e.rollup_seed_captured = entry.rollup_seed_captured;
+            }
+        })
+        .or_insert(entry);
+}
+
+fn subxact_start_sub() {
+    PENDING_STACK.with(|s| {
+        s.borrow_mut().push(HashMap::new());
+    });
+}
+
+fn subxact_commit_sub() {
+    PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let popped = match stack.pop() {
+            Some(f) => f,
+            None => {
+                // No-op: subxact COMMIT_SUB fired without a matching
+                // START_SUB (would indicate a callback registered
+                // mid-subxact). Re-establish invariant defensively.
+                stack.push(HashMap::new());
+                return;
+            }
+        };
+        if stack.is_empty() {
+            // Restore single-frame invariant; carry the merged result
+            // forward as the new top-level frame.
+            stack.push(popped);
+            return;
+        }
+        let parent = stack.last_mut().unwrap();
+        for (key, entry) in popped {
+            merge_entry(parent, key, entry);
+        }
+    });
+}
+
+fn subxact_abort_sub() {
+    PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let _ = stack.pop();
+        if stack.is_empty() {
+            stack.push(HashMap::new());
+        }
+    });
+}
+
+/// Stage `(amount_delta, qty_delta)` for the cell keyed by
+/// `(account_id, period_id, currency_id, ledger_kind)`. On the first
+/// stage in a backend, registers the XactCallback + SubXactCallback so
+/// the staged deltas apply at COMMIT and discard on ROLLBACK.
+///
+/// Same-key applies within one (sub)transaction are collapsed into a
+/// single pending entry (deltas summed). SubXact START pushes a fresh
+/// frame; COMMIT_SUB merges into parent; ABORT_SUB discards.
+fn stage_apply(
+    account_id: i64,
+    period_id: i32,
+    currency_id: i16,
+    ledger_kind: i16,
+    amount_delta: i64,
+    qty_delta: i64,
+) {
+    ensure_callbacks_registered();
+    ensure_top_frame();
+    let key = pack_key(account_id, period_id, currency_id, ledger_kind as u8);
+
+    // Fast path: if entry already exists in the top frame, just sum.
+    let need_seed = PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let top = stack.last_mut().unwrap();
+        if let Some(existing) = top.get_mut(&key) {
+            existing.amount_delta = existing.amount_delta.saturating_add(amount_delta);
+            existing.qty_delta = existing.qty_delta.saturating_add(qty_delta);
+            return false;
+        }
+        // Reserve the entry; rollup_seed populated below if needed.
+        top.insert(
+            key,
+            PendingEntry {
+                amount_delta,
+                qty_delta,
+                rollup_seed: None,
+                rollup_seed_captured: false,
+            },
+        );
+        true
+    });
+
+    if !need_seed {
+        return;
+    }
+
+    // Probe shmem under SHARED. If the cell already exists, no
+    // rollup_seed needed — at commit we'll just fetch_add against the
+    // existing cell.
+    let exists_in_shmem = {
+        let table = HASH_TABLE.share();
+        cell_exists(&table, key)
+    };
+
+    let seed = if exists_in_shmem {
+        None
+    } else {
+        lookup_rollup_seed(account_id, period_id, currency_id, ledger_kind)
+    };
+
+    PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let top = stack.last_mut().unwrap();
+        if let Some(entry) = top.get_mut(&key) {
+            entry.rollup_seed = seed;
+            entry.rollup_seed_captured = true;
+        }
+    });
+}
+
 // ── SQL surface ───────────────────────────────────────────────────────
 
 #[pg_extern]
@@ -531,10 +917,25 @@ fn ledger_shmem_drained_count() -> i64 {
     n
 }
 
-/// The hot-path apply. Adds (`amount_delta`, `qty_delta`) to the cell
-/// keyed by (`account_id`, `period_id`, `currency_id`, `ledger_kind`),
-/// creating the cell with the deltas as initial values if absent.
-/// Returns the new `last_seq`.
+/// The hot-path apply. STAGES `(amount_delta, qty_delta)` into the
+/// per-backend pending stack; the actual shmem mutation happens at
+/// COMMIT via the XactCallback. ROLLBACK / ROLLBACK TO discard the
+/// staged delta.
+///
+/// **Return value semantics changed in M10.A2.** Pre-A2, the function
+/// returned the cell's new `last_seq` (synchronous shmem mutation).
+/// Post-A2, it returns `0` — the cell's actual `last_seq` is not
+/// known until COMMIT fires. Callers that need to observe the
+/// post-commit seq should query `ledger_balance_lookup` AFTER the
+/// transaction commits.
+///
+/// **Read-your-writes limitation.** Within a transaction,
+/// `ledger_balance_lookup` returns PRE-staging state because the
+/// cell isn't mutated until COMMIT. The PoC integration
+/// (`post_batch_shmem`) doesn't RYW in a transaction, so this is
+/// non-load-bearing. A future RYW-requiring caller would need a
+/// TX-local sidecar cache or the more invasive "provisional shmem
+/// delta + commit-confirm" pattern.
 #[pg_extern]
 fn ledger_apply_balance_delta(
     account_id: i64,
@@ -544,26 +945,15 @@ fn ledger_apply_balance_delta(
     amount_delta: i64,
     qty_delta: i64,
 ) -> i64 {
-    let key = pack_key(account_id, period_id, currency_id, ledger_kind as u8);
-    {
-        let table = HASH_TABLE.share();
-        if let Some(seq) = try_update_existing(&table, key, amount_delta, qty_delta) {
-            return seq as i64;
-        }
-    }
-
-    // M6: cell not in shmem. Look up rollup BEFORE taking exclusive lock
-    // so the rare lazy-load path doesn't lengthen the lock hold time. A
-    // concurrent inserter racing us between SPI lookup and exclusive
-    // acquire is harmless — re-probe inside exclusive catches it and
-    // routes through the update path; our SPI result is discarded.
-    let rollup_seed = lookup_rollup_seed(account_id, period_id, currency_id, ledger_kind);
-
-    let table = HASH_TABLE.exclusive();
-    if let Some(seq) = try_update_existing(&table, key, amount_delta, qty_delta) {
-        return seq as i64;
-    }
-    insert_new_seeded(&table, key, rollup_seed, amount_delta, qty_delta) as i64
+    stage_apply(
+        account_id,
+        period_id,
+        currency_id,
+        ledger_kind,
+        amount_delta,
+        qty_delta,
+    );
+    0
 }
 
 /// Read the cell at (`account_id`, `period_id`, `currency_id`,

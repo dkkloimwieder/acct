@@ -52,9 +52,16 @@ fn synthetic_offset() -> i64 {
 }
 
 /// I1 — APPLY_SEQ and per-cell last_seq are strictly monotonic across
-/// successive applies. Probes both the global counter via
-/// `ledger_shmem_apply_seq()` and the per-cell value returned by
-/// `ledger_apply_balance_delta`.
+/// successive applies.
+///
+/// **A2 note:** post-acct-4e91, `ledger_apply_balance_delta` returns
+/// 0 (staging op, no seq) — APPLY_SEQ advances at COMMIT, not at
+/// apply time. The cell's `last_seq` is set during the commit
+/// callback. So the assertions here check:
+/// - APPLY_SEQ advances by at least N across N auto-committed
+///   applies (concurrent tests may add more).
+/// - The cell's `last_seq` after the loop is non-zero and is a
+///   plausible value relative to APPLY_SEQ.
 #[tokio::test]
 async fn i1_seq_monotonicity() {
     let pool = PgPoolOptions::new()
@@ -76,19 +83,19 @@ async fn i1_seq_monotonicity() {
         .await
         .expect("pre apply_seq");
 
-    // Apply 100 times against the same cell; capture each returned seq.
+    // Apply 100 times against the same cell; each call auto-commits
+    // (single-statement implicit txn), firing xact_commit which
+    // advances APPLY_SEQ by 1 for this cell.
     let n = 100;
-    let mut seqs: Vec<i64> = Vec::with_capacity(n);
     for _ in 0..n {
-        let s: i64 = sqlx::query_scalar(
+        sqlx::query(
             "SELECT ledger_apply_balance_delta($1::bigint, $2::int, 1::smallint, 1::smallint, 1, 0)",
         )
         .bind(acct)
         .bind(period)
-        .fetch_one(&pool)
+        .execute(&pool)
         .await
         .expect("apply");
-        seqs.push(s);
     }
 
     let post_global: i64 = sqlx::query_scalar("SELECT ledger_shmem_apply_seq()")
@@ -96,24 +103,13 @@ async fn i1_seq_monotonicity() {
         .await
         .expect("post apply_seq");
 
-    // Global APPLY_SEQ advanced by at least N (concurrent tests may add more).
     assert!(
         post_global >= pre_global + n as i64,
-        "APPLY_SEQ regressed or didn't advance: pre={pre_global} post={post_global} n={n}"
+        "APPLY_SEQ did not advance enough: pre={pre_global} post={post_global} n={n}"
     );
 
-    // Per-call returned seqs are strictly increasing.
-    for w in seqs.windows(2) {
-        assert!(
-            w[1] > w[0],
-            "per-cell seq not monotonic: {} -> {}",
-            w[0],
-            w[1]
-        );
-    }
-
-    // The per-cell last_seq reported by ledger_balance_lookup matches
-    // the last returned seq.
+    // The cell's last_seq is set by the commit-time next_seq() call;
+    // it must be > 0 and within the global APPLY_SEQ snapshot.
     let row = sqlx::query(
         "SELECT last_seq FROM ledger_balance_lookup($1::bigint, $2::int, 1::smallint, 1::smallint)",
     )
@@ -123,10 +119,30 @@ async fn i1_seq_monotonicity() {
     .await
     .expect("lookup");
     let last_seq: Option<i64> = row.get(0);
+    let last_seq = last_seq.expect("cell should exist post-commits");
+    assert!(
+        last_seq > pre_global,
+        "I1: cell last_seq ({last_seq}) should exceed pre_global ({pre_global})"
+    );
+    assert!(
+        last_seq <= post_global,
+        "I1: cell last_seq ({last_seq}) cannot exceed APPLY_SEQ snapshot ({post_global})"
+    );
+
+    // The cell's balance reflects all 100 applies (delta-1 each).
+    let bal_row = sqlx::query(
+        "SELECT balance FROM ledger_balance_lookup($1::bigint, $2::int, 1::smallint, 1::smallint)",
+    )
+    .bind(acct)
+    .bind(period)
+    .fetch_one(&pool)
+    .await
+    .expect("balance lookup");
+    let balance: Option<i64> = bal_row.get(0);
     assert_eq!(
-        last_seq,
-        Some(*seqs.last().unwrap()),
-        "ledger_balance_lookup last_seq disagrees with final apply's returned seq"
+        balance,
+        Some(n as i64),
+        "I1: cell balance should equal N=100 applied deltas"
     );
 }
 

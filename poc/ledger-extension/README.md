@@ -122,16 +122,28 @@ becomes the regression-net assertion for "rollback unwinds shmem
 correctly."
 
 M10.D1 ✅ (acct-w88b, 2026-05-12) — invariant catalog landed at
-[`INVARIANTS.md`](INVARIANTS.md) (18 active + 7 placeholders for
-in-flight sub-issues). Five previously-unpinned invariants (I1 seq
-monotonicity, I2 drained ≤ last_seq, I4 OCCUPIED_COUNT consistency,
-I13 bgworker per-DB scope, I14 reset completeness) now have explicit
-pinning tests in `poc/batch-ledger/tests/invariants_t1.rs`. Future
-M10 sub-issues update INVARIANTS.md as they pin new invariants
-(I19-I25 reserved).
+[`INVARIANTS.md`](INVARIANTS.md). Five previously-unpinned invariants
+(I1 seq monotonicity, I2 drained ≤ last_seq, I4 OCCUPIED_COUNT
+consistency, I13 bgworker per-DB scope, I14 reset completeness) now
+have explicit pinning tests in
+`poc/batch-ledger/tests/invariants_t1.rs`.
+
+M10.A2 ✅ (acct-4e91, 2026-05-13) — deferred-apply via XactCallback +
+SubXactCallback. `ledger_apply_balance_delta` STAGES into a
+per-backend PENDING_STACK; commit applies, rollback discards;
+SAVEPOINT supported via SubXactCallback. Closes the rollback
+correctness gap M10.A1 confirmed: rollback_correctness_t1.rs V1/V2
+assertions FLIPPED to drift=0 (regression net). Plus
+transactional_t1.rs adds 5 tests covering savepoint nesting,
+cross-backend isolation, multi-cell collapse, drain isolation,
+RYW-limitation pinning. INVARIANTS.md gains I19 (same-key collapse)
++ I20 (savepoint discard) pinned by the new tests; I8 statement
+flipped from "KNOWN GAP" to enforced form.
+
+A2 perf delta vs M9 documented in
+[`bench/results-shmem-apply-A2.md`](../../batch-ledger/bench/results-shmem-apply-A2.md).
 
 Remaining M10 sub-issues (open):
-- acct-4e91 — A2 XactCallback + SubXactCallback + PENDING_STACK (~1 day)
 - acct-zo4t — B4-prep seqlock for WAC-grade torn-read prevention (~0.5 day)
 - acct-n4mo — B4 post_batch_wac_shmem + bench (~2-3 days)
 - acct-jjqc / nn31 / 713c — B1/B2/B3 multi-dimension scenarios
