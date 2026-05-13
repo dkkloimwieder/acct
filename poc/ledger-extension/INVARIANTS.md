@@ -44,9 +44,22 @@ inter-thread reordering. `insert_new_seeded` is called under EXCLUSIVE
 (no race), so plain `store` is correct there. Reset path zeroes both
 atomics.
 
-**Pinned by.** `tests/invariants_t1.rs::i1_seq_monotonicity` (this
-issue) — samples `ledger_shmem_apply_seq()` across many applies; asserts
-strictly increasing.
+**Pinned by.**
+- `tests/invariants_t1.rs::i1_seq_monotonicity` — single-threaded;
+  samples `ledger_shmem_apply_seq()` (global) across N applies and
+  asserts the cell's final `last_seq` falls within the [pre, post]
+  global snapshot.
+- `tests/invariants_t1.rs::i1b_per_cell_last_seq_monotonic`
+  (acct-fyl3) — multi-writer + dedicated readers tight-looping on
+  `ledger_balance_lookup`. Each reader asserts the sequence of
+  observed `last_seq` values is non-decreasing within its own view.
+  Stress test rather than a falsification gate — the race window
+  between `next_seq()` and the store is microseconds-wide and gets
+  re-advanced by the next peer apply before a SQL lookup round-trip
+  resolves; empirical probing against a buggy `store` variant
+  surfaced zero violations across ~27K applies. Test serves as a
+  multi-writer regression net + sanity check that final balance
+  matches applied deltas.
 
 ---
 

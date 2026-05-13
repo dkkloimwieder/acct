@@ -4,6 +4,8 @@
 //! invariants that the M9 PoC scenarios protected only implicitly:
 //!
 //! - **I1** APPLY_SEQ and per-cell `last_seq` are monotonic.
+//! - **I1b** per-cell `last_seq` is monotone across concurrent writers
+//!   (acct-fyl3 — falsification gate for the `store→fetch_max` fix).
 //! - **I2** drained_seq ≤ last_seq always.
 //! - **I4** OCCUPIED_COUNT matches actual occupied buckets.
 //! - **I13** bgworker scoped to `ledger.drain_database`.
@@ -143,6 +145,219 @@ async fn i1_seq_monotonicity() {
         balance,
         Some(n as i64),
         "I1: cell balance should equal N=100 applied deltas"
+    );
+}
+
+/// I1b — per-cell `last_seq` is monotone under concurrent writers.
+///
+/// **acct-fyl3 — regression guard for the store→fetch_max fix.**
+///
+/// The bug: pre-fix, `try_update_existing` did
+/// `b.last_seq.store(seq, Release)` after pulling `seq` from
+/// `next_seq()`. Under multi-writer SHARED LWLock, two writers can
+/// race so that the *later* `next_seq()` caller commits its store
+/// FIRST, and the *earlier* caller's `store(smaller_seq)` lands
+/// AFTER, leaving the cell at a value SMALLER than was previously
+/// observed by some thread. Post-fix uses `fetch_max(seq, AcqRel)`,
+/// guaranteeing per-cell monotonicity regardless of inter-thread
+/// reordering.
+///
+/// **Falsification limit (documented honestly).** This test was
+/// designed as a falsification gate but empirical probing against
+/// the buggy `store` variant on this rig surfaced zero violations
+/// across ~27K applies + ~14K reader samples (4s wall). The race
+/// window between `next_seq()` and the store is a few CPU
+/// instructions wide; the cell is re-advanced by the very next peer
+/// apply within microseconds, far faster than a SQL lookup
+/// round-trip (~30–100 µs) can resolve. The bug is real — the
+/// reasoning is in `lib.rs` at the fetch_max site — but SQL-driven
+/// probing cannot catch its transient regression window.
+///
+/// What this test still pins:
+/// - The multi-writer SHARED-lock cell-update path holds up under
+///   heavy concurrent contention without crashing, deadlocking, or
+///   losing applies (final balance matches total applied deltas).
+/// - The final `last_seq` is at least as large as the max observed
+///   by any reader (sanity check on the value being stable post-
+///   quiescence).
+/// - Future regressions that widen the race window (e.g.,
+///   introducing yields or expensive work between `next_seq()` and
+///   `fetch_max`) would be more likely to surface here than in
+///   `i1_seq_monotonicity` (single-threaded).
+///
+/// Existing `i1_seq_monotonicity` covers the global APPLY_SEQ via
+/// `fetch_add`. This probe targets the per-cell update path with
+/// concurrent writers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 12)]
+async fn i1b_per_cell_last_seq_monotonic() {
+    let pool = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(&db_url())
+        .await
+        .expect("connect");
+
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS ledger_extension")
+        .execute(&pool)
+        .await
+        .expect("create ext");
+
+    let acct = synthetic_offset();
+    let period: i32 = 7_006;
+
+    // Seed the cell single-threaded so all workers race on the
+    // existing-cell `try_update_existing` path (where the fetch_max
+    // lives) rather than the EXCLUSIVE-protected insert_new_seeded.
+    sqlx::query(
+        "SELECT ledger_apply_balance_delta($1::bigint, $2::int, 1::smallint, 1::smallint, 1, 0)",
+    )
+    .bind(acct)
+    .bind(period)
+    .execute(&pool)
+    .await
+    .expect("seed cell");
+
+    // Race exposure: the buggy `store` race window between
+    // `next_seq() → store` is only a few CPU instructions wide.
+    // Detection pattern: dedicated polling readers tight-loop on
+    // last_seq lookup, recording the observed value series. The
+    // assertion is per-reader monotonicity. With buggy store, a
+    // peer-writer's late store will regress the cell below a value
+    // some reader has already observed.
+    //
+    // Writers pump applies to the same cell to keep contention high.
+    // Test runs for fixed wall-time so the falsification probability
+    // converges regardless of host speed.
+    const WRITERS: usize = 8;
+    const READERS: usize = 4;
+    const TEST_DURATION_MS: u64 = 4_000;
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let total_applies = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let mut writer_handles = Vec::new();
+    for _w in 0..WRITERS {
+        let pool = pool.clone();
+        let stop = stop.clone();
+        let total_applies = total_applies.clone();
+        let h = tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                sqlx::query(
+                    "SELECT ledger_apply_balance_delta($1::bigint, $2::int, 1::smallint, 1::smallint, 1, 0)",
+                )
+                .bind(acct)
+                .bind(period)
+                .execute(&pool)
+                .await
+                .expect("apply");
+                total_applies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        writer_handles.push(h);
+    }
+
+    let mut reader_handles = Vec::new();
+    for r in 0..READERS {
+        let pool = pool.clone();
+        let stop = stop.clone();
+        let h = tokio::spawn(async move {
+            let mut local_max: i64 = 0;
+            let mut violations: Vec<(i64, i64)> = Vec::new();
+            let mut samples: u64 = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let row = sqlx::query(
+                    "SELECT last_seq FROM ledger_balance_lookup($1::bigint, $2::int, 1::smallint, 1::smallint)",
+                )
+                .bind(acct)
+                .bind(period)
+                .fetch_one(&pool)
+                .await
+                .expect("lookup");
+                let observed: Option<i64> = row.get(0);
+                let observed = observed.expect("cell should exist after seed");
+                if observed < local_max {
+                    violations.push((local_max, observed));
+                }
+                if observed > local_max {
+                    local_max = observed;
+                }
+                samples += 1;
+            }
+            (r, samples, local_max, violations)
+        });
+        reader_handles.push(h);
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(TEST_DURATION_MS)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    for h in writer_handles {
+        h.await.expect("writer join");
+    }
+
+    let mut global_max: i64 = 0;
+    let mut all_violations: Vec<(usize, i64, i64)> = Vec::new();
+    let mut total_samples: u64 = 0;
+    for h in reader_handles {
+        let (r, samples, local_max, violations) = h.await.expect("reader join");
+        total_samples += samples;
+        if local_max > global_max {
+            global_max = local_max;
+        }
+        for (prev, obs) in violations {
+            all_violations.push((r, prev, obs));
+        }
+    }
+    let applies = total_applies.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "i1b: applies={applies} reader_samples={total_samples} global_max={global_max} violations={}",
+        all_violations.len()
+    );
+
+    if !all_violations.is_empty() {
+        let sample: Vec<String> = all_violations
+            .iter()
+            .take(10)
+            .map(|(r, prev, obs)| {
+                format!("reader={r} prev_max={prev} observed={obs}")
+            })
+            .collect();
+        panic!(
+            "I1b: per-cell last_seq regressed within at least one reader's view; \
+             total violations={} (sample, up to 10): {:?}",
+            all_violations.len(),
+            sample
+        );
+    }
+
+    // Final cell last_seq must dominate every per-worker max-observed.
+    let final_seq: Option<i64> = sqlx::query_scalar(
+        "SELECT last_seq FROM ledger_balance_lookup($1::bigint, $2::int, 1::smallint, 1::smallint)",
+    )
+    .bind(acct)
+    .bind(period)
+    .fetch_one(&pool)
+    .await
+    .expect("final lookup");
+    let final_seq = final_seq.expect("cell should exist post-test");
+    assert!(
+        final_seq >= global_max,
+        "I1b: final last_seq ({final_seq}) cannot be less than max-observed ({global_max})"
+    );
+
+    // Sanity: cell's balance must equal seed + total_applies (each delta=+1).
+    let bal: Option<i64> = sqlx::query_scalar(
+        "SELECT balance FROM ledger_balance_lookup($1::bigint, $2::int, 1::smallint, 1::smallint)",
+    )
+    .bind(acct)
+    .bind(period)
+    .fetch_one(&pool)
+    .await
+    .expect("balance lookup");
+    let expected = 1 + applies as i64;
+    assert_eq!(
+        bal,
+        Some(expected),
+        "I1b sanity: balance disagrees with applied deltas (seed=1 + applies={applies})"
     );
 }
 
