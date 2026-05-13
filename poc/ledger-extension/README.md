@@ -160,6 +160,25 @@ torn read `(balance=38022000, qty=38021)` within 15s); post-fix passes
 documented in
 [`bench/results-shmem-apply-B4prep.md`](../../batch-ledger/bench/results-shmem-apply-B4prep.md).
 
+acct-2g9w ✅ (2026-05-13) — `ledger_dispatch_wac_batch` + maximal SQL
+wrapper (`post_batch_wac_shmem_maximal`, migs 0018 / 0019). Pushes WAC
+running-avg dispatch fully into Rust: parses envelope JSONB, validates,
+maintains an in-batch `HashMap<i64, (i64, i64)>` running-avg pool map
+(lazy-seeded from shmem via inlined probe — no `TableIterator<Vec>`
+allocation per pool), computes per-leg `(amount, qty)` for transfer
+/ wac_receipt / wac_issue, stages all legs via `stage_apply`, and
+returns priced legs through a `TableIterator`. SQL wrapper (mig 0019)
+collapses to a single CTE statement: input parse, replay anti-JOIN,
+dispatcher call, set-based INSERT, status return — no temp table.
+Headline: **fan-in 1.28× (72K tps) / fan-out 5.24× (59K tps)** over
+B4's mig 0014 baseline; **fan-out p99 collapse from 2,626 ms → 453 ms
+(-83%)**. The minimal r8xv variant (acct-r8xv) falsified the call-
+boundary-overhead hypothesis; maximal proves the actual ceiling was
+plpgsql per-envelope work. Below the 70K state-memo stretch target
+on fan-out (posting_lines INSERT + WAL is irreducible by design) but
+above the acct-togd 7-10× projection floor. Bench details in
+[`bench/results-shmem-wac-maximal.md`](../../batch-ledger/bench/results-shmem-wac-maximal.md).
+
 M10.B4 ✅ (acct-n4mo, 2026-05-13) — `post_batch_wac_shmem` (mig 0014)
 applies WAC perpetual via the shmem hot path with the AtomicU128
 coupled-read guarantee. Pool snapshot at batch start comes from

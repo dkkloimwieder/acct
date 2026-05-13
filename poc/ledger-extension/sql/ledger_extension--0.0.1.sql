@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'ledger_apply_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1262
+-- src/lib.rs:1530
 -- ledger_extension::ledger_balance_lookup
 CREATE  FUNCTION "ledger_balance_lookup"(
 	"account_id" bigint, /* i64 */
@@ -52,7 +52,7 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1634
+-- src/lib.rs:1902
 -- requires:
 --   ledger_balance_lookup
 
@@ -114,6 +114,23 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
         RETURN NEXT;
     END;
     $body$ LANGUAGE plpgsql STABLE;
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:1319
+-- ledger_extension::ledger_dispatch_wac_batch
+CREATE  FUNCTION "ledger_dispatch_wac_batch"(
+	"envelopes" jsonb /* pgrx::datum::json::JsonB */
+) RETURNS TABLE (
+	"envelope_idx" INT,  /* i32 */
+	"debit_account_id" bigint,  /* i64 */
+	"credit_account_id" bigint,  /* i64 */
+	"amount" bigint,  /* i64 */
+	"qty" bigint  /* core::option::Option<i64> */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_dispatch_wac_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -198,7 +215,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_occupied_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1350
+-- src/lib.rs:1618
 -- ledger_extension::ledger_shmem_recon
 CREATE  FUNCTION "ledger_shmem_recon"() RETURNS TABLE (
 	"account_id" bigint,  /* i64 */
@@ -213,7 +230,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_recon_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1598
+-- src/lib.rs:1866
 -- ledger_extension::ledger_shmem_reset
 CREATE  FUNCTION "ledger_shmem_reset"() RETURNS void
 STRICT
@@ -222,7 +239,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1505
+-- src/lib.rs:1773
 -- ledger_extension::ledger_test_panic_after_fetch_add
 CREATE  FUNCTION "ledger_test_panic_after_fetch_add"(
 	"account_id" bigint, /* i64 */
@@ -238,7 +255,7 @@ AS 'MODULE_PATHNAME', 'ledger_test_panic_after_fetch_add_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1535
+-- src/lib.rs:1803
 -- ledger_extension::ledger_test_panic_before_fetch_add
 CREATE  FUNCTION "ledger_test_panic_before_fetch_add"(
 	"account_id" bigint, /* i64 */
@@ -252,7 +269,7 @@ AS 'MODULE_PATHNAME', 'ledger_test_panic_before_fetch_add_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1554
+-- src/lib.rs:1822
 -- ledger_extension::ledger_test_panic_in_exclusive
 CREATE  FUNCTION "ledger_test_panic_in_exclusive"(
 	"account_id" bigint, /* i64 */

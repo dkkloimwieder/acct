@@ -1256,6 +1256,274 @@ fn ledger_apply_batch(envelopes: pgrx::JsonB) -> i64 {
     parsed.len() as i64
 }
 
+/// acct-2g9w helper: probe shmem for `(value, qty)` at the PoC convention
+/// `(period_id=1, currency_id=1, ledger_kind=1)`. Returns `(0, 0)` if no
+/// cell exists. Inlined into the WAC dispatcher to avoid the
+/// `TableIterator<Vec>` allocation that `ledger_balance_lookup` does per
+/// call.
+#[inline]
+fn probe_shmem_pool(pool_id: i64) -> (i64, i64) {
+    let key = pack_key(pool_id, 1, 1, 1);
+    let key_hi = (key >> 64) as u64;
+    let key_lo = key as u64;
+    let table = HASH_TABLE.share();
+    let start = slot_for(key);
+    for probe in 0..N_BUCKETS {
+        let idx = (start + probe) & (N_BUCKETS - 1);
+        let b = &table.buckets[idx];
+        if b.occupied.load(Ordering::Acquire) == 0 {
+            return (0, 0);
+        }
+        if b.key_hi.load(Ordering::Acquire) == key_hi
+            && b.key_lo.load(Ordering::Acquire) == key_lo
+        {
+            return unpack_bal_qty(b.balance_qty.load(Ordering::Acquire));
+        }
+    }
+    (0, 0)
+}
+
+/// acct-2g9w — maximal r8xv. Push WAC running-avg dispatch fully into
+/// Rust. Wraps the per-envelope work of mig 0014's plpgsql
+/// `post_batch_wac_shmem`: shmem pool seed, in-batch running-avg map,
+/// per-leg amount/qty computation, and `stage_apply`. Returns per-
+/// envelope priced legs so the SQL wrapper can do a single set-based
+/// `INSERT INTO posting_lines`.
+///
+/// Envelope shape mirrors mig 0014:
+/// ```json
+/// {
+///   "envelope_idx": 0,
+///   "kind": "transfer" | "wac_receipt" | "wac_issue",
+///   "debit_account_id": ...,
+///   "credit_account_id": ...,
+///   "amount": ...,        // required for transfer
+///   "qty": ...,           // required for wac_*
+///   "unit_cost": ...      // required for wac_receipt
+/// }
+/// ```
+///
+/// Returned rows:
+///   transfer    : qty=NULL, amount=caller-supplied
+///   wac_receipt : qty=Some(qty), amount=qty*unit_cost
+///   wac_issue   : qty=Some(qty), amount=qty*running_avg
+///
+/// `period_id`, `currency_id`, `ledger_kind` are hardcoded to the PoC
+/// convention (1, 1, 1). Idempotency replays are pre-filtered by the
+/// SQL wrapper BEFORE invoking this fn — every envelope here is a
+/// fresh posting that will both INSERT a posting_line and stage_apply
+/// its legs.
+///
+/// Two-pass: validates ALL envelopes (raises on any malformed input)
+/// before any `stage_apply`. Atomicity matches `ledger_apply_batch`.
+#[pg_extern]
+fn ledger_dispatch_wac_batch(
+    envelopes: pgrx::JsonB,
+) -> TableIterator<
+    'static,
+    (
+        name!(envelope_idx, i32),
+        name!(debit_account_id, i64),
+        name!(credit_account_id, i64),
+        name!(amount, i64),
+        name!(qty, Option<i64>),
+    ),
+> {
+    let arr = match envelopes.0.as_array() {
+        Some(a) => a,
+        None => pgrx::error!("ledger_dispatch_wac_batch: envelopes must be a JSONB array"),
+    };
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Transfer,
+        WacReceipt,
+        WacIssue,
+    }
+    struct Parsed {
+        envelope_idx: i32,
+        kind: Kind,
+        debit: i64,
+        credit: i64,
+        amount: Option<i64>,
+        qty: Option<i64>,
+        unit_cost: Option<i64>,
+    }
+
+    // Pass 1: parse + structural validate.
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(arr.len());
+    for (idx, env) in arr.iter().enumerate() {
+        let obj = match env.as_object() {
+            Some(o) => o,
+            None => pgrx::error!(
+                "ledger_dispatch_wac_batch: envelope[{}] is not an object",
+                idx
+            ),
+        };
+        let kind_str = obj
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("transfer");
+        let kind = match kind_str {
+            "transfer" => Kind::Transfer,
+            "wac_receipt" => Kind::WacReceipt,
+            "wac_issue" => Kind::WacIssue,
+            other => pgrx::error!(
+                "ledger_dispatch_wac_batch: envelope[{}] unknown kind '{}'",
+                idx,
+                other
+            ),
+        };
+        let env_idx = obj
+            .get("envelope_idx")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(idx as i64) as i32;
+        let debit = match obj.get("debit_account_id").and_then(|v| v.as_i64()) {
+            Some(v) => v,
+            None => pgrx::error!(
+                "ledger_dispatch_wac_batch: envelope[{}] missing debit_account_id",
+                idx
+            ),
+        };
+        let credit = match obj.get("credit_account_id").and_then(|v| v.as_i64()) {
+            Some(v) => v,
+            None => pgrx::error!(
+                "ledger_dispatch_wac_batch: envelope[{}] missing credit_account_id",
+                idx
+            ),
+        };
+        let amount = obj.get("amount").and_then(|v| v.as_i64());
+        let qty = obj.get("qty").and_then(|v| v.as_i64());
+        let unit_cost = obj.get("unit_cost").and_then(|v| v.as_i64());
+
+        match kind {
+            Kind::Transfer => {
+                if amount.is_none() {
+                    pgrx::error!(
+                        "ledger_dispatch_wac_batch: envelope[{}] transfer missing amount",
+                        idx
+                    );
+                }
+            }
+            Kind::WacReceipt => {
+                if qty.unwrap_or(0) <= 0 {
+                    pgrx::error!(
+                        "ledger_dispatch_wac_batch: envelope[{}] wac_receipt missing/invalid qty",
+                        idx
+                    );
+                }
+                if unit_cost.unwrap_or(0) <= 0 {
+                    pgrx::error!(
+                        "ledger_dispatch_wac_batch: envelope[{}] wac_receipt missing/invalid unit_cost",
+                        idx
+                    );
+                }
+            }
+            Kind::WacIssue => {
+                if qty.unwrap_or(0) <= 0 {
+                    pgrx::error!(
+                        "ledger_dispatch_wac_batch: envelope[{}] wac_issue missing/invalid qty",
+                        idx
+                    );
+                }
+            }
+        }
+        parsed.push(Parsed {
+            envelope_idx: env_idx,
+            kind,
+            debit,
+            credit,
+            amount,
+            qty,
+            unit_cost,
+        });
+    }
+
+    // Local in-batch running-avg map: account_id -> (value, qty).
+    // Seeded lazily from shmem (one SHARED probe per distinct pool on
+    // first reference). PoC convention pins period=1, currency=1, kind=1.
+    let mut pool_map: HashMap<i64, (i64, i64)> = HashMap::with_capacity(arr.len().min(64));
+
+    // Pass 2: price each envelope, building output rows + collecting
+    // legs to stage_apply. Defer stage_apply until pricing succeeds for
+    // all envelopes (matches `ledger_apply_batch`'s validate-then-stage
+    // atomicity: if pricing raises mid-batch, no PENDING_STACK pollution).
+    let mut rows: Vec<(i32, i64, i64, i64, Option<i64>)> = Vec::with_capacity(parsed.len());
+    // Legs to stage: (account_id, amount_delta, qty_delta).
+    let mut legs: Vec<(i64, i64, i64)> = Vec::with_capacity(parsed.len() * 2);
+
+    for p in &parsed {
+        let (out_amount, out_qty_opt) = match p.kind {
+            Kind::Transfer => {
+                let amt = p.amount.expect("validated");
+                // debit +amt/0; credit -amt/0
+                legs.push((p.debit, amt, 0));
+                legs.push((p.credit, -amt, 0));
+                (amt, None)
+            }
+            Kind::WacReceipt => {
+                let qty = p.qty.expect("validated");
+                let uc = p.unit_cost.expect("validated");
+                let amt = qty.saturating_mul(uc);
+                let pool_id = p.debit;
+                let entry = pool_map
+                    .entry(pool_id)
+                    .or_insert_with(|| probe_shmem_pool(pool_id));
+                entry.0 = entry.0.saturating_add(amt);
+                entry.1 = entry.1.saturating_add(qty);
+                // pool gets +amount/+qty; counterparty gets -amount/0
+                legs.push((p.debit, amt, qty));
+                legs.push((p.credit, -amt, 0));
+                (amt, Some(qty))
+            }
+            Kind::WacIssue => {
+                let qty = p.qty.expect("validated");
+                // Pool is the credit account.
+                let pool_id = p.credit;
+                let entry = pool_map
+                    .entry(pool_id)
+                    .or_insert_with(|| probe_shmem_pool(pool_id));
+                let running_value = entry.0;
+                let running_qty = entry.1;
+                if running_qty <= 0 {
+                    pgrx::error!(
+                        "ledger_dispatch_wac_batch: envelope[{}] wac_issue from empty pool {} (running qty={})",
+                        p.envelope_idx,
+                        p.credit,
+                        running_qty
+                    );
+                }
+                if qty > running_qty {
+                    pgrx::error!(
+                        "ledger_dispatch_wac_batch: envelope[{}] wac_issue qty={} exceeds running qty={}",
+                        p.envelope_idx,
+                        qty,
+                        running_qty
+                    );
+                }
+                // Integer division: matches mig 0014 / mig 0006 semantics.
+                let unit_cost = running_value / running_qty;
+                let amt = unit_cost.saturating_mul(qty);
+                entry.0 = running_value - amt;
+                entry.1 = running_qty - qty;
+                // pool (credit) gets -amount/-qty; counterparty (debit) gets +amount/0
+                legs.push((p.credit, -amt, -qty));
+                legs.push((p.debit, amt, 0));
+                (amt, Some(qty))
+            }
+        };
+        rows.push((p.envelope_idx, p.debit, p.credit, out_amount, out_qty_opt));
+    }
+
+    // Pass 3: stage every leg. PENDING_STACK fast-path collapses same-key
+    // legs across envelopes (e.g., fan-in batches with one shared pool).
+    for (account_id, amt, qty) in &legs {
+        stage_apply(*account_id, 1, 1, 1, *amt, *qty);
+    }
+
+    TableIterator::new(rows)
+}
+
 /// Read the cell at (`account_id`, `period_id`, `currency_id`,
 /// `ledger_kind`). Returns one row of NULLs if absent. Takes the SHARED
 /// LWLock; concurrent appliers can proceed without blocking the reader.
