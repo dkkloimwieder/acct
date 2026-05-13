@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'ledger_apply_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1530
+-- src/lib.rs:1910
 -- ledger_extension::ledger_balance_lookup
 CREATE  FUNCTION "ledger_balance_lookup"(
 	"account_id" bigint, /* i64 */
@@ -52,7 +52,7 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1902
+-- src/lib.rs:2282
 -- requires:
 --   ledger_balance_lookup
 
@@ -114,6 +114,30 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
         RETURN NEXT;
     END;
     $body$ LANGUAGE plpgsql STABLE;
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:1561
+-- ledger_extension::ledger_dispatch_fifo_batch
+CREATE  FUNCTION "ledger_dispatch_fifo_batch"(
+	"envelopes" jsonb /* pgrx::datum::json::JsonB */
+) RETURNS TABLE (
+	"envelope_idx" INT,  /* i32 */
+	"row_kind" TEXT,  /* alloc::string::String */
+	"kind" TEXT,  /* core::option::Option<alloc::string::String> */
+	"debit_account_id" bigint,  /* core::option::Option<i64> */
+	"credit_account_id" bigint,  /* core::option::Option<i64> */
+	"amount" bigint,  /* core::option::Option<i64> */
+	"qty" bigint,  /* core::option::Option<i64> */
+	"unit_cost" bigint,  /* core::option::Option<i64> */
+	"layer_sentinel" INT,  /* core::option::Option<i32> */
+	"layer_id" bigint,  /* core::option::Option<i64> */
+	"depl_qty" bigint,  /* core::option::Option<i64> */
+	"depl_cost" bigint  /* core::option::Option<i64> */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_dispatch_fifo_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -215,7 +239,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_occupied_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1618
+-- src/lib.rs:1998
 -- ledger_extension::ledger_shmem_recon
 CREATE  FUNCTION "ledger_shmem_recon"() RETURNS TABLE (
 	"account_id" bigint,  /* i64 */
@@ -230,7 +254,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_recon_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1866
+-- src/lib.rs:2246
 -- ledger_extension::ledger_shmem_reset
 CREATE  FUNCTION "ledger_shmem_reset"() RETURNS void
 STRICT
@@ -239,7 +263,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1773
+-- src/lib.rs:2153
 -- ledger_extension::ledger_test_panic_after_fetch_add
 CREATE  FUNCTION "ledger_test_panic_after_fetch_add"(
 	"account_id" bigint, /* i64 */
@@ -255,7 +279,7 @@ AS 'MODULE_PATHNAME', 'ledger_test_panic_after_fetch_add_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1803
+-- src/lib.rs:2183
 -- ledger_extension::ledger_test_panic_before_fetch_add
 CREATE  FUNCTION "ledger_test_panic_before_fetch_add"(
 	"account_id" bigint, /* i64 */
@@ -269,7 +293,7 @@ AS 'MODULE_PATHNAME', 'ledger_test_panic_before_fetch_add_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1822
+-- src/lib.rs:2202
 -- ledger_extension::ledger_test_panic_in_exclusive
 CREATE  FUNCTION "ledger_test_panic_in_exclusive"(
 	"account_id" bigint, /* i64 */

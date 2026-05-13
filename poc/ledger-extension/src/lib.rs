@@ -1524,6 +1524,386 @@ fn ledger_dispatch_wac_batch(
     TableIterator::new(rows)
 }
 
+/// acct-m6q3 — FIFO maximal. Push the per-pool layer walk + depletion
+/// dispatch into Rust, mirroring `ledger_dispatch_wac_batch`. mig 0020's
+/// per-envelope plpgsql work (jsonb_set on per-pool layer lists, O(N²))
+/// collapses to a HashMap<i64, Vec<LayerRec>> with in-place mutation.
+///
+/// Envelope shape:
+/// ```json
+/// {
+///   "envelope_idx": 0,
+///   "kind": "transfer" | "fifo_receipt" | "fifo_issue",
+///   "debit_account_id": ..., "credit_account_id": ...,
+///   "amount": ...,       // transfer
+///   "qty": ...,          // fifo_*
+///   "unit_cost": ...     // fifo_receipt
+/// }
+/// ```
+///
+/// Output rows are EITHER legs ('leg') OR depletion records ('depl'),
+/// tagged via `row_kind`. The SQL wrapper splits them via CTEs and
+/// resolves layer_sentinel → real cost_layers.id after the receipt
+/// INSERT.
+///
+/// - leg rows: one per envelope. fifo_receipt carries layer_sentinel
+///   (negative; the wrapper maps it to the new cost_layers.id).
+/// - depl rows: zero (for receipts/transfers) or N (for issues, one
+///   per consumed layer). Each carries EITHER layer_sentinel (in-batch
+///   new layer) OR layer_id (pre-existing).
+///
+/// One SPI fetch under FOR UPDATE at batch start locks all active
+/// layers for every touched issue-pool. Locks held until txn commit.
+///
+/// Like `ledger_dispatch_wac_batch`: replays are pre-filtered by the
+/// SQL wrapper before the dispatcher is invoked; every envelope here
+/// is a fresh posting that contributes to in-batch layer state.
+#[pg_extern]
+fn ledger_dispatch_fifo_batch(
+    envelopes: pgrx::JsonB,
+) -> TableIterator<
+    'static,
+    (
+        name!(envelope_idx, i32),
+        name!(row_kind, String),
+        name!(kind, Option<String>),
+        name!(debit_account_id, Option<i64>),
+        name!(credit_account_id, Option<i64>),
+        name!(amount, Option<i64>),
+        name!(qty, Option<i64>),
+        name!(unit_cost, Option<i64>),
+        name!(layer_sentinel, Option<i32>),
+        name!(layer_id, Option<i64>),
+        name!(depl_qty, Option<i64>),
+        name!(depl_cost, Option<i64>),
+    ),
+> {
+    let arr = match envelopes.0.as_array() {
+        Some(a) => a,
+        None => pgrx::error!("ledger_dispatch_fifo_batch: envelopes must be a JSONB array"),
+    };
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Transfer,
+        FifoReceipt,
+        FifoIssue,
+    }
+    struct Parsed {
+        envelope_idx: i32,
+        kind: Kind,
+        debit: i64,
+        credit: i64,
+        amount: Option<i64>,
+        qty: Option<i64>,
+        unit_cost: Option<i64>,
+    }
+
+    // Pass 1: parse + structural validate.
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(arr.len());
+    for (idx, env) in arr.iter().enumerate() {
+        let obj = match env.as_object() {
+            Some(o) => o,
+            None => pgrx::error!(
+                "ledger_dispatch_fifo_batch: envelope[{}] is not an object",
+                idx
+            ),
+        };
+        let kind_str = obj
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("transfer");
+        let kind = match kind_str {
+            "transfer" => Kind::Transfer,
+            "fifo_receipt" => Kind::FifoReceipt,
+            "fifo_issue" => Kind::FifoIssue,
+            other => pgrx::error!(
+                "ledger_dispatch_fifo_batch: envelope[{}] unknown kind '{}'",
+                idx,
+                other
+            ),
+        };
+        let env_idx = obj
+            .get("envelope_idx")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(idx as i64) as i32;
+        let debit = match obj.get("debit_account_id").and_then(|v| v.as_i64()) {
+            Some(v) => v,
+            None => pgrx::error!(
+                "ledger_dispatch_fifo_batch: envelope[{}] missing debit_account_id",
+                idx
+            ),
+        };
+        let credit = match obj.get("credit_account_id").and_then(|v| v.as_i64()) {
+            Some(v) => v,
+            None => pgrx::error!(
+                "ledger_dispatch_fifo_batch: envelope[{}] missing credit_account_id",
+                idx
+            ),
+        };
+        let amount = obj.get("amount").and_then(|v| v.as_i64());
+        let qty = obj.get("qty").and_then(|v| v.as_i64());
+        let unit_cost = obj.get("unit_cost").and_then(|v| v.as_i64());
+
+        match kind {
+            Kind::Transfer => {
+                if amount.is_none() {
+                    pgrx::error!(
+                        "ledger_dispatch_fifo_batch: envelope[{}] transfer missing amount",
+                        idx
+                    );
+                }
+            }
+            Kind::FifoReceipt => {
+                if qty.unwrap_or(0) <= 0 {
+                    pgrx::error!(
+                        "ledger_dispatch_fifo_batch: envelope[{}] fifo_receipt missing/invalid qty",
+                        idx
+                    );
+                }
+                if unit_cost.unwrap_or(0) <= 0 {
+                    pgrx::error!(
+                        "ledger_dispatch_fifo_batch: envelope[{}] fifo_receipt missing/invalid unit_cost",
+                        idx
+                    );
+                }
+            }
+            Kind::FifoIssue => {
+                if qty.unwrap_or(0) <= 0 {
+                    pgrx::error!(
+                        "ledger_dispatch_fifo_batch: envelope[{}] fifo_issue missing/invalid qty",
+                        idx
+                    );
+                }
+            }
+        }
+        parsed.push(Parsed {
+            envelope_idx: env_idx,
+            kind,
+            debit,
+            credit,
+            amount,
+            qty,
+            unit_cost,
+        });
+    }
+
+    // Per-pool layer state. Pre-existing layers loaded via one SPI fetch
+    // under FOR UPDATE; in-batch new layers appended as fifo_receipt
+    // envelopes are walked. Greedy FIFO consumes from index 0.
+    struct LayerRec {
+        sentinel: Option<i32>, // Some(-N) for in-batch new layers
+        layer_id: Option<i64>, // Some(real) for pre-existing
+        qty_remaining: i64,
+        unit_cost: i64,
+    }
+    let mut pool_layers: HashMap<i64, Vec<LayerRec>> = HashMap::new();
+
+    // Collect distinct pool_ids touched by fifo_issue envelopes — only
+    // these need pre-existing layer state. fifo_receipt pools start
+    // empty (in-batch new layers) unless they also see issues.
+    let mut issue_pools: Vec<i64> = parsed
+        .iter()
+        .filter_map(|p| match p.kind {
+            Kind::FifoIssue => Some(p.credit),
+            _ => None,
+        })
+        .collect();
+    issue_pools.sort_unstable();
+    issue_pools.dedup();
+
+    if !issue_pools.is_empty() {
+        // ORDER BY ensures deterministic FIFO order across multiple
+        // active layers per pool. FOR UPDATE locks layer rows until
+        // commit — concurrent issues on overlapping pools serialize on
+        // these row locks (acceptable; matches mig 0020 semantics).
+        let sql = "SELECT cl.pool_account_id, cl.id, cl.qty_remaining, cl.unit_cost \
+                   FROM cost_layers cl \
+                   WHERE cl.pool_account_id = ANY($1::bigint[]) AND cl.qty_remaining > 0 \
+                   ORDER BY cl.pool_account_id, cl.receipt_date, cl.id \
+                   FOR UPDATE";
+        let fetched: Vec<(i64, i64, i64, i64)> = Spi::connect_mut(|client| {
+            let args: Vec<pgrx::datum::DatumWithOid> = vec![issue_pools.clone().into()];
+            // `update()` (not `select()`) marks the SPI connection as mutable
+            // so FOR UPDATE is permitted. We're still issuing a SELECT — the
+            // "mutability" here is about row-locking, not row-writing.
+            let tup = client
+                .update(sql, None, &args)
+                .expect("fifo_dispatch SPI fetch cost_layers FOR UPDATE");
+            let mut rows: Vec<(i64, i64, i64, i64)> = Vec::new();
+            for row in tup {
+                let pid: i64 = row["pool_account_id"].value().unwrap().unwrap();
+                let lid: i64 = row["id"].value().unwrap().unwrap();
+                let qr: i64 = row["qty_remaining"].value().unwrap().unwrap();
+                let uc: i64 = row["unit_cost"].value().unwrap().unwrap();
+                rows.push((pid, lid, qr, uc));
+            }
+            rows
+        });
+        for (pid, lid, qr, uc) in fetched {
+            pool_layers
+                .entry(pid)
+                .or_insert_with(Vec::new)
+                .push(LayerRec {
+                    sentinel: None,
+                    layer_id: Some(lid),
+                    qty_remaining: qr,
+                    unit_cost: uc,
+                });
+        }
+    }
+
+    // Pass 2: walk envelopes, build output rows, collect stage_apply legs.
+    let mut rows: Vec<(
+        i32,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i32>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    )> = Vec::with_capacity(parsed.len() * 2);
+    let mut legs: Vec<(i64, i64, i64)> = Vec::with_capacity(parsed.len() * 2);
+    let mut next_sentinel: i32 = -1;
+
+    for p in &parsed {
+        match p.kind {
+            Kind::Transfer => {
+                let amt = p.amount.expect("validated");
+                legs.push((p.debit, amt, 0));
+                legs.push((p.credit, -amt, 0));
+                rows.push((
+                    p.envelope_idx,
+                    "leg".to_string(),
+                    Some("transfer".to_string()),
+                    Some(p.debit),
+                    Some(p.credit),
+                    Some(amt),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            Kind::FifoReceipt => {
+                let qty = p.qty.expect("validated");
+                let uc = p.unit_cost.expect("validated");
+                let amt = qty.saturating_mul(uc);
+                let sentinel = next_sentinel;
+                next_sentinel -= 1;
+                // Append to pool's layer list (FIFO order — receipts later
+                // in the batch sit after pre-existing layers + earlier
+                // in-batch receipts, matching mig 0020's append semantics).
+                pool_layers
+                    .entry(p.debit)
+                    .or_insert_with(Vec::new)
+                    .push(LayerRec {
+                        sentinel: Some(sentinel),
+                        layer_id: None,
+                        qty_remaining: qty,
+                        unit_cost: uc,
+                    });
+                legs.push((p.debit, amt, qty));
+                legs.push((p.credit, -amt, 0));
+                rows.push((
+                    p.envelope_idx,
+                    "leg".to_string(),
+                    Some("fifo_receipt".to_string()),
+                    Some(p.debit),
+                    Some(p.credit),
+                    Some(amt),
+                    Some(qty),
+                    Some(uc),
+                    Some(sentinel),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            Kind::FifoIssue => {
+                let qty = p.qty.expect("validated");
+                let pool_id = p.credit;
+                let layers = pool_layers.entry(pool_id).or_insert_with(Vec::new);
+                let mut remaining = qty;
+                let mut total_cost: i64 = 0;
+                // Greedy walk; emit one depl row per consumed layer.
+                let mut depl_rows: Vec<(Option<i32>, Option<i64>, i64, i64)> = Vec::new();
+                for layer in layers.iter_mut() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if layer.qty_remaining == 0 {
+                        continue;
+                    }
+                    let take = remaining.min(layer.qty_remaining);
+                    let cost = take.saturating_mul(layer.unit_cost);
+                    depl_rows.push((layer.sentinel, layer.layer_id, take, cost));
+                    layer.qty_remaining -= take;
+                    total_cost = total_cost.saturating_add(cost);
+                    remaining -= take;
+                }
+                if remaining > 0 {
+                    pgrx::error!(
+                        "ledger_dispatch_fifo_batch: envelope[{}] fifo_issue short by {} units (pool {} exhausted)",
+                        p.envelope_idx,
+                        remaining,
+                        pool_id
+                    );
+                }
+                // pool (credit) -amount/-qty; counterparty (debit) +amount/0
+                legs.push((pool_id, -total_cost, -qty));
+                legs.push((p.debit, total_cost, 0));
+                // Leg row for the issue.
+                rows.push((
+                    p.envelope_idx,
+                    "leg".to_string(),
+                    Some("fifo_issue".to_string()),
+                    Some(p.debit),
+                    Some(pool_id),
+                    Some(total_cost),
+                    Some(qty),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
+                // One depl row per consumed layer.
+                for (sentinel, layer_id, take, cost) in depl_rows {
+                    rows.push((
+                        p.envelope_idx,
+                        "depl".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        sentinel,
+                        layer_id,
+                        Some(take),
+                        Some(cost),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Pass 3: stage_apply per leg. PENDING_STACK collapses same-key legs.
+    for (account_id, amt, qty) in &legs {
+        stage_apply(*account_id, 1, 1, 1, *amt, *qty);
+    }
+
+    TableIterator::new(rows)
+}
+
 /// Read the cell at (`account_id`, `period_id`, `currency_id`,
 /// `ledger_kind`). Returns one row of NULLs if absent. Takes the SHARED
 /// LWLock; concurrent appliers can proceed without blocking the reader.
