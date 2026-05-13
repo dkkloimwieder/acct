@@ -185,6 +185,18 @@ static APPLY_SEQ: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"ledger_apply_se
 static LEDGER_SHMEM_INSERT_FAILURES: PgAtomic<AtomicU64> =
     unsafe { PgAtomic::new(c"ledger_shmem_insert_failures") };
 
+// acct-3ovt (M10.C2): bgworker drain SPI failure observability.
+// `_CONSECUTIVE` counts ticks with ≥1 failed upsert (resets to 0 on
+// the first clean tick); `_TOTAL` counts every failed upsert (never
+// resets without `ledger_shmem_reset`). The bgworker emits
+// `warning!` when `_CONSECUTIVE` reaches `LEDGER_DRAIN_WARN_AFTER`
+// (default 5 ticks = 500ms at the default 100ms cadence).
+static LEDGER_DRAIN_CONSECUTIVE_FAILS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"ledger_drain_consecutive_fails") };
+static LEDGER_DRAIN_TOTAL_FAILURES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"ledger_drain_total_failures") };
+const LEDGER_DRAIN_WARN_AFTER: u64 = 5;
+
 // M5 — bgworker drain configuration.
 static DRAIN_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
 static DRAIN_DATABASE: GucSetting<Option<CString>> =
@@ -196,6 +208,8 @@ pub extern "C-unwind" fn _PG_init() {
     pg_shmem_init!(OCCUPIED_COUNT);
     pg_shmem_init!(APPLY_SEQ);
     pg_shmem_init!(LEDGER_SHMEM_INSERT_FAILURES);
+    pg_shmem_init!(LEDGER_DRAIN_CONSECUTIVE_FAILS);
+    pg_shmem_init!(LEDGER_DRAIN_TOTAL_FAILURES);
 
     GucRegistry::define_int_guc(
         c"ledger.drain_interval_ms",
@@ -338,32 +352,76 @@ fn do_drain_tick() {
                             drained_at = EXCLUDED.drained_at
                 WHERE account_balances_rollup.last_seq < EXCLUDED.last_seq";
     let mut succeeded: Vec<(u128, u64)> = Vec::with_capacity(dirty.len());
+    let mut failed_this_tick: u64 = 0;
+    let mut last_err: Option<String> = None;
     for (a, p, c, l, bal, qty, last, key) in &dirty {
-        let res = Spi::run_with_args(
-            sql,
-            &[
-                (*a).into(),
-                (*p).into(),
-                (*c).into(),
-                (*l).into(),
-                (*bal).into(),
-                (*qty).into(),
-                (*last as i64).into(),
-            ],
-        );
-        if res.is_ok() {
-            succeeded.push((*key, *last));
-        } else {
-            // Rollup table missing in this DB, or transient error.
-            // Don't propagate — next tick re-tries. (Bgworker restarts
-            // on uncaught error per `set_restart_time(1s)`.)
-            log!("ledger_drain: upsert failed for ({a}, {p}, {c}, {l})");
+        // acct-3ovt: wrap the SPI call in PgTryBuilder so a missing-
+        // table / schema-error (which raises an FFI-level ERROR that
+        // crosses Rust boundaries as a long-jump) is caught locally.
+        // Without this, the error aborts the tick's transaction
+        // BEFORE we increment the failure counter — the escalation
+        // path stays silent because the panicking tick never reaches
+        // its tail.
+        let outcome: Result<(), String> = pgrx::PgTryBuilder::new(|| {
+            match Spi::run_with_args(
+                sql,
+                &[
+                    (*a).into(),
+                    (*p).into(),
+                    (*c).into(),
+                    (*l).into(),
+                    (*bal).into(),
+                    (*qty).into(),
+                    (*last as i64).into(),
+                ],
+            ) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(format!("{e}")),
+            }
+        })
+        .catch_others(|caught| Err(format!("{caught:?}")))
+        .execute();
+
+        match outcome {
+            Ok(()) => succeeded.push((*key, *last)),
+            Err(e) => {
+                failed_this_tick += 1;
+                last_err = Some(e.clone());
+                log!("ledger_drain: upsert failed for ({a}, {p}, {c}, {l}): {e}");
+            }
         }
     }
 
     let table = HASH_TABLE.share();
     for (key, last) in &succeeded {
         stamp_drained(&table, *key, *last);
+    }
+
+    // acct-3ovt: escalation. Update consecutive-failure counter and
+    // emit a single rich warning when crossing LEDGER_DRAIN_WARN_AFTER.
+    // The warning is per-threshold-crossing (not per-tick) so log
+    // volume stays bounded under sustained outages.
+    if failed_this_tick > 0 {
+        LEDGER_DRAIN_TOTAL_FAILURES
+            .get()
+            .fetch_add(failed_this_tick, Ordering::AcqRel);
+        let prev = LEDGER_DRAIN_CONSECUTIVE_FAILS
+            .get()
+            .fetch_add(1, Ordering::AcqRel);
+        let now = prev + 1;
+        if now == LEDGER_DRAIN_WARN_AFTER {
+            pgrx::warning!(
+                "ledger_drain: {now} consecutive ticks with SPI errors \
+                 (this tick: {failed_this_tick} failed of {} dirty cells); \
+                 last error: {}. Check that `account_balances_rollup` \
+                 exists in the target DB and the bgworker has access.",
+                dirty.len(),
+                last_err.as_deref().unwrap_or("<none>")
+            );
+        }
+    } else {
+        // First clean tick after a failure run: reset to 0.
+        LEDGER_DRAIN_CONSECUTIVE_FAILS.get().store(0, Ordering::Release);
     }
 }
 
@@ -533,28 +591,40 @@ fn insert_new_seeded(
 /// SPI lookup against `account_balances_rollup`. Returns `None` on
 /// "no row," missing table, or any SPI error — callers treat that as
 /// "no prior state" and the new cell starts at delta-only.
+///
+/// Wrapped in `PgTryBuilder` so a missing rollup table (or any other
+/// Postgres-side error inside SPI) returns `None` instead of
+/// propagating an ERROR back to the user transaction. This matters
+/// for acct-3ovt-style outages where the bgworker test wants to break
+/// the rollup table to exercise the drain-failure escalation path —
+/// without this guard, the user's `ledger_apply_balance_delta` call
+/// also fails because of the lazy-load SPI.
 fn lookup_rollup_seed(
     account_id: i64,
     period_id: i32,
     currency_id: i16,
     ledger_kind: i16,
 ) -> Option<(i64, i64, u64)> {
-    let res = Spi::get_three_with_args::<i64, i64, i64>(
-        "SELECT balance, qty, last_seq
-           FROM account_balances_rollup
-          WHERE account_id = $1 AND period_id = $2
-            AND currency_id = $3 AND ledger_kind = $4",
-        &[
-            account_id.into(),
-            period_id.into(),
-            currency_id.into(),
-            ledger_kind.into(),
-        ],
-    );
-    match res {
-        Ok((Some(bal), Some(qty), Some(seq))) => Some((bal, qty, seq as u64)),
-        _ => None,
-    }
+    pgrx::PgTryBuilder::new(|| {
+        let res = Spi::get_three_with_args::<i64, i64, i64>(
+            "SELECT balance, qty, last_seq
+               FROM account_balances_rollup
+              WHERE account_id = $1 AND period_id = $2
+                AND currency_id = $3 AND ledger_kind = $4",
+            &[
+                account_id.into(),
+                period_id.into(),
+                currency_id.into(),
+                ledger_kind.into(),
+            ],
+        );
+        match res {
+            Ok((Some(bal), Some(qty), Some(seq))) => Some((bal, qty, seq as u64)),
+            _ => None,
+        }
+    })
+    .catch_others(|_caught| None)
+    .execute()
 }
 
 // ── M10.A2: deferred-apply via XactCallback + SubXactCallback ─────────
@@ -993,6 +1063,26 @@ fn ledger_shmem_insert_failure_count() -> i64 {
         .load(Ordering::Acquire) as i64
 }
 
+/// acct-3ovt: count of consecutive bgworker drain ticks with at least
+/// one failed UPSERT. Resets to 0 on the first fully-successful tick.
+/// Emits a `warning!` (visible in `pg_stat_activity` and logs) when
+/// it reaches `LEDGER_DRAIN_WARN_AFTER` (default 5).
+#[pg_extern]
+fn ledger_drain_consecutive_fails() -> i64 {
+    LEDGER_DRAIN_CONSECUTIVE_FAILS
+        .get()
+        .load(Ordering::Acquire) as i64
+}
+
+/// acct-3ovt: cumulative count of failed UPSERTs across all drain
+/// ticks since the bgworker started (or last `ledger_shmem_reset`).
+#[pg_extern]
+fn ledger_drain_total_failures() -> i64 {
+    LEDGER_DRAIN_TOTAL_FAILURES
+        .get()
+        .load(Ordering::Acquire) as i64
+}
+
 /// Count of occupied cells whose `last_seq > drained_seq` —
 /// pending bgworker drain.
 #[pg_extern]
@@ -1323,6 +1413,8 @@ fn ledger_shmem_reset() {
     OCCUPIED_COUNT.get().store(0, Ordering::Release);
     APPLY_SEQ.get().store(0, Ordering::Release);
     LEDGER_SHMEM_INSERT_FAILURES.get().store(0, Ordering::Release);
+    LEDGER_DRAIN_CONSECUTIVE_FAILS.get().store(0, Ordering::Release);
+    LEDGER_DRAIN_TOTAL_FAILURES.get().store(0, Ordering::Release);
 }
 
 // ── M4: durable rollup table + balance() reader ───────────────────────
