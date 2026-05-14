@@ -7,7 +7,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1954
+-- src/lib.rs:1969
 -- ledger_extension::fifo_apply_batch_inline
 CREATE  FUNCTION "fifo_apply_batch_inline"(
 	"envelopes" jsonb /* pgrx::datum::json::JsonB */
@@ -199,7 +199,48 @@ AS 'MODULE_PATHNAME', 'fifo_test_cell_lock_addr_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1194
+-- src/h_arena.rs:122
+-- ledger_extension::h_arena::h_apply_delta
+CREATE  FUNCTION "h_apply_delta"(
+	"group_id" bigint, /* i64 */
+	"qty_delta" bigint /* i64 */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'h_apply_delta_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/h_arena.rs:137
+-- ledger_extension::h_arena::h_arena_lookup
+CREATE  FUNCTION "h_arena_lookup"(
+	"group_id" bigint /* i64 */
+) RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'h_arena_lookup_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/h_arena.rs:176
+-- ledger_extension::h_arena::h_arena_occupied_count
+CREATE  FUNCTION "h_arena_occupied_count"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'h_arena_occupied_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/h_arena.rs:162
+-- ledger_extension::h_arena::h_arena_reset
+CREATE  FUNCTION "h_arena_reset"() RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'h_arena_reset_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:1209
 -- ledger_extension::ledger_apply_balance_delta
 CREATE  FUNCTION "ledger_apply_balance_delta"(
 	"account_id" bigint, /* i64 */
@@ -215,7 +256,7 @@ AS 'MODULE_PATHNAME', 'ledger_apply_balance_delta_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1233
+-- src/lib.rs:1248
 -- ledger_extension::ledger_apply_batch
 CREATE  FUNCTION "ledger_apply_batch"(
 	"envelopes" jsonb /* pgrx::datum::json::JsonB */
@@ -226,7 +267,7 @@ AS 'MODULE_PATHNAME', 'ledger_apply_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2518
+-- src/lib.rs:2533
 -- ledger_extension::ledger_balance_lookup
 CREATE  FUNCTION "ledger_balance_lookup"(
 	"account_id" bigint, /* i64 */
@@ -244,7 +285,7 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2890
+-- src/lib.rs:2905
 -- requires:
 --   ledger_balance_lookup
 
@@ -309,7 +350,7 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1594
+-- src/lib.rs:1609
 -- ledger_extension::ledger_dispatch_fifo_batch
 CREATE  FUNCTION "ledger_dispatch_fifo_batch"(
 	"envelopes" jsonb /* pgrx::datum::json::JsonB */
@@ -333,7 +374,7 @@ AS 'MODULE_PATHNAME', 'ledger_dispatch_fifo_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1348
+-- src/lib.rs:1363
 -- ledger_extension::ledger_dispatch_wac_batch
 CREATE  FUNCTION "ledger_dispatch_wac_batch"(
 	"envelopes" jsonb /* pgrx::datum::json::JsonB */
@@ -350,7 +391,7 @@ AS 'MODULE_PATHNAME', 'ledger_dispatch_wac_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1121
+-- src/lib.rs:1136
 -- ledger_extension::ledger_drain_consecutive_fails
 CREATE  FUNCTION "ledger_drain_consecutive_fails"() RETURNS bigint /* i64 */
 STRICT
@@ -359,7 +400,7 @@ AS 'MODULE_PATHNAME', 'ledger_drain_consecutive_fails_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1130
+-- src/lib.rs:1145
 -- ledger_extension::ledger_drain_total_failures
 CREATE  FUNCTION "ledger_drain_total_failures"() RETURNS bigint /* i64 */
 STRICT
@@ -368,7 +409,7 @@ AS 'MODULE_PATHNAME', 'ledger_drain_total_failures_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1085
+-- src/lib.rs:1100
 -- ledger_extension::ledger_extension_version
 CREATE  FUNCTION "ledger_extension_version"() RETURNS TEXT /* &str */
 STRICT
@@ -377,7 +418,7 @@ AS 'MODULE_PATHNAME', 'ledger_extension_version_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1100
+-- src/lib.rs:1115
 -- ledger_extension::ledger_shmem_apply_seq
 CREATE  FUNCTION "ledger_shmem_apply_seq"() RETURNS bigint /* i64 */
 STRICT
@@ -386,7 +427,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_apply_seq_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1090
+-- src/lib.rs:1105
 -- ledger_extension::ledger_shmem_capacity
 CREATE  FUNCTION "ledger_shmem_capacity"() RETURNS bigint /* i64 */
 STRICT
@@ -395,7 +436,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_capacity_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1139
+-- src/lib.rs:1154
 -- ledger_extension::ledger_shmem_dirty_count
 CREATE  FUNCTION "ledger_shmem_dirty_count"() RETURNS bigint /* i64 */
 STRICT
@@ -404,7 +445,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_dirty_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1157
+-- src/lib.rs:1172
 -- ledger_extension::ledger_shmem_drained_count
 CREATE  FUNCTION "ledger_shmem_drained_count"() RETURNS bigint /* i64 */
 STRICT
@@ -413,7 +454,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_drained_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1110
+-- src/lib.rs:1125
 -- ledger_extension::ledger_shmem_insert_failure_count
 CREATE  FUNCTION "ledger_shmem_insert_failure_count"() RETURNS bigint /* i64 */
 STRICT
@@ -422,7 +463,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_insert_failure_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1095
+-- src/lib.rs:1110
 -- ledger_extension::ledger_shmem_occupied
 CREATE  FUNCTION "ledger_shmem_occupied"() RETURNS bigint /* i64 */
 STRICT
@@ -431,7 +472,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_occupied_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2606
+-- src/lib.rs:2621
 -- ledger_extension::ledger_shmem_recon
 CREATE  FUNCTION "ledger_shmem_recon"() RETURNS TABLE (
 	"account_id" bigint,  /* i64 */
@@ -446,7 +487,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_recon_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2854
+-- src/lib.rs:2869
 -- ledger_extension::ledger_shmem_reset
 CREATE  FUNCTION "ledger_shmem_reset"() RETURNS void
 STRICT
@@ -455,7 +496,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2761
+-- src/lib.rs:2776
 -- ledger_extension::ledger_test_panic_after_fetch_add
 CREATE  FUNCTION "ledger_test_panic_after_fetch_add"(
 	"account_id" bigint, /* i64 */
@@ -471,7 +512,7 @@ AS 'MODULE_PATHNAME', 'ledger_test_panic_after_fetch_add_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2791
+-- src/lib.rs:2806
 -- ledger_extension::ledger_test_panic_before_fetch_add
 CREATE  FUNCTION "ledger_test_panic_before_fetch_add"(
 	"account_id" bigint, /* i64 */
@@ -485,7 +526,7 @@ AS 'MODULE_PATHNAME', 'ledger_test_panic_before_fetch_add_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2810
+-- src/lib.rs:2825
 -- ledger_extension::ledger_test_panic_in_exclusive
 CREATE  FUNCTION "ledger_test_panic_in_exclusive"(
 	"account_id" bigint, /* i64 */

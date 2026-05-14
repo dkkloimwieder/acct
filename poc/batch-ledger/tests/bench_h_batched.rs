@@ -99,13 +99,30 @@ async fn h_batched_bench() {
     let max_retries = env_or::<u32>("POC_BENCH_MAX_RETRIES", 10);
     let bench_fn = std::env::var("POC_BENCH_FUNCTION")
         .unwrap_or_else(|_| "post_batch_h".to_string());
+    // Isolation: pure-SQL H needs SERIALIZABLE (the trigger-based
+    // invariant only catches concurrent writers under SSI). The ext
+    // variant moves the invariant to shmem CAS — RC is correct.
+    // Default per function variant; explicit override via env.
+    let default_iso = if bench_fn.to_lowercase() == "post_batch_h_ext" {
+        "read_committed"
+    } else {
+        "serializable"
+    };
+    let iso_str =
+        std::env::var("POC_BENCH_ISOLATION").unwrap_or_else(|_| default_iso.to_string());
+    let iso_sql = match iso_str.to_lowercase().as_str() {
+        "serializable" | "ssl" | "ssi" => "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "read_committed" | "rc" => "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        other => panic!("POC_BENCH_ISOLATION must be serializable|read_committed; got {other}"),
+    };
 
     let bench_fn_lc = bench_fn.to_lowercase();
-    let (layers_table, cons_table) = match bench_fn_lc.as_str() {
-        "post_batch_h" => ("cost_layers_h", "cost_consumptions_h"),
-        "post_batch_h_app" => ("cost_layers_h_app", "cost_consumptions_h_app"),
+    let (layers_table, cons_table, uses_extension) = match bench_fn_lc.as_str() {
+        "post_batch_h" => ("cost_layers_h", "cost_consumptions_h", false),
+        "post_batch_h_app" => ("cost_layers_h_app", "cost_consumptions_h_app", false),
+        "post_batch_h_ext" => ("cost_layers_h_ext", "cost_consumptions_h_ext", true),
         other => panic!(
-            "POC_BENCH_FUNCTION must be post_batch_h | post_batch_h_app; got {other}"
+            "POC_BENCH_FUNCTION must be post_batch_h | post_batch_h_app | post_batch_h_ext; got {other}"
         ),
     };
 
@@ -125,6 +142,19 @@ async fn h_batched_bench() {
     .await
     .expect("truncate");
 
+    if uses_extension {
+        // Ensure the extension is installed and reset h_arena shmem so
+        // residue from prior runs doesn't pollute this run's pre-seed.
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS ledger_extension")
+            .execute(&pool)
+            .await
+            .expect("create ext");
+        sqlx::query("SELECT h_arena_reset()")
+            .execute(&pool)
+            .await
+            .expect("h_arena_reset");
+    }
+
     // Pre-seed N layer_groups so issues never exhaust at realistic mix
     // (workers × batch_size × issue_pct × max_qty per group is far below
     // group_qty per group).
@@ -139,6 +169,27 @@ async fn h_batched_bench() {
     .await
     .expect("seed layers");
 
+    if uses_extension {
+        // Mirror the durable seed in the h_arena shmem so consumption
+        // commits don't trip the invariant check. One h_apply_delta per
+        // group, all inside a single txn so the PRE_COMMIT applies the
+        // seed atomically.
+        let seed_sql = format!(
+            "DO $$
+             DECLARE g INT;
+             BEGIN
+               FOR g IN 1..{}::int LOOP
+                 PERFORM h_apply_delta(g::BIGINT, {}::BIGINT);
+               END LOOP;
+             END$$",
+            groups_count, group_qty
+        );
+        sqlx::query(&seed_sql)
+            .execute(&pool)
+            .await
+            .expect("h_arena seed");
+    }
+
     let dl_before: i64 = sqlx::query_scalar(
         "SELECT deadlocks::BIGINT FROM pg_stat_database WHERE datname = 'acct_poc'",
     )
@@ -148,8 +199,8 @@ async fn h_batched_bench() {
 
     eprintln!();
     eprintln!(
-        "========= H batched (fn={}, batch={}, groups={}, issue_pct={}%, workers={}, duration={}s) =========",
-        bench_fn, batch_size, groups_count, issue_pct, workers, duration_secs
+        "========= H batched (fn={}, iso={}, batch={}, groups={}, issue_pct={}%, workers={}, duration={}s) =========",
+        bench_fn, iso_str, batch_size, groups_count, issue_pct, workers, duration_secs
     );
 
     let stats = Arc::new(Stats::default());
@@ -210,7 +261,7 @@ async fn h_batched_bench() {
                         Err(e) => break Err(e),
                     };
                     if let Err(e) =
-                        sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                        sqlx::query(iso_sql)
                             .execute(&mut *tx)
                             .await
                     {

@@ -85,6 +85,11 @@ pgrx::pg_module_magic!();
 // even when they share `_PG_init` wiring.
 mod fifo;
 
+// acct-zm69 — H arena. Per-group effective_qty shmem rollup for
+// Candidate H invariant enforcement. Separate module from WAC + FIFO;
+// shares only the `_PG_init` wiring.
+mod h_arena;
+
 // 16384 slots × 64-byte cache-aligned bucket = 1 MiB shmem.
 // Sized so the fan-out PoC bench (5000 accounts) lands at a sub-30%
 // load factor with comfortable headroom. Open-addressing probes
@@ -231,6 +236,9 @@ pub extern "C-unwind" fn _PG_init() {
     // pg_shmem_init!() calls above wire up.
     fifo::init();
 
+    // acct-zm69 — H arena (per-group effective_qty rollup).
+    h_arena::init();
+
     // acct-17vr: register XactCallback + SubXactCallback unconditionally
     // at postmaster init. Each forked backend inherits the callback list,
     // so callbacks fire from the very first transaction event regardless
@@ -258,6 +266,13 @@ pub extern "C-unwind" fn _PG_init() {
         );
         pg_sys::RegisterSubXactCallback(
             Some(fifo::fifo_subxact_callback),
+            std::ptr::null_mut(),
+        );
+
+        // acct-zm69 — H arena's XactCallback. No SubXact yet (PoC
+        // bench shape doesn't exercise SAVEPOINT); add later if needed.
+        pg_sys::RegisterXactCallback(
+            Some(h_arena::h_xact_callback),
             std::ptr::null_mut(),
         );
     }
