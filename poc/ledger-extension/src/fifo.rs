@@ -16,7 +16,7 @@
 //!
 //! NO SQL apply path here. The `fifo_apply_batch` pg_extern lands in
 //! sub 2 (acct-uy4p). NO ring-buffer mutation either — `push_layer` /
-//! `consume_layers` arrive with sub 2 + sub 3 (acct-b8ub coalescing).
+//! `consume_layers` arrive with sub 2.
 //!
 //! ## Two atomicity domains (mirrors WAC)
 //!
@@ -32,8 +32,10 @@
 //! - `layers[MAX_LAYERS]` indexed via `head` + `n_layers` (head outward
 //!   is oldest; tail = `(head + n_layers) % MAX_LAYERS`).
 //! - `head` / `n_layers` are u16, protected by the per-cell LWLock.
-//! - On overflow at receipt time, sub 3 coalesces the two oldest layers
-//!   into a weighted-average. Cost-preserving, lossy on FIFO order.
+//! - On overflow at receipt time, sub 3 (acct-b8ub) spills the
+//!   overflowing receipt directly to durable `cost_layers`, skipping
+//!   shmem residency. Strict per-unit FIFO preserved; the spilled tail
+//!   is consumed via SPI walk after the in-shmem range exhausts.
 //!
 //! ## Cell-lock acquisition discipline
 //!
@@ -69,10 +71,12 @@ pub const FIFO_N_BUCKETS: usize = 16384;
 /// ~100-200 receipts per pool in a burst, then sustained issues drain
 /// the ring back down between bursts. 256 layers = ~50% headroom above
 /// the burst size. Sustained net-receipt-positive flow eventually
-/// overflows regardless of cap — overflow handling is structural:
-/// either spill-to-durable (preserves FIFO order; slow path on
-/// post-ring layers) or coalescing (sub 3 / acct-b8ub; sacrifices
-/// strict FIFO semantics — under review pending workload driver).
+/// overflows regardless of cap — overflow handling routes the
+/// overflowing receipt directly to durable `cost_layers`
+/// (spill-to-durable, sub 3 / acct-b8ub). Strict per-unit FIFO
+/// preserved; slow-path SPI walk consumes the spilled tail after the
+/// in-shmem range exhausts. Currently parked pending a workload driver
+/// that actually overflows 256.
 pub const MAX_LAYERS: usize = 256;
 
 /// Max pending-drain entries per cell between bgworker ticks (sub 4 /
@@ -440,8 +444,8 @@ pub fn fifo_arena_capacity() -> i64 {
     FIFO_N_BUCKETS as i64
 }
 
-/// Returns `MAX_LAYERS`. Useful for tests that want to know coalesce
-/// threshold without hardcoding.
+/// Returns `MAX_LAYERS`. Useful for tests that want to know the
+/// per-cell ring depth cap without hardcoding.
 #[pg_extern]
 pub fn fifo_max_layers() -> i64 {
     MAX_LAYERS as i64
@@ -608,7 +612,8 @@ pub fn insert_fifo_cell(arena: &FifoArena, key: u128) -> Option<usize> {
 
 /// Push a layer to the tail of the ring. **Caller MUST hold the cell's
 /// LWLock EXCLUSIVE.** Returns `false` if the ring is full
-/// (MAX_LAYERS reached); sub 3 (acct-b8ub) adds coalescing.
+/// (MAX_LAYERS reached); sub 3 (acct-b8ub) spills the overflowing
+/// receipt to durable `cost_layers` and preserves strict per-unit FIFO.
 #[inline]
 pub fn push_layer(ring: &mut RingFields, layer: Layer) -> bool {
     if ring.n_layers as usize >= MAX_LAYERS {
@@ -1152,7 +1157,7 @@ pub fn fifo_apply_batch_maximal(
                         if !ok {
                             pgrx::error!(
                                 "fifo_apply_batch_maximal: lazy-seed overflow at cell {} \
-                                 (>{} layers in durable cost_layers; coalescing is sub 3)",
+                                 (>{} layers in durable cost_layers; spill-to-durable is sub 3 / acct-b8ub)",
                                 cell_idx,
                                 MAX_LAYERS
                             );
@@ -1181,7 +1186,7 @@ pub fn fifo_apply_batch_maximal(
                         if !ok {
                             pgrx::error!(
                                 "fifo_apply_batch_maximal: envelope[{}] receipt overflowed cell {} \
-                                 (MAX_LAYERS={}; coalescing is sub 3)",
+                                 (MAX_LAYERS={}; spill-to-durable is sub 3 / acct-b8ub)",
                                 p.envelope_idx,
                                 cell_idx,
                                 MAX_LAYERS

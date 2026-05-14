@@ -24,7 +24,7 @@ AS 'MODULE_PATHNAME', 'fifo_apply_batch_inline_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:754
+-- src/fifo.rs:759
 -- ledger_extension::fifo::fifo_apply_batch_maximal
 CREATE  FUNCTION "fifo_apply_batch_maximal"(
 	"envelopes" jsonb /* pgrx::datum::json::JsonB */
@@ -41,7 +41,7 @@ AS 'MODULE_PATHNAME', 'fifo_apply_batch_maximal_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:438
+-- src/fifo.rs:442
 -- ledger_extension::fifo::fifo_arena_capacity
 CREATE  FUNCTION "fifo_arena_capacity"() RETURNS bigint /* i64 */
 STRICT
@@ -50,7 +50,7 @@ AS 'MODULE_PATHNAME', 'fifo_arena_capacity_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:1824
+-- src/fifo.rs:1829
 -- ledger_extension::fifo::fifo_arena_recon
 CREATE  FUNCTION "fifo_arena_recon"() RETURNS TABLE (
 	"pool_account_id" bigint,  /* i64 */
@@ -66,7 +66,7 @@ AS 'MODULE_PATHNAME', 'fifo_arena_recon_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:1747
+-- src/fifo.rs:1752
 -- ledger_extension::fifo::fifo_arena_reset
 CREATE  FUNCTION "fifo_arena_reset"() RETURNS bool /* bool */
 STRICT
@@ -75,7 +75,7 @@ AS 'MODULE_PATHNAME', 'fifo_arena_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:1728
+-- src/fifo.rs:1733
 -- ledger_extension::fifo::fifo_drain_consecutive_failures
 CREATE  FUNCTION "fifo_drain_consecutive_failures"() RETURNS bigint /* i64 */
 STRICT
@@ -84,7 +84,7 @@ AS 'MODULE_PATHNAME', 'fifo_drain_consecutive_failures_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:1709
+-- src/fifo.rs:1714
 -- ledger_extension::fifo::fifo_drain_rows_total
 CREATE  FUNCTION "fifo_drain_rows_total"() RETURNS bigint /* i64 */
 STRICT
@@ -93,7 +93,7 @@ AS 'MODULE_PATHNAME', 'fifo_drain_rows_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:1718
+-- src/fifo.rs:1723
 -- ledger_extension::fifo::fifo_drain_ticks_total
 CREATE  FUNCTION "fifo_drain_ticks_total"() RETURNS bigint /* i64 */
 STRICT
@@ -102,7 +102,7 @@ AS 'MODULE_PATHNAME', 'fifo_drain_ticks_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:1673
+-- src/fifo.rs:1678
 -- ledger_extension::fifo::fifo_force_drain_tick
 CREATE  FUNCTION "fifo_force_drain_tick"() RETURNS bool /* bool */
 STRICT
@@ -111,7 +111,7 @@ AS 'MODULE_PATHNAME', 'fifo_force_drain_tick_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:445
+-- src/fifo.rs:449
 -- ledger_extension::fifo::fifo_max_layers
 CREATE  FUNCTION "fifo_max_layers"() RETURNS bigint /* i64 */
 STRICT
@@ -120,7 +120,7 @@ AS 'MODULE_PATHNAME', 'fifo_max_layers_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:1691
+-- src/fifo.rs:1696
 -- ledger_extension::fifo::fifo_pending_drain_n
 CREATE  FUNCTION "fifo_pending_drain_n"(
 	"idx" bigint /* i64 */
@@ -131,7 +131,7 @@ AS 'MODULE_PATHNAME', 'fifo_pending_drain_n_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:455
+-- src/fifo.rs:459
 -- ledger_extension::fifo::fifo_test_acquire_release
 CREATE  FUNCTION "fifo_test_acquire_release"(
 	"idx" bigint, /* i64 */
@@ -143,7 +143,7 @@ AS 'MODULE_PATHNAME', 'fifo_test_acquire_release_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:473
+-- src/fifo.rs:477
 -- ledger_extension::fifo::fifo_test_acquire_two_sorted
 CREATE  FUNCTION "fifo_test_acquire_two_sorted"(
 	"idx_a" bigint, /* i64 */
@@ -155,7 +155,7 @@ AS 'MODULE_PATHNAME', 'fifo_test_acquire_two_sorted_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:500
+-- src/fifo.rs:504
 -- ledger_extension::fifo::fifo_test_cell_lock_addr
 CREATE  FUNCTION "fifo_test_cell_lock_addr"(
 	"idx" bigint /* i64 */

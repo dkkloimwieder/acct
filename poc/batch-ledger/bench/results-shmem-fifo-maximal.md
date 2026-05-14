@@ -433,10 +433,10 @@ inline (durable; crash-safe; no reconstruct logic needed).
 - **Workload shape pivot: 100% issue, 0% receipt.** F-shmem's
   MAX_LAYERS=64 ring cannot accommodate the prior 70% issue / 30%
   receipt mix (each receipt adds a layer; 300 receipts per
-  1000-envelope batch → cap hit in ~21% of first batch). Coalescing
-  is sub 3 / acct-b8ub — out of scope for sub 4 / sub 7. Issue-
-  dominant ("warehouse outflow") workload is the realistic F regime
-  until coalescing ships.
+  1000-envelope batch → cap hit in ~21% of first batch).
+  Spill-to-durable is sub 3 / acct-b8ub — out of scope for sub 4 /
+  sub 7. Issue-dominant ("warehouse outflow") workload is the
+  realistic F regime until spill-to-durable ships.
 - Each layer pre-seeded with 1 B qty (5 layers × 5 B qty/pool) so
   a 60s pure-issue run cannot fully drain any layer. Keeps the
   ring stable at 5 layers throughout the bench — exercises the
@@ -499,9 +499,10 @@ Zero deadlocks across all cells; zero `batches_err`.
 ## What it doesn't measure
 
 1. **Mixed-receipt workloads.** 70/30 issue/receipt is blocked by
-   MAX_LAYERS=64; sub 3 (`acct-b8ub` coalescing) is the gate. Real
-   ERP workloads with bursty receipts (PO match days) would need
-   coalescing.
+   MAX_LAYERS=64; sub 3 (`acct-b8ub` spill-to-durable) is the gate.
+   Real ERP workloads with bursty receipts (PO match days) would
+   need the spill-to-durable path that preserves strict per-unit
+   FIFO when the in-shmem cap is exceeded.
 2. **Layer churn at the head.** This bench's 5-layer seed never
    fully drains a layer; sub 4's `pending_drain` only stages drain
    deltas (not head-advance / fully-drained-layer signals). A
@@ -520,10 +521,10 @@ Zero deadlocks across all cells; zero `batches_err`.
 - **acct-e9tf F architecture validated.** Closing the epic at sub 4
   is justified: target hit; correctness pinned; bgworker drain
   composes; no known regression.
-- **acct-b8ub (sub 3 coalescing) becomes optional**, gated on a
-  workload driver. If no acct ERP feature needs F at high receipt
-  rate, sub 3 stays parked. If pure-issue 41K is enough,
-  shippable.
+- **acct-b8ub (sub 3 spill-to-durable) becomes optional**, gated on
+  a workload driver. If no acct ERP feature pushes a pool past
+  MAX_LAYERS=256 live layers, sub 3 stays parked. Pure-issue 41K
+  is enough for the current envelope.
 - **acct-u324 (sub 5 crash recovery)** + **acct-6g2u (sub 6 recon)**
   remain on the path. Sub 4's half-α architecture means sub 5 is
   not a heavy lift (posting_lines IS truth; no shmem→durable
@@ -538,8 +539,9 @@ issue-dominant workloads. The 31-41K tps headline:
 - 1.24-3.0× over inline (the no-shmem upper bound)
 - Within 6-29% of WAC's shmem-native ceiling
 
-For mixed-receipt workloads, the inline path (mig 0023) remains
-the recommended production path until coalescing (sub 3) ships.
+For mixed-receipt workloads that push past MAX_LAYERS=256, the
+inline path (mig 0023) remains the recommended fallback until
+spill-to-durable (sub 3 / acct-b8ub) ships.
 
 ## Files
 
@@ -658,7 +660,7 @@ ring and lets the bgworker handle `qty_remaining` UPSERTs out-of-band.
 errors. No `pending_drain` overflow falls into inline. Stable across
 3 replicates per F cell (max-min variance < 8%).
 
-## What's still gated on sub 3 (coalescing / spill-to-durable)
+## What's still gated on sub 3 (spill-to-durable)
 
 - **Fan-in mixed shape.** 20 writers concentrating all receipts on
   one ring will fill the cap at any reasonable value. This is the

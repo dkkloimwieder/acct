@@ -475,9 +475,10 @@ async fn t4_idempotent_replay() {
 /// T5 — multi-writer fan-in: 6 concurrent backends each post 8
 /// receipts to one shared pool. The per-cell LWLock serializes the
 /// apply phase; the per-account stage_apply lands coupled writes
-/// via the shmem hash table. Load (6 × 8 = 48 receipts) stays under
-/// MAX_LAYERS=64 — sub 3 (acct-b8ub coalescing) ships the
-/// high-cardinality variant.
+/// via the shmem hash table. Load (6 × 8 = 48 receipts) stays well
+/// under MAX_LAYERS=256 — sub 3 (acct-b8ub spill-to-durable) handles
+/// the per-pool high-cardinality variant when a workload driver
+/// pushes past the cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn t5_multi_writer_fan_in_coupled_writes() {
     let p = pool().await;
