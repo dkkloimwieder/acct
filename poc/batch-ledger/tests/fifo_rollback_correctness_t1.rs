@@ -1,55 +1,40 @@
-//! acct-majp / M10 FIFO arena rollback correctness gate.
+//! acct-majp / acct-b3vs — M10 FIFO arena rollback correctness.
 //!
-//! ## A1 gate (this commit)
+//! ## Pre-A2 baseline (acct-majp A1, commits 0827461 + a859d3f)
 //!
-//! `fifo_apply_batch_maximal` mutates shmem state IMMEDIATELY during the
-//! apply call:
+//! `fifo_apply_batch_maximal` mutated shmem state IMMEDIATELY during the
+//! apply call (Phase 8 ring push / consume / pending_drain push / overflow
+//! flip). On ROLLBACK the durable side cleaned up but shmem retained the
+//! state — `fifo_arena_recon` flagged drift. V1/V2 were the gate tests
+//! confirming the bug; V3/V4/V5 the invariants that already held.
 //!
-//! - Phase 4: `insert_fifo_cell` allocates a bucket under arena
-//!   EXCLUSIVE (creates occupancy + key, transitions seeded).
-//! - Phase 8: `push_layer` advances the ring tail; `consume_from_head`
-//!   advances the head and decrements layer qty; `push_pending_drain`
-//!   stages an entry for the bgworker.
-//! - Phase 8 (overflow path): flips `overflow_active`, CAS-sets
-//!   `overflow_first_spilled_layer_id` watermark.
-//! - Phase 10 `stage_apply` for balance/qty (WAC arena) — already
-//!   covered by acct-4e91's XactCallback path.
+//! ## A2 (acct-b3vs)
 //!
-//! Phase 8 / 8 (overflow) mutations are not transactional. If the
-//! surrounding PG transaction ROLLBACKs after the apply call, the
-//! durable side rolls back cleanly (`posting_lines` / `cost_layers` /
-//! `cost_layer_depletions` disappear) but the shmem ring retains the
-//! pushed layer / advanced head. `fifo_arena_recon` reports the
-//! divergence.
+//! `fifo_apply_batch_maximal` Phase 8 now applies against a per-cell
+//! `CellShadow` held in a thread_local `FIFO_PENDING_STACK`. Mutations
+//! are staged as `LayerOp` (Push / Consume / PendingDrainPush /
+//! OverflowActivate). On `xact_commit`, sorted cell-idx walk acquires
+//! each cell EXCLUSIVE and replays. On `xact_abort` shadows discard.
+//! SubXactCallback handles SAVEPOINT / ROLLBACK TO.
 //!
-//! ## V1 — minimal: single receipt, ROLLBACK
+//! Phase 4 cell allocation stays in-place (bucket leak under abort is
+//! bounded). Phase 8.5 / 8.6 stay unchanged (already SPI-only +
+//! local-Vec).
 //!
-//! `BEGIN; fifo_apply_batch_maximal(receipt qty=100); ROLLBACK;`
+//! ## Polarity post-A2
 //!
-//! Pre-fix: bucket allocated + ring contains a layer with qty=100, but
-//! `cost_layers` is empty. Recon row exists with `shmem_live=100`,
-//! `durable_qty=NULL` (pool absent from cost_layers).
+//! - V1: shmem_live=0 (ring empty); recon row may exist (cell allocated
+//!   by Phase 4) but reports zero state.
+//! - V2: shmem_live=100 (baseline preserved); drift=0.
+//! - V3 / V4 / V5: invariant — same outcome pre- and post-A2.
 //!
-//! ## V2 — recon-coupled: pre-existing layer + receipt + ROLLBACK
+//! ## New cases added by A2
 //!
-//! Commit a receipt (qty=100) first to establish a durable layer +
-//! shmem cell. Then `BEGIN; receipt qty=50; ROLLBACK;`. Pre-fix: shmem
-//! ring shows 150 (100 + 50), durable shows 100; drift = 100 - 150 =
-//! -50.
-//!
-//! ## V3 — invariant: COMMIT path applies normally
-//!
-//! Same receipt apply but with COMMIT. Drift = 0 both pre- and
-//! post-fix. Pins the "we didn't break the happy path" half of the A2
-//! contract.
-//!
-//! ## Post-A2 polarity flip
-//!
-//! When A2 lands (per-cell ring deltas staged into PENDING_STACK,
-//! replayed at xact_commit, discarded at xact_abort), the V1/V2
-//! assertions flip from `drift != 0` to `drift == 0` (or no recon
-//! row at all). V3's assertion is invariant across the flip. The
-//! polarity flip commit modifies this file in place.
+//! - V6: SAVEPOINT s1; apply; ROLLBACK TO s1; COMMIT → no shmem state.
+//! - V7: nested savepoint mixed commit/rollback → only s1's apply lands.
+//! - V8: ROLLBACK TO s1 then re-apply → only the re-apply lands.
+//! - V9: in-batch overflow_active flip rolled back → real cell flag=0.
+//! - V10: mixed cell-hosted + durable_only partial rollback.
 //!
 //! Destructive of shmem state for the synthetic pool keys; uses a
 //! disjoint base (`4_500_000_000_000`) from other FIFO test binaries.
@@ -161,12 +146,11 @@ async fn recon_row(
 
 /// V1 — minimal: BEGIN; fifo_receipt qty=100; ROLLBACK.
 ///
-/// **A1 polarity (pre-fix):** the rolled-back receipt leaks a layer
-/// into the shmem ring. Recon row exists with `shmem_live_qty=100`
-/// and `durable_qty=NULL` (cost_layers row rolled back).
-///
-/// Post-A2 this assertion FLIPS: either no recon row (ring empty), or
-/// row with `shmem_live_qty=0`.
+/// **Post-A2 polarity:** the rolled-back receipt's layer push lives only
+/// in `FIFO_PENDING_STACK`. On `xact_abort` the stack is discarded; the
+/// real ring never sees the push. Phase 4 still allocated the cell, so
+/// a recon row may exist (cell occupied) but all `shmem_*_qty` columns
+/// are zero. Durable side cleaned up.
 #[tokio::test]
 async fn v1_rollback_leaks_layer_to_ring() {
     let p = pool().await;
@@ -234,32 +218,33 @@ async fn v1_rollback_leaks_layer_to_ring() {
     .expect("count posting_lines");
     assert_eq!(posting_rows, 0, "V1: posting_lines rolled back as expected");
 
-    // Shmem side: PRE-A2 — the receipt's layer leaks into the ring.
+    // Shmem side: post-A2 — shadow discarded on abort. Phase 4 cell
+    // allocation stayed in-place, so a recon row may exist showing the
+    // cell is allocated but empty.
     let post = recon_row(&p, pool_id).await;
-    assert!(
-        post.is_some(),
-        "V1 A1: expected recon row to exist showing the leaked layer \
-         (cell allocated by Phase 4 + layer pushed by Phase 8). Got None — \
-         either A2 already landed and this gate's polarity should flip, or \
-         the cell allocation path is unexpectedly deferred. Found: {post:?}"
-    );
-    let (live, pending, total, durable, drift) = post.unwrap();
-    assert_eq!(
-        live, 100,
-        "V1 A1 BUG CONFIRMED: ring retains the rolled-back receipt's layer \
-         (shmem_live={live}, expected 100). Phase 8's push_layer leaked."
-    );
-    assert_eq!(pending, 0, "V1: no pending_drain for receipt-only batch");
-    assert_eq!(total, 100, "V1: shmem_total = live + pending = 100");
-    assert_eq!(
-        durable, None,
-        "V1: durable_qty is NULL because cost_layers row was rolled back"
-    );
-    assert_eq!(
-        drift, None,
-        "V1: drift is NULL when durable is NULL (recon's pool_exists CTE \
-         produces no row for empty cost_layers)"
-    );
+    match post {
+        Some((live, pending, total, durable, drift)) => {
+            assert_eq!(
+                live, 0,
+                "V1 A2: ring empty after rollback (cell allocated by Phase 4 \
+                 but Phase 8 ops stayed in shadow). shmem_live={live}"
+            );
+            assert_eq!(pending, 0, "V1 A2: no pending_drain — receipt-only batch staged nothing");
+            assert_eq!(total, 0, "V1 A2: shmem_total = 0");
+            assert_eq!(
+                durable, None,
+                "V1 A2: durable_qty NULL because cost_layers row was rolled back"
+            );
+            assert_eq!(
+                drift, None,
+                "V1 A2: drift NULL when durable is NULL"
+            );
+        }
+        None => {
+            // Acceptable: if recon's CTE produces no row for empty cells,
+            // the absence is also a pass signal.
+        }
+    }
 
     cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
 }
@@ -360,19 +345,23 @@ async fn v2_rollback_recon_shows_drift() {
     .expect("durable sum");
     assert_eq!(durable_sum, 100, "V2: durable still 100 post-rollback");
 
-    // Shmem ring: PRE-A2 has 100 + 50 = 150.
+    // Shmem ring: post-A2 — the rolled-back receipt stayed in shadow
+    // (xact_abort discarded). Real ring shows only the baseline 100.
     let post = recon_row(&p, pool_id).await.expect("V2 cell present");
     let (live, _pending, _total, durable, drift) = post;
     assert_eq!(
-        live, 150,
-        "V2 A1 BUG CONFIRMED: ring retains rolled-back layer \
-         (shmem_live={live}, expected 100+50=150)"
+        live, 100,
+        "V2 A2: ring unchanged from baseline after rollback \
+         (shmem_live={live}, expected 100). The rolled-back receipt's \
+         Push op stayed in FIFO_PENDING_STACK and was discarded by \
+         xact_abort."
     );
-    assert_eq!(durable, Some(100), "V2: durable_qty = 100");
+    assert_eq!(durable, Some(100), "V2 A2: durable_qty = 100");
     assert_eq!(
         drift,
-        Some(-50),
-        "V2 A1 BUG CONFIRMED: drift = durable - shmem_total = 100 - 150 = -50; got {drift:?}"
+        Some(0),
+        "V2 A2: drift = 0; rolled-back ops never reached the real ring; \
+         got {drift:?}"
     );
 
     cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
@@ -724,4 +713,481 @@ async fn v5_q2_rollback_on_pure_spill_walk_no_shmem_delta() {
     );
 
     cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
+}
+
+// ─── A2 (acct-b3vs) — savepoint + overflow + mixed-routing cases ──────
+//
+// V6/V7/V8 exercise SubXactCallback frame management. V9 verifies the
+// OverflowActivate op is correctly deferred through commit/rollback.
+// V10 mixes Phase 4 cell-hosted with Phase 8.6 durable_only in one txn.
+
+/// V6 — BEGIN; SAVEPOINT s1; apply receipt; ROLLBACK TO s1; COMMIT.
+///
+/// SubXactCallback START_SUB pushes a frame; the apply lands in s1's
+/// frame. ROLLBACK TO s1 → ABORT_SUB pops the frame (discarding the
+/// shadow) then PG re-pushes s1 → START_SUB inserts a fresh empty
+/// frame. COMMIT → top-level COMMIT_SUB merges empty s1' into top
+/// (no-op) then xact_commit drains top-frame (empty) → no replay.
+///
+/// Net: no shmem state for this pool. cost_layers also clean (PG
+/// rolled back the subxact's INSERTs).
+#[tokio::test]
+async fn v6_savepoint_rollback_to_discards_apply() {
+    let p = pool().await;
+    let (pool_id, ap_id, cogs_id) = unique_accounts();
+    seed_accounts(
+        &p,
+        &[
+            (pool_id, "fifo_pool", "inv_value_raw"),
+            (ap_id, "fifo_ap", "credit_normal"),
+            (cogs_id, "fifo_cogs", "debit_normal"),
+        ],
+    )
+    .await;
+
+    let mut tx = p.begin().await.expect("begin tx");
+    sqlx::query("SAVEPOINT s1")
+        .execute(&mut *tx)
+        .await
+        .expect("savepoint s1");
+    let envelopes = serde_json::json!([
+        {
+            "envelope_idx": 0,
+            "kind": "fifo_receipt",
+            "debit_account_id": pool_id,
+            "credit_account_id": ap_id,
+            "qty": 75,
+            "unit_cost": 1000,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&envelopes)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("apply within s1");
+    sqlx::query("ROLLBACK TO SAVEPOINT s1")
+        .execute(&mut *tx)
+        .await
+        .expect("rollback to s1");
+    tx.commit().await.expect("commit top-level");
+
+    let cl: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM cost_layers WHERE pool_account_id = $1::bigint",
+    )
+    .bind(pool_id)
+    .fetch_one(&p)
+    .await
+    .expect("cl");
+    assert_eq!(cl, 0, "V6: durable cost_layers rolled back by ROLLBACK TO");
+
+    let post = recon_row(&p, pool_id).await;
+    if let Some((live, pending, total, _, _)) = post {
+        assert_eq!(live, 0, "V6: shmem_live=0 (shadow discarded by ABORT_SUB)");
+        assert_eq!(pending, 0, "V6: no pending");
+        assert_eq!(total, 0, "V6: shmem_total=0");
+    }
+    // None is also acceptable (cell allocated by Phase 4 but recon CTE
+    // may not surface a row when ring is empty + no durable).
+
+    cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
+}
+
+/// V7 — nested savepoint, inner aborts, outer commits.
+///
+/// BEGIN; SAVEPOINT s1; receipt A (qty=80); SAVEPOINT s2; receipt B
+/// (qty=20); ROLLBACK TO s2; COMMIT;
+///
+/// Frame timeline:
+/// - START_SUB s1 → push frame_s1
+/// - apply A → shadow_A in frame_s1
+/// - START_SUB s2 → push frame_s2 (inherits A's ring from frame_s1)
+/// - apply B → shadow_B in frame_s2 (B's qty applied to inherited ring)
+/// - ROLLBACK TO s2 → ABORT_SUB pops frame_s2 (discards B);
+///   re-START_SUB s2 → push empty frame_s2'
+/// - COMMIT:
+///   - COMMIT_SUB s2' → merge empty frame_s2' into frame_s1 (no-op)
+///   - COMMIT_SUB s1 → merge frame_s1 (with shadow_A) into top frame
+///   - xact_commit → replay shadow_A's ops → push layer A; ring shows 80.
+///
+/// Net: live=80, durable=80, drift=0. B never applied.
+#[tokio::test]
+async fn v7_nested_savepoint_mixed_commit_rollback() {
+    let p = pool().await;
+    let (pool_id, ap_id, cogs_id) = unique_accounts();
+    seed_accounts(
+        &p,
+        &[
+            (pool_id, "fifo_pool", "inv_value_raw"),
+            (ap_id, "fifo_ap", "credit_normal"),
+            (cogs_id, "fifo_cogs", "debit_normal"),
+        ],
+    )
+    .await;
+
+    let mut tx = p.begin().await.expect("begin tx");
+    sqlx::query("SAVEPOINT s1").execute(&mut *tx).await.expect("s1");
+    let recv_a = serde_json::json!([
+        {
+            "envelope_idx": 0, "kind": "fifo_receipt",
+            "debit_account_id": pool_id, "credit_account_id": ap_id,
+            "qty": 80, "unit_cost": 1000,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&recv_a)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("apply A under s1");
+
+    sqlx::query("SAVEPOINT s2").execute(&mut *tx).await.expect("s2");
+    let recv_b = serde_json::json!([
+        {
+            "envelope_idx": 0, "kind": "fifo_receipt",
+            "debit_account_id": pool_id, "credit_account_id": ap_id,
+            "qty": 20, "unit_cost": 1100,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&recv_b)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("apply B under s2");
+
+    sqlx::query("ROLLBACK TO SAVEPOINT s2")
+        .execute(&mut *tx)
+        .await
+        .expect("rollback to s2");
+    tx.commit().await.expect("commit");
+
+    let durable: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(qty_remaining), 0)::bigint FROM cost_layers \
+         WHERE pool_account_id = $1::bigint",
+    )
+    .bind(pool_id)
+    .fetch_one(&p)
+    .await
+    .expect("durable");
+    assert_eq!(durable, 80, "V7: only A committed; durable=80");
+
+    let post = recon_row(&p, pool_id).await.expect("V7 cell");
+    assert_eq!(
+        post.0, 80,
+        "V7: live=80 (B's ops in s2's frame were discarded by ABORT_SUB)"
+    );
+    assert_eq!(post.3, Some(80), "V7: durable_qty=80");
+    assert_eq!(post.4, Some(0), "V7: drift=0");
+
+    cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
+}
+
+/// V8 — apply, ROLLBACK TO, re-apply, COMMIT.
+///
+/// BEGIN; SAVEPOINT s1; receipt A (qty=42); ROLLBACK TO s1; receipt B
+/// (qty=99); COMMIT;
+///
+/// Net: only B applied. ROLLBACK TO discards A's shadow; receipt B
+/// (still under re-pushed s1) commits to top frame on COMMIT, drains
+/// at xact_commit → live=99.
+#[tokio::test]
+async fn v8_savepoint_rollback_then_apply_persists() {
+    let p = pool().await;
+    let (pool_id, ap_id, cogs_id) = unique_accounts();
+    seed_accounts(
+        &p,
+        &[
+            (pool_id, "fifo_pool", "inv_value_raw"),
+            (ap_id, "fifo_ap", "credit_normal"),
+            (cogs_id, "fifo_cogs", "debit_normal"),
+        ],
+    )
+    .await;
+
+    let mut tx = p.begin().await.expect("begin tx");
+    sqlx::query("SAVEPOINT s1").execute(&mut *tx).await.expect("s1");
+    let recv_a = serde_json::json!([
+        {
+            "envelope_idx": 0, "kind": "fifo_receipt",
+            "debit_account_id": pool_id, "credit_account_id": ap_id,
+            "qty": 42, "unit_cost": 1000,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&recv_a)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("apply A");
+
+    sqlx::query("ROLLBACK TO SAVEPOINT s1")
+        .execute(&mut *tx)
+        .await
+        .expect("rollback to s1");
+
+    let recv_b = serde_json::json!([
+        {
+            "envelope_idx": 0, "kind": "fifo_receipt",
+            "debit_account_id": pool_id, "credit_account_id": ap_id,
+            "qty": 99, "unit_cost": 1200,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&recv_b)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("apply B");
+
+    tx.commit().await.expect("commit");
+
+    let durable: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(qty_remaining), 0)::bigint FROM cost_layers \
+         WHERE pool_account_id = $1::bigint",
+    )
+    .bind(pool_id)
+    .fetch_one(&p)
+    .await
+    .expect("durable");
+    assert_eq!(durable, 99, "V8: only B committed; durable=99");
+
+    let post = recon_row(&p, pool_id).await.expect("V8 cell");
+    assert_eq!(post.0, 99, "V8: live=99");
+    assert_eq!(post.3, Some(99), "V8: durable_qty=99");
+    assert_eq!(post.4, Some(0), "V8: drift=0");
+
+    cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
+}
+
+/// V9 — overflow transition rolled back.
+///
+/// Setup: commit MAX_LAYERS receipts (ring full, overflow_active=0
+/// still — push_layer returned true on the last one because n_layers
+/// went from MAX-1 to MAX exactly, no further pushes attempted yet).
+/// Then `BEGIN; receipt`. The (MAX_LAYERS+1)-th push in shadow returns
+/// false; shadow's overflow_active flips to 1; ops record
+/// OverflowActivate. `ROLLBACK`.
+///
+/// Post-A2: real cell's overflow_active stays at 0 (the
+/// OverflowActivate op stayed in shadow, was discarded by xact_abort).
+/// fifo_overflow_state() returns (false, 0).
+///
+/// Pre-A2 this would have returned (true, lid) — the apply-time
+/// `b.overflow_active.store(1, Release)` mutated the real cell
+/// directly.
+#[tokio::test]
+async fn v9_overflow_transition_rolled_back() {
+    let p = pool().await;
+    let ml = max_layers(&p).await as usize;
+    let (pool_id, ap_id, cogs_id) = unique_accounts();
+    seed_accounts(
+        &p,
+        &[
+            (pool_id, "fifo_pool", "inv_value_raw"),
+            (ap_id, "fifo_ap", "credit_normal"),
+            (cogs_id, "fifo_cogs", "debit_normal"),
+        ],
+    )
+    .await;
+
+    // Fill ring to MAX_LAYERS exactly (committed).
+    let recv = receipt_batch(pool_id, ap_id, ml, "2026-05-14");
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&recv)
+    .fetch_all(&p)
+    .await
+    .expect("fill ring");
+
+    // Sanity: overflow_active still 0 (no overflow yet).
+    let pre: Option<(bool, i64)> = sqlx::query(
+        "SELECT overflow_active, watermark FROM fifo_overflow_state($1::bigint)",
+    )
+    .bind(pool_id)
+    .fetch_optional(&p)
+    .await
+    .expect("pre overflow")
+    .map(|r| {
+        (
+            r.get::<bool, _>("overflow_active"),
+            r.get::<i64, _>("watermark"),
+        )
+    });
+    assert_eq!(
+        pre,
+        Some((false, 0)),
+        "V9 setup: cell present, overflow_active still 0 (got {pre:?})"
+    );
+
+    // Rolled-back receipt that should trip overflow.
+    let mut tx = p.begin().await.expect("begin");
+    let extra = serde_json::json!([
+        {
+            "envelope_idx": 0, "kind": "fifo_receipt",
+            "debit_account_id": pool_id, "credit_account_id": ap_id,
+            "qty": 10, "unit_cost": 1500,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&extra)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("apply overflow-causing receipt");
+    tx.rollback().await.expect("rollback");
+
+    // Post-A2: overflow_active stayed at 0 (shadow discarded).
+    let post: Option<(bool, i64)> = sqlx::query(
+        "SELECT overflow_active, watermark FROM fifo_overflow_state($1::bigint)",
+    )
+    .bind(pool_id)
+    .fetch_optional(&p)
+    .await
+    .expect("post overflow")
+    .map(|r| {
+        (
+            r.get::<bool, _>("overflow_active"),
+            r.get::<i64, _>("watermark"),
+        )
+    });
+    assert_eq!(
+        post,
+        Some((false, 0)),
+        "V9 A2: overflow_active stays 0 post-rollback (got {post:?}). \
+         Pre-A2 this would have been (true, lid) because Phase 8 \
+         mutated the real cell at apply time."
+    );
+
+    cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
+}
+
+/// V10 — mixed cell-hosted + durable_only partial rollback.
+///
+/// Saturate the arena except for one pre-warmed cell. The pre-warmed
+/// pool (cell-hosted) and a fresh pool (no cell — Phase 8.6
+/// durable_only) get rolled-back receipts in the same txn. Assert:
+/// - Cell-hosted pool's shmem_live=0 (shadow discarded).
+/// - Durable_only pool has no cost_layers row + no recon row.
+///
+/// Destructive (uses fifo_force_arena_full); `#[ignore]`'d.
+#[tokio::test]
+#[ignore]
+async fn v10_mixed_cell_hosted_and_durable_only_partial_rollback() {
+    let p = pool().await;
+    let (cell_pool, ap_id, cogs_id) = unique_accounts();
+    let (durable_pool, _, _) = unique_accounts();
+    seed_accounts(
+        &p,
+        &[
+            (cell_pool, "fifo_pool_a", "inv_value_raw"),
+            (durable_pool, "fifo_pool_b", "inv_value_raw"),
+            (ap_id, "fifo_ap", "credit_normal"),
+            (cogs_id, "fifo_cogs", "debit_normal"),
+        ],
+    )
+    .await;
+
+    // Pre-warm the cell-hosted pool with a committed receipt.
+    let warm = serde_json::json!([
+        {
+            "envelope_idx": 0, "kind": "fifo_receipt",
+            "debit_account_id": cell_pool, "credit_account_id": ap_id,
+            "qty": 50, "unit_cost": 1000,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&warm)
+    .fetch_all(&p)
+    .await
+    .expect("warm cell");
+
+    // Saturate arena so durable_only's pool gets no cell.
+    let marked: i64 = sqlx::query("SELECT fifo_force_arena_full() AS n")
+        .fetch_one(&p)
+        .await
+        .expect("fill")
+        .get::<i64, _>("n");
+    assert!(marked > 0);
+
+    // Rolled-back receipts: one to cell-hosted, one to durable_only.
+    let mut tx = p.begin().await.expect("begin");
+    let mixed = serde_json::json!([
+        {
+            "envelope_idx": 0, "kind": "fifo_receipt",
+            "debit_account_id": cell_pool, "credit_account_id": ap_id,
+            "qty": 30, "unit_cost": 1100,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        },
+        {
+            "envelope_idx": 1, "kind": "fifo_receipt",
+            "debit_account_id": durable_pool, "credit_account_id": ap_id,
+            "qty": 25, "unit_cost": 1200,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&mixed)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("mixed apply");
+    tx.rollback().await.expect("rollback");
+
+    // Cell-hosted pool: shadow discarded; baseline 50 preserved.
+    let post_cell = recon_row(&p, cell_pool).await.expect("cell pool");
+    assert_eq!(post_cell.0, 50, "V10: cell-hosted shmem_live=50 (rolled-back receipt discarded)");
+    assert_eq!(post_cell.3, Some(50), "V10: cell-hosted durable=50");
+    assert_eq!(post_cell.4, Some(0), "V10: cell-hosted drift=0");
+
+    // Durable-only pool: no cell, no cost_layers row.
+    let dur_cl: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM cost_layers WHERE pool_account_id = $1::bigint",
+    )
+    .bind(durable_pool)
+    .fetch_one(&p)
+    .await
+    .expect("durable cl");
+    assert_eq!(dur_cl, 0, "V10: durable_only pool has no cost_layers after rollback");
+
+    let post_dur = recon_row(&p, durable_pool).await;
+    assert!(
+        post_dur.is_none(),
+        "V10: durable_only pool has no recon row (no cell allocated). Got {post_dur:?}"
+    );
+
+    let cleared: i64 = sqlx::query("SELECT fifo_release_sentinels() AS n")
+        .fetch_one(&p)
+        .await
+        .expect("release")
+        .get::<i64, _>("n");
+    assert!(cleared > 0);
+
+    cleanup(&p, &[cell_pool, durable_pool, ap_id, cogs_id]).await;
 }

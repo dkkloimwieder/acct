@@ -72,7 +72,8 @@
 use pgrx::prelude::*;
 use pgrx::shmem::{PGRXSharedMemory, PgSharedMemoryInitialization};
 use pgrx::{PgLwLock, pg_shmem_init};
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 // ── constants ────────────────────────────────────────────────────────
@@ -770,6 +771,501 @@ fn bucket(arena: &FifoArena, idx: usize) -> &FifoBucket {
     &arena.buckets[idx]
 }
 
+// ── M10.A2 (acct-b3vs) — deferred-apply via XactCallback ─────────────
+//
+// Pre-A2, `fifo_apply_batch_maximal` Phase 8 mutated the real ring
+// during the apply call. `BEGIN; apply; ROLLBACK;` left the staged
+// layers / consumed head / overflow flag in shmem (`fifo_arena_recon`
+// surfaced drift). A1 gate confirmed via
+// `tests/fifo_rollback_correctness_t1.rs` V1/V2.
+//
+// A2 defers Phase 8 mutations through a per-backend thread_local
+// `FIFO_PENDING_STACK` of `FifoFrame`s. Each frame is a `HashMap<cell_idx,
+// CellShadow>`. The apply path snapshots the cell's `RingFields` +
+// `overflow_active` + watermark + seeded under a brief SHARED hold, then
+// drops the lock and applies envelopes against the shadow's working
+// `RingFields` copy. Each mutation appends a `LayerOp` (`Push` /
+// `Consume` / `PendingDrainPush` / `OverflowActivate`) to `shadow.ops`.
+// On `xact_commit`, sorted cell-idx walk acquires each cell EXCLUSIVE
+// and replays ops against the real ring. On `xact_abort`, shadows
+// discard. `SubXactCallback` (`SAVEPOINT` / `ROLLBACK TO`) frames
+// push / pop / merge.
+//
+// Phase 4 (cell allocation) STAYS IN-PLACE. Aborted batches leak the
+// bucket (occupied=1, key set, ring empty); future ops probe and reuse.
+// At 16384 buckets this is bounded; abort-traffic-driven leak handling
+// is filed as acct-b3vs-followup.
+//
+// Phase 8.5 (spill walk) and Phase 8.6 (durable_only) are SPI-only +
+// local-Vec and rollback-clean by construction. Verified by A1 V4/V5.
+//
+// Lazy-seed split: `CellShadow.seed_ops` (replayed only if real ring's
+// `seeded == 0` at commit time) vs `CellShadow.ops` (always replayed).
+// Prevents double-seeding when a concurrent backend's commit stamped
+// seeded=1 between this backend's snapshot and commit. Per-layer
+// attribution under cross-backend same-pool concurrency is best-effort
+// at PoC scale; pool-level recon is the invariant.
+
+/// Replay-time op queued at apply against the shadow. Replayed in
+/// insertion order against the real ring at xact_commit.
+#[derive(Clone, Debug)]
+pub enum LayerOp {
+    /// `push_layer(ring, layer)`. On overflow at replay (ring full) the
+    /// commit-time replay flips overflow_active in-place.
+    Push(Layer),
+    /// `consume_from_head(ring, qty)`. Replay-time slices are discarded;
+    /// the depletion records were already written at apply time in
+    /// Phase 9d against shadow-time slice identities. Pool-level
+    /// `SUM(qty_remaining)` reconciliation holds; per-layer attribution
+    /// may drift under cross-backend same-pool concurrency.
+    Consume { qty: i64 },
+    /// `push_pending_drain(ring, layer_id, qty_consumed)`. On overflow
+    /// at replay time, log + count (recon will flag drift).
+    PendingDrainPush { layer_id: i64, qty_consumed: i64 },
+    /// Set `b.overflow_active = 1` + CAS-set
+    /// `overflow_first_spilled_layer_id`. Emitted when shadow's
+    /// `push_layer` returned false (ring full) — either during
+    /// lazy-seed or batch receipt apply.
+    OverflowActivate { watermark: i64 },
+}
+
+/// Per-cell shadow held in a `FifoFrame`. Snapshots the cell's ring +
+/// overflow state at first apply within a transaction; mutated by
+/// subsequent envelopes in the same call (and across calls in the same
+/// txn); replayed against the real ring at xact_commit.
+pub struct CellShadow {
+    /// Working copy of the cell's `RingFields`. Cloned bitwise from the
+    /// real ring at snapshot time. Lazy-seed pushes (if any) and batch
+    /// envelope mutations are applied here so subsequent in-batch
+    /// envelopes (and subsequent same-txn calls) see them.
+    pub ring: Box<RingFields>,
+    /// Working copy of `b.overflow_active` (0 / 1).
+    pub overflow_active: u8,
+    /// Working copy of `b.overflow_first_spilled_layer_id`.
+    pub overflow_watermark: i64,
+    /// True iff at snapshot time `b.seeded == 0`. Drives conditional
+    /// replay of `seed_ops` at commit + stamping `seeded=1`.
+    pub stamp_seeded: bool,
+    /// Lazy-seed pushes (and any seed-loop overflow flip). Replayed
+    /// AT COMMIT only if `stamp_seeded && b.seeded == 0` at commit time
+    /// (else a concurrent backend already seeded; skip to avoid
+    /// double-seeding).
+    pub seed_ops: Vec<LayerOp>,
+    /// Batch envelope ops. Always replayed at commit.
+    pub ops: Vec<LayerOp>,
+}
+
+/// One frame in `FIFO_PENDING_STACK`. The top-level transaction's frame
+/// sits at index 0; subxact START_SUB pushes a fresh frame, COMMIT_SUB
+/// merges popped frame into parent, ABORT_SUB pops + discards.
+pub struct FifoFrame {
+    pub cells: std::collections::HashMap<usize, CellShadow>,
+}
+
+impl FifoFrame {
+    fn new() -> Self {
+        Self {
+            cells: std::collections::HashMap::new(),
+        }
+    }
+}
+
+thread_local! {
+    /// Per-backend stack of pending FIFO shadows. Frame management is
+    /// lazy: backends that never call `fifo_apply_batch_maximal` keep
+    /// the stack empty and the xact/subxact callbacks become no-ops.
+    /// Callbacks registered in `_PG_init` (mirrors WAC arena pattern,
+    /// acct-17vr / acct-4e91).
+    pub(crate) static FIFO_PENDING_STACK: RefCell<Vec<FifoFrame>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Ensure the stack has a top-level frame. Called before any shadow
+/// insertion. Mirrors `lib.rs::ensure_top_frame` for the WAC arena.
+fn fifo_ensure_top_frame() {
+    FIFO_PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        if stack.is_empty() {
+            stack.push(FifoFrame::new());
+        }
+    });
+}
+
+/// Bitwise clone of `RingFields`. All fields are POD (no Drop, no
+/// references, no interior mutability inside this type), so
+/// `std::ptr::read` is sound. Used to snapshot the live ring under
+/// SHARED lock and to clone a parent frame's working ring into a
+/// freshly-pushed subxact frame.
+#[inline]
+fn ring_fields_clone(src: &RingFields) -> Box<RingFields> {
+    let mut dst: Box<RingFields> = Box::new(RingFields::default());
+    // SAFETY: RingFields is repr(C), all fields are POD primitives or
+    // arrays of POD. Non-overlapping (src is in shmem, dst is heap).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            src as *const RingFields,
+            &mut *dst as *mut RingFields,
+            1,
+        );
+    }
+    dst
+}
+
+/// Acquire (or lazily allocate) the per-cell shadow in the top frame
+/// for `cell_idx`. Caller MUST have called `fifo_ensure_top_frame()`
+/// already.
+///
+/// Discipline:
+/// - If top frame already has a shadow for this cell, return it.
+/// - Else if any parent frame has a shadow (parent-frame inheritance),
+///   clone its ring + overflow state into a fresh subxact-frame shadow
+///   with empty `ops` / `seed_ops` / `stamp_seeded=false` (parent owns
+///   the seeding obligation).
+/// - Else snapshot the live ring under SHARED lock. If at that moment
+///   `b.seeded == 0`, populate `seed_ops` from `seed_cache` (Phase 6
+///   already SPI-loaded the durable cost_layers) and set
+///   `stamp_seeded=true`.
+///
+/// The returned `CellShadow` is consumed by the caller; the caller
+/// re-inserts it into the top frame after applying the batch ops.
+fn fifo_acquire_shadow(
+    cell_idx: usize,
+    seed_cache: &std::collections::HashMap<usize, Vec<SeedLayerSnapshot>>,
+) -> CellShadow {
+    // First: try to pull existing shadow from top frame.
+    let from_top: Option<CellShadow> = FIFO_PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let top = stack.last_mut().expect("top frame ensured");
+        top.cells.remove(&cell_idx)
+    });
+    if let Some(shadow) = from_top {
+        return shadow;
+    }
+
+    // Second: look for parent-frame shadow to inherit working state from.
+    let from_parent: Option<(Box<RingFields>, u8, i64)> =
+        FIFO_PENDING_STACK.with(|s| {
+            let stack = s.borrow();
+            if stack.len() < 2 {
+                return None;
+            }
+            for i in (0..stack.len() - 1).rev() {
+                if let Some(p) = stack[i].cells.get(&cell_idx) {
+                    return Some((
+                        ring_fields_clone(&p.ring),
+                        p.overflow_active,
+                        p.overflow_watermark,
+                    ));
+                }
+            }
+            None
+        });
+    if let Some((ring, oa, ow)) = from_parent {
+        return CellShadow {
+            ring,
+            overflow_active: oa,
+            overflow_watermark: ow,
+            stamp_seeded: false,
+            seed_ops: Vec::new(),
+            ops: Vec::new(),
+        };
+    }
+
+    // Third: snapshot from the live ring under brief SHARED lock.
+    let arena = FIFO_ARENA.share();
+    let b = bucket(&arena, cell_idx);
+    let _guard = acquire_fifo_cell(cell_idx, FifoCellMode::Shared);
+    let ring_snap = ring_fields_clone(unsafe { ring_ref(b) });
+    let overflow_active = b.overflow_active.load(Ordering::Acquire);
+    let overflow_watermark = b.overflow_first_spilled_layer_id.load(Ordering::Acquire);
+    let needs_seed = b.seeded.load(Ordering::Acquire) == 0;
+    drop(_guard);
+
+    let mut shadow = CellShadow {
+        ring: ring_snap,
+        overflow_active,
+        overflow_watermark,
+        stamp_seeded: needs_seed,
+        seed_ops: Vec::new(),
+        ops: Vec::new(),
+    };
+
+    if needs_seed {
+        if let Some(seeds) = seed_cache.get(&cell_idx) {
+            for s in seeds {
+                let layer = Layer {
+                    qty: s.qty_remaining,
+                    unit_cost: s.unit_cost,
+                    layer_id: s.layer_id,
+                };
+                let ok = push_layer(&mut shadow.ring, layer);
+                if ok {
+                    shadow.seed_ops.push(LayerOp::Push(layer));
+                } else {
+                    if shadow.overflow_active == 0 {
+                        shadow.overflow_active = 1;
+                        if shadow.overflow_watermark == 0 {
+                            shadow.overflow_watermark = s.layer_id;
+                        }
+                        shadow.seed_ops.push(LayerOp::OverflowActivate {
+                            watermark: s.layer_id,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    shadow
+}
+
+/// Insert shadow back into the top frame after applying batch ops.
+fn fifo_install_shadow(cell_idx: usize, shadow: CellShadow) {
+    FIFO_PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let top = stack.last_mut().expect("top frame ensured");
+        top.cells.insert(cell_idx, shadow);
+    });
+}
+
+/// SeedLayer snapshot shape — defined here so the shadow acquire
+/// helper can reference it. Matches Phase 6's local `SeedLayer` type.
+#[derive(Copy, Clone)]
+pub struct SeedLayerSnapshot {
+    pub layer_id: i64,
+    pub qty_remaining: i64,
+    pub unit_cost: i64,
+}
+
+// ── xact / subxact callbacks ─────────────────────────────────────────
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn fifo_xact_callback(
+    event: pg_sys::XactEvent::Type,
+    _arg: *mut c_void,
+) {
+    match event {
+        pg_sys::XactEvent::XACT_EVENT_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_COMMIT => fifo_xact_commit(),
+        pg_sys::XactEvent::XACT_EVENT_ABORT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => fifo_xact_abort(),
+        _ => {}
+    }
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn fifo_subxact_callback(
+    event: pg_sys::SubXactEvent::Type,
+    _my_subid: pg_sys::SubTransactionId,
+    _parent_subid: pg_sys::SubTransactionId,
+    _arg: *mut c_void,
+) {
+    match event {
+        pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => fifo_subxact_start_sub(),
+        pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => fifo_subxact_commit_sub(),
+        pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => fifo_subxact_abort_sub(),
+        _ => {}
+    }
+}
+
+/// Commit: drain the top-level frame, sort cell indices, acquire each
+/// cell EXCLUSIVE in order, replay ops against the real ring. Mirrors
+/// the apply-time discipline (sorted cell-lock acquisition prevents
+/// inter-backend deadlock on multi-cell commits).
+///
+/// MUST succeed. Any error here is reported by PG after the durable
+/// commit has happened; recon will flag any resulting drift.
+fn fifo_xact_commit() {
+    let frame = FIFO_PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        if stack.is_empty() {
+            return FifoFrame::new();
+        }
+        // Merge all frames (defensive: subxact callbacks should have
+        // collapsed everything into frame 0 by COMMIT time).
+        let drained: Vec<FifoFrame> = stack.drain(..).collect();
+        stack.push(FifoFrame::new());
+        // Walk frames in order; later frames' shadows supersede earlier
+        // ones for the same cell (subxact COMMIT_SUB merge semantics
+        // already guarantee this in well-formed traffic; this loop is
+        // defensive).
+        let mut merged: std::collections::HashMap<usize, CellShadow> =
+            std::collections::HashMap::new();
+        for f in drained {
+            for (idx, sh) in f.cells {
+                match merged.entry(idx) {
+                    std::collections::hash_map::Entry::Occupied(mut occ) => {
+                        let p = occ.get_mut();
+                        p.ops.extend(sh.ops);
+                        p.ring = sh.ring;
+                        p.overflow_active = sh.overflow_active;
+                        p.overflow_watermark = sh.overflow_watermark;
+                        if sh.stamp_seeded && !p.stamp_seeded {
+                            p.stamp_seeded = true;
+                            p.seed_ops = sh.seed_ops;
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(vac) => {
+                        vac.insert(sh);
+                    }
+                }
+            }
+        }
+        FifoFrame { cells: merged }
+    });
+
+    if frame.cells.is_empty() {
+        return;
+    }
+
+    let mut cell_idxs: Vec<usize> = frame.cells.keys().copied().collect();
+    cell_idxs.sort_unstable();
+
+    let arena = FIFO_ARENA.share();
+    let mut shadows = frame.cells;
+    for idx in cell_idxs {
+        let shadow = shadows
+            .remove(&idx)
+            .expect("cell_idx came from shadows.keys()");
+        let _guard = acquire_fifo_cell(idx, FifoCellMode::Exclusive);
+        let b = bucket(&arena, idx);
+        // SAFETY: cell LWLock held EXCLUSIVE; sole writer of ring.
+        let ring = unsafe { ring_mut(b) };
+
+        // Conditional seed replay: only if the real ring is still
+        // unseeded. Otherwise a concurrent backend's commit already
+        // populated the head with the same durable layers; replaying
+        // our seed_ops would double-push.
+        if shadow.stamp_seeded && b.seeded.load(Ordering::Acquire) == 0 {
+            for op in shadow.seed_ops.iter() {
+                fifo_replay_op(op, ring, b);
+            }
+            b.seeded.store(1, Ordering::Release);
+        }
+
+        // Always replay batch ops.
+        for op in shadow.ops.iter() {
+            fifo_replay_op(op, ring, b);
+        }
+
+        // Stamp last_seq so bgworker picks up the dirty cell.
+        let seq = next_seq();
+        b.last_seq.fetch_max(seq, Ordering::AcqRel);
+    }
+}
+
+fn fifo_replay_op(op: &LayerOp, ring: &mut RingFields, b: &FifoBucket) {
+    match op {
+        LayerOp::Push(layer) => {
+            let ok = push_layer(ring, *layer);
+            if !ok {
+                // Ring became full at commit time; flip overflow_active.
+                b.overflow_active.store(1, Ordering::Release);
+                let _ = b
+                    .overflow_first_spilled_layer_id
+                    .compare_exchange(
+                        0,
+                        layer.layer_id,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+            }
+        }
+        LayerOp::Consume { qty } => {
+            // Results discarded — depletion records were written at
+            // apply time against shadow-time slice identities.
+            let _ = consume_from_head(ring, *qty);
+        }
+        LayerOp::PendingDrainPush {
+            layer_id,
+            qty_consumed,
+        } => {
+            let staged = push_pending_drain(ring, *layer_id, *qty_consumed);
+            if !staged {
+                pgrx::warning!(
+                    "fifo_xact_commit: pending_drain overflow at replay \
+                     for layer_id={layer_id} (qty={qty_consumed}); \
+                     recon may surface drift until bgworker drain catches up",
+                );
+            }
+        }
+        LayerOp::OverflowActivate { watermark } => {
+            b.overflow_active.store(1, Ordering::Release);
+            let _ = b
+                .overflow_first_spilled_layer_id
+                .compare_exchange(
+                    0,
+                    *watermark,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+        }
+    }
+}
+
+/// Abort: discard all staged shadows. Reset stack to a single empty
+/// top-level frame.
+fn fifo_xact_abort() {
+    FIFO_PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        stack.clear();
+        stack.push(FifoFrame::new());
+    });
+}
+
+fn fifo_subxact_start_sub() {
+    FIFO_PENDING_STACK.with(|s| {
+        s.borrow_mut().push(FifoFrame::new());
+    });
+}
+
+fn fifo_subxact_commit_sub() {
+    FIFO_PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let popped = match stack.pop() {
+            Some(f) => f,
+            None => {
+                stack.push(FifoFrame::new());
+                return;
+            }
+        };
+        if stack.is_empty() {
+            stack.push(popped);
+            return;
+        }
+        let parent = stack.last_mut().unwrap();
+        for (cell_idx, child_shadow) in popped.cells {
+            match parent.cells.entry(cell_idx) {
+                std::collections::hash_map::Entry::Occupied(mut occ) => {
+                    let p = occ.get_mut();
+                    p.ops.extend(child_shadow.ops);
+                    p.ring = child_shadow.ring;
+                    p.overflow_active = child_shadow.overflow_active;
+                    p.overflow_watermark = child_shadow.overflow_watermark;
+                    if child_shadow.stamp_seeded && !p.stamp_seeded {
+                        p.stamp_seeded = true;
+                        p.seed_ops = child_shadow.seed_ops;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(vac) => {
+                    vac.insert(child_shadow);
+                }
+            }
+        }
+    });
+}
+
+fn fifo_subxact_abort_sub() {
+    FIFO_PENDING_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let _ = stack.pop();
+        if stack.is_empty() {
+            stack.push(FifoFrame::new());
+        }
+    });
+}
+
 // ── fifo_apply_batch_maximal pg_extern ────────────────────────────────
 
 /// Sub 2 — synchronous-apply FIFO batch function. The F-shmem path:
@@ -1106,12 +1602,7 @@ pub fn fifo_apply_batch_maximal(
         }
     }
 
-    struct SeedLayer {
-        layer_id: i64,
-        qty_remaining: i64,
-        unit_cost: i64,
-    }
-    let mut seed_cache: HashMap<usize, Vec<SeedLayer>> = HashMap::new();
+    let mut seed_cache: HashMap<usize, Vec<SeedLayerSnapshot>> = HashMap::new();
     if !cells_needing_seed.is_empty() {
         let pool_ids: Vec<i64> = cells_needing_seed.iter().map(|(_, p)| *p).collect();
         let fetched: Vec<(i64, i64, i64, i64)> = Spi::connect(|client| {
@@ -1144,7 +1635,7 @@ pub fn fifo_apply_batch_maximal(
             .collect();
         for (pid, lid, qr, uc) in fetched {
             if let Some(&cell) = pool_to_cell_map.get(&pid) {
-                seed_cache.entry(cell).or_insert_with(Vec::new).push(SeedLayer {
+                seed_cache.entry(cell).or_insert_with(Vec::new).push(SeedLayerSnapshot {
                     layer_id: lid,
                     qty_remaining: qr,
                     unit_cost: uc,
@@ -1232,205 +1723,179 @@ pub fn fifo_apply_batch_maximal(
     }
     let mut spill_queue: Vec<SpillIssueState> = Vec::new();
 
-    // Phase 8 — sorted cell-lock acquisition + apply.
-    {
-        let arena = FIFO_ARENA.share();
-        for (&cell_idx, env_indices) in &cells_to_envelopes {
-            let _guard = acquire_fifo_cell(cell_idx, FifoCellMode::Exclusive);
-            let b = bucket(&arena, cell_idx);
-            // SAFETY: cell LWLock held EXCLUSIVE; sole writer of ring.
-            let ring = unsafe { ring_mut(b) };
+    // Phase 8 — M10.A2 (acct-b3vs): apply against per-cell shadow,
+    // stage ops into FIFO_PENDING_STACK. Replay at xact_commit; discard
+    // at xact_abort. The cell lock is held ONLY for the brief snapshot
+    // at first-touch (acquire_shadow) and at commit-time replay. All
+    // batch mutations between snapshot and shadow-install are against
+    // the per-backend, per-call shadow's working `RingFields`.
+    //
+    // Phase 4 (cell allocation) and Phase 8.5 / 8.6 (spill walks +
+    // durable_only paths) are UNCHANGED — they remain in-place per the
+    // A2 design (acct-b3vs Q2/Q3/Q4 resolutions).
+    fifo_ensure_top_frame();
+    for (&cell_idx, env_indices) in &cells_to_envelopes {
+        let mut shadow = fifo_acquire_shadow(cell_idx, &seed_cache);
 
-            // Lazy-seed if needed (under cell lock so transition is atomic).
-            //
-            // Seeds arrive ordered by `(receipt_date, id)` ascending. The
-            // first `MAX_LAYERS` are pushed into the ring (head); on the
-            // (MAX_LAYERS+1)-th `push_layer` returns false. sub 3
-            // (acct-b8ub) handles this by flipping `overflow_active=1`,
-            // CAS-setting the watermark to the first un-pushed seed's
-            // `layer_id`, and breaking out of the seed loop — the
-            // remaining durable rows stay as the spilled tail and get
-            // consumed via Phase 8.5 SPI walk when issues drain past
-            // the ring.
-            if b.seeded.load(Ordering::Acquire) == 0 {
-                if let Some(seeds) = seed_cache.get(&cell_idx) {
-                    for s in seeds {
-                        let ok = push_layer(
-                            ring,
-                            Layer {
-                                qty: s.qty_remaining,
-                                unit_cost: s.unit_cost,
-                                layer_id: s.layer_id,
-                            },
-                        );
-                        if !ok {
-                            b.overflow_active.store(1, Ordering::Release);
-                            // CAS 0 -> s.layer_id; preserves the FIRST
-                            // overflowing layer's id if multiple seeds
-                            // would have overflowed across multiple
-                            // sessions (sticky-monotone watermark).
-                            let _ = b
-                                .overflow_first_spilled_layer_id
-                                .compare_exchange(
-                                    0,
-                                    s.layer_id,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                );
-                            break;
+        // Apply envelopes in original envelope order within the cell.
+        for &i in env_indices.iter() {
+            let p = &parsed[i];
+            match p.kind {
+                Kind::FifoReceipt => {
+                    let uc = p.unit_cost.expect("validated");
+                    let lid = env_layer_id[i].expect("pre-allocated");
+                    let amt = p.qty.saturating_mul(uc);
+                    // sub 3 (acct-b8ub) sticky-spill: if the shadow is
+                    // already overflow_active, skip the ring push
+                    // regardless of whether prior drains have made
+                    // room — preserves the watermark invariant.
+                    let already_overflow = shadow.overflow_active == 1;
+                    let layer = Layer {
+                        qty: p.qty,
+                        unit_cost: uc,
+                        layer_id: lid,
+                    };
+                    let pushed = if already_overflow {
+                        false
+                    } else {
+                        let ok = push_layer(&mut shadow.ring, layer);
+                        if ok {
+                            shadow.ops.push(LayerOp::Push(layer));
+                        }
+                        ok
+                    };
+                    if !pushed {
+                        if shadow.overflow_active == 0 {
+                            shadow.overflow_active = 1;
+                            if shadow.overflow_watermark == 0 {
+                                shadow.overflow_watermark = lid;
+                            }
+                            shadow.ops.push(LayerOp::OverflowActivate {
+                                watermark: lid,
+                            });
                         }
                     }
+                    env_total_cost[i] = Some(amt);
+                    pl_debit.push(p.debit);
+                    pl_credit.push(p.credit);
+                    pl_amount.push(amt);
+                    pl_currency.push(String::new()); // filled post-apply
+                    pl_idemp.push(p.idempotency_key.clone());
+                    pl_bdate.push(p.business_date.clone());
+                    pl_qty.push(p.qty);
+                    pl_env_idx.push(i);
+                    nl_id.push(lid);
+                    nl_pool.push(p.debit);
+                    nl_qty.push(p.qty);
+                    nl_uc.push(uc);
+                    nl_bdate.push(p.business_date.clone());
+                    nl_idemp.push(p.idempotency_key.clone());
+                    let e = bal_deltas.entry(p.debit).or_insert((0, 0));
+                    e.0 += amt;
+                    e.1 += p.qty;
+                    let e = bal_deltas.entry(p.credit).or_insert((0, 0));
+                    e.0 -= amt;
                 }
-                b.seeded.store(1, Ordering::Release);
-            }
-
-            // Apply envelopes in original envelope order within the cell.
-            for &i in env_indices.iter() {
-                let p = &parsed[i];
-                match p.kind {
-                    Kind::FifoReceipt => {
-                        let uc = p.unit_cost.expect("validated");
-                        let lid = env_layer_id[i].expect("pre-allocated");
-                        let amt = p.qty.saturating_mul(uc);
-                        // sub 3 (acct-b8ub) sticky-spill: if the cell
-                        // is already overflow_active, skip the ring
-                        // push regardless of whether prior drains have
-                        // made room — preserves the watermark invariant
-                        // (all in-shmem layers have id < watermark).
-                        // Otherwise try push; on overflow flip the flag
-                        // and capture the watermark. The durable
-                        // `cost_layers` INSERT (Phase 9c), posting_line
-                        // emission, and bal_deltas update happen
-                        // unconditionally — the receipt occurred, the
-                        // ledger records it, only the ring is bypassed.
-                        let already_overflow =
-                            b.overflow_active.load(Ordering::Acquire) == 1;
-                        let pushed = if already_overflow {
-                            false
+                Kind::FifoIssue => {
+                    let res = consume_from_head(&mut shadow.ring, p.qty);
+                    let in_shmem_qty = p.qty - res.shortage;
+                    if in_shmem_qty > 0 {
+                        shadow.ops.push(LayerOp::Consume { qty: in_shmem_qty });
+                    }
+                    // In-shmem slices ALWAYS post to dp_* + stage
+                    // pending_drain — they're real consumes the
+                    // shadow ring already mutated. This holds whether
+                    // or not we go to Phase 8.5 for the spill tail.
+                    for slice in &res.consumed {
+                        dp_layer_id.push(slice.layer_id);
+                        dp_issue_idemp.push(p.idempotency_key.clone());
+                        dp_qty.push(slice.qty_consumed);
+                        dp_cost.push(slice.qty_consumed.saturating_mul(slice.unit_cost));
+                        // sub 4: stage drain into shadow's pending_drain
+                        // ring. Overflow → inline fallback via
+                        // accum_drain. The shadow's pending_drain_n
+                        // tracks capacity; replay at commit re-stages
+                        // against the real ring.
+                        let staged = push_pending_drain(
+                            &mut shadow.ring,
+                            slice.layer_id,
+                            slice.qty_consumed,
+                        );
+                        if staged {
+                            shadow.ops.push(LayerOp::PendingDrainPush {
+                                layer_id: slice.layer_id,
+                                qty_consumed: slice.qty_consumed,
+                            });
                         } else {
-                            push_layer(
-                                ring,
-                                Layer {
-                                    qty: p.qty,
-                                    unit_cost: uc,
-                                    layer_id: lid,
-                                },
-                            )
-                        };
-                        if !pushed {
-                            b.overflow_active.store(1, Ordering::Release);
-                            let _ = b
-                                .overflow_first_spilled_layer_id
-                                .compare_exchange(
-                                    0,
-                                    lid,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                );
+                            *accum_drain.entry(slice.layer_id).or_insert(0) +=
+                                slice.qty_consumed;
                         }
-                        env_total_cost[i] = Some(amt);
+                    }
+
+                    if res.shortage > 0 {
+                        let overflow_active = shadow.overflow_active == 1;
+                        if !overflow_active {
+                            // Pool truly exhausted (no shmem, no
+                            // spill tail) — error as today.
+                            pgrx::error!(
+                                "fifo_apply_batch_maximal: envelope[{}] fifo_issue short by {} units \
+                                 (pool {} exhausted in shmem ring)",
+                                p.envelope_idx,
+                                res.shortage,
+                                p.credit
+                            );
+                        }
+                        // Spill-defer to Phase 8.5. Watermark comes
+                        // from shadow (consistent with prior in-batch
+                        // overflow flips) rather than the real cell.
+                        // Phase 8.5's SPI walk reads durable
+                        // cost_layers — same-batch receipts haven't
+                        // been INSERTed yet (Phase 9c is later), so
+                        // any in-batch overflow_active flip's
+                        // watermark refers to a NOT-YET-DURABLE row.
+                        // That's harmless: the walk just finds zero
+                        // candidates beyond the pre-batch watermark
+                        // and the spill remains short; existing error
+                        // path handles.
+                        spill_queue.push(SpillIssueState {
+                            env_i: i,
+                            shortage: res.shortage,
+                            in_shmem_total_cost: res.total_cost,
+                            watermark: shadow.overflow_watermark,
+                        });
+                        // DO NOT push pl_* / bal_deltas here —
+                        // total_cost is still incomplete (spill
+                        // contribution unknown). Phase 8.5 pushes
+                        // them with the final amount.
+                    } else {
+                        env_total_cost[i] = Some(res.total_cost);
                         pl_debit.push(p.debit);
                         pl_credit.push(p.credit);
-                        pl_amount.push(amt);
+                        pl_amount.push(res.total_cost);
                         pl_currency.push(String::new()); // filled post-apply
                         pl_idemp.push(p.idempotency_key.clone());
                         pl_bdate.push(p.business_date.clone());
                         pl_qty.push(p.qty);
                         pl_env_idx.push(i);
-                        nl_id.push(lid);
-                        nl_pool.push(p.debit);
-                        nl_qty.push(p.qty);
-                        nl_uc.push(uc);
-                        nl_bdate.push(p.business_date.clone());
-                        nl_idemp.push(p.idempotency_key.clone());
                         let e = bal_deltas.entry(p.debit).or_insert((0, 0));
-                        e.0 += amt;
-                        e.1 += p.qty;
+                        e.0 += res.total_cost;
                         let e = bal_deltas.entry(p.credit).or_insert((0, 0));
-                        e.0 -= amt;
-                    }
-                    Kind::FifoIssue => {
-                        let res = consume_from_head(ring, p.qty);
-                        // In-shmem slices ALWAYS post to dp_* + stage
-                        // pending_drain — they're real consumes the
-                        // ring already mutated. This holds whether or
-                        // not we go to Phase 8.5 for the spill tail.
-                        for slice in &res.consumed {
-                            dp_layer_id.push(slice.layer_id);
-                            dp_issue_idemp.push(p.idempotency_key.clone());
-                            dp_qty.push(slice.qty_consumed);
-                            dp_cost.push(slice.qty_consumed.saturating_mul(slice.unit_cost));
-                            // sub 4: stage drain into pending_drain ring
-                            // under cell lock. Overflow → inline fallback.
-                            let staged = push_pending_drain(
-                                ring,
-                                slice.layer_id,
-                                slice.qty_consumed,
-                            );
-                            if !staged {
-                                *accum_drain.entry(slice.layer_id).or_insert(0) +=
-                                    slice.qty_consumed;
-                            }
-                        }
-
-                        if res.shortage > 0 {
-                            let overflow_active =
-                                b.overflow_active.load(Ordering::Acquire) == 1;
-                            if !overflow_active {
-                                // Pool truly exhausted (no shmem, no
-                                // spill tail) — error as today.
-                                pgrx::error!(
-                                    "fifo_apply_batch_maximal: envelope[{}] fifo_issue short by {} units \
-                                     (pool {} exhausted in shmem ring)",
-                                    p.envelope_idx,
-                                    res.shortage,
-                                    p.credit
-                                );
-                            }
-                            // Spill-defer to Phase 8.5. We still hold
-                            // the cell lock here; we capture the
-                            // watermark snapshot under the lock so the
-                            // SPI walk's `id >= watermark` predicate
-                            // is consistent with cell state at this
-                            // envelope's point in the batch order.
-                            let watermark = b
-                                .overflow_first_spilled_layer_id
-                                .load(Ordering::Acquire);
-                            spill_queue.push(SpillIssueState {
-                                env_i: i,
-                                shortage: res.shortage,
-                                in_shmem_total_cost: res.total_cost,
-                                watermark,
-                            });
-                            // DO NOT push pl_* / bal_deltas here —
-                            // total_cost is still incomplete (spill
-                            // contribution unknown). Phase 8.5 pushes
-                            // them with the final amount.
-                        } else {
-                            env_total_cost[i] = Some(res.total_cost);
-                            pl_debit.push(p.debit);
-                            pl_credit.push(p.credit);
-                            pl_amount.push(res.total_cost);
-                            pl_currency.push(String::new()); // filled post-apply
-                            pl_idemp.push(p.idempotency_key.clone());
-                            pl_bdate.push(p.business_date.clone());
-                            pl_qty.push(p.qty);
-                            pl_env_idx.push(i);
-                            let e = bal_deltas.entry(p.debit).or_insert((0, 0));
-                            e.0 += res.total_cost;
-                            let e = bal_deltas.entry(p.credit).or_insert((0, 0));
-                            e.0 -= res.total_cost;
-                            e.1 -= p.qty;
-                        }
+                        e.0 -= res.total_cost;
+                        e.1 -= p.qty;
                     }
                 }
             }
-
-            // Stamp last_seq for drain.
-            let seq = next_seq();
-            b.last_seq.fetch_max(seq, Ordering::AcqRel);
-            // guard drops here, releasing the cell lock.
         }
+
+        // last_seq stamp DEFERRED to xact_commit (after replay). Bumping
+        // it here would mark the cell dirty for the bgworker even though
+        // the real ring hasn't been mutated yet; the drain pass would
+        // run, find nothing to flush, and stamp drained_seq up. Benign
+        // but wasteful. Stamping at commit aligns "marked dirty" with
+        // "real mutation visible".
+
+        // Install shadow back into the top frame.
+        fifo_install_shadow(cell_idx, shadow);
     }
 
     // Phase 8.5 (sub 3 / acct-b8ub) — spill consume for issues whose
@@ -2188,6 +2653,35 @@ pub fn fifo_arena_reset() -> bool {
         ring.pending_drain_n = 0;
     }
     true
+}
+
+// ── acct-b3vs (A2) — V9 probe for overflow_active rollback verification ──
+
+/// Surfaces `(overflow_active, overflow_first_spilled_layer_id)` for the
+/// PoC-keyed pool whose `pack_fifo_key_poc(pool_account_id)` is in
+/// shmem. Empty row set if no cell exists. SHARED probe; no lock cycle.
+///
+/// V9 uses this to assert post-A2 that a rolled-back batch whose
+/// shadow flipped overflow_active does NOT leave the real cell's flag
+/// set. Pre-A2 this probe would return `(true, some_lid)` after the
+/// rolled-back transition; post-A2 it returns `(false, 0)` because the
+/// OverflowActivate op stayed in shadow and was discarded.
+#[pg_extern]
+pub fn fifo_overflow_state(
+    pool_account_id: i64,
+) -> TableIterator<'static, (name!(overflow_active, bool), name!(watermark, i64))> {
+    let key = pack_fifo_key_poc(pool_account_id);
+    let arena = FIFO_ARENA.share();
+    let rows: Vec<(bool, i64)> = match probe_fifo_cell(&arena, key) {
+        Some(cell_idx) => {
+            let b = &arena.buckets[cell_idx];
+            let active = b.overflow_active.load(Ordering::Acquire) == 1;
+            let wm = b.overflow_first_spilled_layer_id.load(Ordering::Acquire);
+            vec![(active, wm)]
+        }
+        None => Vec::new(),
+    };
+    TableIterator::new(rows)
 }
 
 // ── sub 8 (acct-cpe8) — test helpers for arena bucket exhaustion ────

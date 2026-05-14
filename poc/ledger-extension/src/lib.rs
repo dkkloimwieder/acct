@@ -247,6 +247,19 @@ pub extern "C-unwind" fn _PG_init() {
             Some(ledger_subxact_callback),
             std::ptr::null_mut(),
         );
+        // acct-b3vs (M10.A2) — FIFO arena's parallel callback chain.
+        // Registered alongside the WAC arena's; PG invokes both per
+        // event (registration order is independent for the two
+        // arenas). FIFO_PENDING_STACK uses the same lazy-frame
+        // discipline.
+        pg_sys::RegisterXactCallback(
+            Some(fifo::fifo_xact_callback),
+            std::ptr::null_mut(),
+        );
+        pg_sys::RegisterSubXactCallback(
+            Some(fifo::fifo_subxact_callback),
+            std::ptr::null_mut(),
+        );
     }
 
     GucRegistry::define_int_guc(
