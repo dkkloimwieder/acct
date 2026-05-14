@@ -90,6 +90,10 @@ mod fifo;
 // shares only the `_PG_init` wiring.
 mod h_arena;
 
+// acct-1grr — H per-layer arena (path 2 of zm69.h6 followup).
+// Per-layer residual_qty shmem for FIFO cost attribution via CAS.
+mod h_layer_arena;
+
 // 16384 slots × 64-byte cache-aligned bucket = 1 MiB shmem.
 // Sized so the fan-out PoC bench (5000 accounts) lands at a sub-30%
 // load factor with comfortable headroom. Open-addressing probes
@@ -239,6 +243,9 @@ pub extern "C-unwind" fn _PG_init() {
     // acct-zm69 — H arena (per-group effective_qty rollup).
     h_arena::init();
 
+    // acct-1grr — H per-layer arena (per-layer residual_qty CAS).
+    h_layer_arena::init();
+
     // acct-17vr: register XactCallback + SubXactCallback unconditionally
     // at postmaster init. Each forked backend inherits the callback list,
     // so callbacks fire from the very first transaction event regardless
@@ -273,6 +280,13 @@ pub extern "C-unwind" fn _PG_init() {
         // bench shape doesn't exercise SAVEPOINT); add later if needed.
         pg_sys::RegisterXactCallback(
             Some(h_arena::h_xact_callback),
+            std::ptr::null_mut(),
+        );
+
+        // acct-1grr — H per-layer arena's XactCallback. Eager-apply
+        // model; only COMMIT (clear) and ABORT (reverse) phases used.
+        pg_sys::RegisterXactCallback(
+            Some(h_layer_arena::hl_xact_callback),
             std::ptr::null_mut(),
         );
     }

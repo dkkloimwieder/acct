@@ -101,12 +101,14 @@ async fn h_batched_bench() {
         .unwrap_or_else(|_| "post_batch_h".to_string());
     // Isolation: pure-SQL H needs SERIALIZABLE (the trigger-based
     // invariant only catches concurrent writers under SSI). The ext
-    // variant moves the invariant to shmem CAS — RC is correct.
-    // Default per function variant; explicit override via env.
-    let default_iso = if bench_fn.to_lowercase() == "post_batch_h_ext" {
-        "read_committed"
-    } else {
-        "serializable"
+    // variants serialize via shmem CAS (post_batch_h_ext) or row-level
+    // FOR UPDATE (post_batch_h_ext_fifo_walk) — RC is correct.
+    let default_iso = match bench_fn.to_lowercase().as_str() {
+        "post_batch_h_ext"
+        | "post_batch_h_ext_fifo_walk"
+        | "post_batch_h_ext_layer_shmem"
+        | "post_batch_h_ext_deferred" => "read_committed",
+        _ => "serializable",
     };
     let iso_str =
         std::env::var("POC_BENCH_ISOLATION").unwrap_or_else(|_| default_iso.to_string());
@@ -120,9 +122,14 @@ async fn h_batched_bench() {
     let (layers_table, cons_table, uses_extension) = match bench_fn_lc.as_str() {
         "post_batch_h" => ("cost_layers_h", "cost_consumptions_h", false),
         "post_batch_h_app" => ("cost_layers_h_app", "cost_consumptions_h_app", false),
-        "post_batch_h_ext" => ("cost_layers_h_ext", "cost_consumptions_h_ext", true),
+        "post_batch_h_ext"
+        | "post_batch_h_ext_fifo_walk"
+        | "post_batch_h_ext_layer_shmem"
+        | "post_batch_h_ext_deferred" => {
+            ("cost_layers_h_ext", "cost_consumptions_h_ext", true)
+        }
         other => panic!(
-            "POC_BENCH_FUNCTION must be post_batch_h | post_batch_h_app | post_batch_h_ext; got {other}"
+            "POC_BENCH_FUNCTION unsupported: {other}. Valid: post_batch_h | post_batch_h_app | post_batch_h_ext | post_batch_h_ext_fifo_walk | post_batch_h_ext_layer_shmem | post_batch_h_ext_deferred"
         ),
     };
 
@@ -134,17 +141,22 @@ async fn h_batched_bench() {
         .await
         .expect("connect");
 
-    // Clean slate on both table pairs so cross-run state doesn't leak.
-    sqlx::query(&format!(
-        "TRUNCATE {cons_table}, {layers_table} RESTART IDENTITY"
-    ))
-    .execute(&pool)
-    .await
-    .expect("truncate");
+    // Clean slate. For the ext path, also truncate the depletions
+    // table (only used by post_batch_h_ext_fifo_walk; harmless for the
+    // qty-only post_batch_h_ext path).
+    let truncate_sql = if uses_extension {
+        format!(
+            "TRUNCATE cost_layer_depletions_h_ext, {cons_table}, {layers_table} RESTART IDENTITY"
+        )
+    } else {
+        format!("TRUNCATE {cons_table}, {layers_table} RESTART IDENTITY")
+    };
+    sqlx::query(&truncate_sql)
+        .execute(&pool)
+        .await
+        .expect("truncate");
 
     if uses_extension {
-        // Ensure the extension is installed and reset h_arena shmem so
-        // residue from prior runs doesn't pollute this run's pre-seed.
         sqlx::query("CREATE EXTENSION IF NOT EXISTS ledger_extension")
             .execute(&pool)
             .await
@@ -153,21 +165,38 @@ async fn h_batched_bench() {
             .execute(&pool)
             .await
             .expect("h_arena_reset");
+        // Reset per-layer arena too (used by path 2). Harmless for
+        // other ext variants — they don't touch h_layer_arena.
+        // Tolerate older builds where h_layer_arena_reset isn't yet
+        // installed; ignore the function-not-found error in that case.
+        let _ = sqlx::query("SELECT h_layer_arena_reset()")
+            .execute(&pool)
+            .await;
     }
 
     // Pre-seed N layer_groups so issues never exhaust at realistic mix
     // (workers × batch_size × issue_pct × max_qty per group is far below
-    // group_qty per group).
-    sqlx::query(&format!(
-        "INSERT INTO {layers_table} (layer_group_id, qty, unit_cost, source_kind)
-         SELECT g, $1, 100, 'receipt'
-           FROM generate_series(1, $2::int) g"
-    ))
-    .bind(group_qty)
-    .bind(groups_count as i32)
-    .execute(&pool)
-    .await
-    .expect("seed layers");
+    // group_qty per group). The ext layers table requires qty_remaining
+    // populated (mig 0030); seed it equal to qty.
+    let seed_sql = if uses_extension {
+        format!(
+            "INSERT INTO {layers_table} (layer_group_id, qty, qty_remaining, unit_cost, source_kind)
+             SELECT g, $1, $1, 100, 'receipt'
+               FROM generate_series(1, $2::int) g"
+        )
+    } else {
+        format!(
+            "INSERT INTO {layers_table} (layer_group_id, qty, unit_cost, source_kind)
+             SELECT g, $1, 100, 'receipt'
+               FROM generate_series(1, $2::int) g"
+        )
+    };
+    sqlx::query(&seed_sql)
+        .bind(group_qty)
+        .bind(groups_count as i32)
+        .execute(&pool)
+        .await
+        .expect("seed layers");
 
     if uses_extension {
         // Mirror the durable seed in the h_arena shmem so consumption
@@ -188,6 +217,26 @@ async fn h_batched_bench() {
             .execute(&pool)
             .await
             .expect("h_arena seed");
+
+        // For path 2 (layer_shmem), also seed h_layer_arena cells so
+        // FIFO walks find a non-zero residual on pre-seeded layers.
+        // Tolerate older extension builds without h_layer_create.
+        if bench_fn.to_lowercase() == "post_batch_h_ext_layer_shmem" {
+            let layer_seed_sql = format!(
+                "DO $$
+                 DECLARE r RECORD;
+                 BEGIN
+                   FOR r IN SELECT layer_id FROM cost_layers_h_ext ORDER BY layer_id LOOP
+                     PERFORM h_layer_create(r.layer_id, {}::BIGINT);
+                   END LOOP;
+                 END$$",
+                group_qty
+            );
+            sqlx::query(&layer_seed_sql)
+                .execute(&pool)
+                .await
+                .expect("h_layer_arena seed");
+        }
     }
 
     let dl_before: i64 = sqlx::query_scalar(
