@@ -120,7 +120,7 @@ thread_local! {
 ///
 /// Applies at PRE_COMMIT; does NOT mutate shmem here.
 #[pg_extern]
-fn h_apply_delta(group_id: i64, qty_delta: i64) {
+pub fn h_apply_delta(group_id: i64, qty_delta: i64) {
     if group_id <= 0 {
         error!("h_apply_delta: group_id must be > 0; got {group_id}");
     }

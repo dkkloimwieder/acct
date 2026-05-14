@@ -94,6 +94,10 @@ mod h_arena;
 // Per-layer residual_qty shmem for FIFO cost attribution via CAS.
 mod h_layer_arena;
 
+// acct-xeee — H native batch FIFO wrapper (path 4 of zm69 evaluation).
+// Single FFI per batch; native shmem walk; bulk-INSERT depletions at end.
+mod h_batch_fifo;
+
 // 16384 slots × 64-byte cache-aligned bucket = 1 MiB shmem.
 // Sized so the fan-out PoC bench (5000 accounts) lands at a sub-30%
 // load factor with comfortable headroom. Open-addressing probes

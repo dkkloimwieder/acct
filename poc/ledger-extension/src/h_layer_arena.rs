@@ -55,7 +55,19 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 
-pub const HL_N_BUCKETS: usize = 65536;
+// acct-xeee: bumped 2^16 → 2^22 (256MiB) so 60s fan_out benches at
+// path 4's measured ~80K transfers/s (~24K new layer cells per second
+// at 30% receipts) sustain under 40% hash-table load.
+//
+// h_layer_arena has no cell reclamation — cells live until the next
+// h_layer_arena_reset() — so capacity must cover the per-bench-run
+// receipt count. Production usage would either: (a) reset between
+// reporting windows, (b) add a tombstone-on-drained-and-quiescent
+// reclamation path, or (c) partition by lot/period so reset is
+// naturally scoped. None of those are needed for the PoC bench.
+//
+// At 4M buckets × 64 byte cache-aligned cell = 256 MiB shmem.
+pub const HL_N_BUCKETS: usize = 1 << 22;
 
 #[repr(C, align(64))]
 pub struct HLBucket {
@@ -106,7 +118,7 @@ thread_local! {
 /// layer_id (shouldn't, since layer_id is BIGSERIAL), the qty is
 /// added to its residual.
 #[pg_extern]
-fn h_layer_create(layer_id: i64, qty: i64) {
+pub fn h_layer_create(layer_id: i64, qty: i64) {
     if layer_id <= 0 {
         error!("h_layer_create: layer_id must be > 0; got {layer_id}");
     }
@@ -132,7 +144,7 @@ fn h_layer_create(layer_id: i64, qty: i64) {
 /// Returns 0 if the cell doesn't exist (layer was never seeded) — caller
 /// should advance to the next layer.
 #[pg_extern]
-fn h_layer_decrement(layer_id: i64, requested: i64) -> i64 {
+pub fn h_layer_decrement(layer_id: i64, requested: i64) -> i64 {
     if requested <= 0 {
         return 0;
     }

@@ -107,7 +107,8 @@ async fn h_batched_bench() {
         "post_batch_h_ext"
         | "post_batch_h_ext_fifo_walk"
         | "post_batch_h_ext_layer_shmem"
-        | "post_batch_h_ext_deferred" => "read_committed",
+        | "post_batch_h_ext_deferred"
+        | "h_apply_batch_fifo" => "read_committed",
         _ => "serializable",
     };
     let iso_str =
@@ -125,11 +126,12 @@ async fn h_batched_bench() {
         "post_batch_h_ext"
         | "post_batch_h_ext_fifo_walk"
         | "post_batch_h_ext_layer_shmem"
-        | "post_batch_h_ext_deferred" => {
+        | "post_batch_h_ext_deferred"
+        | "h_apply_batch_fifo" => {
             ("cost_layers_h_ext", "cost_consumptions_h_ext", true)
         }
         other => panic!(
-            "POC_BENCH_FUNCTION unsupported: {other}. Valid: post_batch_h | post_batch_h_app | post_batch_h_ext | post_batch_h_ext_fifo_walk | post_batch_h_ext_layer_shmem | post_batch_h_ext_deferred"
+            "POC_BENCH_FUNCTION unsupported: {other}. Valid: post_batch_h | post_batch_h_app | post_batch_h_ext | post_batch_h_ext_fifo_walk | post_batch_h_ext_layer_shmem | post_batch_h_ext_deferred | h_apply_batch_fifo"
         ),
     };
 
@@ -218,10 +220,12 @@ async fn h_batched_bench() {
             .await
             .expect("h_arena seed");
 
-        // For path 2 (layer_shmem), also seed h_layer_arena cells so
-        // FIFO walks find a non-zero residual on pre-seeded layers.
-        // Tolerate older extension builds without h_layer_create.
-        if bench_fn.to_lowercase() == "post_batch_h_ext_layer_shmem" {
+        // For paths 2 (layer_shmem) and 4 (h_apply_batch_fifo), also
+        // seed h_layer_arena cells so FIFO walks find a non-zero residual
+        // on pre-seeded layers. Tolerate older extension builds without
+        // h_layer_create.
+        let fn_lc = bench_fn.to_lowercase();
+        if fn_lc == "post_batch_h_ext_layer_shmem" || fn_lc == "h_apply_batch_fifo" {
             let layer_seed_sql = format!(
                 "DO $$
                  DECLARE r RECORD;

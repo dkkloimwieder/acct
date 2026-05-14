@@ -93,8 +93,10 @@ async fn h_ext_fifo_walk_concurrent_correctness() {
             .await
             .expect("h_arena seed");
     }
-    // For path 2 (layer_shmem), seed h_layer_arena per-layer cells.
-    if bench_fn == "post_batch_h_ext_layer_shmem" {
+    // For path 2 (layer_shmem) and path 4 (h_apply_batch_fifo), seed
+    // h_layer_arena per-layer cells. Path 4 reads residual via shmem CAS
+    // so pre-seeded layers must have cells.
+    if bench_fn == "post_batch_h_ext_layer_shmem" || bench_fn == "h_apply_batch_fifo" {
         sqlx::query(
             "DO $$
              DECLARE r RECORD;
@@ -247,8 +249,11 @@ async fn h_ext_fifo_walk_concurrent_correctness() {
 
     // I2: SUM(depletion.qty_consumed) per layer == qty_received - qty_remaining.
     // Only applies to paths that maintain durable qty_remaining (paths 1 and 3).
-    // Path 2 (layer_shmem) keeps residual in shmem only; qty_remaining stays stale.
-    let drift_rows: Vec<(i64, i64, i64, i64)> = if bench_fn == "post_batch_h_ext_layer_shmem" {
+    // Path 2 (layer_shmem) and path 4 (h_apply_batch_fifo) keep residual in
+    // shmem only; qty_remaining stays stale (the shmem cell IS the truth).
+    let drift_rows: Vec<(i64, i64, i64, i64)> = if bench_fn == "post_batch_h_ext_layer_shmem"
+        || bench_fn == "h_apply_batch_fifo"
+    {
         Vec::new()
     } else {
         sqlx::query_as(
@@ -275,8 +280,10 @@ async fn h_ext_fifo_walk_concurrent_correctness() {
     }
 
     // I3: h_arena effective_qty per group == SUM(layers.residual) per group.
-    // Path 2 uses h_layer_arena residual as truth; paths 1/3 use durable qty_remaining.
-    let arena_drift_sql = if bench_fn == "post_batch_h_ext_layer_shmem" {
+    // Paths 2 + 4 use h_layer_arena residual as truth; paths 1/3 use durable qty_remaining.
+    let arena_drift_sql = if bench_fn == "post_batch_h_ext_layer_shmem"
+        || bench_fn == "h_apply_batch_fifo"
+    {
         "WITH layer_residuals AS (
              SELECT layer_group_id, SUM(h_layer_lookup(layer_id))::BIGINT AS residual
                FROM cost_layers_h_ext
