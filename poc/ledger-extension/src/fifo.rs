@@ -44,6 +44,21 @@
 //!   `id >= overflow_first_spilled_layer_id` in `(receipt_date, id)`
 //!   order via SPI `FOR UPDATE`.
 //!
+//! ## Bucket-exhaustion handling (sub 8 / acct-cpe8)
+//!
+//! When all `FIFO_N_BUCKETS` buckets are occupied at insert time
+//! (no key match, open-addressing probe walked the whole table),
+//! the pool is routed through a **durable-only** path: it gets no
+//! shmem cell, all its envelopes apply directly against
+//! `cost_layers` via SPI. Receipts INSERT a new layer (no ring
+//! push, no `pending_drain` staging). Issues SPI-walk the pool's
+//! durable rows under `FOR UPDATE` in `(receipt_date, id)` order
+//! and stage their `qty_remaining` decrement via the existing
+//! `accum_drain` → Phase 9e UPDATE path. Mirrors the
+//! spill-to-durable philosophy of sub 3 but at the bucket
+//! dimension rather than the layer dimension. Same-pool cell
+//! reclamation when arena occupancy drops is future polish.
+//!
 //! ## Cell-lock acquisition discipline
 //!
 //! Multi-cell batches MUST acquire cell locks in cell-index ascending
@@ -975,19 +990,30 @@ pub fn fifo_apply_batch_maximal(
     }
 
     // Phase 4 — if any pools missed, take EXCLUSIVE + re-probe + insert.
+    //
+    // sub 8 (acct-cpe8): if `insert_fifo_cell` returns None (arena full,
+    // open-addressing probe walked all FIFO_N_BUCKETS without finding a
+    // free slot), the pool is marked `durable_only` rather than raising.
+    // Its envelopes apply via SPI in Phase 8.6 — no shmem cell, no ring,
+    // no pending_drain. `env_cell[i]` stays None for those envelopes.
+    let mut durable_only_pools: std::collections::HashSet<i64> =
+        std::collections::HashSet::new();
     if !missing_pools.is_empty() {
         let arena = FIFO_ARENA.exclusive();
         for pool_account_id in &missing_pools {
             let key = pack_fifo_key_poc(*pool_account_id);
-            let cell = insert_fifo_cell(&arena, key).unwrap_or_else(|| {
-                pgrx::error!(
-                    "fifo_apply_batch_maximal: FIFO arena full inserting pool_account_id={}",
-                    pool_account_id
-                )
-            });
-            pool_to_cell.insert(*pool_account_id, cell);
+            match insert_fifo_cell(&arena, key) {
+                Some(cell) => {
+                    pool_to_cell.insert(*pool_account_id, cell);
+                }
+                None => {
+                    durable_only_pools.insert(*pool_account_id);
+                }
+            }
         }
         // Backfill env_cell for envelopes whose pool was in missing_pools.
+        // durable_only pools have no entry in pool_to_cell, so env_cell
+        // stays None for them — Phase 7 routes them into durable_only_envs.
         for (i, p) in parsed.iter().enumerate() {
             if env_cell[i].is_some() {
                 continue;
@@ -996,6 +1022,8 @@ pub fn fifo_apply_batch_maximal(
                 env_cell[i] = pool_to_cell.get(&pool).copied();
             }
             // replays: env_pool[i] is None; env_cell stays None.
+            // durable_only: env_pool[i] is Some(pool) but pool_to_cell
+            // doesn't have it; env_cell stays None.
             let _ = p; // unused
         }
     }
@@ -1061,7 +1089,13 @@ pub fn fifo_apply_batch_maximal(
             if replay_map.contains_key(&p.idempotency_key) {
                 continue;
             }
-            let cell = env_cell[i].unwrap();
+            // sub 8 (acct-cpe8): durable_only envelopes have no cell —
+            // they apply via SPI in Phase 8.6 and bypass the lazy-seed
+            // scan entirely.
+            let cell = match env_cell[i] {
+                Some(c) => c,
+                None => continue,
+            };
             if !seen.insert(cell) {
                 continue;
             }
@@ -1124,13 +1158,25 @@ pub fn fifo_apply_batch_maximal(
     }
 
     // Phase 7 — group envelopes by cell_idx in sorted order.
+    //
+    // sub 8 (acct-cpe8): durable_only envelopes (env_cell[i] is None
+    // because the pool got no shmem cell in Phase 4) are routed into
+    // `durable_only_envs` in original envelope_idx order; Phase 8.6
+    // handles them via SPI after Phase 8.5.
     let mut cells_to_envelopes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut durable_only_envs: Vec<usize> = Vec::new();
     for (i, p) in parsed.iter().enumerate() {
         if replay_map.contains_key(&p.idempotency_key) {
             continue;
         }
-        let cell = env_cell[i].unwrap();
-        cells_to_envelopes.entry(cell).or_default().push(i);
+        match env_cell[i] {
+            Some(cell) => {
+                cells_to_envelopes.entry(cell).or_default().push(i);
+            }
+            None => {
+                durable_only_envs.push(i);
+            }
+        }
     }
 
     // Result + INSERT payload accumulators.
@@ -1499,6 +1545,141 @@ pub fn fifo_apply_batch_maximal(
             let e = bal_deltas.entry(p.credit).or_insert((0, 0));
             e.0 -= total_cost;
             e.1 -= p.qty;
+        }
+    }
+
+    // Phase 8.6 (sub 8 / acct-cpe8) — durable-only envelopes.
+    //
+    // Pools that got no shmem cell in Phase 4 (arena bucket exhaustion)
+    // apply directly against `cost_layers` via SPI. No cell lock is
+    // taken; the FOR UPDATE row locks on `cost_layers` provide
+    // serialization with other concurrent backends. Receipts INSERT
+    // a new layer (via the existing Phase 9c bulk path — push to
+    // `nl_*` here). Issues walk the pool's durable rows in
+    // `(receipt_date, id)` order and stage the consumed qty via
+    // `accum_drain` for Phase 9e UPDATE.
+    //
+    // Discipline: NO FifoCellGuards are held here (durable_only pools
+    // have no cell). Within a pool, envelopes apply in `env_idx`
+    // order. Across pools, ordering is irrelevant because pools
+    // don't share durable rows. The walk uses the existing
+    // half-α-architecture pattern (Phase 8.5-shaped SPI call).
+    //
+    // Limitation (matches Phase 8.5): same-batch receipts whose
+    // `cost_layers` row is inserted at Phase 9c are NOT visible to
+    // a subsequent same-batch issue's SPI walk here (it executes
+    // before Phase 9c). Workloads that need same-batch RYW on
+    // durable_only pools must split into separate batches. Same
+    // constraint applies to same-batch multi-issue: the second
+    // issue's SPI walk sees the same `qty_remaining` snapshot as
+    // the first (accum_drain not flushed until Phase 9e), and may
+    // double-consume layers the first already drained. Filed as
+    // acct-cpe8-followup if a workload driver surfaces.
+    if !durable_only_envs.is_empty() {
+        for &i in &durable_only_envs {
+            let p = &parsed[i];
+            match p.kind {
+                Kind::FifoReceipt => {
+                    let uc = p.unit_cost.expect("validated");
+                    let lid = env_layer_id[i].expect("pre-allocated");
+                    let amt = p.qty.saturating_mul(uc);
+                    env_total_cost[i] = Some(amt);
+                    pl_debit.push(p.debit);
+                    pl_credit.push(p.credit);
+                    pl_amount.push(amt);
+                    pl_currency.push(String::new());
+                    pl_idemp.push(p.idempotency_key.clone());
+                    pl_bdate.push(p.business_date.clone());
+                    pl_qty.push(p.qty);
+                    pl_env_idx.push(i);
+                    nl_id.push(lid);
+                    nl_pool.push(p.debit);
+                    nl_qty.push(p.qty);
+                    nl_uc.push(uc);
+                    nl_bdate.push(p.business_date.clone());
+                    nl_idemp.push(p.idempotency_key.clone());
+                    let e = bal_deltas.entry(p.debit).or_insert((0, 0));
+                    e.0 += amt;
+                    e.1 += p.qty;
+                    let e = bal_deltas.entry(p.credit).or_insert((0, 0));
+                    e.0 -= amt;
+                }
+                Kind::FifoIssue => {
+                    // SPI walk: all durable rows for the pool with
+                    // residual qty, in FIFO order, FOR UPDATE.
+                    let candidates: Vec<(i64, i64, i64)> = Spi::connect_mut(|client| {
+                        let args: Vec<pgrx::datum::DatumWithOid> = vec![p.credit.into()];
+                        let tup = client
+                            .update(
+                                "SELECT id, qty_remaining, unit_cost FROM cost_layers \
+                                 WHERE pool_account_id = $1::bigint \
+                                   AND qty_remaining > 0 \
+                                 ORDER BY receipt_date, id \
+                                 FOR UPDATE",
+                                None,
+                                &args,
+                            )
+                            .expect("maximal: durable_only SELECT cost_layers FOR UPDATE");
+                        let mut v: Vec<(i64, i64, i64)> = Vec::new();
+                        for row in tup {
+                            let lid: i64 = row["id"].value().unwrap().unwrap();
+                            let qr: i64 = row["qty_remaining"].value().unwrap().unwrap();
+                            let uc: i64 = row["unit_cost"].value().unwrap().unwrap();
+                            v.push((lid, qr, uc));
+                        }
+                        v
+                    });
+
+                    let mut remaining = p.qty;
+                    let mut total_cost: i64 = 0;
+                    let mut consumed: Vec<(i64, i64, i64)> = Vec::new();
+                    for (lid, qty_rem, uc) in candidates {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = remaining.min(qty_rem);
+                        total_cost = total_cost.saturating_add(take.saturating_mul(uc));
+                        consumed.push((lid, take, uc));
+                        remaining -= take;
+                    }
+
+                    if remaining > 0 {
+                        pgrx::error!(
+                            "fifo_apply_batch_maximal: envelope[{}] fifo_issue short by {} units \
+                             (pool {} durable-only path exhausted; arena bucket exhaustion)",
+                            p.envelope_idx,
+                            remaining,
+                            p.credit
+                        );
+                    }
+
+                    // Stage durable UPDATE via accum_drain (Phase 9e).
+                    // durable_only layers never sat in the ring; this is
+                    // the only path to decrement their qty_remaining.
+                    for (lid, qty, uc) in &consumed {
+                        dp_layer_id.push(*lid);
+                        dp_issue_idemp.push(p.idempotency_key.clone());
+                        dp_qty.push(*qty);
+                        dp_cost.push(qty.saturating_mul(*uc));
+                        *accum_drain.entry(*lid).or_insert(0) += qty;
+                    }
+
+                    env_total_cost[i] = Some(total_cost);
+                    pl_debit.push(p.debit);
+                    pl_credit.push(p.credit);
+                    pl_amount.push(total_cost);
+                    pl_currency.push(String::new());
+                    pl_idemp.push(p.idempotency_key.clone());
+                    pl_bdate.push(p.business_date.clone());
+                    pl_qty.push(p.qty);
+                    pl_env_idx.push(i);
+                    let e = bal_deltas.entry(p.debit).or_insert((0, 0));
+                    e.0 += total_cost;
+                    let e = bal_deltas.entry(p.credit).or_insert((0, 0));
+                    e.0 -= total_cost;
+                    e.1 -= p.qty;
+                }
+            }
         }
     }
 
@@ -2007,6 +2188,81 @@ pub fn fifo_arena_reset() -> bool {
         ring.pending_drain_n = 0;
     }
     true
+}
+
+// ── sub 8 (acct-cpe8) — test helpers for arena bucket exhaustion ────
+
+/// Test-only: mark every currently-unoccupied FIFO bucket as occupied
+/// by a sentinel key (`key_lo = 1`, `key_hi = idx`), forcing any
+/// subsequent real pool insert via `insert_fifo_cell` to return None
+/// after a full probe walk. Real PoC pool keys always have
+/// `key_lo = 0` (`pack_fifo_key_poc` packs the pool_account_id into
+/// the upper 64 bits), so:
+///
+/// - The sentinel keys cannot collide with any real pool by key match
+///   (the equality check in `insert_fifo_cell` fails on `key_lo`).
+/// - `fifo_arena_recon` already skips non-PoC-shape keys
+///   (`if key_lo != 0 { continue; }`), so sentinels are invisible to
+///   that recon's output.
+///
+/// Each sentinel slot gets a unique `key_hi` (the bucket index) so the
+/// probe loop doesn't short-circuit on a same-key match before
+/// exhausting the table.
+///
+/// Returns the number of buckets newly marked. Pair with
+/// `fifo_release_sentinels` for cleanup so the helper doesn't leak
+/// across test binaries when the arena is shared.
+#[pg_extern]
+pub fn fifo_force_arena_full() -> i64 {
+    let arena = FIFO_ARENA.exclusive();
+    let mut marked: i64 = 0;
+    for i in 0..FIFO_N_BUCKETS {
+        let b = &arena.buckets[i];
+        if b.occupied.load(Ordering::Relaxed) != 0 {
+            continue;
+        }
+        // Sentinel: distinct key_hi per bucket avoids `insert_fifo_cell`
+        // probe-loop key-match short-circuit; key_lo = 1 marks the row
+        // as test-only (real PoC keys always have key_lo = 0).
+        b.key_hi.store(i as u64, Ordering::Relaxed);
+        b.key_lo.store(1, Ordering::Relaxed);
+        // seeded=1 so the apply path never tries to lazy-seed this
+        // sentinel (would SPI-fetch garbage). Doesn't matter for
+        // correctness — apply skips it because env_cell never points
+        // here — but it's defense in depth if a future code path
+        // iterates all occupied cells.
+        b.seeded.store(1, Ordering::Release);
+        b.occupied.store(1, Ordering::Release);
+        marked += 1;
+    }
+    marked
+}
+
+/// Test-only: clear `occupied` (and the sentinel key bits) on every
+/// bucket whose `key_lo == 1` — the marker set by
+/// `fifo_force_arena_full`. Returns the number of buckets cleared.
+/// Real PoC pool cells (key_lo == 0) are left untouched, so this is
+/// safe to call in tests that share the arena with concurrent
+/// non-cpe8 tests.
+#[pg_extern]
+pub fn fifo_release_sentinels() -> i64 {
+    let arena = FIFO_ARENA.exclusive();
+    let mut cleared: i64 = 0;
+    for i in 0..FIFO_N_BUCKETS {
+        let b = &arena.buckets[i];
+        if b.occupied.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        if b.key_lo.load(Ordering::Relaxed) != 1 {
+            continue;
+        }
+        b.key_hi.store(0, Ordering::Relaxed);
+        b.key_lo.store(0, Ordering::Relaxed);
+        b.seeded.store(0, Ordering::Relaxed);
+        b.occupied.store(0, Ordering::Release);
+        cleared += 1;
+    }
+    cleared
 }
 
 // ── sub 6 (acct-6g2u) — FIFO arena recon ─────────────────────────────
