@@ -2236,6 +2236,13 @@ pub fn fifo_apply_batch_maximal(
                 })
             })
             .collect();
+        // qty_received (acct-a3rj Phase B): full receipt qty BEFORE any
+        // in-batch drain. In this path `nl_qty` is `p.qty` (the input
+        // receipt qty); in-batch consumption applies separately via
+        // accum_drain / pending_drain → cost_layers.qty_remaining is
+        // decremented later. So qty_received = qty_remaining at INSERT
+        // time = nl_qty. Reused below as the immutable receipt-side
+        // anchor for fifo_overconsume_check.
         Spi::connect_mut(|client| {
             let args: Vec<pgrx::datum::DatumWithOid> = vec![
                 nl_id.clone().into(),
@@ -2248,9 +2255,9 @@ pub fn fifo_apply_batch_maximal(
             client
                 .update(
                     "INSERT INTO cost_layers \
-                       (id, pool_account_id, qty_remaining, unit_cost, receipt_date, \
-                        receipt_posting_line_id) \
-                     SELECT u.lid, u.pool, u.qty, u.uc, u.bdate::date, u.pl \
+                       (id, pool_account_id, qty_remaining, qty_received, unit_cost, \
+                        receipt_date, receipt_posting_line_id) \
+                     SELECT u.lid, u.pool, u.qty, u.qty, u.uc, u.bdate::date, u.pl \
                      FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::text[], $6::bigint[]) \
                               AS u(lid, pool, qty, uc, bdate, pl)",
                     None,

@@ -50,7 +50,7 @@ AS 'MODULE_PATHNAME', 'fifo_arena_capacity_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2829
+-- src/fifo.rs:2836
 -- ledger_extension::fifo::fifo_arena_recon
 CREATE  FUNCTION "fifo_arena_recon"() RETURNS TABLE (
 	"pool_account_id" bigint,  /* i64 */
@@ -67,7 +67,7 @@ AS 'MODULE_PATHNAME', 'fifo_arena_recon_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2635
+-- src/fifo.rs:2642
 -- ledger_extension::fifo::fifo_arena_reset
 CREATE  FUNCTION "fifo_arena_reset"() RETURNS bool /* bool */
 STRICT
@@ -76,7 +76,7 @@ AS 'MODULE_PATHNAME', 'fifo_arena_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2615
+-- src/fifo.rs:2622
 -- ledger_extension::fifo::fifo_drain_consecutive_failures
 CREATE  FUNCTION "fifo_drain_consecutive_failures"() RETURNS bigint /* i64 */
 STRICT
@@ -85,7 +85,7 @@ AS 'MODULE_PATHNAME', 'fifo_drain_consecutive_failures_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2596
+-- src/fifo.rs:2603
 -- ledger_extension::fifo::fifo_drain_rows_total
 CREATE  FUNCTION "fifo_drain_rows_total"() RETURNS bigint /* i64 */
 STRICT
@@ -94,7 +94,7 @@ AS 'MODULE_PATHNAME', 'fifo_drain_rows_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2605
+-- src/fifo.rs:2612
 -- ledger_extension::fifo::fifo_drain_ticks_total
 CREATE  FUNCTION "fifo_drain_ticks_total"() RETURNS bigint /* i64 */
 STRICT
@@ -103,7 +103,7 @@ AS 'MODULE_PATHNAME', 'fifo_drain_ticks_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2709
+-- src/fifo.rs:2716
 -- ledger_extension::fifo::fifo_force_arena_full
 CREATE  FUNCTION "fifo_force_arena_full"() RETURNS bigint /* i64 */
 STRICT
@@ -112,7 +112,7 @@ AS 'MODULE_PATHNAME', 'fifo_force_arena_full_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2560
+-- src/fifo.rs:2567
 -- ledger_extension::fifo::fifo_force_drain_tick
 CREATE  FUNCTION "fifo_force_drain_tick"() RETURNS bool /* bool */
 STRICT
@@ -130,7 +130,7 @@ AS 'MODULE_PATHNAME', 'fifo_max_layers_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2669
+-- src/fifo.rs:2676
 -- ledger_extension::fifo::fifo_overflow_state
 CREATE  FUNCTION "fifo_overflow_state"(
 	"pool_account_id" bigint /* i64 */
@@ -144,7 +144,7 @@ AS 'MODULE_PATHNAME', 'fifo_overflow_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2578
+-- src/fifo.rs:2585
 -- ledger_extension::fifo::fifo_pending_drain_n
 CREATE  FUNCTION "fifo_pending_drain_n"(
 	"idx" bigint /* i64 */
@@ -155,7 +155,7 @@ AS 'MODULE_PATHNAME', 'fifo_pending_drain_n_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/fifo.rs:2741
+-- src/fifo.rs:2748
 -- ledger_extension::fifo::fifo_release_sentinels
 CREATE  FUNCTION "fifo_release_sentinels"() RETURNS bigint /* i64 */
 STRICT
@@ -226,7 +226,7 @@ AS 'MODULE_PATHNAME', 'ledger_apply_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2514
+-- src/lib.rs:2518
 -- ledger_extension::ledger_balance_lookup
 CREATE  FUNCTION "ledger_balance_lookup"(
 	"account_id" bigint, /* i64 */
@@ -244,7 +244,7 @@ AS 'MODULE_PATHNAME', 'ledger_balance_lookup_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2886
+-- src/lib.rs:2890
 -- requires:
 --   ledger_balance_lookup
 
@@ -431,7 +431,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_occupied_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2602
+-- src/lib.rs:2606
 -- ledger_extension::ledger_shmem_recon
 CREATE  FUNCTION "ledger_shmem_recon"() RETURNS TABLE (
 	"account_id" bigint,  /* i64 */
@@ -446,7 +446,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_recon_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2850
+-- src/lib.rs:2854
 -- ledger_extension::ledger_shmem_reset
 CREATE  FUNCTION "ledger_shmem_reset"() RETURNS void
 STRICT
@@ -455,7 +455,7 @@ AS 'MODULE_PATHNAME', 'ledger_shmem_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2757
+-- src/lib.rs:2761
 -- ledger_extension::ledger_test_panic_after_fetch_add
 CREATE  FUNCTION "ledger_test_panic_after_fetch_add"(
 	"account_id" bigint, /* i64 */
@@ -471,7 +471,7 @@ AS 'MODULE_PATHNAME', 'ledger_test_panic_after_fetch_add_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2787
+-- src/lib.rs:2791
 -- ledger_extension::ledger_test_panic_before_fetch_add
 CREATE  FUNCTION "ledger_test_panic_before_fetch_add"(
 	"account_id" bigint, /* i64 */
@@ -485,7 +485,7 @@ AS 'MODULE_PATHNAME', 'ledger_test_panic_before_fetch_add_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:2806
+-- src/lib.rs:2810
 -- ledger_extension::ledger_test_panic_in_exclusive
 CREATE  FUNCTION "ledger_test_panic_in_exclusive"(
 	"account_id" bigint, /* i64 */

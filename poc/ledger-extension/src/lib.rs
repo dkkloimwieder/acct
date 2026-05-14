@@ -2386,13 +2386,17 @@ fn fifo_apply_batch_inline(
                 nl_pl_ids.clone().into(),
                 nl_sentinel.clone().into(),
             ];
+            // qty_received (acct-a3rj Phase B): full receipt qty,
+            // identical to qty_remaining at INSERT time on this path
+            // (in-batch drain is staged separately, not pre-deducted
+            // here). See companion comment in fifo.rs::fifo_apply_batch_maximal.
             let tup = client
                 .update(
                     "WITH inserted AS ( \
                        INSERT INTO cost_layers \
-                         (pool_account_id, qty_remaining, unit_cost, receipt_date, \
-                          receipt_posting_line_id) \
-                       SELECT u.pool, u.qty, u.uc, u.bdate::date, u.pl \
+                         (pool_account_id, qty_remaining, qty_received, unit_cost, \
+                          receipt_date, receipt_posting_line_id) \
+                       SELECT u.pool, u.qty, u.qty, u.uc, u.bdate::date, u.pl \
                        FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::text[], $5::bigint[], $6::int[]) \
                             WITH ORDINALITY AS u(pool, qty, uc, bdate, pl, sentinel, ord) \
                        ORDER BY u.ord \

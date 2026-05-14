@@ -415,10 +415,12 @@ async fn r5_phantom_durable_row_detected() {
 
     // Inject phantom durable row: 25 qty_remaining the shmem doesn't
     // know about. Recon should report drift = +25.
+    // acct-a3rj Phase B: include qty_received (= qty_remaining for a
+    // never-depleted phantom).
     sqlx::query(
         "INSERT INTO cost_layers \
-            (pool_account_id, qty_remaining, unit_cost, receipt_date) \
-         VALUES ($1::bigint, 25, 1500, '2026-05-13')",
+            (pool_account_id, qty_remaining, qty_received, unit_cost, receipt_date) \
+         VALUES ($1::bigint, 25, 25, 1500, '2026-05-13')",
     )
     .bind(pool_id)
     .execute(&p)
@@ -457,10 +459,11 @@ async fn r6_orphan_durable_pool_not_surfaced() {
     .await;
 
     // No apply call → no shmem cell. Inject a durable row directly.
+    // acct-a3rj Phase B: include qty_received.
     sqlx::query(
         "INSERT INTO cost_layers \
-            (pool_account_id, qty_remaining, unit_cost, receipt_date) \
-         VALUES ($1::bigint, 50, 1000, '2026-05-13')",
+            (pool_account_id, qty_remaining, qty_received, unit_cost, receipt_date) \
+         VALUES ($1::bigint, 50, 50, 1000, '2026-05-13')",
     )
     .bind(pool_id)
     .execute(&p)

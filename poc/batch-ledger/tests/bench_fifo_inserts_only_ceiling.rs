@@ -112,8 +112,10 @@ async fn fifo_inserts_only_ceiling() {
         .map(|_| chrono::NaiveDate::from_ymd_opt(2026, 5, 13).unwrap())
         .collect();
     let seed_layer_ids: Vec<i64> = sqlx::query_scalar(
-        "INSERT INTO cost_layers (pool_account_id, qty_remaining, unit_cost, receipt_date) \
-         SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::date[]) \
+        // acct-a3rj Phase B: qty_received = qty_remaining for synthetic seed.
+        "INSERT INTO cost_layers (pool_account_id, qty_remaining, qty_received, unit_cost, receipt_date) \
+         SELECT pool, qty, qty, uc, rd FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::date[]) \
+              AS u(pool, qty, uc, rd) \
          RETURNING id",
     )
     .bind(&seed_cl_pool)
@@ -221,8 +223,10 @@ async fn fifo_inserts_only_ceiling() {
                 }
                 if !cl_pool.is_empty() {
                     let cl_res = sqlx::query(
-                        "INSERT INTO cost_layers (pool_account_id, qty_remaining, unit_cost, receipt_date) \
-                         SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::date[])",
+                        // acct-a3rj Phase B: qty_received = qty_remaining for bench seed.
+                        "INSERT INTO cost_layers (pool_account_id, qty_remaining, qty_received, unit_cost, receipt_date) \
+                         SELECT pool, qty, qty, uc, rd FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::date[]) \
+                              AS u(pool, qty, uc, rd)",
                     )
                     .bind(&cl_pool)
                     .bind(&cl_qty)

@@ -246,6 +246,37 @@ async fn depletion_count_for_layer(p: &sqlx::PgPool, layer_id: i64) -> i64 {
     .expect("depletion count")
 }
 
+async fn qty_received_for_layer(p: &sqlx::PgPool, layer_id: i64) -> i64 {
+    sqlx::query_scalar("SELECT qty_received FROM cost_layers WHERE id = $1::bigint")
+        .bind(layer_id)
+        .fetch_one(p)
+        .await
+        .expect("qty_received")
+}
+
+/// One row per layer where SUM(depletions) > qty_received. Returns
+/// `(layer_id, pool_account_id, qty_received, total_consumed, overshoot)`.
+async fn overconsume_rows(p: &sqlx::PgPool) -> Vec<(i64, i64, i64, i64, i64)> {
+    sqlx::query(
+        "SELECT layer_id, pool_account_id, qty_received, total_consumed, overshoot \
+         FROM fifo_overconsume_check() ORDER BY layer_id",
+    )
+    .fetch_all(p)
+    .await
+    .expect("fifo_overconsume_check")
+    .into_iter()
+    .map(|r| {
+        (
+            r.get::<i64, _>("layer_id"),
+            r.get::<i64, _>("pool_account_id"),
+            r.get::<i64, _>("qty_received"),
+            r.get::<i64, _>("total_consumed"),
+            r.get::<i64, _>("overshoot"),
+        )
+    })
+    .collect()
+}
+
 fn receipt_envelope(pool_id: i64, ap_id: i64, qty: i64, unit_cost: i64) -> serde_json::Value {
     serde_json::json!([{
         "envelope_idx": 0,
@@ -442,11 +473,43 @@ async fn r_mb6_concurrent_exhaustion_over_consumes_thin_layer() {
         "R-MB6: recon.durable_qty matches direct SUM(cost_layers.qty_remaining)"
     );
 
-    // GAP DOCUMENTATION: print the state so it shows in --nocapture.
+    // Invariant 5 (Phase B): the new `qty_received` column anchors the
+    // immutable receipt-side value. With L1 received at qty=100 it is
+    // 100 and not decremented by depletions.
+    let l1_received = qty_received_for_layer(&admin, l1_id).await;
+    assert_eq!(
+        l1_received, 100,
+        "R-MB6 Phase B: cost_layers.qty_received for L1 = 100 (immutable receipt-side anchor)"
+    );
+
+    // Invariant 6 (Phase B): `fifo_overconsume_check()` detects the
+    // over-attribution. Without this function the over-consume was
+    // invisible — `qty_remaining` non-negativity hides it (drain
+    // failures get logged + dropped) and `fifo_arena_recon.drift`
+    // measures pending-vs-durable lag, not depletion-vs-received.
+    let oc = overconsume_rows(&admin).await;
+    let oc_for_l1: Vec<_> = oc.iter().filter(|(lid, _, _, _, _)| *lid == l1_id).collect();
+    assert_eq!(
+        oc_for_l1.len(),
+        1,
+        "R-MB6 Phase B: fifo_overconsume_check fires exactly once for L1; got {} rows. \
+         Detection signal is the canonical truth, not derivative of drain success.",
+        oc_for_l1.len()
+    );
+    let (_, oc_pool, oc_received, oc_consumed, oc_overshoot) = oc_for_l1[0];
+    assert_eq!(*oc_pool, pool_id, "R-MB6 Phase B: pool_account_id surfaced");
+    assert_eq!(*oc_received, 100, "R-MB6 Phase B: qty_received reported = 100");
+    assert_eq!(*oc_consumed, 200, "R-MB6 Phase B: total_consumed reported = 200");
+    assert_eq!(*oc_overshoot, 100, "R-MB6 Phase B: overshoot = 100 (200 - 100)");
+
+    // GAP DOCUMENTATION (post-detection): print the state so it shows
+    // in --nocapture. R-MB6 still describes the gap; Phase B added the
+    // recon-side detection function. Phase C will reframe R-MB6 from
+    // "documents the gap" to "regression test for the detection".
     eprintln!(
-        "R-MB6 gap state: L1 original=100, SUM(depletions)={post_deps_sum}, \
-         qty_remaining={post_durable}, recon=({:?})",
-        recon
+        "R-MB6 state: L1 received=100, SUM(depletions)={post_deps_sum}, \
+         qty_remaining={post_durable}, recon=({:?}), overconsume_rows={:?}",
+        recon, oc
     );
 
     cleanup(&admin, &[pool_id, ap_id, cogs_id]).await;
