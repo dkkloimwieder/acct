@@ -378,6 +378,45 @@ async fn v2_rollback_recon_shows_drift() {
     cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
 }
 
+/// Build a receipt envelope batch JSONB. qty=10, unit_cost=1000 per
+/// envelope.
+fn receipt_batch(
+    pool_id: i64,
+    ap_id: i64,
+    n: usize,
+    business_date: &str,
+) -> serde_json::Value {
+    let mut envelopes: Vec<serde_json::Value> = Vec::with_capacity(n);
+    for i in 0..n {
+        envelopes.push(serde_json::json!({
+            "envelope_idx": i as i32,
+            "kind": "fifo_receipt",
+            "debit_account_id": pool_id,
+            "credit_account_id": ap_id,
+            "qty": 10,
+            "unit_cost": 1000,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": business_date,
+        }));
+    }
+    serde_json::Value::Array(envelopes)
+}
+
+async fn force_drain(p: &sqlx::PgPool) {
+    sqlx::query("SELECT fifo_force_drain_tick()")
+        .execute(p)
+        .await
+        .expect("force drain");
+}
+
+async fn max_layers(p: &sqlx::PgPool) -> i64 {
+    sqlx::query("SELECT fifo_max_layers() AS ml")
+        .fetch_one(p)
+        .await
+        .expect("max_layers")
+        .get::<i64, _>("ml")
+}
+
 /// V3 — invariant: COMMIT path applies the receipt normally.
 ///
 /// Same envelope shape as V1 but the transaction commits. Drift=0 both
@@ -425,6 +464,264 @@ async fn v3_commit_applies_receipt_normally() {
     assert_eq!(pending, 0, "V3: no pending");
     assert_eq!(durable, Some(250), "V3: durable=250 after commit");
     assert_eq!(drift, Some(0), "V3: drift=0 after commit");
+
+    cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
+}
+
+// ─── Q2 / Q3 verification cases ───────────────────────────────────────
+//
+// The acct-majp issue description hypothesises:
+//
+// - **Q3**: Phase 8.6 durable_only path is clean by construction — no
+//   cell allocated (Phase 4 returned None), no ring mutation, only SPI
+//   + local Vec. Rollback should leave nothing in shmem.
+//
+// - **Q2**: Phase 8.5 spill walk on a pre-existing overflow_active
+//   cell does only SPI (`SELECT FOR UPDATE` + `UPDATE qty_remaining`)
+//   + local Vec. No ring mutation, no overflow flag changes. Rollback
+//   should leave shmem state identical to pre-rollback snapshot.
+//
+// These cases verify the hypotheses empirically on the unfixed extension.
+// They are invariant across A2: post-fix, they continue to pass — the
+// durable_only and pure-spill-walk paths never had a leak, A2's deferral
+// machinery just doesn't apply to them.
+
+/// V4 — Q3 verification: rollback on Phase 8.6 durable_only path leaves
+/// zero shmem state.
+///
+/// Procedure: occupy every bucket with sentinels via
+/// `fifo_force_arena_full`; the real pool's first Phase 4
+/// `insert_fifo_cell` returns None; the apply routes via Phase 8.6.
+/// ROLLBACK; assert no recon row appears for the real pool (no cell was
+/// ever allocated) and the durable side rolled back cleanly.
+///
+/// Destructive: marks all empty buckets across the arena. Cleanup
+/// releases via `fifo_release_sentinels`. `#[ignore]`'d to keep out of
+/// the default parallel suite.
+#[tokio::test]
+#[ignore]
+async fn v4_q3_rollback_on_durable_only_path_no_shmem_leak() {
+    let p = pool().await;
+    let (pool_id, ap_id, cogs_id) = unique_accounts();
+    seed_accounts(
+        &p,
+        &[
+            (pool_id, "fifo_pool", "inv_value_raw"),
+            (ap_id, "fifo_ap", "credit_normal"),
+            (cogs_id, "fifo_cogs", "debit_normal"),
+        ],
+    )
+    .await;
+
+    // Sanity: real pool has no cell yet.
+    let pre = recon_row(&p, pool_id).await;
+    assert!(
+        pre.is_none(),
+        "V4 precondition: pool {pool_id} should have no shmem cell pre-fill. Got {pre:?}"
+    );
+
+    // Saturate the arena. Real pool will be unable to acquire a cell.
+    let marked: i64 = sqlx::query("SELECT fifo_force_arena_full() AS n")
+        .fetch_one(&p)
+        .await
+        .expect("fill arena")
+        .get::<i64, _>("n");
+    assert!(marked > 0, "V4: fifo_force_arena_full should mark some buckets");
+
+    // Apply a receipt to the real pool inside a transaction, then
+    // ROLLBACK. Should route via Phase 8.6 durable_only (no cell
+    // allocation, no ring mutation).
+    let mut tx = p.begin().await.expect("begin tx");
+    let envelopes = serde_json::json!([
+        {
+            "envelope_idx": 0,
+            "kind": "fifo_receipt",
+            "debit_account_id": pool_id,
+            "credit_account_id": ap_id,
+            "qty": 100,
+            "unit_cost": 1000,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    let result: Result<_, _> = sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&envelopes)
+    .fetch_all(&mut *tx)
+    .await;
+    // Apply must succeed under durable_only routing.
+    let _ = result.expect("V4: durable_only apply should succeed");
+    tx.rollback().await.expect("rollback");
+
+    // Durable side: rolled back.
+    let cl: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM cost_layers WHERE pool_account_id = $1::bigint",
+    )
+    .bind(pool_id)
+    .fetch_one(&p)
+    .await
+    .expect("cl count");
+    assert_eq!(cl, 0, "V4: cost_layers rolled back");
+
+    // Shmem side: zero state for real pool. Recon's `pool_account_id` filter
+    // skips sentinel-key buckets (key_lo != 0 → defensive skip in recon's
+    // Phase 1 walk per fifo.rs:2375).
+    let post = recon_row(&p, pool_id).await;
+    assert!(
+        post.is_none(),
+        "V4 Q3 VERIFIED: durable_only routing leaves zero shmem state \
+         on the real pool — no cell was ever allocated. Got recon row: {post:?}. \
+         If this fires post-fix, the A2 implementation accidentally allocated \
+         a cell for the durable_only path."
+    );
+
+    // Cleanup sentinels so other tests can run.
+    let cleared: i64 = sqlx::query("SELECT fifo_release_sentinels() AS n")
+        .fetch_one(&p)
+        .await
+        .expect("release sentinels")
+        .get::<i64, _>("n");
+    assert!(cleared > 0, "V4: should clear at least one sentinel");
+
+    cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
+}
+
+/// V5 — Q2 verification: rollback of an issue that walks only Phase 8.5
+/// spill tail leaves shmem state identical to pre-rollback.
+///
+/// Procedure:
+/// 1. Commit `MAX_LAYERS + 10` receipts → ring caps at MAX_LAYERS,
+///    overflow_active=1, watermark set, 10 layers spilled to durable.
+/// 2. Commit an issue draining the entire ring head → ring empty,
+///    overflow_active still 1, durable tail (10 layers × qty=10) intact.
+/// 3. Force drain to flush pending_drain into durable
+///    cost_layers.qty_remaining.
+/// 4. Snapshot recon: `shmem_live=0, shmem_pending=0, shmem_spilled=100,
+///    durable=100, drift=0`.
+/// 5. `BEGIN; apply issue qty=50;` → pure Phase 8.5 spill walk (ring is
+///    empty so Phase 8 consume_from_head returns nothing; 8.5 walks 5
+///    spilled layers via SPI `SELECT FOR UPDATE` + `UPDATE qty_remaining`).
+///    `ROLLBACK;`
+/// 6. Assert: post-rollback recon matches pre-rollback snapshot. Phase
+///    8.5's only mutations were SPI-side (rolled back) + local Vec
+///    (dies with the txn).
+///
+/// Invariant across A2: same outcome pre- and post-fix.
+#[tokio::test]
+async fn v5_q2_rollback_on_pure_spill_walk_no_shmem_delta() {
+    let p = pool().await;
+    let ml = max_layers(&p).await as usize;
+    let (pool_id, ap_id, cogs_id) = unique_accounts();
+    seed_accounts(
+        &p,
+        &[
+            (pool_id, "fifo_pool", "inv_value_raw"),
+            (ap_id, "fifo_ap", "credit_normal"),
+            (cogs_id, "fifo_cogs", "debit_normal"),
+        ],
+    )
+    .await;
+
+    // Step 1: receipts that trip overflow_active.
+    let n_total = ml + 10;
+    let recv = receipt_batch(pool_id, ap_id, n_total, "2026-05-14");
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&recv)
+    .fetch_all(&p)
+    .await
+    .expect("setup receipts");
+
+    // Step 2: issue draining the ENTIRE in-shmem ring (qty = ml * 10).
+    // Phase 8 consume_from_head drains the ring fully; 8.5 not yet
+    // touched at this stage.
+    let drain_qty = (ml as i64) * 10;
+    let drain = serde_json::json!([
+        {
+            "envelope_idx": 0,
+            "kind": "fifo_issue",
+            "debit_account_id": cogs_id,
+            "credit_account_id": pool_id,
+            "qty": drain_qty,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&drain)
+    .fetch_all(&p)
+    .await
+    .expect("drain ring");
+
+    // Step 3: flush pending_drain. After this, in-shmem ring is empty
+    // (shmem_live=0, shmem_pending=0); durable cost_layers.qty_remaining
+    // reflects the spill tail (10 × 10 = 100).
+    force_drain(&p).await;
+
+    // Step 4: snapshot.
+    let snap = recon_row(&p, pool_id).await.expect("V5 cell present pre");
+    let (live_pre, pending_pre, total_pre, durable_pre, drift_pre) = snap;
+    assert_eq!(live_pre, 0, "V5 setup: ring drained, shmem_live=0");
+    assert_eq!(pending_pre, 0, "V5 setup: drain flushed, shmem_pending=0");
+    assert_eq!(total_pre, 0, "V5 setup: shmem_total=0");
+    assert_eq!(
+        durable_pre,
+        Some(100),
+        "V5 setup: durable = 10 spilled × qty 10 (got {durable_pre:?})"
+    );
+    assert_eq!(drift_pre, Some(0), "V5 setup: drift=0 at quiescence");
+
+    // Step 5: pure spill walk inside a rolled-back txn.
+    let mut tx = p.begin().await.expect("begin tx");
+    let issue_pure_spill = serde_json::json!([
+        {
+            "envelope_idx": 0,
+            "kind": "fifo_issue",
+            "debit_account_id": cogs_id,
+            "credit_account_id": pool_id,
+            "qty": 50,
+            "idempotency_key": Uuid::new_v4().to_string(),
+            "business_date": "2026-05-14",
+        }
+    ]);
+    sqlx::query(
+        "SELECT envelope_idx, status FROM post_batch_fifo_maximal_F($1::jsonb)",
+    )
+    .bind(&issue_pure_spill)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("pure spill issue");
+    tx.rollback().await.expect("rollback");
+
+    // Step 6: durable side rolled back — qty_remaining unchanged.
+    let durable_post: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(qty_remaining), 0)::bigint FROM cost_layers \
+         WHERE pool_account_id = $1::bigint",
+    )
+    .bind(pool_id)
+    .fetch_one(&p)
+    .await
+    .expect("durable post");
+    assert_eq!(
+        durable_post, 100,
+        "V5: durable cost_layers.qty_remaining rolled back to pre-txn"
+    );
+
+    // Shmem must match snapshot. Phase 8.5's local accum_drain Vec
+    // died with the function frame; ring + overflow flags were never
+    // touched.
+    let post = recon_row(&p, pool_id).await.expect("V5 cell present post");
+    assert_eq!(
+        post, snap,
+        "V5 Q2 VERIFIED: pure Phase 8.5 spill walk leaves zero shmem \
+         delta on rollback. Pre={snap:?} Post={post:?}. \
+         If this fires post-fix, A2 accidentally added shmem state to \
+         the spill walk path."
+    );
 
     cleanup(&p, &[pool_id, ap_id, cogs_id]).await;
 }
