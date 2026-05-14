@@ -1,9 +1,10 @@
-//! acct-a3rj — FIFO concurrent over-consume gap (R-MB6).
+//! acct-a3rj — FIFO concurrent over-consume regression net (R-MB6).
 //!
 //! ## Scope
 //!
-//! Documents the concurrent over-consume gap in A2 (acct-b3vs, shipped at
-//! commit `dff20bd`) at `poc/ledger-extension/src/fifo.rs:1175-1179`:
+//! Regression test for the concurrent over-consume condition in A2
+//! (acct-b3vs, shipped at commit `dff20bd`) at
+//! `poc/ledger-extension/src/fifo.rs:1175-1179`:
 //!
 //! ```text
 //! LayerOp::Consume { qty } => {
@@ -37,7 +38,7 @@
 //!   and issues `UPDATE cost_layers SET qty_remaining = qty_remaining
 //!   - 2N WHERE id = L1`. With `qty_remaining=N` and CHECK
 //!   `qty_remaining >= 0`, this fails. Drain entries are logged then
-//!   dropped → drift surfaces.
+//!   dropped.
 //!
 //! The depletion-side signal is unambiguous: `SUM(cost_layer_depletions
 //! .qty_consumed for L1) = 2N > N = L1.original_qty`.
@@ -52,26 +53,36 @@
 //!   layer pattern.
 //! - `property_fifo_rollback` pre-seeds 10M baseline.
 //!
-//! "Thin-layer concurrent exhaustion" is the missing shape.
+//! "Thin-layer concurrent exhaustion" is the shape they were missing.
 //!
-//! ## Polarity
+//! ## Detection
 //!
-//! R-MB6 documents CURRENT A2 behavior:
+//! Phase B (commit `fdad1c3`) added `cost_layers.qty_received` (the
+//! immutable receipt-side anchor populated at INSERT and never
+//! decremented) plus `fifo_overconsume_check()`, a pure-SQL function
+//! that returns one row per layer where `SUM(qty_consumed) >
+//! qty_received` with overshoot magnitude. R-MB6 exercises the
+//! concurrent-exhaustion shape end-to-end and asserts:
 //!
-//! - Both txns commit successfully (no SQL error during commit).
-//! - `cost_layer_depletions` has 2 rows for L1, each `qty_consumed=N`,
-//!   summing to `2N`.
-//! - The SUM exceeds the layer's original qty `N` — over-consume is
-//!   recorded but undetected by any current check.
+//! - Both txns commit (no SQL error during commit).
+//! - `cost_layer_depletions` has 2 rows for L1 summing to `2N` (the
+//!   recorded over-attribution).
+//! - `cost_layers.qty_received for L1 = N` (the immutable anchor).
+//! - `fifo_overconsume_check()` returns one row identifying L1 with
+//!   `overshoot = N`.
 //!
-//! When acct-a3rj Phase B lands (add `cost_layers.qty_received`
-//! column populated at INSERT + new recon check `SUM(depletions) <=
-//! qty_received`), assertion polarities flip: depletion SUM > received
-//! must be surfaced by the recon function rather than silently
-//! over-counting.
+//! If a future rewrite of the FIFO arena (Approach E in-place +
+//! needs_repair, Approach B OCC PreCommit validation, etc.) eliminates
+//! the over-consume at the source rather than detecting it post-hoc,
+//! R-MB6 flips: the `2 depletion rows for L1` and
+//! `fifo_overconsume_check returns one row` assertions need updating
+//! to reflect "one txn commits, the other gets a serialization
+//! failure" or whichever shape the new approach exhibits.
 //!
-//! Pattern matches t5's R-CR2 "documents the gap" shape — silent-
-//! failure profile pinned now, regression test once detection ships.
+//! Companion to t5's R-CR2 (un-drained pending_drain loss profile) —
+//! both pin a real correctness condition that A2 records but cannot
+//! itself surface; this one surfaced via the schema + recon extension
+//! in Phase B, R-CR2 still awaits a recovery-path fix.
 //!
 //! Base prefix `6_900_000_000_000` (disjoint from t1 4.5e12 / t2 4.9e12
 //! / t3 5.3e12 / t4 5.7e12 / t5 6.1e12 / property 6.5e12).
@@ -315,7 +326,7 @@ async fn apply_committed(p: &sqlx::PgPool, envelopes: &serde_json::Value) {
 /// **R-MB6** — Concurrent over-consume against a single thin layer.
 ///
 /// Setup: receive qty=100, force_drain → one durable `cost_layers` row
-/// `L1{qty_remaining=100, original=100}`.
+/// `L1{qty_remaining=100, qty_received=100}`.
 ///
 /// Workload: two backends, each opens a tx, applies a `fifo_issue
 /// qty=100`, then commits. Tasks synchronize on a barrier so both apply
@@ -323,23 +334,25 @@ async fn apply_committed(p: &sqlx::PgPool, envelopes: &serde_json::Value) {
 /// snapshots the same pre-commit ring state (L1=100). Both apply
 /// phases insert `cost_layer_depletions` rows for `{layer=L1, qty=100}`.
 ///
-/// Current (gap) behavior assertions (these document the gap; flip
-/// polarity when Phase B's recon check lands):
+/// Asserted invariants (the regression net for the over-consume
+/// condition + Phase B detection):
 ///
 /// 1. Both txns commit without error.
-/// 2. `SUM(cost_layer_depletions.qty_consumed for L1) = 200` —
-///    over-consume recorded.
-/// 3. `SUM > L1.original_qty=100` — the gap signal.
-/// 4. After best-effort `force_drain`:
-///    - `cost_layers.qty_remaining for L1` either stays at 100
-///      (drain batch hit the CHECK constraint, was rolled back +
-///      logged) OR partially advances (drain decremented some but
-///      not all entries). Either way it never goes negative.
-///    - No existing recon check fires on the
-///      `SUM(depletions) > original_qty` invariant violation. The
-///      `fifo_arena_recon().drift` may or may not surface a non-
-///      zero value depending on whether pending_drain entries are
-///      still in shmem.
+/// 2. `cost_layer_depletions` has exactly two rows for L1.
+/// 3. `SUM(qty_consumed for L1) = 200`.
+/// 4. `cost_layers.qty_received for L1 = 100` — the immutable
+///    receipt-side anchor (Phase B).
+/// 5. `fifo_overconsume_check()` returns one row for L1 with
+///    `qty_received=100, total_consumed=200, overshoot=100` (Phase B).
+/// 6. After best-effort `force_drain`, `cost_layers.qty_remaining for
+///    L1` stays in `[0, 100]` (CHECK constraint floors the
+///    decrement). `fifo_arena_recon().drift` may surface non-zero
+///    pending-vs-durable lag — that's a separate signal from the
+///    over-consume invariant.
+///
+/// If a future FIFO-arena rewrite eliminates the over-consume at the
+/// source, assertions 2 + 3 + 5 must be updated (one txn commits, the
+/// other gets serialization failure / pre-commit validation error).
 #[tokio::test]
 async fn r_mb6_concurrent_exhaustion_over_consumes_thin_layer() {
     let admin = admin_pool().await;
@@ -427,20 +440,21 @@ async fn r_mb6_concurrent_exhaustion_over_consumes_thin_layer() {
          L1's original qty was 100. Over-consume recorded. Got {post_deps_sum}"
     );
 
-    // Invariant 3: the gap signal. Over-consume is recorded but the
-    // current schema has no `cost_layers.qty_received` column to
-    // compare against; no existing recon check surfaces this.
+    // Invariant 3: depletion sum exceeds the layer's original qty.
+    // Pinning this here keeps R-MB6 honest about what the workload
+    // produces; Phase B's `fifo_overconsume_check` (invariant 6 below)
+    // is the canonical detection.
     let l1_original_qty: i64 = 100;
     assert!(
         post_deps_sum > l1_original_qty,
-        "R-MB6 GAP SIGNAL: SUM(depletions)={post_deps_sum} > original_qty={l1_original_qty}. \
-         A2 records the over-consume in cost_layer_depletions but no recon \
-         check fires on this invariant (acct-a3rj Phase B will add one)."
+        "R-MB6: SUM(depletions)={post_deps_sum} > original_qty={l1_original_qty}. \
+         A2 records the over-consume in cost_layer_depletions; \
+         fifo_overconsume_check (invariant 6) detects it."
     );
 
     // Best-effort drain. May fail internally on the CHECK
-    // qty_remaining >= 0; not asserted either way — observed state
-    // documented below.
+    // qty_remaining >= 0; not asserted either way — bounded by
+    // invariant 4 below.
     force_drain(&admin).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     force_drain(&admin).await;
@@ -502,10 +516,8 @@ async fn r_mb6_concurrent_exhaustion_over_consumes_thin_layer() {
     assert_eq!(*oc_consumed, 200, "R-MB6 Phase B: total_consumed reported = 200");
     assert_eq!(*oc_overshoot, 100, "R-MB6 Phase B: overshoot = 100 (200 - 100)");
 
-    // GAP DOCUMENTATION (post-detection): print the state so it shows
-    // in --nocapture. R-MB6 still describes the gap; Phase B added the
-    // recon-side detection function. Phase C will reframe R-MB6 from
-    // "documents the gap" to "regression test for the detection".
+    // Diagnostic: print final state under --nocapture for at-a-glance
+    // confirmation that the over-consume signal looks right.
     eprintln!(
         "R-MB6 state: L1 received=100, SUM(depletions)={post_deps_sum}, \
          qty_remaining={post_durable}, recon=({:?}), overconsume_rows={:?}",
