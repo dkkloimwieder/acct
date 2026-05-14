@@ -32,10 +32,17 @@
 //! - `layers[MAX_LAYERS]` indexed via `head` + `n_layers` (head outward
 //!   is oldest; tail = `(head + n_layers) % MAX_LAYERS`).
 //! - `head` / `n_layers` are u16, protected by the per-cell LWLock.
-//! - On overflow at receipt time, sub 3 (acct-b8ub) spills the
-//!   overflowing receipt directly to durable `cost_layers`, skipping
-//!   shmem residency. Strict per-unit FIFO preserved; the spilled tail
-//!   is consumed via SPI walk after the in-shmem range exhausts.
+//! - On overflow at receipt time (sub 3 / acct-b8ub), the overflowing
+//!   receipt INSERTs to durable `cost_layers` only — the ring is left
+//!   untouched. `overflow_active` flips to 1 on the bucket; while set,
+//!   subsequent receipts also bypass the ring even if drains have made
+//!   room (sticky-spill preserves the FIFO watermark). The first
+//!   spilled layer's id is captured in `overflow_first_spilled_layer_id`
+//!   so spill consumes can locate the spilled tail without scanning the
+//!   ring contents. Strict per-unit FIFO preserved: issues consume the
+//!   in-shmem head first, then walk durable rows with
+//!   `id >= overflow_first_spilled_layer_id` in `(receipt_date, id)`
+//!   order via SPI `FOR UPDATE`.
 //!
 //! ## Cell-lock acquisition discipline
 //!
@@ -51,7 +58,7 @@ use pgrx::prelude::*;
 use pgrx::shmem::{PGRXSharedMemory, PgSharedMemoryInitialization};
 use pgrx::{PgLwLock, pg_shmem_init};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 // ── constants ────────────────────────────────────────────────────────
 
@@ -193,6 +200,19 @@ unsafe impl PGRXSharedMemory for RingFields {}
 ///   state. Subsequent issues walk shmem; durable `cost_layers` is the
 ///   audit trail (drift-detected by recon).
 ///
+/// `overflow_active` (sub 3 / acct-b8ub): set to 1 the first time a
+/// receipt or lazy-seed push hits the `MAX_LAYERS` cap. While set,
+/// subsequent receipts spill directly to durable `cost_layers` without
+/// touching the ring (sticky-spill). Issues consume the in-shmem head
+/// first, then SPI-walk durable rows with
+/// `id >= overflow_first_spilled_layer_id`. The flag stays sticky for
+/// the PoC — clearing on full drain is a hardening follow-up.
+///
+/// `overflow_first_spilled_layer_id`: 0 = unset; > 0 = `cost_layers.id`
+/// of the first layer that was forced out of the ring. CAS-set on
+/// first overflow; subsequent overflows preserve the original value.
+/// All in-shmem layers have id strictly less than this watermark.
+///
 /// Header layout fits in 64 bytes; the 1544-byte `RingFields` follows.
 #[repr(C, align(64))]
 pub struct FifoBucket {
@@ -201,7 +221,13 @@ pub struct FifoBucket {
     /// authoritative layer state for this cell. Transition gated by
     /// the cell's EXCLUSIVE LWLock during sub 2's apply phase.
     pub seeded: AtomicU8,
-    pub _pad0: [u8; 6],
+    /// Spill-to-durable active flag (sub 3 / acct-b8ub). `0` = ring is
+    /// the sole layer store; `1` = ring is full / capped, subsequent
+    /// receipts and the spill tail consume via durable. Read lock-free
+    /// during Phase 8 spill-routing; writes are CAS / Release stores
+    /// from inside the cell's EXCLUSIVE critical section.
+    pub overflow_active: AtomicU8,
+    pub _pad0: [u8; 5],
     pub key_hi: AtomicU64,
     pub key_lo: AtomicU64,
     /// Monotone seq stamped by the last apply that mutated this cell's
@@ -211,7 +237,11 @@ pub struct FifoBucket {
     /// Highest `last_seq` value the bgworker has UPSERTed to durable
     /// `cost_layers`. Dirty iff `last_seq > drained_seq`.
     pub drained_seq: AtomicU64,
-    pub _pad1: [u8; 24],
+    /// First spilled layer's `cost_layers.id` (sub 3 / acct-b8ub).
+    /// `0` = unset; `> 0` = watermark for spill walks. CAS-set on
+    /// first overflow; all in-shmem layers have id strictly less.
+    pub overflow_first_spilled_layer_id: AtomicI64,
+    pub _pad1: [u8; 16],
     /// Cell-lock-protected ring buffer. Access ONLY via `ring_mut`
     /// while holding this cell's LWLock EXCLUSIVE.
     pub ring: UnsafeCell<RingFields>,
@@ -612,8 +642,12 @@ pub fn insert_fifo_cell(arena: &FifoArena, key: u128) -> Option<usize> {
 
 /// Push a layer to the tail of the ring. **Caller MUST hold the cell's
 /// LWLock EXCLUSIVE.** Returns `false` if the ring is full
-/// (MAX_LAYERS reached); sub 3 (acct-b8ub) spills the overflowing
-/// receipt to durable `cost_layers` and preserves strict per-unit FIFO.
+/// (`MAX_LAYERS` reached). The caller (sub 3 / acct-b8ub) handles
+/// overflow by setting the bucket's `overflow_active` flag, CAS-setting
+/// `overflow_first_spilled_layer_id` to the overflowing layer's id,
+/// and still INSERTing the durable `cost_layers` row — the layer
+/// becomes a spilled tail entry consumed via SPI walk after the ring
+/// drains.
 #[inline]
 pub fn push_layer(ring: &mut RingFields, layer: Layer) -> bool {
     if ring.n_layers as usize >= MAX_LAYERS {
@@ -1133,6 +1167,25 @@ pub fn fifo_apply_batch_maximal(
     // balance + qty deltas (stage_apply):
     let mut bal_deltas: HashMap<i64, (i64, i64)> = HashMap::new();
 
+    // sub 3 (acct-b8ub) — spill-deferred issue queue. An issue whose
+    // `consume_from_head` returned `shortage > 0` AND whose cell is
+    // `overflow_active = 1` cannot satisfy entirely from the in-shmem
+    // ring; the remainder lives in durable `cost_layers` rows that
+    // never resided in the ring. Phase 8.5 walks them via SPI under
+    // `FOR UPDATE` and folds the spill slices into the same envelope's
+    // `dp_*` + `pl_*` + `bal_deltas` accumulators. While the envelope
+    // sits in `spill_queue`, its `pl_*` / `bal_deltas` updates are
+    // DEFERRED — Phase 8 only pushes the in-shmem `dp_*` slices and
+    // stages pending_drain. The final amount cannot be computed until
+    // the spill walk completes.
+    struct SpillIssueState {
+        env_i: usize,
+        shortage: i64,
+        in_shmem_total_cost: i64,
+        watermark: i64,
+    }
+    let mut spill_queue: Vec<SpillIssueState> = Vec::new();
+
     // Phase 8 — sorted cell-lock acquisition + apply.
     {
         let arena = FIFO_ARENA.share();
@@ -1143,6 +1196,16 @@ pub fn fifo_apply_batch_maximal(
             let ring = unsafe { ring_mut(b) };
 
             // Lazy-seed if needed (under cell lock so transition is atomic).
+            //
+            // Seeds arrive ordered by `(receipt_date, id)` ascending. The
+            // first `MAX_LAYERS` are pushed into the ring (head); on the
+            // (MAX_LAYERS+1)-th `push_layer` returns false. sub 3
+            // (acct-b8ub) handles this by flipping `overflow_active=1`,
+            // CAS-setting the watermark to the first un-pushed seed's
+            // `layer_id`, and breaking out of the seed loop — the
+            // remaining durable rows stay as the spilled tail and get
+            // consumed via Phase 8.5 SPI walk when issues drain past
+            // the ring.
             if b.seeded.load(Ordering::Acquire) == 0 {
                 if let Some(seeds) = seed_cache.get(&cell_idx) {
                     for s in seeds {
@@ -1155,12 +1218,20 @@ pub fn fifo_apply_batch_maximal(
                             },
                         );
                         if !ok {
-                            pgrx::error!(
-                                "fifo_apply_batch_maximal: lazy-seed overflow at cell {} \
-                                 (>{} layers in durable cost_layers; spill-to-durable is sub 3 / acct-b8ub)",
-                                cell_idx,
-                                MAX_LAYERS
-                            );
+                            b.overflow_active.store(1, Ordering::Release);
+                            // CAS 0 -> s.layer_id; preserves the FIRST
+                            // overflowing layer's id if multiple seeds
+                            // would have overflowed across multiple
+                            // sessions (sticky-monotone watermark).
+                            let _ = b
+                                .overflow_first_spilled_layer_id
+                                .compare_exchange(
+                                    0,
+                                    s.layer_id,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                );
+                            break;
                         }
                     }
                 }
@@ -1175,22 +1246,41 @@ pub fn fifo_apply_batch_maximal(
                         let uc = p.unit_cost.expect("validated");
                         let lid = env_layer_id[i].expect("pre-allocated");
                         let amt = p.qty.saturating_mul(uc);
-                        let ok = push_layer(
-                            ring,
-                            Layer {
-                                qty: p.qty,
-                                unit_cost: uc,
-                                layer_id: lid,
-                            },
-                        );
-                        if !ok {
-                            pgrx::error!(
-                                "fifo_apply_batch_maximal: envelope[{}] receipt overflowed cell {} \
-                                 (MAX_LAYERS={}; spill-to-durable is sub 3 / acct-b8ub)",
-                                p.envelope_idx,
-                                cell_idx,
-                                MAX_LAYERS
-                            );
+                        // sub 3 (acct-b8ub) sticky-spill: if the cell
+                        // is already overflow_active, skip the ring
+                        // push regardless of whether prior drains have
+                        // made room — preserves the watermark invariant
+                        // (all in-shmem layers have id < watermark).
+                        // Otherwise try push; on overflow flip the flag
+                        // and capture the watermark. The durable
+                        // `cost_layers` INSERT (Phase 9c), posting_line
+                        // emission, and bal_deltas update happen
+                        // unconditionally — the receipt occurred, the
+                        // ledger records it, only the ring is bypassed.
+                        let already_overflow =
+                            b.overflow_active.load(Ordering::Acquire) == 1;
+                        let pushed = if already_overflow {
+                            false
+                        } else {
+                            push_layer(
+                                ring,
+                                Layer {
+                                    qty: p.qty,
+                                    unit_cost: uc,
+                                    layer_id: lid,
+                                },
+                            )
+                        };
+                        if !pushed {
+                            b.overflow_active.store(1, Ordering::Release);
+                            let _ = b
+                                .overflow_first_spilled_layer_id
+                                .compare_exchange(
+                                    0,
+                                    lid,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                );
                         }
                         env_total_cost[i] = Some(amt);
                         pl_debit.push(p.debit);
@@ -1215,16 +1305,10 @@ pub fn fifo_apply_batch_maximal(
                     }
                     Kind::FifoIssue => {
                         let res = consume_from_head(ring, p.qty);
-                        if res.shortage > 0 {
-                            pgrx::error!(
-                                "fifo_apply_batch_maximal: envelope[{}] fifo_issue short by {} units \
-                                 (pool {} exhausted in shmem ring)",
-                                p.envelope_idx,
-                                res.shortage,
-                                p.credit
-                            );
-                        }
-                        env_total_cost[i] = Some(res.total_cost);
+                        // In-shmem slices ALWAYS post to dp_* + stage
+                        // pending_drain — they're real consumes the
+                        // ring already mutated. This holds whether or
+                        // not we go to Phase 8.5 for the spill tail.
                         for slice in &res.consumed {
                             dp_layer_id.push(slice.layer_id);
                             dp_issue_idemp.push(p.idempotency_key.clone());
@@ -1242,19 +1326,56 @@ pub fn fifo_apply_batch_maximal(
                                     slice.qty_consumed;
                             }
                         }
-                        pl_debit.push(p.debit);
-                        pl_credit.push(p.credit);
-                        pl_amount.push(res.total_cost);
-                        pl_currency.push(String::new()); // filled post-apply
-                        pl_idemp.push(p.idempotency_key.clone());
-                        pl_bdate.push(p.business_date.clone());
-                        pl_qty.push(p.qty);
-                        pl_env_idx.push(i);
-                        let e = bal_deltas.entry(p.debit).or_insert((0, 0));
-                        e.0 += res.total_cost;
-                        let e = bal_deltas.entry(p.credit).or_insert((0, 0));
-                        e.0 -= res.total_cost;
-                        e.1 -= p.qty;
+
+                        if res.shortage > 0 {
+                            let overflow_active =
+                                b.overflow_active.load(Ordering::Acquire) == 1;
+                            if !overflow_active {
+                                // Pool truly exhausted (no shmem, no
+                                // spill tail) — error as today.
+                                pgrx::error!(
+                                    "fifo_apply_batch_maximal: envelope[{}] fifo_issue short by {} units \
+                                     (pool {} exhausted in shmem ring)",
+                                    p.envelope_idx,
+                                    res.shortage,
+                                    p.credit
+                                );
+                            }
+                            // Spill-defer to Phase 8.5. We still hold
+                            // the cell lock here; we capture the
+                            // watermark snapshot under the lock so the
+                            // SPI walk's `id >= watermark` predicate
+                            // is consistent with cell state at this
+                            // envelope's point in the batch order.
+                            let watermark = b
+                                .overflow_first_spilled_layer_id
+                                .load(Ordering::Acquire);
+                            spill_queue.push(SpillIssueState {
+                                env_i: i,
+                                shortage: res.shortage,
+                                in_shmem_total_cost: res.total_cost,
+                                watermark,
+                            });
+                            // DO NOT push pl_* / bal_deltas here —
+                            // total_cost is still incomplete (spill
+                            // contribution unknown). Phase 8.5 pushes
+                            // them with the final amount.
+                        } else {
+                            env_total_cost[i] = Some(res.total_cost);
+                            pl_debit.push(p.debit);
+                            pl_credit.push(p.credit);
+                            pl_amount.push(res.total_cost);
+                            pl_currency.push(String::new()); // filled post-apply
+                            pl_idemp.push(p.idempotency_key.clone());
+                            pl_bdate.push(p.business_date.clone());
+                            pl_qty.push(p.qty);
+                            pl_env_idx.push(i);
+                            let e = bal_deltas.entry(p.debit).or_insert((0, 0));
+                            e.0 += res.total_cost;
+                            let e = bal_deltas.entry(p.credit).or_insert((0, 0));
+                            e.0 -= res.total_cost;
+                            e.1 -= p.qty;
+                        }
                     }
                 }
             }
@@ -1263,6 +1384,121 @@ pub fn fifo_apply_batch_maximal(
             let seq = next_seq();
             b.last_seq.fetch_max(seq, Ordering::AcqRel);
             // guard drops here, releasing the cell lock.
+        }
+    }
+
+    // Phase 8.5 (sub 3 / acct-b8ub) — spill consume for issues whose
+    // in-shmem consumption ran short on an overflow_active cell.
+    //
+    // Discipline: NO FifoCellGuards are held in this scope (Phase 8's
+    // closing `}` released the last one). The methodology rule "NEVER
+    // do SPI under cell-lock" is preserved — spill walks acquire
+    // row-level locks via `FOR UPDATE` on `cost_layers` and rely on
+    // those for serialization across concurrent backends.
+    //
+    // Per-pool FIFO ordering within this batch is preserved because
+    // (a) `cells_to_envelopes` iterates cells in ascending order and
+    // (b) `env_indices` inside each cell preserves the original
+    // envelope_idx order — so `spill_queue` is pushed in envelope
+    // order for a given pool, and `Vec` iteration here matches.
+    //
+    // Same-pool spill walks from different envelopes in this batch
+    // see prior envelopes' UPDATEs because both reads and writes
+    // execute in the same Postgres txn (SPI runs in the apply call's
+    // own snapshot).
+    if !spill_queue.is_empty() {
+        for spill in &spill_queue {
+            let p = &parsed[spill.env_i];
+
+            // SPI walk: durable rows for the pool whose id is at or
+            // beyond the spill watermark and still have residual qty.
+            // FOR UPDATE serializes against other backends mid-spill
+            // on the same pool. The select happens via `connect_mut`
+            // because FOR UPDATE counts as a writer for SPI's purposes.
+            let candidates: Vec<(i64, i64, i64)> = Spi::connect_mut(|client| {
+                let args: Vec<pgrx::datum::DatumWithOid> =
+                    vec![p.credit.into(), spill.watermark.into()];
+                let tup = client
+                    .update(
+                        "SELECT id, qty_remaining, unit_cost FROM cost_layers \
+                         WHERE pool_account_id = $1::bigint \
+                           AND id >= $2::bigint \
+                           AND qty_remaining > 0 \
+                         ORDER BY receipt_date, id \
+                         FOR UPDATE",
+                        None,
+                        &args,
+                    )
+                    .expect("maximal: spill SELECT cost_layers FOR UPDATE");
+                let mut v: Vec<(i64, i64, i64)> = Vec::new();
+                for row in tup {
+                    let lid: i64 = row["id"].value().unwrap().unwrap();
+                    let qr: i64 = row["qty_remaining"].value().unwrap().unwrap();
+                    let uc: i64 = row["unit_cost"].value().unwrap().unwrap();
+                    v.push((lid, qr, uc));
+                }
+                v
+            });
+
+            // Walk candidates head-to-tail, consume up to `shortage`.
+            let mut remaining = spill.shortage;
+            let mut spill_total_cost: i64 = 0;
+            // (layer_id, qty_taken, unit_cost) for dp_* + accum_drain.
+            let mut spill_consumed: Vec<(i64, i64, i64)> = Vec::new();
+            for (lid, qty_rem, uc) in candidates {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(qty_rem);
+                spill_total_cost =
+                    spill_total_cost.saturating_add(take.saturating_mul(uc));
+                spill_consumed.push((lid, take, uc));
+                remaining -= take;
+            }
+
+            if remaining > 0 {
+                pgrx::error!(
+                    "fifo_apply_batch_maximal: envelope[{}] fifo_issue short by {} units \
+                     (pool {} exhausted in shmem ring + spilled tail; \
+                      watermark={})",
+                    p.envelope_idx,
+                    remaining,
+                    p.credit,
+                    spill.watermark
+                );
+            }
+
+            // Append spill slices to dp_* and stage their durable
+            // UPDATE via accum_drain (Phase 9e). Spilled layers never
+            // sat in the shmem ring, so they never went through
+            // pending_drain; the inline UPDATE is the only path to
+            // decrement their qty_remaining.
+            for (lid, qty, uc) in &spill_consumed {
+                dp_layer_id.push(*lid);
+                dp_issue_idemp.push(p.idempotency_key.clone());
+                dp_qty.push(*qty);
+                dp_cost.push(qty.saturating_mul(*uc));
+                *accum_drain.entry(*lid).or_insert(0) += qty;
+            }
+
+            // Now we know the final total_cost — push pl_* and bal_deltas.
+            let total_cost = spill
+                .in_shmem_total_cost
+                .saturating_add(spill_total_cost);
+            env_total_cost[spill.env_i] = Some(total_cost);
+            pl_debit.push(p.debit);
+            pl_credit.push(p.credit);
+            pl_amount.push(total_cost);
+            pl_currency.push(String::new()); // filled post-apply
+            pl_idemp.push(p.idempotency_key.clone());
+            pl_bdate.push(p.business_date.clone());
+            pl_qty.push(p.qty);
+            pl_env_idx.push(spill.env_i);
+            let e = bal_deltas.entry(p.debit).or_insert((0, 0));
+            e.0 += total_cost;
+            let e = bal_deltas.entry(p.credit).or_insert((0, 0));
+            e.0 -= total_cost;
+            e.1 -= p.qty;
         }
     }
 
@@ -1746,7 +1982,8 @@ pub fn fifo_drain_consecutive_failures() -> i64 {
 /// Acquires `FIFO_ARENA.exclusive()` to serialize against insertions
 /// and probes that take `share()`, but DOES NOT take cell LWLocks —
 /// quiescence is the load-bearing precondition. Wipes occupied,
-/// seeded, key, last_seq, drained_seq, and the ring state
+/// seeded, overflow_active, overflow_first_spilled_layer_id, key,
+/// last_seq, drained_seq, and the ring state
 /// (head/n_layers/pending_drain_n). Layer/pending_drain arrays are
 /// not zeroed; n=0 makes them unreachable.
 #[pg_extern]
@@ -1756,10 +1993,13 @@ pub fn fifo_arena_reset() -> bool {
         let b = &arena.buckets[i];
         b.occupied.store(0, Ordering::Relaxed);
         b.seeded.store(0, Ordering::Relaxed);
+        b.overflow_active.store(0, Ordering::Relaxed);
         b.key_hi.store(0, Ordering::Relaxed);
         b.key_lo.store(0, Ordering::Relaxed);
         b.last_seq.store(0, Ordering::Relaxed);
         b.drained_seq.store(0, Ordering::Relaxed);
+        b.overflow_first_spilled_layer_id
+            .store(0, Ordering::Relaxed);
         // SAFETY: caller-guaranteed quiescence (no concurrent apply).
         let ring = unsafe { ring_mut(b) };
         ring.head = 0;
@@ -1781,12 +2021,22 @@ pub fn fifo_arena_reset() -> bool {
 ///   the next bgworker tick (sub 4 half-α architecture).
 /// - `shmem_total_qty`     — `shmem_live_qty + shmem_pending_qty`. At drain
 ///   quiescence this is the canonical shmem position for the pool.
+/// - `shmem_spilled_qty`   — SUM(`cost_layers.qty_remaining`) for the cell's
+///   spilled tail (sub 3 / acct-b8ub): rows whose `id >= watermark` for
+///   overflow_active cells; 0 for non-overflow cells. Surfaces the
+///   portion of pool qty that lives durable-only because it never fit
+///   in the ring.
 /// - `durable_qty`         — SUM(`cost_layers.qty_remaining`) WHERE
 ///   `pool_account_id = cell's pool`. NULL if the pool has no rows in
 ///   `cost_layers` (signals: post-restart pre-lazy-seed, rollback-leaked
 ///   shmem cell, or test scaffolding leak).
-/// - `drift`               — `durable_qty - shmem_total_qty`. NULL when
-///   `durable_qty` is NULL (cannot compare).
+/// - `drift`               — `durable_qty - shmem_spilled_qty - shmem_total_qty`.
+///   NULL when `durable_qty` is NULL (cannot compare). For non-overflow
+///   cells `shmem_spilled_qty=0` and this reduces to the original
+///   `durable - shmem_total` form. For overflow cells the spilled tail
+///   is excluded from the equation because it isn't shmem-managed —
+///   the half-α invariant only constrains the shmem-owned portion to
+///   match its durable shadow.
 ///
 /// ## Quiescence semantics
 ///
@@ -1834,6 +2084,7 @@ pub fn fifo_arena_recon() -> TableIterator<
         name!(shmem_live_qty, i64),
         name!(shmem_pending_qty, i64),
         name!(shmem_total_qty, i64),
+        name!(shmem_spilled_qty, i64),
         name!(durable_qty, Option<i64>),
         name!(drift, Option<i64>),
     ),
@@ -1841,8 +2092,17 @@ pub fn fifo_arena_recon() -> TableIterator<
     // Phase 1 — snapshot occupied cells. Each cell snapshot is coherent
     // because the SHARED LWLock blocks the EXCLUSIVE-holding writers
     // (push_layer, consume_from_head, drain_pending_into).
-    let mut cells: Vec<(i64 /* pool */, i64 /* live */, i64 /* pending */)> =
-        Vec::new();
+    //
+    // sub 3 (acct-b8ub): also capture `overflow_active` + `watermark`
+    // so the SPI side can split durable rows into shmem-owned (id <
+    // watermark) and spilled-tail (id >= watermark) for overflow cells.
+    let mut cells: Vec<(
+        i64, /* pool */
+        i64, /* live */
+        i64, /* pending */
+        i64, /* watermark (0 = no overflow) */
+        i32, /* overflow_active 0/1 */
+    )> = Vec::new();
     {
         let arena = FIFO_ARENA.share();
         for i in 0..FIFO_N_BUCKETS {
@@ -1876,7 +2136,11 @@ pub fn fifo_arena_recon() -> TableIterator<
             for k in 0..(ring.pending_drain_n as usize) {
                 pending = pending.saturating_add(ring.pending_drain[k].qty_consumed);
             }
-            cells.push((pool_account_id, live, pending));
+            let overflow_active = b.overflow_active.load(Ordering::Acquire) as i32;
+            let watermark = b
+                .overflow_first_spilled_layer_id
+                .load(Ordering::Acquire);
+            cells.push((pool_account_id, live, pending, watermark, overflow_active));
             // guard releases here; next iteration acquires the next cell.
         }
     }
@@ -1894,15 +2158,27 @@ pub fn fifo_arena_recon() -> TableIterator<
     // qty_remaining=0" (durable_qty=0 + drift = -shmem_total). The
     // first signals a structural state (post-restart, rollback leak);
     // the second is normal (drained pool).
-    let pool_ids: Vec<i64> = cells.iter().map(|(p, _, _)| *p).collect();
-    let live_qtys: Vec<i64> = cells.iter().map(|(_, l, _)| *l).collect();
-    let pend_qtys: Vec<i64> = cells.iter().map(|(_, _, p)| *p).collect();
+    //
+    // sub 3: `spilled_per_pool` sums `qty_remaining` only over rows
+    // with `id >= watermark` for cells where `overflow_active = 1` and
+    // `watermark > 0`. For non-overflow cells the join produces 0
+    // (LEFT JOIN, COALESCE). Drift then subtracts the spilled portion
+    // so the half-α invariant (shmem-owned == ring) is the assertion
+    // being checked.
+    let pool_ids: Vec<i64> = cells.iter().map(|(p, _, _, _, _)| *p).collect();
+    let live_qtys: Vec<i64> = cells.iter().map(|(_, l, _, _, _)| *l).collect();
+    let pend_qtys: Vec<i64> = cells.iter().map(|(_, _, p, _, _)| *p).collect();
+    let watermarks: Vec<i64> = cells.iter().map(|(_, _, _, w, _)| *w).collect();
+    let overflows: Vec<i32> = cells.iter().map(|(_, _, _, _, o)| *o).collect();
 
     let sql = "
         WITH cells_in AS (
-            SELECT pool_account_id, shmem_live, shmem_pending
-              FROM unnest($1::bigint[], $2::bigint[], $3::bigint[])
-                AS u(pool_account_id, shmem_live, shmem_pending)
+            SELECT pool_account_id, shmem_live, shmem_pending,
+                   watermark, overflow_active
+              FROM unnest($1::bigint[], $2::bigint[], $3::bigint[],
+                          $4::bigint[], $5::int[])
+                AS u(pool_account_id, shmem_live, shmem_pending,
+                     watermark, overflow_active)
         ),
         pool_exists AS (
             SELECT DISTINCT pool_account_id
@@ -1914,32 +2190,48 @@ pub fn fifo_arena_recon() -> TableIterator<
               FROM cost_layers
              WHERE pool_account_id = ANY($1::bigint[])
              GROUP BY pool_account_id
+        ),
+        spilled AS (
+            SELECT cl.pool_account_id, SUM(cl.qty_remaining)::bigint AS q
+              FROM cost_layers cl
+              JOIN cells_in c ON c.pool_account_id = cl.pool_account_id
+             WHERE cl.pool_account_id = ANY($1::bigint[])
+               AND c.overflow_active = 1
+               AND c.watermark > 0
+               AND cl.id >= c.watermark
+             GROUP BY cl.pool_account_id
         )
         SELECT c.pool_account_id,
                c.shmem_live,
                c.shmem_pending,
                (c.shmem_live + c.shmem_pending)::bigint AS shmem_total,
+               COALESCE(s.q, 0)::bigint AS shmem_spilled_qty,
                CASE WHEN p.pool_account_id IS NOT NULL
                     THEN COALESCE(d.q, 0)::bigint
                     ELSE NULL
                END AS durable_qty,
                CASE WHEN p.pool_account_id IS NOT NULL
-                    THEN (COALESCE(d.q, 0) - (c.shmem_live + c.shmem_pending))::bigint
+                    THEN (COALESCE(d.q, 0)
+                          - COALESCE(s.q, 0)
+                          - (c.shmem_live + c.shmem_pending))::bigint
                     ELSE NULL
                END AS drift
           FROM cells_in c
           LEFT JOIN pool_exists p ON p.pool_account_id = c.pool_account_id
           LEFT JOIN durable d     ON d.pool_account_id = c.pool_account_id
+          LEFT JOIN spilled s     ON s.pool_account_id = c.pool_account_id
          ORDER BY c.pool_account_id
     ";
 
-    let out: Vec<(i64, i64, i64, i64, Option<i64>, Option<i64>)> =
+    let out: Vec<(i64, i64, i64, i64, i64, Option<i64>, Option<i64>)> =
         pgrx::PgTryBuilder::new(|| {
             Spi::connect(|client| {
                 let args: Vec<pgrx::datum::DatumWithOid> = vec![
                     pool_ids.clone().into(),
                     live_qtys.clone().into(),
                     pend_qtys.clone().into(),
+                    watermarks.clone().into(),
+                    overflows.clone().into(),
                 ];
                 let tup = client
                     .select(sql, None, &args)
@@ -1950,9 +2242,10 @@ pub fn fifo_arena_recon() -> TableIterator<
                     let l: i64 = row["shmem_live"].value().unwrap().unwrap();
                     let pd: i64 = row["shmem_pending"].value().unwrap().unwrap();
                     let t: i64 = row["shmem_total"].value().unwrap().unwrap();
+                    let sp: i64 = row["shmem_spilled_qty"].value().unwrap().unwrap();
                     let d: Option<i64> = row["durable_qty"].value().unwrap();
                     let dr: Option<i64> = row["drift"].value().unwrap();
-                    rows.push((p, l, pd, t, d, dr));
+                    rows.push((p, l, pd, t, sp, d, dr));
                 }
                 rows
             })
@@ -1960,10 +2253,14 @@ pub fn fifo_arena_recon() -> TableIterator<
         .catch_others(|_| {
             // SPI error path: surface one row per cell with shmem-side
             // values populated and durable_qty / drift NULL. Matches
-            // ledger_shmem_recon's legacy fallback shape.
+            // ledger_shmem_recon's legacy fallback shape. shmem_spilled
+            // is shmem-side (durable-derived, not snapshotted) so it
+            // collapses to 0 on SPI failure — drift is NULL anyway.
             cells
                 .iter()
-                .map(|(p, l, pd)| (*p, *l, *pd, *l + *pd, None::<i64>, None::<i64>))
+                .map(|(p, l, pd, _, _)| {
+                    (*p, *l, *pd, *l + *pd, 0i64, None::<i64>, None::<i64>)
+                })
                 .collect()
         })
         .execute();
