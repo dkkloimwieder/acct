@@ -1763,3 +1763,205 @@ pub fn fifo_arena_reset() -> bool {
     }
     true
 }
+
+// ── sub 6 (acct-6g2u) — FIFO arena recon ─────────────────────────────
+
+/// Per-cell shmem-vs-durable layer recon. For each occupied FIFO arena
+/// cell, returns:
+///
+/// - `pool_account_id`     — the pool tracked by this cell (PoC key shape).
+/// - `shmem_live_qty`      — SUM(`layers[].qty`) in the ring (live layers only;
+///   fully-consumed layers are evicted via head-advance in `consume_from_head`).
+/// - `shmem_pending_qty`   — SUM(`pending_drain[].qty_consumed`) staged for
+///   the next bgworker tick (sub 4 half-α architecture).
+/// - `shmem_total_qty`     — `shmem_live_qty + shmem_pending_qty`. At drain
+///   quiescence this is the canonical shmem position for the pool.
+/// - `durable_qty`         — SUM(`cost_layers.qty_remaining`) WHERE
+///   `pool_account_id = cell's pool`. NULL if the pool has no rows in
+///   `cost_layers` (signals: post-restart pre-lazy-seed, rollback-leaked
+///   shmem cell, or test scaffolding leak).
+/// - `drift`               — `durable_qty - shmem_total_qty`. NULL when
+///   `durable_qty` is NULL (cannot compare).
+///
+/// ## Quiescence semantics
+///
+/// At drain quiescence (no in-flight `fifo_apply_batch_maximal`, bgworker
+/// tick completed, `pending_drain_n == 0` per cell), `drift = 0` exactly
+/// for every cell whose pool has durable rows.
+///
+/// Under load each row is internally coherent (the cell's SHARED LWLock
+/// is held during the in-shmem snapshot), but `drift` may reflect
+/// in-flight transient states. The `shmem_pending_qty` term in the
+/// equation eliminates the bgworker-flush lag specifically; it does not
+/// eliminate the apply-in-progress lag between Phase 9 of
+/// `fifo_apply_batch_maximal` (durable INSERT/UPDATE) and the eventual
+/// txn commit. Best practice: call at quiescence for an exact verdict;
+/// under load, treat `|drift| > 0` as advisory unless it persists across
+/// successive snapshots after `fifo_force_drain_tick()`.
+///
+/// ## What this recon does NOT detect
+///
+/// - **Orphan durable pools.** Pools with rows in `cost_layers` but no
+///   shmem cell (post-restart pre-lazy-seed state) are silently skipped —
+///   the iteration is shmem-side. The lazy-seed path repopulates the cell
+///   on first apply; until then, the pool is invisible to this recon. A
+///   future shape could optionally include a `WHERE pool_account_id NOT
+///   IN (occupied cell keys)` subquery for fuller coverage.
+/// - **Per-layer drift.** This rolls up to the pool level. Per-layer
+///   `qty_remaining` skew is detectable by joining `cost_layers` to the
+///   shmem layer array on `layer_id`, but the PoC's recon contract
+///   (per-cell SUM equality) is sufficient for the half-α correctness
+///   guarantee. File as a follow-up shape if a workload driver surfaces.
+///
+/// ## Lock discipline
+///
+/// Takes `FIFO_ARENA.share()` for the outer scan to prevent concurrent
+/// insertions from advancing occupied flags mid-iteration, then
+/// `acquire_fifo_cell(idx, Shared)` per-cell to coexist with apply
+/// writers (which take EXCLUSIVE). Cell-locks are acquired in ascending
+/// index order so the recon never deadlocks against apply, which takes
+/// cell-locks in batch-sorted (also ascending) order.
+#[pg_extern]
+pub fn fifo_arena_recon() -> TableIterator<
+    'static,
+    (
+        name!(pool_account_id, i64),
+        name!(shmem_live_qty, i64),
+        name!(shmem_pending_qty, i64),
+        name!(shmem_total_qty, i64),
+        name!(durable_qty, Option<i64>),
+        name!(drift, Option<i64>),
+    ),
+> {
+    // Phase 1 — snapshot occupied cells. Each cell snapshot is coherent
+    // because the SHARED LWLock blocks the EXCLUSIVE-holding writers
+    // (push_layer, consume_from_head, drain_pending_into).
+    let mut cells: Vec<(i64 /* pool */, i64 /* live */, i64 /* pending */)> =
+        Vec::new();
+    {
+        let arena = FIFO_ARENA.share();
+        for i in 0..FIFO_N_BUCKETS {
+            let b = &arena.buckets[i];
+            if b.occupied.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let key_hi = b.key_hi.load(Ordering::Acquire);
+            let key_lo = b.key_lo.load(Ordering::Acquire);
+            // PoC key shape: `pack_fifo_key_poc(pool_account_id)` puts
+            // pool in upper 64 bits, lower is 0. Skip non-PoC-shape
+            // keys defensively so a future multi-dimensional key
+            // doesn't silently misreport pool_account_id as stale bits.
+            if key_lo != 0 {
+                continue;
+            }
+            let pool_account_id = key_hi as i64;
+
+            let _guard = acquire_fifo_cell(i, FifoCellMode::Shared);
+            // SAFETY: cell LWLock held SHARED; ring mutators all take
+            // EXCLUSIVE, so the read cannot observe torn layers /
+            // pending_drain state.
+            let ring = unsafe { ring_ref(b) };
+
+            let mut live: i64 = 0;
+            for offset in 0..(ring.n_layers as usize) {
+                let lidx = (ring.head as usize + offset) % MAX_LAYERS;
+                live = live.saturating_add(ring.layers[lidx].qty);
+            }
+            let mut pending: i64 = 0;
+            for k in 0..(ring.pending_drain_n as usize) {
+                pending = pending.saturating_add(ring.pending_drain[k].qty_consumed);
+            }
+            cells.push((pool_account_id, live, pending));
+            // guard releases here; next iteration acquires the next cell.
+        }
+    }
+
+    if cells.is_empty() {
+        return TableIterator::new(Vec::new());
+    }
+
+    // Phase 2 — bulk SPI: per-pool SUM(qty_remaining) joined to the
+    // cells snapshot. One round-trip regardless of cell count (mirrors
+    // ledger_shmem_recon's acct-dav7 #7 refactor).
+    //
+    // `pool_exists` separates "pool absent from cost_layers" (NULL
+    // durable_qty + NULL drift) from "pool present but every layer
+    // qty_remaining=0" (durable_qty=0 + drift = -shmem_total). The
+    // first signals a structural state (post-restart, rollback leak);
+    // the second is normal (drained pool).
+    let pool_ids: Vec<i64> = cells.iter().map(|(p, _, _)| *p).collect();
+    let live_qtys: Vec<i64> = cells.iter().map(|(_, l, _)| *l).collect();
+    let pend_qtys: Vec<i64> = cells.iter().map(|(_, _, p)| *p).collect();
+
+    let sql = "
+        WITH cells_in AS (
+            SELECT pool_account_id, shmem_live, shmem_pending
+              FROM unnest($1::bigint[], $2::bigint[], $3::bigint[])
+                AS u(pool_account_id, shmem_live, shmem_pending)
+        ),
+        pool_exists AS (
+            SELECT DISTINCT pool_account_id
+              FROM cost_layers
+             WHERE pool_account_id = ANY($1::bigint[])
+        ),
+        durable AS (
+            SELECT pool_account_id, SUM(qty_remaining)::bigint AS q
+              FROM cost_layers
+             WHERE pool_account_id = ANY($1::bigint[])
+             GROUP BY pool_account_id
+        )
+        SELECT c.pool_account_id,
+               c.shmem_live,
+               c.shmem_pending,
+               (c.shmem_live + c.shmem_pending)::bigint AS shmem_total,
+               CASE WHEN p.pool_account_id IS NOT NULL
+                    THEN COALESCE(d.q, 0)::bigint
+                    ELSE NULL
+               END AS durable_qty,
+               CASE WHEN p.pool_account_id IS NOT NULL
+                    THEN (COALESCE(d.q, 0) - (c.shmem_live + c.shmem_pending))::bigint
+                    ELSE NULL
+               END AS drift
+          FROM cells_in c
+          LEFT JOIN pool_exists p ON p.pool_account_id = c.pool_account_id
+          LEFT JOIN durable d     ON d.pool_account_id = c.pool_account_id
+         ORDER BY c.pool_account_id
+    ";
+
+    let out: Vec<(i64, i64, i64, i64, Option<i64>, Option<i64>)> =
+        pgrx::PgTryBuilder::new(|| {
+            Spi::connect(|client| {
+                let args: Vec<pgrx::datum::DatumWithOid> = vec![
+                    pool_ids.clone().into(),
+                    live_qtys.clone().into(),
+                    pend_qtys.clone().into(),
+                ];
+                let tup = client
+                    .select(sql, None, &args)
+                    .expect("fifo_arena_recon SPI select");
+                let mut rows = Vec::with_capacity(cells.len());
+                for row in tup {
+                    let p: i64 = row["pool_account_id"].value().unwrap().unwrap();
+                    let l: i64 = row["shmem_live"].value().unwrap().unwrap();
+                    let pd: i64 = row["shmem_pending"].value().unwrap().unwrap();
+                    let t: i64 = row["shmem_total"].value().unwrap().unwrap();
+                    let d: Option<i64> = row["durable_qty"].value().unwrap();
+                    let dr: Option<i64> = row["drift"].value().unwrap();
+                    rows.push((p, l, pd, t, d, dr));
+                }
+                rows
+            })
+        })
+        .catch_others(|_| {
+            // SPI error path: surface one row per cell with shmem-side
+            // values populated and durable_qty / drift NULL. Matches
+            // ledger_shmem_recon's legacy fallback shape.
+            cells
+                .iter()
+                .map(|(p, l, pd)| (*p, *l, *pd, *l + *pd, None::<i64>, None::<i64>))
+                .collect()
+        })
+        .execute();
+
+    TableIterator::new(out)
+}

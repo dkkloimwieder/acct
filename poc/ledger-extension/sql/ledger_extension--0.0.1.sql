@@ -50,6 +50,22 @@ AS 'MODULE_PATHNAME', 'fifo_arena_capacity_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/fifo.rs:1824
+-- ledger_extension::fifo::fifo_arena_recon
+CREATE  FUNCTION "fifo_arena_recon"() RETURNS TABLE (
+	"pool_account_id" bigint,  /* i64 */
+	"shmem_live_qty" bigint,  /* i64 */
+	"shmem_pending_qty" bigint,  /* i64 */
+	"shmem_total_qty" bigint,  /* i64 */
+	"durable_qty" bigint,  /* core::option::Option<i64> */
+	"drift" bigint  /* core::option::Option<i64> */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'fifo_arena_recon_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/fifo.rs:1747
 -- ledger_extension::fifo::fifo_arena_reset
 CREATE  FUNCTION "fifo_arena_reset"() RETURNS bool /* bool */
