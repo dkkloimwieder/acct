@@ -48,7 +48,7 @@ async fn fifo_receipt_creates_cost_layer() {
     let tag = Uuid::new_v4().to_string();
     let (ap, _cogs, raw) = seed_fifo_fixture(&pool, &tag).await;
 
-    let r = sqlx::query_as::<_, BatchRow>("SELECT * FROM post_batch($1)")
+    let r = sqlx::query_as::<_, BatchRow>("SELECT * FROM post_batch_fifo($1)")
         .bind(json!([{
             "envelope_idx": 0, "kind": "fifo_receipt",
             "debit_account_id": raw, "credit_account_id": ap,
@@ -76,7 +76,7 @@ async fn fifo_issue_walks_layers_in_receipt_date_order() {
     // Layer 1: 10 @ 100, business_date 2026-05-01
     // Layer 2: 10 @ 200, business_date 2026-05-02
     // Issue 15: should take all 10 from L1 (cost 1000) + 5 from L2 (cost 1000) = 2000
-    let _: Vec<BatchRow> = sqlx::query_as("SELECT * FROM post_batch($1)")
+    let _: Vec<BatchRow> = sqlx::query_as("SELECT * FROM post_batch_fifo($1)")
         .bind(json!([{
             "envelope_idx": 0, "kind": "fifo_receipt",
             "debit_account_id": raw, "credit_account_id": ap,
@@ -85,7 +85,7 @@ async fn fifo_issue_walks_layers_in_receipt_date_order() {
             "business_date": "2026-05-01",
         }]))
         .fetch_all(&pool).await.expect("L1");
-    let _: Vec<BatchRow> = sqlx::query_as("SELECT * FROM post_batch($1)")
+    let _: Vec<BatchRow> = sqlx::query_as("SELECT * FROM post_batch_fifo($1)")
         .bind(json!([{
             "envelope_idx": 0, "kind": "fifo_receipt",
             "debit_account_id": raw, "credit_account_id": ap,
@@ -95,7 +95,7 @@ async fn fifo_issue_walks_layers_in_receipt_date_order() {
         }]))
         .fetch_all(&pool).await.expect("L2");
 
-    let r = sqlx::query_as::<_, BatchRow>("SELECT * FROM post_batch($1)")
+    let r = sqlx::query_as::<_, BatchRow>("SELECT * FROM post_batch_fifo($1)")
         .bind(json!([{
             "envelope_idx": 0, "kind": "fifo_issue",
             "debit_account_id": cogs, "credit_account_id": raw,
@@ -129,7 +129,7 @@ async fn fifo_in_batch_receipt_visible_to_later_issue() {
     let (ap, cogs, raw) = seed_fifo_fixture(&pool, &tag).await;
 
     // Single batch: receipt 20 @ 50, then issue 5. Issue should consume 5 @ 50 = 250.
-    let r = sqlx::query_as::<_, BatchRow>("SELECT * FROM post_batch($1)")
+    let r = sqlx::query_as::<_, BatchRow>("SELECT * FROM post_batch_fifo($1)")
         .bind(json!([
             {
                 "envelope_idx": 0, "kind": "fifo_receipt",
@@ -166,7 +166,7 @@ async fn fifo_issue_exceeding_pool_rejects_whole_batch() {
     let tag = Uuid::new_v4().to_string();
     let (ap, cogs, raw) = seed_fifo_fixture(&pool, &tag).await;
 
-    let _: Vec<BatchRow> = sqlx::query_as("SELECT * FROM post_batch($1)")
+    let _: Vec<BatchRow> = sqlx::query_as("SELECT * FROM post_batch_fifo($1)")
         .bind(json!([{
             "envelope_idx": 0, "kind": "fifo_receipt",
             "debit_account_id": raw, "credit_account_id": ap,
@@ -176,7 +176,7 @@ async fn fifo_issue_exceeding_pool_rejects_whole_batch() {
         }]))
         .fetch_all(&pool).await.expect("seed");
 
-    let res = sqlx::query_as::<_, BatchRow>("SELECT * FROM post_batch($1)")
+    let res = sqlx::query_as::<_, BatchRow>("SELECT * FROM post_batch_fifo($1)")
         .bind(json!([{
             "envelope_idx": 0, "kind": "fifo_issue",
             "debit_account_id": cogs, "credit_account_id": raw,
