@@ -54,7 +54,7 @@ static SLOTS_PER_SHARD: GucSetting<i32> = GucSetting::<i32>::new(4096);
 static SPILLOVER_ARENA_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 static BATCH_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
 static BATCH_SIZE_MAX: GucSetting<i32> = GucSetting::<i32>::new(1024);
-static COMMITTER_LEASE_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
+pub(crate) static COMMITTER_LEASE_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
 static QUEUE_FULL_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
 
 // `semantics` is a string GUC. Enum-of-{compensation, reservation}

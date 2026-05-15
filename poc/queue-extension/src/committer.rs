@@ -849,6 +849,10 @@ fn process_group(
     };
 
     // (4) Plan. plan_apply is pure; safe to call without sub-tx.
+    // M8.1 (acct-4d4n.17): wrap plan_apply in Instant::now() so we can
+    // bucket per-call latency and per-event dispatch/error counts in
+    // the PocMethodStatsArena. dispatch_count is per-event (each event
+    // in the batch counts independently); latency is per-call.
     let result: PocApplyResult = if to_plan_events.is_empty() {
         PocApplyResult::default()
     } else {
@@ -856,7 +860,13 @@ fn process_group(
             pool,
             events: to_plan_events.clone(),
         };
-        method.plan_apply(&batch, &snapshot)
+        let dispatch_n = batch.events.len() as u64;
+        let t0 = std::time::Instant::now();
+        let r = method.plan_apply(&batch, &snapshot);
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        let error_n = r.per_event.iter().filter(|er| er.error.is_some()).count() as u64;
+        queue::record_dispatch(method_tag, elapsed_ns, dispatch_n, error_n);
+        r
     };
 
     // (5) Partition plan_apply output: success rows go to INSERT, errors
@@ -1177,13 +1187,17 @@ fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
 
     // Fill each slot. State flips to SLOT_FILLED regardless of error;
     // the error_code field carries the per-event outcome.
+    let mut shard_errors_this_batch: u64 = 0;
     for (slot_idx, resolution) in all_resolutions {
         let (unit, total, err_code) = match resolution {
             SlotResolution::Filled {
                 applied_unit_cost,
                 applied_total_cost,
             } => (applied_unit_cost, applied_total_cost, 0u16),
-            SlotResolution::Error { code } => (0, 0, code),
+            SlotResolution::Error { code } => {
+                shard_errors_this_batch += 1;
+                (0, 0, code)
+            }
         };
         let res = queue::fill_slot_result_with_error(
             shard_idx,
@@ -1226,6 +1240,13 @@ fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
         // Skipped silently if no waiter was stamped (push-only paths)
         // or the waiter PID has gone stale (M5c.2 will reap).
         signal_waiter(shard_idx, slot_idx);
+    }
+
+    // M8.1 (acct-4d4n.17): publish per-event errors to the shard's
+    // narrow error_count. One AcqRel fetch_add per drain rather than
+    // per-error to keep the hot path cheap under load.
+    if shard_errors_this_batch > 0 {
+        queue::bump_shard_error(shard_idx, shard_errors_this_batch);
     }
 
     // M5c.1 (acct-4d4n.14): drain advanced head inside `drain_apply_batch`
@@ -2072,6 +2093,140 @@ fn poc_ledger_shard_stats_all() -> TableIterator<
         rows.push((shard_idx as i32, h as i64, t as i64, depth, cp, cs, nrs, nss));
     }
     TableIterator::new(rows.into_iter())
+}
+
+// ── M8.1 (acct-4d4n.17): observability surface ───────────────────────
+//
+// Five SQL functions per spec §4.3 (O3). All read shmem without writing.
+// `poc_ledger_shard_stats` and `poc_ledger_method_stats` materialize
+// their snapshots up front so the TableIterator's yields don't
+// interleave shard_arena `share()` with concurrent committer activity.
+//
+// Q5 lean: `committer_lease_remaining_ms` clamps ≥0 (saturates to 0 on
+// expired leases). A separate boolean for "expired" can be filed
+// later if telemetry consumers need to distinguish "no committer" from
+// "lease expired" without computing from acquire_at_ns + GUC.
+
+#[pg_extern]
+fn poc_ledger_shard_stats() -> TableIterator<
+    'static,
+    (
+        name!(shard_id, i32),
+        name!(depth, i64),
+        name!(committer_pid, i32),
+        name!(committer_lease_remaining_ms, i64),
+        name!(last_committer_tx_id, i64),
+        name!(error_count, i64),
+    ),
+> {
+    let lease_ms: i64 = crate::COMMITTER_LEASE_MS.get() as i64;
+    let now_ns: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let mut rows: Vec<(i32, i64, i32, i64, i64, i64)> = Vec::with_capacity(POC_SHARD_COUNT);
+    for shard_idx in 0..POC_SHARD_COUNT {
+        let (h, t) = queue::shard_head_tail(shard_idx);
+        let depth = t.wrapping_sub(h) as i64;
+        let cp = queue::read_committer_pid(shard_idx);
+        let acquired_ns = queue::read_committer_acquired_at_ns(shard_idx);
+        // Lease remaining: lease_ms - (now - acquired)/1e6, clamped ≥0.
+        // No committer / acquired_ns=0 → remaining = 0 (no live lease).
+        let remaining_ms: i64 = if cp == 0 || acquired_ns == 0 {
+            0
+        } else {
+            let elapsed_ms = now_ns.saturating_sub(acquired_ns) / 1_000_000;
+            let rem = lease_ms.saturating_sub(elapsed_ms as i64);
+            if rem < 0 { 0 } else { rem }
+        };
+        let cs = queue::read_committer_tx_seq(shard_idx) as i64;
+        let ec = queue::read_shard_error_count(shard_idx) as i64;
+        rows.push((shard_idx as i32, depth, cp, remaining_ms, cs, ec));
+    }
+    TableIterator::new(rows.into_iter())
+}
+
+#[pg_extern]
+fn poc_ledger_method_stats() -> TableIterator<
+    'static,
+    (
+        name!(method_id, String),
+        name!(dispatch_count, i64),
+        name!(error_count, i64),
+        name!(error_rate, f64),
+        name!(plan_apply_p50_ns, i64),
+        name!(plan_apply_p99_ns, i64),
+    ),
+> {
+    let methods: [(u8, &str); queue::POC_METHOD_COUNT] = [
+        (queue::METHOD_FIFO, "fifo"),
+        (queue::METHOD_AVG, "avg"),
+        (queue::METHOD_STD, "std"),
+        (queue::METHOD_MOCK, "mock"),
+    ];
+    let mut rows: Vec<(String, i64, i64, f64, i64, i64)> =
+        Vec::with_capacity(queue::POC_METHOD_COUNT);
+    for (tag, name) in methods.iter() {
+        let (dispatch, errors, p50_ns, p99_ns) = queue::read_method_stats(*tag);
+        let rate: f64 = if dispatch == 0 {
+            0.0
+        } else {
+            errors as f64 / dispatch as f64
+        };
+        rows.push((
+            (*name).to_string(),
+            dispatch as i64,
+            errors as i64,
+            rate,
+            // Clamp p99/p50 saturation values into i64 range without
+            // overflowing; u64::MAX is bigger than i64::MAX.
+            p50_ns.min(i64::MAX as u64) as i64,
+            p99_ns.min(i64::MAX as u64) as i64,
+        ));
+    }
+    TableIterator::new(rows.into_iter())
+}
+
+/// Reset all per-method shmem counters. Test/bench helper; mirrors
+/// `poc_ledger_shard_reset` for the per-shard ring/slots.
+#[pg_extern]
+fn poc_ledger_method_stats_reset() {
+    queue::method_stats_reset();
+}
+
+/// Per-shard `next_request_seq` accessor. Returns -1 for an
+/// out-of-range shard_idx. Matches the M4.1 column shape in
+/// `poc_ledger_shard_stats_all`.
+#[pg_extern]
+fn poc_ledger_apply_seq(shard_idx: i32) -> i64 {
+    if shard_idx < 0 || (shard_idx as usize) >= POC_SHARD_COUNT {
+        return -1;
+    }
+    queue::read_next_request_seq(shard_idx as usize) as i64
+}
+
+/// Per-shard `committer_tx_seq` accessor. Returns -1 for an
+/// out-of-range shard_idx.
+#[pg_extern]
+fn poc_ledger_committer_tx_seq(shard_idx: i32) -> i64 {
+    if shard_idx < 0 || (shard_idx as usize) >= POC_SHARD_COUNT {
+        return -1;
+    }
+    queue::read_committer_tx_seq(shard_idx as usize) as i64
+}
+
+/// Sum of per-shard ring depths across every shard. Equals
+/// SUM(`poc_ledger_shard_stats().depth`). Provided as a convenience
+/// for operators / dashboards that need a single scalar.
+#[pg_extern]
+fn poc_ledger_queue_depth() -> i64 {
+    let mut total: i64 = 0;
+    for shard_idx in 0..POC_SHARD_COUNT {
+        let (h, t) = queue::shard_head_tail(shard_idx);
+        total = total.saturating_add(t.wrapping_sub(h) as i64);
+    }
+    total
 }
 
 // ── M5b.1 (acct-4d4n.12): startup recovery worker ─────────────────────

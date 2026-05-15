@@ -116,6 +116,12 @@ pub struct PocQueueShard {
     /// follow-up territory if M9 benches surface contention.
     pub ring_full_waiter_pid: AtomicI32,
     pub _pad3: [u8; 4],
+    /// M8.1 (acct-4d4n.17): per-shard count of slot-fill errors
+    /// (SlotResolution::Error in drain_and_commit's per-event loop).
+    /// Narrow scope per Q4 lean: counts only plan_apply-derived errors
+    /// surfaced to slots. Broader recovery / backpressure counters are
+    /// M8.2's scope. Reset to 0 by `shard_reset`.
+    pub error_count: AtomicU64,
 }
 
 // ── PocPendingRequest ─────────────────────────────────────────────────
@@ -226,9 +232,178 @@ unsafe impl PGRXSharedMemory for PocShardArena {}
 pub static POC_SHARD_ARENA: PgLwLock<PocShardArena> =
     unsafe { PgLwLock::new(c"poc_shard_arena") };
 
-/// Wire up the arena's shmem segment. Called from `_PG_init`.
+// ── M8.1 (acct-4d4n.17) PocMethodStatsArena ──────────────────────────
+//
+// Top-level per-method telemetry (Q2 lean: top-level — methods are
+// global, the 4-element table is ~1 KiB vs ~16 KiB if per-shard ×
+// per-method). 30 exponential latency buckets per method cover
+// elapsed_ns ∈ [1, 2^30) split as bucket_i = floor(log2(elapsed_ns));
+// values ≥ 2^29 ns (≈ 537 ms) saturate into bucket 29.
+//
+// All fields are AtomicU64; updates are wait-free fetch_add. Readers
+// snapshot under acquire ordering without locking — small skew across
+// the (dispatch_count, error_count, buckets) tuple is acceptable for
+// telemetry-grade observability.
+
+pub const POC_METHOD_COUNT: usize = 4;
+pub const POC_LATENCY_BUCKETS: usize = 30;
+
+#[repr(C, align(64))]
+pub struct PocMethodStats {
+    /// Total events the method has processed (per-event count; each
+    /// event in a batch counts independently). Drives error_rate
+    /// denominator.
+    pub dispatch_count: AtomicU64,
+    /// Total events the method returned with `error.is_some()`. Narrow
+    /// per Q4 lean — does not include orphan recovery, ring-full,
+    /// takeover, or other transport-level failures (M8.2's scope).
+    pub error_count: AtomicU64,
+    /// log2-ns latency histogram. Each `plan_apply` call increments the
+    /// bucket matching its elapsed wall time. Total call_count =
+    /// SUM(buckets).
+    pub latency_buckets: [AtomicU64; POC_LATENCY_BUCKETS],
+}
+
+#[repr(C)]
+pub struct PocMethodStatsArena {
+    pub methods: [PocMethodStats; POC_METHOD_COUNT],
+}
+
+impl Default for PocMethodStatsArena {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+unsafe impl PGRXSharedMemory for PocMethodStatsArena {}
+
+pub static POC_METHOD_STATS_ARENA: PgLwLock<PocMethodStatsArena> =
+    unsafe { PgLwLock::new(c"poc_method_stats_arena") };
+
+/// Wire up both shmem segments. Called from `_PG_init`.
 pub fn init() {
     pg_shmem_init!(POC_SHARD_ARENA);
+    pg_shmem_init!(POC_METHOD_STATS_ARENA);
+}
+
+/// Map an elapsed_ns to its log2 bucket index in [0, POC_LATENCY_BUCKETS).
+fn latency_bucket(elapsed_ns: u64) -> usize {
+    if elapsed_ns < 2 {
+        return 0;
+    }
+    let bits = 63 - elapsed_ns.leading_zeros() as usize; // floor(log2)
+    if bits >= POC_LATENCY_BUCKETS {
+        POC_LATENCY_BUCKETS - 1
+    } else {
+        bits
+    }
+}
+
+/// Record one `plan_apply` call's outcome: bump per-event dispatch +
+/// error counters, then bucket the elapsed wall time. `dispatch_n` and
+/// `error_n` are per-event counts (a single plan_apply may process N
+/// events with K errors). `method_tag` out-of-range is silently
+/// dropped — method_tag is bounded by the push path.
+pub fn record_dispatch(method_tag: u8, elapsed_ns: u64, dispatch_n: u64, error_n: u64) {
+    let idx = method_tag as usize;
+    if idx >= POC_METHOD_COUNT {
+        return;
+    }
+    let arena = POC_METHOD_STATS_ARENA.share();
+    let m = &arena.methods[idx];
+    if dispatch_n > 0 {
+        m.dispatch_count.fetch_add(dispatch_n, Ordering::AcqRel);
+    }
+    if error_n > 0 {
+        m.error_count.fetch_add(error_n, Ordering::AcqRel);
+    }
+    let bucket = latency_bucket(elapsed_ns);
+    m.latency_buckets[bucket].fetch_add(1, Ordering::AcqRel);
+}
+
+/// Snapshot one method's (dispatch_count, error_count, p50_ns, p99_ns).
+/// Percentiles return 0 when no call has been recorded yet. p50/p99 are
+/// the bucket upper bound (2^(bucket+1)) so successive ranks compare
+/// monotonically; absolute accuracy is within 2× per bucket width.
+pub fn read_method_stats(method_tag: u8) -> (u64, u64, u64, u64) {
+    let idx = method_tag as usize;
+    if idx >= POC_METHOD_COUNT {
+        return (0, 0, 0, 0);
+    }
+    let arena = POC_METHOD_STATS_ARENA.share();
+    let m = &arena.methods[idx];
+    let dispatch = m.dispatch_count.load(Ordering::Acquire);
+    let errors = m.error_count.load(Ordering::Acquire);
+    let buckets: [u64; POC_LATENCY_BUCKETS] = std::array::from_fn(|i| {
+        m.latency_buckets[i].load(Ordering::Acquire)
+    });
+    let total: u64 = buckets.iter().sum();
+    let (p50, p99) = if total == 0 {
+        (0, 0)
+    } else {
+        let target_p50 = total.div_ceil(2);
+        let target_p99 = ((total as u128 * 99 + 99) / 100) as u64;
+        let mut cum: u64 = 0;
+        let mut p50_b: usize = 0;
+        let mut p99_b: usize = 0;
+        let mut p50_set = false;
+        let mut p99_set = false;
+        for (i, &v) in buckets.iter().enumerate() {
+            cum = cum.saturating_add(v);
+            if !p50_set && cum >= target_p50 {
+                p50_b = i;
+                p50_set = true;
+            }
+            if !p99_set && cum >= target_p99 {
+                p99_b = i;
+                p99_set = true;
+            }
+        }
+        // Bucket upper bound: 2^(bucket+1). Clamp the top bucket so we
+        // don't overflow u64 on bucket 29.
+        let bound = |b: usize| -> u64 {
+            if b + 1 >= 63 {
+                u64::MAX
+            } else {
+                1u64 << (b + 1)
+            }
+        };
+        (bound(p50_b), bound(p99_b))
+    };
+    (dispatch, errors, p50, p99)
+}
+
+/// M8.1: bump per-shard error_count by 1 for each slot-fill error.
+pub fn bump_shard_error(shard_idx: usize, n: u64) {
+    if n == 0 {
+        return;
+    }
+    let arena = POC_SHARD_ARENA.share();
+    arena.shards[shard_idx]
+        .error_count
+        .fetch_add(n, Ordering::AcqRel);
+}
+
+/// M8.1: read per-shard error_count.
+pub fn read_shard_error_count(shard_idx: usize) -> u64 {
+    let arena = POC_SHARD_ARENA.share();
+    arena.shards[shard_idx]
+        .error_count
+        .load(Ordering::Acquire)
+}
+
+/// M8.1: zero all per-method shmem counters. Mirrors the
+/// `shard_reset` semantics for the per-shard ring/slots. Useful for
+/// bench harnesses that need a clean baseline between cases.
+pub fn method_stats_reset() {
+    let arena = POC_METHOD_STATS_ARENA.share();
+    for m in &arena.methods {
+        m.dispatch_count.store(0, Ordering::Release);
+        m.error_count.store(0, Ordering::Release);
+        for b in &m.latency_buckets {
+            b.store(0, Ordering::Release);
+        }
+    }
 }
 
 /// Stamp `capacity` on each shard once shmem is up. Called from a
@@ -1221,6 +1396,7 @@ pub fn shard_reset(shard_idx: usize) {
         .capacity
         .store(POC_REQUESTS_PER_SHARD as u32, Ordering::Release);
     shard.ring_full_waiter_pid.store(0, Ordering::Release);
+    shard.error_count.store(0, Ordering::Release);
     for req in &arena.requests[shard_idx] {
         req.valid.store(REQ_EMPTY, Ordering::Release);
         req.request_seq.store(0, Ordering::Release);
