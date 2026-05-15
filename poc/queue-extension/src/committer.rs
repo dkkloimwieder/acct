@@ -1249,6 +1249,11 @@ fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
         queue::bump_shard_error(shard_idx, shard_errors_this_batch);
     }
 
+    // M8.2 (acct-4d4n.18): record this drain's batch size into the
+    // per-shard rolling window for poc_ledger_avg_batch_size(). Skips
+    // zero-length drains (no representative sample).
+    queue::record_batch_size(shard_idx, drained.len() as u32);
+
     // M5c.1 (acct-4d4n.14): drain advanced head inside `drain_apply_batch`
     // (line `shard.head.store(head + n)`), so ring capacity opened up.
     // Wake the per-shard backpressure waiter (if any) so they can
@@ -1335,6 +1340,11 @@ fn poc_ledger_apply(
     let timeout_ms = crate::queue_full_timeout_ms_now() as i64;
     let bp_start_ns = clock_ns();
     let request_seq: u64;
+    // M8.2 (acct-4d4n.18): bump backpressure_count at most once per
+    // apply call (per Q4 lean: waiter instances, not wake cycles). Set
+    // on first Err arm; subsequent retries within this call don't
+    // re-bump.
+    let mut bp_bumped: bool = false;
     'backpressure: loop {
         match queue::ring_push_apply(
             shard_idx,
@@ -1376,6 +1386,11 @@ fn poc_ledger_apply(
                             shard_idx, timeout_ms
                         ),
                     );
+                }
+                // M8.2: first wait-instance bump for this apply call.
+                if !bp_bumped {
+                    queue::bump_backpressure();
+                    bp_bumped = true;
                 }
                 // Claim the per-shard waiter slot. CAS-from-0
                 // succeeds for the first contender; subsequent
@@ -1975,6 +1990,16 @@ fn orphan_recovery(shard_idx: usize) -> (usize, usize) {
             abandoned += 1;
         }
     }
+    // M8.2 (acct-4d4n.18): orphans reaching this function means a prior
+    // committer died with slots ALLOCATED but never reached SLOT_FILLED.
+    // The user-tx those slots belonged to either committed (recovered →
+    // we backfill the slot from durable cost rows) or aborted (abandoned →
+    // we mark SLOT_ABANDONED). Either way the predecessor committer's
+    // would-be-tx failed to reach a clean SLOT_FILLED → bump per Q5
+    // lean's "sub-tx ERROR" interpretation.
+    if recovered + abandoned > 0 {
+        queue::bump_committer_tx_failure();
+    }
     (recovered, abandoned)
 }
 
@@ -2229,6 +2254,61 @@ fn poc_ledger_queue_depth() -> i64 {
     total
 }
 
+// ── M8.2 (acct-4d4n.18): recovery + backpressure event counters ──────
+//
+// Five SQL surfaces per spec §4.3 (O3). Q1 lean: separate
+// PocRecoveryStats arena from per-method stats. Q4 lean: backpressure
+// counts waiter instances (per apply call). Q5 lean: committer_tx_failures
+// is sub-tx-level (orphan_recovery invocations that reclaimed slots).
+
+#[pg_extern]
+fn poc_ledger_backpressure_count() -> i64 {
+    queue::read_backpressure_count() as i64
+}
+
+#[pg_extern]
+fn poc_ledger_committer_tx_failures() -> i64 {
+    queue::read_committer_tx_failures() as i64
+}
+
+#[pg_extern]
+fn poc_ledger_orphan_compensations() -> i64 {
+    queue::read_orphan_compensations() as i64
+}
+
+#[pg_extern]
+fn poc_ledger_lease_takeovers() -> i64 {
+    queue::read_lease_takeovers() as i64
+}
+
+/// Per-shard rolling-mean batch size from the last
+/// POC_BATCH_SAMPLE_WINDOW (=16) drains per Q2 lean (TableIterator
+/// per-shard). Mean over non-zero samples only — a fresh ring with
+/// 3 drains reports the mean of those 3, not 3/16. Shards with no
+/// drains yet return 0.
+#[pg_extern]
+fn poc_ledger_avg_batch_size() -> TableIterator<
+    'static,
+    (
+        name!(shard_id, i32),
+        name!(avg_batch_size, i32),
+    ),
+> {
+    let mut rows: Vec<(i32, i32)> = Vec::with_capacity(POC_SHARD_COUNT);
+    for shard_idx in 0..POC_SHARD_COUNT {
+        let avg = queue::read_avg_batch_size(shard_idx) as i32;
+        rows.push((shard_idx as i32, avg));
+    }
+    TableIterator::new(rows.into_iter())
+}
+
+/// Reset all M8.2 counters. Bench/test helper; mirrors
+/// `poc_ledger_method_stats_reset`.
+#[pg_extern]
+fn poc_ledger_recovery_stats_reset() {
+    queue::recovery_stats_reset();
+}
+
 // ── M5b.1 (acct-4d4n.12): startup recovery worker ─────────────────────
 //
 // One-shot bgworker registered in `_PG_init`. Runs once on postmaster
@@ -2460,6 +2540,10 @@ fn run_startup_recovery_once() {
                         match queue::ring_push_compensate(shard, xid_i64) {
                             Ok(_) => {
                                 enqueued_xids += 1;
+                                // M8.2 (acct-4d4n.18): one bump per
+                                // successful compensation push from the
+                                // startup-recovery worker's Phase B scan.
+                                queue::bump_orphan_compensation();
                             }
                             Err(()) => {
                                 pgrx::log!(

@@ -280,10 +280,11 @@ unsafe impl PGRXSharedMemory for PocMethodStatsArena {}
 pub static POC_METHOD_STATS_ARENA: PgLwLock<PocMethodStatsArena> =
     unsafe { PgLwLock::new(c"poc_method_stats_arena") };
 
-/// Wire up both shmem segments. Called from `_PG_init`.
+/// Wire up all three shmem segments. Called from `_PG_init`.
 pub fn init() {
     pg_shmem_init!(POC_SHARD_ARENA);
     pg_shmem_init!(POC_METHOD_STATS_ARENA);
+    pg_shmem_init!(POC_RECOVERY_STATS);
 }
 
 /// Map an elapsed_ns to its log2 bucket index in [0, POC_LATENCY_BUCKETS).
@@ -402,6 +403,174 @@ pub fn method_stats_reset() {
         m.error_count.store(0, Ordering::Release);
         for b in &m.latency_buckets {
             b.store(0, Ordering::Release);
+        }
+    }
+}
+
+// ── M8.2 (acct-4d4n.18) PocRecoveryStats ─────────────────────────────
+//
+// Separate top-level arena from PocMethodStatsArena per Q1 lean: these
+// counters are operationally distinct (transport / recovery events,
+// not per-method dispatch). Clean reset boundary.
+//
+// Four global AtomicU64 counters + per-shard ring of recent batch
+// sizes. Ring is fixed POC_BATCH_SAMPLE_WINDOW = 16 entries per Q3
+// (powers-of-2 modulo, sufficient resolution for telemetry).
+
+pub const POC_BATCH_SAMPLE_WINDOW: usize = 16;
+
+#[repr(C, align(64))]
+pub struct PocPerShardBatchRing {
+    /// Monotonic write index; bucket = (head as usize) & MASK.
+    pub head: AtomicU32,
+    pub _pad: [u8; 4],
+    pub samples: [AtomicU32; POC_BATCH_SAMPLE_WINDOW],
+}
+
+#[repr(C)]
+pub struct PocRecoveryStats {
+    /// Number of `ring_push_apply` calls that entered the WaitLatch
+    /// backpressure loop at least once. Per Q4 lean: counts waiter
+    /// instances (one bump per apply call that went to sleep), not
+    /// wake cycles.
+    pub backpressure_count: AtomicU64,
+    /// Number of `orphan_recovery` invocations that reclaimed ≥1 slot —
+    /// i.e. how many committer-tx aborts the recovery path observed
+    /// and patched up. Per Q5 lean: SPI/sub-tx aborts only; SLOT_ABANDONED
+    /// CAS misses on the cancel path are NOT counted here (those are
+    /// the normal cancel-cleanup flow, not committer failures).
+    pub committer_tx_failures: AtomicU64,
+    /// Number of compensations the startup-recovery worker (Phase B)
+    /// enqueued for aborted user-tx xids it found by scanning cost
+    /// tables. Bumped once per `ring_push_compensate` call.
+    pub orphan_compensations: AtomicU64,
+    /// Number of successful `try_acquire_or_takeover` takeovers
+    /// (TakeoverOutcome::TookOver). Counted at the function boundary
+    /// so every caller (apply path, bench helper, slot-audit) attributes
+    /// uniformly.
+    pub lease_takeovers: AtomicU64,
+    /// Per-shard rolling-window batch-size samples. Drain calls write
+    /// at `head++ & MASK`; readers compute mean over POC_BATCH_SAMPLE_WINDOW
+    /// most-recent non-zero samples (or zero if window is empty).
+    pub batch_rings: [PocPerShardBatchRing; POC_SHARD_COUNT],
+}
+
+impl Default for PocRecoveryStats {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+unsafe impl PGRXSharedMemory for PocRecoveryStats {}
+
+pub static POC_RECOVERY_STATS: PgLwLock<PocRecoveryStats> =
+    unsafe { PgLwLock::new(c"poc_recovery_stats") };
+
+pub fn bump_backpressure() {
+    POC_RECOVERY_STATS
+        .share()
+        .backpressure_count
+        .fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn bump_committer_tx_failure() {
+    POC_RECOVERY_STATS
+        .share()
+        .committer_tx_failures
+        .fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn bump_orphan_compensation() {
+    POC_RECOVERY_STATS
+        .share()
+        .orphan_compensations
+        .fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn bump_lease_takeover() {
+    POC_RECOVERY_STATS
+        .share()
+        .lease_takeovers
+        .fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn read_backpressure_count() -> u64 {
+    POC_RECOVERY_STATS
+        .share()
+        .backpressure_count
+        .load(Ordering::Acquire)
+}
+
+pub fn read_committer_tx_failures() -> u64 {
+    POC_RECOVERY_STATS
+        .share()
+        .committer_tx_failures
+        .load(Ordering::Acquire)
+}
+
+pub fn read_orphan_compensations() -> u64 {
+    POC_RECOVERY_STATS
+        .share()
+        .orphan_compensations
+        .load(Ordering::Acquire)
+}
+
+pub fn read_lease_takeovers() -> u64 {
+    POC_RECOVERY_STATS
+        .share()
+        .lease_takeovers
+        .load(Ordering::Acquire)
+}
+
+/// Record one drain's batch size for the per-shard rolling window.
+/// Drain calls of size 0 are skipped (no work means no representative
+/// sample — they'd dilute the mean).
+pub fn record_batch_size(shard_idx: usize, batch_size: u32) {
+    if batch_size == 0 || shard_idx >= POC_SHARD_COUNT {
+        return;
+    }
+    let ring = &POC_RECOVERY_STATS.share().batch_rings[shard_idx];
+    let h = ring.head.fetch_add(1, Ordering::AcqRel);
+    let idx = (h as usize) & (POC_BATCH_SAMPLE_WINDOW - 1);
+    ring.samples[idx].store(batch_size, Ordering::Release);
+}
+
+/// Read the per-shard mean batch size. Returns 0 when the ring is
+/// empty (no drains recorded). Mean is over only the non-zero samples
+/// (a fresh ring starts at all zeros; partial fills don't dilute).
+pub fn read_avg_batch_size(shard_idx: usize) -> u32 {
+    if shard_idx >= POC_SHARD_COUNT {
+        return 0;
+    }
+    let ring = &POC_RECOVERY_STATS.share().batch_rings[shard_idx];
+    let mut total: u64 = 0;
+    let mut count: u64 = 0;
+    for s in &ring.samples {
+        let v = s.load(Ordering::Acquire);
+        if v > 0 {
+            total += v as u64;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0
+    } else {
+        (total / count) as u32
+    }
+}
+
+/// Zero all recovery stats counters + batch-size rings. Bench harness
+/// helper; mirrors `method_stats_reset`.
+pub fn recovery_stats_reset() {
+    let arena = POC_RECOVERY_STATS.share();
+    arena.backpressure_count.store(0, Ordering::Release);
+    arena.committer_tx_failures.store(0, Ordering::Release);
+    arena.orphan_compensations.store(0, Ordering::Release);
+    arena.lease_takeovers.store(0, Ordering::Release);
+    for ring in &arena.batch_rings {
+        ring.head.store(0, Ordering::Release);
+        for s in &ring.samples {
+            s.store(0, Ordering::Release);
         }
     }
 }
@@ -1314,6 +1483,14 @@ pub fn try_acquire_or_takeover(
             shard
                 .committer_acquired_at_ns
                 .store(now_ns, Ordering::Release);
+            // M8.2 (acct-4d4n.18): bump at the function boundary so
+            // every caller — apply path, bench helper, slot-audit —
+            // attributes uniformly. Counts only successful takeovers
+            // (TookOver outcome), not Acquired-from-empty or Lost/Held.
+            POC_RECOVERY_STATS
+                .share()
+                .lease_takeovers
+                .fetch_add(1, Ordering::AcqRel);
             TakeoverOutcome::TookOver { stale_pid: cur_pid }
         }
         Err(_) => TakeoverOutcome::Lost,
