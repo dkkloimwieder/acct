@@ -205,6 +205,14 @@ pub struct PocResultSlot {
     /// cleared at recycle.
     /// (acct-4d4n.15, M5c.2)
     pub acquired_at_ns: AtomicU64,
+    /// Wall-clock at the moment the committer stamps SLOT_FILLED and
+    /// is about to `SetLatch` the waiter. The waiting backend reads
+    /// this AFTER its `WaitLatch` returns and buckets
+    /// `now_ns - set_latched_at_ns` into the B5 wake-latency
+    /// histogram. Zero = no committer-side latch yet stamped (push-only
+    /// paths, ABANDONED slots). Cleared at recycle.
+    /// (acct-4d4n.19, M8.3)
+    pub set_latched_at_ns: AtomicU64,
 }
 
 // ── Arena (entire shmem segment, one PgLwLock) ────────────────────────
@@ -280,11 +288,12 @@ unsafe impl PGRXSharedMemory for PocMethodStatsArena {}
 pub static POC_METHOD_STATS_ARENA: PgLwLock<PocMethodStatsArena> =
     unsafe { PgLwLock::new(c"poc_method_stats_arena") };
 
-/// Wire up all three shmem segments. Called from `_PG_init`.
+/// Wire up all four shmem segments. Called from `_PG_init`.
 pub fn init() {
     pg_shmem_init!(POC_SHARD_ARENA);
     pg_shmem_init!(POC_METHOD_STATS_ARENA);
     pg_shmem_init!(POC_RECOVERY_STATS);
+    pg_shmem_init!(POC_BOTTLENECK_STATS);
 }
 
 /// Map an elapsed_ns to its log2 bucket index in [0, POC_LATENCY_BUCKETS).
@@ -575,6 +584,154 @@ pub fn recovery_stats_reset() {
     }
 }
 
+// ── M8.3 (acct-4d4n.19) PocBottleneckStats ───────────────────────────
+//
+// Two extension-tracked dimensions for the bake-off classifier:
+//
+//   B3 (plan_apply CPU): cumulative ns spent inside method.plan_apply
+//     since the last reset. Already bucketed in PocMethodStatsArena
+//     for p50/p99, but the classifier needs the SUM for the share
+//     calculation (B3_ns / wall_ms × 1e6 = B3 fraction of cell wall time).
+//
+//   B5 (wake latency): per-sample histogram of `now_ns - set_latched_at_ns`
+//     captured by waiters after WaitLatch returns. 30 log2-ns buckets
+//     mirroring PocMethodStats so percentile math is uniform.
+//
+// B1 (LWLock) and B2 (WAL fsync) are caller-sampled — the bench harness
+// reads `pg_stat_activity` / `pg_stat_wal` directly. No extension state.
+
+pub const POC_B5_BUCKETS: usize = 30;
+
+#[repr(C)]
+pub struct PocBottleneckStats {
+    /// Cumulative ns spent inside plan_apply since reset (B3 source).
+    pub plan_apply_total_ns: AtomicU64,
+    /// Cumulative ns observed in wake-latency samples (B5 source for
+    /// mean = total / count).
+    pub wake_total_ns: AtomicU64,
+    /// Number of wake-latency samples recorded.
+    pub wake_sample_count: AtomicU64,
+    /// 30 log2-ns buckets for wake latency, identical scheme to
+    /// PocMethodStats.latency_buckets.
+    pub wake_buckets: [AtomicU64; POC_B5_BUCKETS],
+}
+
+impl Default for PocBottleneckStats {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+unsafe impl PGRXSharedMemory for PocBottleneckStats {}
+
+pub static POC_BOTTLENECK_STATS: PgLwLock<PocBottleneckStats> =
+    unsafe { PgLwLock::new(c"poc_bottleneck_stats") };
+
+/// B3 add: accumulate ns into plan_apply_total_ns. Called from
+/// process_group after Instant::now() delta capture (M8.1 already
+/// records per-bucket; this is the parallel SUM for the share calc).
+pub fn record_b3_total_ns(elapsed_ns: u64) {
+    POC_BOTTLENECK_STATS
+        .share()
+        .plan_apply_total_ns
+        .fetch_add(elapsed_ns, Ordering::AcqRel);
+}
+
+/// B5 add: record one wake-latency sample. Called from the apply path
+/// after WaitLatch returns and the slot is observed SLOT_FILLED.
+pub fn record_b5_wake_sample(elapsed_ns: u64) {
+    let arena = POC_BOTTLENECK_STATS.share();
+    arena.wake_total_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+    arena.wake_sample_count.fetch_add(1, Ordering::AcqRel);
+    let bucket = latency_bucket(elapsed_ns);
+    let b_idx = bucket.min(POC_B5_BUCKETS - 1);
+    arena.wake_buckets[b_idx].fetch_add(1, Ordering::AcqRel);
+}
+
+/// Read B3 cumulative ns.
+pub fn read_b3_total_ns() -> u64 {
+    POC_BOTTLENECK_STATS
+        .share()
+        .plan_apply_total_ns
+        .load(Ordering::Acquire)
+}
+
+/// Read B5 stats: (total_ns, sample_count, p50_ns, p99_ns). Percentiles
+/// return 0 when no samples; bucket upper bound (2^(bucket+1)) used so
+/// readings compare monotonically with M8.1 method stats.
+pub fn read_b5_wake_stats() -> (u64, u64, u64, u64) {
+    let arena = POC_BOTTLENECK_STATS.share();
+    let total_ns = arena.wake_total_ns.load(Ordering::Acquire);
+    let count = arena.wake_sample_count.load(Ordering::Acquire);
+    let buckets: [u64; POC_B5_BUCKETS] = std::array::from_fn(|i| {
+        arena.wake_buckets[i].load(Ordering::Acquire)
+    });
+    let total_buckets: u64 = buckets.iter().sum();
+    let (p50, p99) = if total_buckets == 0 {
+        (0, 0)
+    } else {
+        let target_p50 = total_buckets.div_ceil(2);
+        let target_p99 = ((total_buckets as u128 * 99 + 99) / 100) as u64;
+        let mut cum: u64 = 0;
+        let mut p50_b: usize = 0;
+        let mut p99_b: usize = 0;
+        let mut p50_set = false;
+        let mut p99_set = false;
+        for (i, &v) in buckets.iter().enumerate() {
+            cum = cum.saturating_add(v);
+            if !p50_set && cum >= target_p50 {
+                p50_b = i;
+                p50_set = true;
+            }
+            if !p99_set && cum >= target_p99 {
+                p99_b = i;
+                p99_set = true;
+            }
+        }
+        let bound = |b: usize| -> u64 {
+            if b + 1 >= 63 { u64::MAX } else { 1u64 << (b + 1) }
+        };
+        (bound(p50_b), bound(p99_b))
+    };
+    (total_ns, count, p50, p99)
+}
+
+/// Bench-harness helper: zero B3/B5 counters + buckets.
+pub fn bottleneck_stats_reset() {
+    let arena = POC_BOTTLENECK_STATS.share();
+    arena.plan_apply_total_ns.store(0, Ordering::Release);
+    arena.wake_total_ns.store(0, Ordering::Release);
+    arena.wake_sample_count.store(0, Ordering::Release);
+    for b in &arena.wake_buckets {
+        b.store(0, Ordering::Release);
+    }
+}
+
+/// Stamp `set_latched_at_ns` on a slot just before the committer fires
+/// `SetLatch` on the waiter. The waiter reads this after `WaitLatch`
+/// returns and computes the roundtrip latency for B5.
+pub fn stamp_set_latched_at_ns(shard_idx: usize, slot_idx: u32, now_ns: u64) {
+    if shard_idx >= POC_SHARD_COUNT {
+        return;
+    }
+    let arena = POC_SHARD_ARENA.share();
+    arena.slots[shard_idx][slot_idx as usize]
+        .set_latched_at_ns
+        .store(now_ns, Ordering::Release);
+}
+
+/// Read the set_latched_at_ns timestamp. Returns 0 if no committer
+/// has latched the slot yet.
+pub fn read_set_latched_at_ns(shard_idx: usize, slot_idx: u32) -> u64 {
+    if shard_idx >= POC_SHARD_COUNT {
+        return 0;
+    }
+    let arena = POC_SHARD_ARENA.share();
+    arena.slots[shard_idx][slot_idx as usize]
+        .set_latched_at_ns
+        .load(Ordering::Acquire)
+}
+
 /// Stamp `capacity` on each shard once shmem is up. Called from a
 /// backend's first touch (idempotent — CAS-set-if-zero).
 fn ensure_capacity_stamped() {
@@ -657,6 +814,7 @@ pub fn recycle_slot(shard_idx: usize, slot_idx: u32) -> Result<u8, u8> {
     slot.issue_id.store(0, Ordering::Release);
     slot.current_request_seq.store(0, Ordering::Release);
     slot.acquired_at_ns.store(0, Ordering::Release);
+    slot.set_latched_at_ns.store(0, Ordering::Release);
     for i in 0..32 {
         slot.depletion_ids_inline[i].store(0, Ordering::Release);
     }
@@ -1594,6 +1752,7 @@ pub fn shard_reset(shard_idx: usize) {
         slot.issue_id.store(0, Ordering::Release);
         slot.current_request_seq.store(0, Ordering::Release);
         slot.acquired_at_ns.store(0, Ordering::Release);
+        slot.set_latched_at_ns.store(0, Ordering::Release);
     }
 }
 

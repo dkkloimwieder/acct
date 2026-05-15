@@ -866,6 +866,10 @@ fn process_group(
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
         let error_n = r.per_event.iter().filter(|er| er.error.is_some()).count() as u64;
         queue::record_dispatch(method_tag, elapsed_ns, dispatch_n, error_n);
+        // M8.3 (acct-4d4n.19): cumulative B3 ns since reset for the
+        // classifier's share calc. The M8.1 buckets give p50/p99; this
+        // is the parallel SUM.
+        queue::record_b3_total_ns(elapsed_ns);
         r
     };
 
@@ -1013,6 +1017,11 @@ fn signal_waiter(shard_idx: usize, slot_idx: u32) {
     if pid == 0 {
         return;
     }
+    // M8.3 (acct-4d4n.19): stamp set_latched_at_ns BEFORE SetLatch so
+    // the waiter's read-after-WaitLatch sees a value that bounds wake
+    // latency from above. If we stamped AFTER, a fast wake (cache-hot
+    // ProcSendSignal) could observe a zero or stale timestamp.
+    queue::stamp_set_latched_at_ns(shard_idx, slot_idx, clock_ns());
     unsafe {
         let proc_ = pgrx::pg_sys::BackendPidGetProc(pid);
         if !proc_.is_null() {
@@ -1447,6 +1456,19 @@ fn poc_ledger_apply(
 
         let state = queue::slot_state(shard_idx, slot_idx);
         if state == SLOT_FILLED {
+            // M8.3 (acct-4d4n.19): sample B5 wake latency. The committer
+            // stamped set_latched_at_ns immediately before SetLatch;
+            // here on the wake side we compute the roundtrip. Skip if
+            // the stamp is zero (caller's own self-drain path — they
+            // never went through signal_waiter) or in the past (clock
+            // skew / committer-self-drain double-loop after Acquired).
+            let stamped = queue::read_set_latched_at_ns(shard_idx, slot_idx);
+            if stamped > 0 {
+                let now = clock_ns();
+                if now > stamped {
+                    queue::record_b5_wake_sample(now - stamped);
+                }
+            }
             break;
         }
         if state == SLOT_ABANDONED {
@@ -2307,6 +2329,143 @@ fn poc_ledger_avg_batch_size() -> TableIterator<
 #[pg_extern]
 fn poc_ledger_recovery_stats_reset() {
     queue::recovery_stats_reset();
+}
+
+// ── M8.3 (acct-4d4n.19): bottleneck classifier surface ───────────────
+//
+// Per spec §5.7. Extension owns B3 (plan_apply CPU sum since reset)
+// and B5 (wake-latency histogram). B1 (LWLock) and B2 (WAL) are
+// caller-sampled — the bench harness reads `pg_stat_activity` /
+// `pg_stat_wal` directly. The classifier accepts caller-supplied B1/B2
+// numerics alongside extension-owned B3/B5 and emits a single text
+// label per cell.
+//
+// Q3 lean: separate JSONB snapshot fn (for M9.3 sweep heatmap) +
+// text classifier fn (for human-readable matrix). Q4 lean: caller
+// composes start_snap + end_snap + classify into a "cell wrapper" at
+// the harness layer rather than the extension owning a wrap-a-cell
+// macro. Q5 lean: caller supplies wall_ms (the harness knows it).
+
+/// JSONB snapshot of all extension-owned bottleneck-relevant counters.
+/// Composes with caller-sampled B1/B2 numbers at classify time. The
+/// `ts_ns` field is monotonic clock; harness can diff two snapshots
+/// to bound the inside-extension observation window.
+#[pg_extern]
+fn poc_ledger_bottleneck_snapshot() -> pgrx::JsonB {
+    let b3_total = queue::read_b3_total_ns();
+    let (b5_total, b5_count, b5_p50, b5_p99) = queue::read_b5_wake_stats();
+    let ts_ns = clock_ns();
+    pgrx::JsonB(serde_json::json!({
+        "b3_plan_apply_total_ns": b3_total,
+        "b5_wake_total_ns": b5_total,
+        "b5_wake_count": b5_count,
+        "b5_p50_ns": b5_p50,
+        "b5_p99_ns": b5_p99,
+        "ts_ns": ts_ns,
+    }))
+}
+
+/// Cumulative wake-latency stats: (p50_ns, p99_ns, sample_count).
+/// Scalar accessor; useful when the harness wants just the latency
+/// dimension without paying JSONB parsing.
+#[pg_extern]
+fn poc_ledger_wake_latency_stats() -> TableIterator<
+    'static,
+    (
+        name!(p50_ns, i64),
+        name!(p99_ns, i64),
+        name!(sample_count, i64),
+    ),
+> {
+    let (_total, count, p50, p99) = queue::read_b5_wake_stats();
+    TableIterator::once((
+        p50.min(i64::MAX as u64) as i64,
+        p99.min(i64::MAX as u64) as i64,
+        count as i64,
+    ))
+}
+
+/// Reset B3 + B5 counters. Mirrors `poc_ledger_method_stats_reset`.
+#[pg_extern]
+fn poc_ledger_bottleneck_stats_reset() {
+    queue::bottleneck_stats_reset();
+}
+
+/// Classify a cell given start/end JSONB snapshots + the caller's
+/// wall_ms + caller-sampled B1/B2 numerics (LWLock wait ms + WAL
+/// fsync ms, both delta over the cell). Returns a TEXT label:
+///
+///   "B1:lwlock", "B2:wal", "B3:cpu", "B5:wake"  — single-dimension dominant (≥50% share)
+///   "mixed:B3+B5", "mixed:B1+B2", ...           — top two dimensions (each ≥15% share)
+///   "idle"                                       — no measurable activity
+///
+/// Share = component_ns / wall_ns. wall_ns = wall_ms × 1e6. The
+/// classifier is rule-based per spec §5.7; M9.3 may swap in a more
+/// sophisticated model later without changing the SQL signature.
+#[pg_extern]
+fn poc_ledger_bottleneck_classify(
+    start_snap: pgrx::JsonB,
+    end_snap: pgrx::JsonB,
+    wall_ms: i64,
+    b1_lock_ms: default!(i64, 0),
+    b2_wal_sync_ms: default!(i64, 0),
+) -> String {
+    fn get_u64(v: &serde_json::Value, key: &str) -> u64 {
+        v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+    }
+    let s0 = &start_snap.0;
+    let s1 = &end_snap.0;
+    let b3_ns = get_u64(s1, "b3_plan_apply_total_ns")
+        .saturating_sub(get_u64(s0, "b3_plan_apply_total_ns"));
+    let b5_ns = get_u64(s1, "b5_wake_total_ns")
+        .saturating_sub(get_u64(s0, "b5_wake_total_ns"));
+    let wall_ns: u64 = (wall_ms.max(1) as u64).saturating_mul(1_000_000);
+    let b1_ns: u64 = (b1_lock_ms.max(0) as u64).saturating_mul(1_000_000);
+    let b2_ns: u64 = (b2_wal_sync_ms.max(0) as u64).saturating_mul(1_000_000);
+
+    // Total component ns may exceed wall_ns (e.g. when N>1 backends
+    // overlap component work). Normalize against MAX(wall_ns, sum) so
+    // shares always sum ≤ 1 and the dominant dimension still surfaces.
+    let sum_components = b1_ns
+        .saturating_add(b2_ns)
+        .saturating_add(b3_ns)
+        .saturating_add(b5_ns);
+    let denom = std::cmp::max(wall_ns, sum_components.max(1));
+
+    let share_b1 = b1_ns as f64 / denom as f64;
+    let share_b2 = b2_ns as f64 / denom as f64;
+    let share_b3 = b3_ns as f64 / denom as f64;
+    let share_b5 = b5_ns as f64 / denom as f64;
+    let shares = [
+        ("B1:lwlock", share_b1),
+        ("B2:wal", share_b2),
+        ("B3:cpu", share_b3),
+        ("B5:wake", share_b5),
+    ];
+    let max_share = shares.iter().map(|s| s.1).fold(0.0f64, f64::max);
+    if max_share < 0.05 {
+        return "idle".to_string();
+    }
+    // Single-dimension: top share ≥ 0.50.
+    for (name, share) in shares.iter() {
+        if *share >= 0.50 {
+            return name.to_string();
+        }
+    }
+    // Mixed: top two dimensions each ≥ 0.15. Sort descending by share.
+    let mut sorted = shares;
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (top_name, top_share) = sorted[0];
+    let (second_name, second_share) = sorted[1];
+    if second_share >= 0.15 {
+        // Trim the "X:" prefix for compactness.
+        let trim = |s: &str| s.split(':').next().unwrap_or(s).to_string();
+        format!("mixed:{}+{}", trim(top_name), trim(second_name))
+    } else if top_share >= 0.15 {
+        top_name.to_string()
+    } else {
+        "idle".to_string()
+    }
 }
 
 // ── M5b.1 (acct-4d4n.12): startup recovery worker ─────────────────────
