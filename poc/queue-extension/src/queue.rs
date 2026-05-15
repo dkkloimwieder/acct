@@ -730,6 +730,24 @@ pub fn read_committer_pid(shard_idx: usize) -> i32 {
         .load(Ordering::Acquire)
 }
 
+/// M5b.1 (acct-4d4n.12): seed the per-shard committer_tx counter so
+/// the next call to `next_committer_tx_id` returns a value strictly
+/// greater than `min_seen`. Called by the startup recovery worker
+/// after scanning durable cost rows: post-restart shmem starts at 0,
+/// new applies would collide with the committer_tx_ids that survived
+/// the restart on disk. Idempotent; uses fetch_max so concurrent
+/// live committers cannot drive the counter backwards.
+pub fn seed_committer_tx_at_least(shard_idx: usize, min_seen: i64) {
+    if min_seen <= 0 || shard_idx >= POC_SHARD_COUNT {
+        return;
+    }
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx];
+    let _ = shard
+        .committer_tx_seq
+        .fetch_max(min_seen as u64, Ordering::AcqRel);
+}
+
 /// Read-only accessor for the current per-shard `committer_tx_seq`.
 /// Distinct from `next_committer_tx_id` which fetch_adds.
 pub fn read_committer_tx_seq(shard_idx: usize) -> u64 {

@@ -18,6 +18,7 @@
 
 #![allow(unexpected_cfgs)]
 
+use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
 use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use std::ffi::CString;
@@ -79,6 +80,23 @@ pub(crate) fn pool_lock_mode_str() -> String {
         .as_ref()
         .map(|c| c.to_string_lossy().to_string())
         .unwrap_or_else(|| "none".to_string())
+}
+
+// M5b.1 (acct-4d4n.12): Database the startup-recovery bgworker
+// connects to via SPI to scan durable cost tables. Postmaster-scope
+// because the worker is registered at _PG_init and reads the value
+// once when it starts.
+static RECOVERY_DATABASE: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"acct_poc_queue"));
+
+/// Read the recovery worker's target database name. Returns the
+/// default ("acct_poc_queue") if unset.
+pub(crate) fn recovery_database_str() -> String {
+    RECOVERY_DATABASE
+        .get()
+        .as_ref()
+        .map(|c| c.to_string_lossy().to_string())
+        .unwrap_or_else(|| "acct_poc_queue".to_string())
 }
 
 // ── _PG_init ────────────────────────────────────────────────────────
@@ -183,6 +201,26 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::empty(),
     );
+    GucRegistry::define_string_guc(
+        c"poc_ledger.recovery_database",
+        c"Database the startup-recovery bgworker connects to (M5b.1)",
+        c"On postmaster startup the recovery worker connects to this database via SPI, scans the cost tables for per-shard max(committer_tx_id) and seeds the shmem counters so post-restart applies cannot collide with pre-restart durable rows. Must be the database where the poc_ledger extension lives.",
+        &RECOVERY_DATABASE,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+
+    // M5b.1 (acct-4d4n.12): one-shot startup recovery worker.
+    // `restart_time = None` means PG does NOT relaunch after the worker
+    // exits — recovery runs once per postmaster start.
+    BackgroundWorkerBuilder::new("poc_ledger_startup_recovery")
+        .set_function("poc_ledger_startup_recovery_main")
+        .set_library("poc_ledger")
+        .set_argument(None)
+        .set_start_time(BgWorkerStartTime::ConsistentState)
+        .set_restart_time(None)
+        .enable_spi_access()
+        .load();
 }
 
 // ── SQL surface ─────────────────────────────────────────────────────
@@ -191,5 +229,5 @@ pub extern "C-unwind" fn _PG_init() {
 /// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M5a.2 waiter cancel + dedup-replay (acct-4d4n.11)"
+    "poc_ledger v0.0.1 — M5b.1 startup recovery worker (counter seed + xid scan stub) (acct-4d4n.12)"
 }

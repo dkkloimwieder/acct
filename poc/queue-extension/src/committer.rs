@@ -1683,3 +1683,209 @@ fn poc_ledger_shard_stats_all() -> TableIterator<
     }
     TableIterator::new(rows.into_iter())
 }
+
+// ── M5b.1 (acct-4d4n.12): startup recovery worker ─────────────────────
+//
+// One-shot bgworker registered in `_PG_init`. Runs once on postmaster
+// startup with `start_time = ConsistentState`, `restart_time = None`.
+//
+// Phase A — counter seeding:
+//   Scan `(sku_id, location_id, MAX(committer_tx_id))` across both
+//   `poc_cost_consumptions` and `poc_cost_depletions`. For each row,
+//   recompute the destination shard via `pool_hash + shard_for` and
+//   keep a per-shard running max. Then bump each shard's shmem
+//   `committer_tx_seq` to that max via `seed_committer_tx_at_least`.
+//
+//   Without this, post-restart shmem starts at 0 and the first apply
+//   on a shard returns `committer_tx_id = 1` — colliding with any
+//   pre-restart durable row that already wrote `committer_tx_id = 1`.
+//   Invariant I4 (monotonic per-shard committer_tx_seq) requires that
+//   the next emitted value strictly exceeds every value seen in the
+//   audit history.
+//
+// Phase B — xid abort scan (STUB):
+//   Walk distinct `user_tx_xid` and call `TransactionIdDidAbort` for
+//   each. For aborted xids, log a placeholder pending the real
+//   compensation enqueue path that M6.1 (acct-4d4n.16) will provide.
+//   Spec §3.5; production xid-watermark tracking is deferred to
+//   design-v2 per §7 Q-F.
+
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn poc_ledger_startup_recovery_main(
+    _arg: pgrx::pg_sys::Datum,
+) {
+    use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
+
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM);
+
+    let dbname = crate::recovery_database_str();
+    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+
+    BackgroundWorker::transaction(|| {
+        run_startup_recovery_once();
+    });
+    // restart_time = None means PG does not relaunch us — we exit
+    // here and stay exited until the next postmaster start.
+}
+
+fn run_startup_recovery_once() {
+    // Pre-check: if the extension's tables don't exist yet (very fresh
+    // database, CREATE EXTENSION hasn't been run, or the wrong
+    // recovery_database GUC), exit cleanly with a log rather than
+    // raising ERROR on a missing-relation SPI failure. Without this
+    // gate the bgworker dies on first install and the next manual
+    // CREATE EXTENSION + restart would have nothing to seed against.
+    let mut have_tables = false;
+    Spi::connect(|client| {
+        let table = client.select(
+            "SELECT to_regclass('poc_cost_consumptions') IS NOT NULL \
+               AND to_regclass('poc_cost_layers') IS NOT NULL \
+               AND to_regclass('poc_cost_depletions') IS NOT NULL \
+               AS ok",
+            None,
+            &[],
+        );
+        if let Ok(tab) = table {
+            for row in tab {
+                let ok: Option<bool> = row["ok"].value().ok().flatten();
+                have_tables = ok.unwrap_or(false);
+            }
+        }
+    });
+    if !have_tables {
+        pgrx::log!(
+            "poc_ledger_startup_recovery: cost tables not present in \
+             database '{}' (fresh install or wrong recovery_database \
+             GUC); exiting without recovery",
+            crate::recovery_database_str()
+        );
+        return;
+    }
+
+    // Phase A — seed per-shard counters.
+    //
+    // Three sources of (sku_id, location_id, committer_tx_id) tuples:
+    //   - poc_cost_consumptions (AVG/STD per-event row; carries sku+loc)
+    //   - poc_cost_layers (FIFO receipts; carries sku+loc)
+    //   - poc_cost_depletions (FIFO consumption rows; JOIN via layer_id
+    //     to poc_cost_layers to derive sku+loc)
+    //
+    // Subquery columns must be aliased (`u.*`) — UNION ALL branches
+    // expose names via the *outer* subquery, not directly. Without
+    // `u.sku_id` etc. PG raises "column does not exist" at parse time.
+    let mut per_shard_max: Vec<i64> = vec![0; POC_SHARD_COUNT];
+    let mut scanned_pool_rows: u64 = 0;
+
+    Spi::connect(|client| {
+        let table = client.select(
+            "SELECT u.sku_id, u.location_id, MAX(u.committer_tx_id)::BIGINT AS maxtx \
+               FROM (\
+                 SELECT sku_id, location_id, committer_tx_id FROM poc_cost_consumptions \
+                 UNION ALL \
+                 SELECT sku_id, location_id, committer_tx_id FROM poc_cost_layers \
+                 UNION ALL \
+                 SELECT l.sku_id, l.location_id, d.committer_tx_id \
+                   FROM poc_cost_depletions d \
+                   JOIN poc_cost_layers l ON d.layer_id = l.layer_id\
+               ) u \
+              GROUP BY u.sku_id, u.location_id",
+            None,
+            &[],
+        );
+        if let Ok(tab) = table {
+            for row in tab {
+                let sku: Option<i64> = row["sku_id"].value().ok().flatten();
+                let loc: Option<i64> = row["location_id"].value().ok().flatten();
+                let maxtx: Option<i64> = row["maxtx"].value().ok().flatten();
+                if let (Some(sku), Some(loc), Some(maxtx)) = (sku, loc, maxtx) {
+                    let ph = pool_hash(sku, loc);
+                    let s = shard_for(ph);
+                    if maxtx > per_shard_max[s] {
+                        per_shard_max[s] = maxtx;
+                    }
+                    scanned_pool_rows += 1;
+                }
+            }
+        }
+    });
+
+    let mut shards_seeded = 0usize;
+    let mut max_overall: i64 = 0;
+    for (idx, &mx) in per_shard_max.iter().enumerate() {
+        if mx > 0 {
+            queue::seed_committer_tx_at_least(idx, mx);
+            shards_seeded += 1;
+            if mx > max_overall {
+                max_overall = mx;
+            }
+        }
+    }
+
+    pgrx::log!(
+        "poc_ledger_startup_recovery: phase A — scanned {} pool rows, \
+         seeded {}/{} shards, max committer_tx_id observed = {}",
+        scanned_pool_rows,
+        shards_seeded,
+        POC_SHARD_COUNT,
+        max_overall
+    );
+
+    // Phase B — xid abort scan (M6.1 will replace the log! with an
+    // actual compensation enqueue).
+    let mut total_xids: u64 = 0;
+    let mut aborted_xids: u64 = 0;
+
+    Spi::connect(|client| {
+        let table = client.select(
+            "SELECT DISTINCT u.user_tx_xid::TEXT AS xid_text FROM (\
+               SELECT user_tx_xid FROM poc_cost_consumptions \
+               UNION ALL \
+               SELECT user_tx_xid FROM poc_cost_layers \
+               UNION ALL \
+               SELECT user_tx_xid FROM poc_cost_depletions\
+             ) u",
+            None,
+            &[],
+        );
+        if let Ok(tab) = table {
+            for row in tab {
+                let xid_text: Option<String> =
+                    row["xid_text"].value().ok().flatten();
+                if let Some(xid_text) = xid_text {
+                    total_xids += 1;
+                    // xid8 textual form is a u64 decimal; pg_xact
+                    // lookups truncate to xid (u32). xid=0/1/2 are
+                    // PG-reserved (InvalidTransactionId / Bootstrap /
+                    // Frozen) and never abort-pending.
+                    if let Ok(full) = xid_text.parse::<u64>() {
+                        let xid32 = full as u32;
+                        if xid32 < 3 {
+                            continue;
+                        }
+                        let aborted = unsafe {
+                            pgrx::pg_sys::TransactionIdDidAbort(xid32.into())
+                        };
+                        if aborted {
+                            aborted_xids += 1;
+                            pgrx::log!(
+                                "poc_ledger_startup_recovery: aborted \
+                                 user_tx_xid {} (xid32={}); compensation \
+                                 emission deferred to M6.1 (acct-4d4n.16)",
+                                xid_text,
+                                xid32
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    pgrx::log!(
+        "poc_ledger_startup_recovery: phase B — scanned {} distinct \
+         user_tx_xids, {} aborted (logged only; emission deferred to M6.1)",
+        total_xids,
+        aborted_xids
+    );
+}
