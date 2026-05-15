@@ -38,7 +38,7 @@ fail_count=0
 $PSQL -c "
   SELECT pg_terminate_backend(pid)
     FROM pg_stat_activity
-   WHERE datname='acct_poc_queue' AND pid <> pg_backend_pid();
+   WHERE datname='acct_poc_queue' AND pid <> pg_backend_pid() AND backend_type = 'client backend';
 " > /dev/null 2>&1 || true
 sleep 1
 

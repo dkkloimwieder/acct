@@ -167,6 +167,20 @@ pub(crate) fn queue_full_timeout_ms_now() -> i32 {
     QUEUE_FULL_TIMEOUT_MS.get()
 }
 
+// M5c.2 (acct-4d4n.15) slot leak audit threshold. Userset so benches
+// can shorten it to a millisecond range to exercise the audit without
+// waiting a full minute.
+static SLOT_AUDIT_MIN_AGE_MS: GucSetting<i32> = GucSetting::<i32>::new(60_000);
+
+/// Read the M5c.2 (acct-4d4n.15) `slot_audit_min_age_ms` GUC. Slots
+/// in SLOT_ALLOCATED state with `now - acquired_at < this` are NOT
+/// reclaimed even if their waiter PID is dead — protects in-flight
+/// applies that haven't reached the wait loop yet. Default 60s
+/// matches spec §3.7; bench scripts shorten to 50–200 ms.
+pub(crate) fn slot_audit_min_age_ms_now() -> i32 {
+    SLOT_AUDIT_MIN_AGE_MS.get()
+}
+
 // ── _PG_init ────────────────────────────────────────────────────────
 
 #[pg_guard]
@@ -287,6 +301,16 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::empty(),
     );
+    GucRegistry::define_int_guc(
+        c"poc_ledger.slot_audit_min_age_ms",
+        c"Slot-leak audit age threshold (M5c.2)",
+        c"Slots in SLOT_ALLOCATED state with acquire-age below this are exempted from the periodic slot-leak audit even when their waiter PID is dead. Protects in-flight applies during their normal acquire→push→wait window. Default 60s matches spec §3.7; benches shorten to 50-200 ms.",
+        &SLOT_AUDIT_MIN_AGE_MS,
+        10,
+        3_600_000,
+        GucContext::Userset,
+        GucFlags::empty(),
+    );
 
     // M5b.1 (acct-4d4n.12): one-shot startup recovery worker.
     // `restart_time = None` means PG does NOT relaunch after the worker
@@ -299,6 +323,23 @@ pub extern "C-unwind" fn _PG_init() {
         .set_restart_time(None)
         .enable_spi_access()
         .load();
+
+    // M5c.2 (acct-4d4n.15): long-lived slot-leak audit worker.
+    // Internally loops with wait_latch(10s); each pass walks every
+    // shard's slot pool and reclaims slots that have been
+    // SLOT_ALLOCATED past `slot_audit_min_age_ms` with a dead waiter
+    // PID. `restart_time = Some(10s)` is for crash-only relaunch —
+    // the steady-state cadence comes from the in-process wait_latch
+    // loop (PG's `restart_time` only fires on crash, not on clean
+    // exit; matches the ledger-extension's drain pattern).
+    BackgroundWorkerBuilder::new("poc_ledger_slot_audit")
+        .set_function("poc_ledger_slot_audit_main")
+        .set_library("poc_ledger")
+        .set_argument(None)
+        .set_start_time(BgWorkerStartTime::ConsistentState)
+        .set_restart_time(Some(std::time::Duration::from_secs(10)))
+        .enable_spi_access()
+        .load();
 }
 
 // ── SQL surface ─────────────────────────────────────────────────────
@@ -307,5 +348,5 @@ pub extern "C-unwind" fn _PG_init() {
 /// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M5c.1 backpressure (push blocks on cv with queue_full_timeout_ms) (acct-4d4n.14)"
+    "poc_ledger v0.0.1 — M5c.2 slot leak audit + periodic bgworker (acct-4d4n.15)"
 }

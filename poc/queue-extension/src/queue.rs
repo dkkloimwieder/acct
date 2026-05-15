@@ -191,6 +191,14 @@ pub struct PocResultSlot {
     /// but the caller errored before push". Cleared at recycle.
     /// (acct-4d4n.10, M5a.1)
     pub current_request_seq: AtomicU64,
+    /// Wall-clock at `acquire_slot` time (nanoseconds since UNIX
+    /// epoch). The M5c.2 slot-leak audit consults this to identify
+    /// SLOT_ALLOCATED entries whose age exceeds
+    /// `poc_ledger.slot_audit_min_age_ms` AND whose `waiter_pid` is
+    /// dead, and reclaims them. Stamped exactly once per acquire;
+    /// cleared at recycle.
+    /// (acct-4d4n.15, M5c.2)
+    pub acquired_at_ns: AtomicU64,
 }
 
 // ── Arena (entire shmem segment, one PgLwLock) ────────────────────────
@@ -265,6 +273,18 @@ pub fn acquire_slot(shard_idx: usize) -> Option<u32> {
             )
             .is_ok()
         {
+            // M5c.2 (acct-4d4n.15): stamp the acquire timestamp so the
+            // slot-leak audit can age the slot. Using SystemTime is
+            // robust across postmaster restart (the audit's age
+            // threshold is a relative ms count; both sides read the
+            // same wall clock).
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            slots[idx]
+                .acquired_at_ns
+                .store(now_ns, Ordering::Release);
             return Some(idx as u32);
         }
     }
@@ -292,6 +312,7 @@ pub fn recycle_slot(shard_idx: usize, slot_idx: u32) -> Result<u8, u8> {
     slot.waiter_pid.store(0, Ordering::Release);
     slot.issue_id.store(0, Ordering::Release);
     slot.current_request_seq.store(0, Ordering::Release);
+    slot.acquired_at_ns.store(0, Ordering::Release);
     for i in 0..32 {
         slot.depletion_ids_inline[i].store(0, Ordering::Release);
     }
@@ -826,6 +847,66 @@ pub fn read_next_slot_seq(shard_idx: usize) -> u64 {
         .load(Ordering::Acquire)
 }
 
+/// M5c.2 (acct-4d4n.15): scan `shard_idx`'s slot pool for leaked
+/// slots — SLOT_ALLOCATED entries whose acquire-age exceeds
+/// `min_age_ns` AND whose `waiter_pid` is dead. Reclaim each via
+/// two-step CAS: state ALLOCATED → ABANDONED, then ABANDONED → FREE
+/// via `recycle_slot`. The ABANDONED intermediate keeps a concurrent
+/// committer's slot-fill CAS from rolling back the audit's work
+/// (M5a.2 logs SLOT_ABANDONED fill misses benignly).
+///
+/// Returns (scanned, reclaimed). `scanned` is the number of
+/// ALLOCATED slots observed; `reclaimed` is the number actually
+/// state-flipped + recycled by this pass.
+pub fn slot_leak_audit_one_shard(
+    shard_idx: usize,
+    now_ns: u64,
+    min_age_ns: u64,
+) -> (usize, usize) {
+    let arena = POC_SHARD_ARENA.share();
+    let slots = &arena.slots[shard_idx];
+    let mut scanned: usize = 0;
+    let mut reclaimed: usize = 0;
+    for (i, slot) in slots.iter().enumerate() {
+        let state = slot.state.load(Ordering::Acquire);
+        if state != SLOT_ALLOCATED {
+            continue;
+        }
+        scanned += 1;
+        let acquired = slot.acquired_at_ns.load(Ordering::Acquire);
+        if acquired == 0 || now_ns.saturating_sub(acquired) < min_age_ns {
+            continue;
+        }
+        let pid = slot.waiter_pid.load(Ordering::Acquire);
+        // Zero waiter_pid means push-only-then-die OR pre-stamp race:
+        // both are legitimate "no live caller" cases. Treat as dead.
+        let dead = pid == 0 || !pg_pid_alive(pid);
+        if !dead {
+            continue;
+        }
+        // Step 1: ALLOCATED → ABANDONED.
+        if slot
+            .state
+            .compare_exchange(
+                SLOT_ALLOCATED,
+                SLOT_ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            // Step 2: ABANDONED → FREE via recycle_slot (clears all
+            // payload fields).
+            let _ = recycle_slot(shard_idx, i as u32);
+            reclaimed += 1;
+        }
+        // CAS failure means a concurrent path (committer fill,
+        // explicit cancel cleanup, prior audit pass) already moved
+        // the slot — count it as scanned but not reclaimed.
+    }
+    (scanned, reclaimed)
+}
+
 /// Read the per-shard `committer_acquired_at_ns` timestamp. Returns 0
 /// when no committer is currently elected. Combined with the
 /// `poc_ledger.committer_lease_ms` GUC, this is the lease-expiry
@@ -1051,6 +1132,7 @@ pub fn shard_reset(shard_idx: usize) {
         slot.waiter_pid.store(0, Ordering::Release);
         slot.issue_id.store(0, Ordering::Release);
         slot.current_request_seq.store(0, Ordering::Release);
+        slot.acquired_at_ns.store(0, Ordering::Release);
     }
 }
 

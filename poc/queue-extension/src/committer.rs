@@ -2000,3 +2000,126 @@ fn run_startup_recovery_once() {
         aborted_xids
     );
 }
+
+// ── M5c.2 (acct-4d4n.15) slot-leak audit ──────────────────────────────
+//
+// Two surfaces:
+//   1. `poc_ledger_slot_audit_main` — periodic bgworker registered at
+//      _PG_init with `restart_time = Some(10s)`. Wakes every 10s, runs
+//      one pass across all shards, exits, gets relaunched.
+//   2. `poc_ledger_slot_leak_audit_tick(shard_idx)` — synchronous SQL
+//      surface for benches + manual operator invocation. Identical
+//      walk to the bgworker; returns (scanned, reclaimed) per shard.
+//
+// Both consult `poc_ledger.slot_audit_min_age_ms` to age-gate
+// reclamation. Default 60s; benches shorten via SET.
+
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn poc_ledger_slot_audit_main(
+    _arg: pgrx::pg_sys::Datum,
+) {
+    use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
+    use std::time::Duration;
+
+    BackgroundWorker::attach_signal_handlers(
+        SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM,
+    );
+    // SPI not strictly needed (shmem-only walk) but pgrx's bgworker
+    // boilerplate expects a connected database.
+    let dbname = crate::recovery_database_str();
+    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+
+    // 10s cadence per spec §3.7. `restart_time` only fires on crash;
+    // periodic execution requires an internal loop with wait_latch
+    // (matches the ledger-extension pattern at poc/ledger-extension).
+    pgrx::log!("poc_ledger_slot_audit: bgworker starting");
+    let interval = Duration::from_secs(10);
+    loop {
+        let alive = BackgroundWorker::wait_latch(Some(interval));
+        if !alive {
+            pgrx::log!("poc_ledger_slot_audit: SIGTERM received, exiting");
+            break;
+        }
+        if BackgroundWorker::sighup_received() {
+            pgrx::log!("poc_ledger_slot_audit: SIGHUP received, calling ProcessConfigFile");
+            unsafe {
+                pgrx::pg_sys::ProcessConfigFile(
+                    pgrx::pg_sys::GucContext::PGC_SIGHUP,
+                );
+            }
+            pgrx::log!("poc_ledger_slot_audit: ProcessConfigFile returned");
+        }
+        slot_audit_one_pass();
+    }
+}
+
+fn slot_audit_one_pass() {
+    let min_age_ms = crate::slot_audit_min_age_ms_now();
+    let min_age_ns = (min_age_ms.max(0) as u64).saturating_mul(1_000_000);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let mut total_scanned: usize = 0;
+    let mut total_reclaimed: usize = 0;
+    for shard in 0..queue::POC_SHARD_COUNT {
+        let (scanned, reclaimed) =
+            queue::slot_leak_audit_one_shard(shard, now_ns, min_age_ns);
+        total_scanned += scanned;
+        total_reclaimed += reclaimed;
+    }
+    // Log only when we did something — keeps the postmaster log
+    // quiet under steady-state operation.
+    if total_scanned > 0 || total_reclaimed > 0 {
+        pgrx::log!(
+            "poc_ledger_slot_audit: tick complete — scanned {} ALLOCATED \
+             slots, reclaimed {} leaked (min_age_ms={})",
+            total_scanned,
+            total_reclaimed,
+            min_age_ms
+        );
+    }
+}
+
+/// Synchronous slot-leak audit. Walks `shard_idx` (or all shards when
+/// `shard_idx = -1`) and reclaims stranded SLOT_ALLOCATED entries.
+/// Returns per-shard (shard_idx, scanned, reclaimed) rows. Used by
+/// the bench harness and operator ad-hoc invocation; same code path
+/// the periodic bgworker calls.
+#[pg_extern]
+fn poc_ledger_slot_leak_audit_tick(
+    shard_idx: i32,
+) -> TableIterator<
+    'static,
+    (
+        name!(shard_idx, i32),
+        name!(scanned, i32),
+        name!(reclaimed, i32),
+    ),
+> {
+    let min_age_ms = crate::slot_audit_min_age_ms_now();
+    let min_age_ns = (min_age_ms.max(0) as u64).saturating_mul(1_000_000);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let mut rows: Vec<(i32, i32, i32)> = Vec::new();
+    if shard_idx == -1 {
+        for shard in 0..queue::POC_SHARD_COUNT {
+            let (s, r) =
+                queue::slot_leak_audit_one_shard(shard, now_ns, min_age_ns);
+            rows.push((shard as i32, s as i32, r as i32));
+        }
+    } else if shard_idx >= 0 && (shard_idx as usize) < queue::POC_SHARD_COUNT {
+        let (s, r) = queue::slot_leak_audit_one_shard(
+            shard_idx as usize,
+            now_ns,
+            min_age_ns,
+        );
+        rows.push((shard_idx, s as i32, r as i32));
+    }
+    TableIterator::new(rows.into_iter())
+}

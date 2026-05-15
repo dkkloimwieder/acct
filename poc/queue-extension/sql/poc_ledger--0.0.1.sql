@@ -186,7 +186,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_error_code_to_text_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:308
+-- src/lib.rs:349
 -- poc_ledger::poc_ledger_hello
 CREATE  FUNCTION "poc_ledger_hello"() RETURNS TEXT /* &str */
 STRICT
@@ -208,7 +208,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_inject_dead_committer_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1077
+-- src/queue.rs:1159
 -- poc_ledger::queue::poc_ledger_max_slot_probe
 CREATE  FUNCTION "poc_ledger_max_slot_probe"() RETURNS INT /* i32 */
 STRICT
@@ -281,7 +281,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_receive_avg_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1067
+-- src/queue.rs:1149
 -- poc_ledger::queue::poc_ledger_requests_per_shard
 CREATE  FUNCTION "poc_ledger_requests_per_shard"() RETURNS INT /* i32 */
 STRICT
@@ -290,7 +290,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_requests_per_shard_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1238
+-- src/queue.rs:1320
 -- poc_ledger::queue::poc_ledger_ring_drain_one
 CREATE  FUNCTION "poc_ledger_ring_drain_one"(
 	"shard_idx" INT /* i32 */
@@ -301,7 +301,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_ring_drain_one_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1210
+-- src/queue.rs:1292
 -- poc_ledger::queue::poc_ledger_ring_push
 CREATE  FUNCTION "poc_ledger_ring_push"(
 	"shard_idx" INT, /* i32 */
@@ -338,7 +338,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_shard_committer_tx_seq_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1062
+-- src/queue.rs:1144
 -- poc_ledger::queue::poc_ledger_shard_count
 CREATE  FUNCTION "poc_ledger_shard_count"() RETURNS INT /* i32 */
 STRICT
@@ -347,7 +347,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_shard_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1262
+-- src/queue.rs:1344
 -- poc_ledger::queue::poc_ledger_shard_depth
 CREATE  FUNCTION "poc_ledger_shard_depth"(
 	"shard_idx" INT /* i32 */
@@ -370,7 +370,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_shard_for_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1246
+-- src/queue.rs:1328
 -- poc_ledger::queue::poc_ledger_shard_head
 CREATE  FUNCTION "poc_ledger_shard_head"(
 	"shard_idx" INT /* i32 */
@@ -381,7 +381,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_shard_head_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1271
+-- src/queue.rs:1353
 -- poc_ledger::queue::poc_ledger_shard_next_request_seq
 CREATE  FUNCTION "poc_ledger_shard_next_request_seq"(
 	"shard_idx" INT /* i32 */
@@ -392,7 +392,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_shard_next_request_seq_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1282
+-- src/queue.rs:1364
 -- poc_ledger::queue::poc_ledger_shard_next_slot_seq
 CREATE  FUNCTION "poc_ledger_shard_next_slot_seq"(
 	"shard_idx" INT /* i32 */
@@ -403,7 +403,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_shard_next_slot_seq_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1131
+-- src/queue.rs:1213
 -- poc_ledger::queue::poc_ledger_shard_reset
 CREATE  FUNCTION "poc_ledger_shard_reset"(
 	"shard_idx" INT /* i32 */
@@ -432,7 +432,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_shard_stats_all_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1254
+-- src/queue.rs:1336
 -- poc_ledger::queue::poc_ledger_shard_tail
 CREATE  FUNCTION "poc_ledger_shard_tail"(
 	"shard_idx" INT /* i32 */
@@ -443,7 +443,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_shard_tail_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1141
+-- src/queue.rs:1223
 -- poc_ledger::queue::poc_ledger_slot_acquire
 CREATE  FUNCTION "poc_ledger_slot_acquire"(
 	"shard_idx" INT /* i32 */
@@ -454,7 +454,22 @@ AS 'MODULE_PATHNAME', 'poc_ledger_slot_acquire_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1180
+-- src/committer.rs:2091
+-- poc_ledger::committer::poc_ledger_slot_leak_audit_tick
+CREATE  FUNCTION "poc_ledger_slot_leak_audit_tick"(
+	"shard_idx" INT /* i32 */
+) RETURNS TABLE (
+	"shard_idx" INT,  /* i32 */
+	"scanned" INT,  /* i32 */
+	"reclaimed" INT  /* i32 */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_ledger_slot_leak_audit_tick_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/queue.rs:1262
 -- poc_ledger::queue::poc_ledger_slot_mark_abandoned
 CREATE  FUNCTION "poc_ledger_slot_mark_abandoned"(
 	"shard_idx" INT, /* i32 */
@@ -466,7 +481,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_slot_mark_abandoned_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1165
+-- src/queue.rs:1247
 -- poc_ledger::queue::poc_ledger_slot_mark_filled
 CREATE  FUNCTION "poc_ledger_slot_mark_filled"(
 	"shard_idx" INT, /* i32 */
@@ -478,7 +493,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_slot_mark_filled_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1195
+-- src/queue.rs:1277
 -- poc_ledger::queue::poc_ledger_slot_recycle
 CREATE  FUNCTION "poc_ledger_slot_recycle"(
 	"shard_idx" INT, /* i32 */
@@ -520,7 +535,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_slot_result_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1149
+-- src/queue.rs:1231
 -- poc_ledger::queue::poc_ledger_slot_state
 CREATE  FUNCTION "poc_ledger_slot_state"(
 	"shard_idx" INT, /* i32 */
@@ -532,7 +547,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_slot_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1072
+-- src/queue.rs:1154
 -- poc_ledger::queue::poc_ledger_slots_per_shard
 CREATE  FUNCTION "poc_ledger_slots_per_shard"() RETURNS INT /* i32 */
 STRICT
@@ -541,7 +556,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_slots_per_shard_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1107
+-- src/queue.rs:1189
 -- poc_ledger::queue::poc_ledger_test_advance_head_and_signal
 CREATE  FUNCTION "poc_ledger_test_advance_head_and_signal"(
 	"shard_idx" INT, /* i32 */
@@ -553,7 +568,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_test_advance_head_and_signal_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/queue.rs:1088
+-- src/queue.rs:1170
 -- poc_ledger::queue::poc_ledger_test_force_ring_full
 CREATE  FUNCTION "poc_ledger_test_force_ring_full"(
 	"shard_idx" INT /* i32 */
