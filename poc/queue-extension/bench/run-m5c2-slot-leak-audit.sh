@@ -49,7 +49,7 @@ $PSQL -c "
 sleep 0.5
 
 reset_state() {
-  $PSQL -c "TRUNCATE poc_test_rows, poc_pool_locks, poc_pool_lock_anchors, poc_cost_consumptions, poc_cost_depletions, poc_cost_layers, poc_cost_avg;" > /dev/null
+  $PSQL -c "TRUNCATE poc_cost_compensation_depletions, poc_cost_compensation_consumptions, poc_test_rows, poc_pool_locks, poc_pool_lock_anchors, poc_cost_consumptions, poc_cost_depletions, poc_cost_layers, poc_cost_avg;" > /dev/null
   $PSQL -c "SELECT poc_ledger_shard_reset(s) FROM generate_series(0, 15) AS s;" > /dev/null
 }
 

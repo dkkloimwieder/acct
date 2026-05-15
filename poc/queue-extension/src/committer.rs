@@ -102,6 +102,64 @@ pgrx::extension_sql!(
     name = "poc_test_rows_schema",
 );
 
+// ── Schema (poc_cost_compensation_*) ─────────────────────────────────
+//
+// M6.1 (acct-4d4n.16). When a user backend aborts after one or more
+// applies, the XactCallback enqueues a Compensate-kind ring entry per
+// distinct aborted xid; the committer drain scans the cost tables for
+// rows stamped `user_tx_xid = xid` and INSERTs one reversal row per
+// found row into these tables.
+//
+// `reverses_X_id` carries a NOT NULL UNIQUE FK to the original row.
+// The UNIQUE guarantees idempotent compensation under any race: a
+// second drain that re-attempts the same xid hits the UNIQUE and
+// raises (or, with ON CONFLICT DO NOTHING, no-ops). Today the drain
+// is single-pass per Compensate ring entry, so the UNIQUE is a
+// regression net rather than a hot path.
+//
+// `layer_id` is denormalized onto poc_cost_compensation_depletions for
+// the cardinality assertion in the M6.1 bench (FIFO N-layer apply →
+// N compensation_depletion rows, each pointing at a distinct layer).
+// `qty` / `unit_cost` / `applied_unit_cost` are snapshotted from the
+// originals so reports don't need a join back.
+
+pgrx::extension_sql!(
+    r#"
+    CREATE TABLE poc_cost_compensation_consumptions (
+        id                      BIGSERIAL PRIMARY KEY,
+        reverses_consumption_id BIGINT NOT NULL UNIQUE
+                                       REFERENCES poc_cost_consumptions(consumption_id),
+        sku_id                  BIGINT NOT NULL,
+        location_id             BIGINT NOT NULL,
+        qty                     BIGINT NOT NULL,
+        applied_unit_cost       BIGINT NOT NULL,
+        user_tx_xid             xid8   NOT NULL,
+        compensated_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        committer_tx_id         BIGINT NOT NULL
+    );
+    CREATE INDEX poc_cost_compensation_consumptions_user_tx
+        ON poc_cost_compensation_consumptions (user_tx_xid);
+
+    CREATE TABLE poc_cost_compensation_depletions (
+        id                    BIGSERIAL PRIMARY KEY,
+        reverses_depletion_id BIGINT NOT NULL UNIQUE
+                                     REFERENCES poc_cost_depletions(depletion_id),
+        layer_id              BIGINT NOT NULL,
+        qty                   BIGINT NOT NULL,
+        unit_cost             BIGINT NOT NULL,
+        user_tx_xid           xid8   NOT NULL,
+        compensated_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        committer_tx_id       BIGINT NOT NULL
+    );
+    CREATE INDEX poc_cost_compensation_depletions_user_tx
+        ON poc_cost_compensation_depletions (user_tx_xid);
+    CREATE INDEX poc_cost_compensation_depletions_layer
+        ON poc_cost_compensation_depletions (layer_id);
+    "#,
+    name = "poc_cost_compensation_schema",
+    requires = ["poc_cost_schema"],
+);
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 fn clock_ns() -> u64 {
@@ -131,6 +189,128 @@ fn method_tag_for(method_name: &str) -> Option<u8> {
         "std" | "STD" => Some(METHOD_STD),
         "mock" | "MOCK" => Some(METHOD_MOCK),
         _ => None,
+    }
+}
+
+// ── M6.1 (acct-4d4n.16) XactCallback machinery ──────────────────────
+//
+// Per spec §1.4 lines 286-300 / §1.7. On the first apply call inside a
+// given backend's process lifetime, register a single backend-scoped
+// XactCallback. The callback fires on every transaction end (COMMIT /
+// ABORT / PREPARE / ...); we act only on XACT_EVENT_ABORT. The
+// thread-locals `LAST_DIRTY_XID` (captured at apply time) tells the
+// callback which xid to compensate for.
+//
+// Why thread-locals (not shmem):
+//   Each backend has at most one in-flight transaction; the dirty
+//   xid is per-backend per-transaction. RegisterXactCallback also
+//   registers per-backend, so the callback fires only for THIS
+//   backend's transactions. No cross-backend coordination needed.
+//
+// Why ring_push_compensate from the callback (not direct SPI):
+//   XactCallback fires DURING abort tear-down. SPI / sub-transactions
+//   are unsafe at that point — the transaction state is being unwound.
+//   The cleanest design (also what spec §1.7 prescribes) is to enqueue
+//   a Compensate ring entry; the next committer drain on that shard
+//   does the actual SPI INSERTs inside a fresh transaction context.
+
+use std::cell::Cell;
+thread_local! {
+    /// 0 = no apply has dirtied state in the current transaction; non-
+    /// zero = the in-flight user_tx_xid that apply rows are stamped
+    /// with. Read on XACT_EVENT_ABORT to decide whether to enqueue a
+    /// Compensate request. Cleared on every transaction end so the
+    /// next transaction starts fresh.
+    static LAST_DIRTY_XID: Cell<i64> = const { Cell::new(0) };
+    /// True once `RegisterXactCallback` has succeeded for THIS backend.
+    /// Re-registering is harmless but not free; the flag short-circuits
+    /// the hot path after the first apply.
+    static XACT_CB_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the per-backend XactCallback exactly once. Idempotent
+/// across multiple apply invocations within the same backend; resets
+/// implicitly across backend restarts (thread-local zeros at fresh
+/// process start).
+fn ensure_xact_cb_registered() {
+    XACT_CB_REGISTERED.with(|flag| {
+        if !flag.get() {
+            unsafe {
+                pgrx::pg_sys::RegisterXactCallback(
+                    Some(poc_ledger_xact_callback),
+                    std::ptr::null_mut(),
+                );
+            }
+            flag.set(true);
+        }
+    });
+}
+
+/// Stamp the current dirty xid. Called by every apply path right
+/// after capturing `user_tx_xid = GetCurrentFullTransactionId()` so
+/// the XactCallback at ABORT can find the xid to compensate.
+fn mark_dirty_xid(user_tx_xid: i64) {
+    LAST_DIRTY_XID.with(|c| c.set(user_tx_xid));
+}
+
+/// XactCallback. Fires for every transaction-end event on THIS backend.
+///
+/// `extern "C-unwind"` matches pgrx's `#[pg_guard]` ABI convention for
+/// callbacks that PG's control flow drives. We must not panic / raise
+/// here — the transaction is already mid-abort and PG isn't prepared
+/// to handle a thrown error.
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn poc_ledger_xact_callback(
+    event: pgrx::pg_sys::XactEvent::Type,
+    _arg: *mut std::ffi::c_void,
+) {
+    // Read + consume the thread-local up front. Any path that exits
+    // without enqueueing a compensate is now in a clean state for the
+    // next transaction.
+    let xid = LAST_DIRTY_XID.with(|c| {
+        let v = c.get();
+        // Clear on every event so PRE_COMMIT / COMMIT / ABORT all
+        // reset the slate for the next transaction. The actual
+        // compensate enqueue happens BEFORE this clear, below.
+        c.set(0);
+        v
+    });
+    if event != pgrx::pg_sys::XactEvent::XACT_EVENT_ABORT {
+        return;
+    }
+    if xid == 0 {
+        // No apply happened in this transaction (or it was already
+        // handled by a prior callback firing); nothing to compensate.
+        return;
+    }
+    // Spread compensate enqueue across shards by hashing the xid. Any
+    // shard works because the committer's `process_compensate_xid`
+    // scans cost tables by user_tx_xid (NOT shard-partitioned). This
+    // just avoids piling all aborts onto shard 0.
+    let mut h: u64 = xid as u64;
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D049BB133111EB);
+    h ^= h >> 31;
+    let shard = (h & (POC_SHARD_COUNT as u64 - 1)) as usize;
+    // Best-effort enqueue. On ring-full, the compensation is deferred
+    // to the next postmaster-start sweep in `run_startup_recovery_once`
+    // (Phase B), which scans cost tables by aborted xid and enqueues
+    // any that lack matching compensation rows. We can't raise from
+    // an XactCallback so a warning is the right level.
+    if let Err(()) = queue::ring_push_compensate(shard, xid) {
+        // WARNING level does not longjmp — safe to emit from inside
+        // an XactCallback fired during ABORT teardown. The Phase B
+        // startup_recovery scan picks the xid up on the next start.
+        pgrx::warning!(
+            "poc_ledger_xact_callback: shard {} ring full enqueueing \
+             compensate for aborted user_tx_xid {}; deferred to next \
+             startup recovery sweep",
+            shard,
+            xid
+        );
     }
 }
 
@@ -851,7 +1031,96 @@ fn signal_ring_full_waiter(shard_idx: usize) {
     }
 }
 
+/// M6.1 (acct-4d4n.16): drain compensate entries from the head of the
+/// shard's ring and INSERT reversal rows for each. Returns the count
+/// of (xid, rows_compensated) processed.
+///
+/// Compensate entries carry only user_tx_xid; the actual list of cost
+/// rows to reverse is discovered via SPI scan against
+/// `poc_cost_consumptions` / `poc_cost_depletions` (both indexed on
+/// `user_tx_xid`). One Compensate entry → up to N consumption + M
+/// depletion reversal rows.
+///
+/// Uses ON CONFLICT DO NOTHING on the UNIQUE (`reverses_*_id`) so
+/// re-driving the same xid (e.g. a duplicate ABORT firing two
+/// callbacks under some abnormal sequence, or a startup-recovery
+/// scan after the runtime callback already enqueued) is idempotent.
+fn drain_and_compensate(
+    shard_idx: usize,
+    batch_size_max: usize,
+) -> usize {
+    let drained: Vec<queue::DrainedCompensate> =
+        queue::drain_compensate_batch(shard_idx, batch_size_max);
+    if drained.is_empty() {
+        return 0;
+    }
+    let committer_tx_id = queue::next_committer_tx_id(shard_idx);
+    let mut total_rows: usize = 0;
+    for c in &drained {
+        // Pass xid as i64; cast `$1::TEXT::xid8` mirrors how the
+        // M2.x INSERT helpers move xid through SPI (insert_test_rows
+        // line 567, insert_consumptions line 462, etc.). The xid8
+        // type can't be bound directly through pgrx's IntoDatum.
+        Spi::connect_mut(|client| {
+            let xid_arg: i64 = c.user_tx_xid;
+            // INSERT compensation_consumptions for every consumption
+            // stamped with this xid. Picks up sku/location/qty/
+            // applied_unit_cost so reports don't need a join.
+            let r1 = client.update(
+                "INSERT INTO poc_cost_compensation_consumptions \
+                   (reverses_consumption_id, sku_id, location_id, qty, \
+                    applied_unit_cost, user_tx_xid, committer_tx_id) \
+                  SELECT c.consumption_id, c.sku_id, c.location_id, c.qty, \
+                         c.applied_unit_cost, c.user_tx_xid, $2::BIGINT \
+                    FROM poc_cost_consumptions c \
+                   WHERE c.user_tx_xid = $1::TEXT::xid8 \
+                  ON CONFLICT (reverses_consumption_id) DO NOTHING",
+                None,
+                &[xid_arg.into(), committer_tx_id.into()],
+            );
+            if let Ok(tup) = r1 {
+                total_rows = total_rows.saturating_add(tup.len());
+            }
+            // INSERT compensation_depletions — `layer_id` denormalized
+            // so the cardinality assertion can group by (xid, layer)
+            // without joining back to poc_cost_depletions.
+            let r2 = client.update(
+                "INSERT INTO poc_cost_compensation_depletions \
+                   (reverses_depletion_id, layer_id, qty, unit_cost, \
+                    user_tx_xid, committer_tx_id) \
+                  SELECT d.depletion_id, d.layer_id, d.qty, d.unit_cost, \
+                         d.user_tx_xid, $2::BIGINT \
+                    FROM poc_cost_depletions d \
+                   WHERE d.user_tx_xid = $1::TEXT::xid8 \
+                  ON CONFLICT (reverses_depletion_id) DO NOTHING",
+                None,
+                &[xid_arg.into(), committer_tx_id.into()],
+            );
+            if let Ok(tup) = r2 {
+                total_rows = total_rows.saturating_add(tup.len());
+            }
+        });
+    }
+    pgrx::log!(
+        "poc_ledger: shard {} compensated {} xid(s), {} reversal rows \
+         (committer_tx_id={})",
+        shard_idx,
+        drained.len(),
+        total_rows,
+        committer_tx_id
+    );
+    drained.len()
+}
+
 fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
+    // M6.1: process any compensate entries sitting at the ring head
+    // BEFORE draining apply entries. drain_compensate_batch stops at
+    // the first non-COMPENSATE entry, so apply entries pushed earlier
+    // in the SAME drain cycle stay in order. The outer loop in
+    // drain_and_commit_full alternates compensate/apply until both
+    // drain empty.
+    let _ = drain_and_compensate(shard_idx, batch_size_max);
+
     let drained: Vec<DrainedApply> =
         queue::drain_apply_batch(shard_idx, batch_size_max);
     if drained.is_empty() {
@@ -1003,6 +1272,12 @@ fn poc_ledger_apply(
         let full = pgrx::pg_sys::GetCurrentFullTransactionId();
         full.value as i64
     };
+
+    // M6.1 (acct-4d4n.16): register the per-backend XactCallback if
+    // not already, and stamp this xid as the in-flight dirty xid so
+    // an ABORT before commit triggers compensation enqueue.
+    ensure_xact_cb_registered();
+    mark_dirty_xid(user_tx_xid);
 
     let ph = pool_hash(sku_id, location_id);
     let shard_idx = shard_for(ph);
@@ -1258,6 +1533,10 @@ fn poc_ledger_push_only(
         let full = pgrx::pg_sys::GetCurrentFullTransactionId();
         full.value as i64
     };
+    // M6.1: same XactCallback dance as poc_ledger_apply — push_only
+    // writes the same durable cost rows under the same xid.
+    ensure_xact_cb_registered();
+    mark_dirty_xid(user_tx_xid);
     let ph = pool_hash(sku_id, location_id);
     let shard_idx = shard_for(ph);
     let slot_idx = queue::acquire_slot(shard_idx).unwrap_or_else(|| {
@@ -1942,20 +2221,43 @@ fn run_startup_recovery_once() {
         max_overall
     );
 
-    // Phase B — xid abort scan (M6.1 will replace the log! with an
-    // actual compensation enqueue).
+    // Phase B — xid abort scan. M6.1 (acct-4d4n.16) wires this to
+    // the same Compensate ring-enqueue path the runtime XactCallback
+    // uses, so any aborted xid whose runtime callback didn't make it
+    // (postmaster crash between ABORT and the next committer drain;
+    // ring-full at enqueue time) is recovered on the next start.
+    //
+    // Idempotency: the committer's compensate handler uses ON CONFLICT
+    // DO NOTHING on the UNIQUE (reverses_*_id), so re-enqueueing an
+    // xid that's already been fully compensated is a no-op SQL-side.
+    // We additionally guard at the scan layer by skipping xids that
+    // already have at least one compensation row.
     let mut total_xids: u64 = 0;
     let mut aborted_xids: u64 = 0;
+    let mut enqueued_xids: u64 = 0;
+    let mut already_compensated: u64 = 0;
 
     Spi::connect(|client| {
         let table = client.select(
-            "SELECT DISTINCT u.user_tx_xid::TEXT AS xid_text FROM (\
-               SELECT user_tx_xid FROM poc_cost_consumptions \
-               UNION ALL \
-               SELECT user_tx_xid FROM poc_cost_layers \
-               UNION ALL \
-               SELECT user_tx_xid FROM poc_cost_depletions\
-             ) u",
+            // LEFT JOIN against either compensation table to surface
+            // "already compensated" xids; if EITHER side has any
+            // matching row, the xid has been handled at least
+            // partially — leave it for ON CONFLICT to swallow at
+            // committer time if we re-enqueue.
+            "SELECT u.user_tx_xid::TEXT AS xid_text, \
+                    (EXISTS(SELECT 1 FROM poc_cost_compensation_consumptions cc \
+                              WHERE cc.user_tx_xid = u.user_tx_xid) \
+                  OR  EXISTS(SELECT 1 FROM poc_cost_compensation_depletions cd \
+                              WHERE cd.user_tx_xid = u.user_tx_xid)) AS already \
+               FROM (\
+                 SELECT DISTINCT user_tx_xid FROM (\
+                   SELECT user_tx_xid FROM poc_cost_consumptions \
+                   UNION ALL \
+                   SELECT user_tx_xid FROM poc_cost_layers \
+                   UNION ALL \
+                   SELECT user_tx_xid FROM poc_cost_depletions\
+                 ) v\
+               ) u",
             None,
             &[],
         );
@@ -1963,29 +2265,57 @@ fn run_startup_recovery_once() {
             for row in tab {
                 let xid_text: Option<String> =
                     row["xid_text"].value().ok().flatten();
+                let already: Option<bool> =
+                    row["already"].value().ok().flatten();
                 if let Some(xid_text) = xid_text {
                     total_xids += 1;
-                    // xid8 textual form is a u64 decimal; pg_xact
-                    // lookups truncate to xid (u32). xid=0/1/2 are
-                    // PG-reserved (InvalidTransactionId / Bootstrap /
-                    // Frozen) and never abort-pending.
                     if let Ok(full) = xid_text.parse::<u64>() {
                         let xid32 = full as u32;
+                        // PG-reserved xids never abort-pending.
                         if xid32 < 3 {
                             continue;
                         }
                         let aborted = unsafe {
                             pgrx::pg_sys::TransactionIdDidAbort(xid32.into())
                         };
-                        if aborted {
-                            aborted_xids += 1;
-                            pgrx::log!(
-                                "poc_ledger_startup_recovery: aborted \
-                                 user_tx_xid {} (xid32={}); compensation \
-                                 emission deferred to M6.1 (acct-4d4n.16)",
-                                xid_text,
-                                xid32
-                            );
+                        if !aborted {
+                            continue;
+                        }
+                        aborted_xids += 1;
+                        if already.unwrap_or(false) {
+                            already_compensated += 1;
+                            continue;
+                        }
+                        // Hash the xid to a shard the same way the
+                        // runtime XactCallback does — splitmix64
+                        // followed by mask. Keep this in sync with
+                        // poc_ledger_xact_callback if you change one.
+                        let mut h: u64 = full;
+                        h ^= h >> 30;
+                        h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+                        h ^= h >> 27;
+                        h = h.wrapping_mul(0x94D049BB133111EB);
+                        h ^= h >> 31;
+                        let shard =
+                            (h & (POC_SHARD_COUNT as u64 - 1)) as usize;
+                        // i64 truncation matches the runtime xid
+                        // capture in `poc_ledger_apply` /
+                        // `poc_ledger_push_only`.
+                        let xid_i64 = full as i64;
+                        match queue::ring_push_compensate(shard, xid_i64) {
+                            Ok(_) => {
+                                enqueued_xids += 1;
+                            }
+                            Err(()) => {
+                                pgrx::log!(
+                                    "poc_ledger_startup_recovery: \
+                                     shard {} ring full enqueueing \
+                                     compensate for user_tx_xid {}; \
+                                     will retry at next start",
+                                    shard,
+                                    xid_text
+                                );
+                            }
                         }
                     }
                 }
@@ -1995,9 +2325,12 @@ fn run_startup_recovery_once() {
 
     pgrx::log!(
         "poc_ledger_startup_recovery: phase B — scanned {} distinct \
-         user_tx_xids, {} aborted (logged only; emission deferred to M6.1)",
+         user_tx_xids, {} aborted, {} already compensated, {} compensate \
+         entries enqueued",
         total_xids,
-        aborted_xids
+        aborted_xids,
+        already_compensated,
+        enqueued_xids
     );
 }
 

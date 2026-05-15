@@ -598,6 +598,12 @@ pub fn drain_apply_batch(shard_idx: usize, max_batch: usize) -> Vec<DrainedApply
     if n == 0 {
         return out;
     }
+    // M6.1 (acct-4d4n.16): stop at the first non-APPLY entry rather
+    // than walk past it. Compensate-kind entries stay at the head for
+    // `drain_compensate_batch` to pick up. Advancing head only by the
+    // contiguous APPLY prefix preserves FIFO ordering between APPLY
+    // and COMPENSATE in the same shard.
+    let mut consumed: u32 = 0;
     for i in 0..n {
         let pos = head_start.wrapping_add(i as u32);
         let idx = (pos as usize) % POC_REQUESTS_PER_SHARD;
@@ -606,19 +612,19 @@ pub fn drain_apply_batch(shard_idx: usize, max_batch: usize) -> Vec<DrainedApply
         // M5c.1 synthetic ring-full test surface (which advances tail
         // without writing) and any future tail-stamp race between
         // `ring_push_apply` and a competing drain. Real producers
-        // stamp `valid = REQ_FILLED` BEFORE advancing tail.
+        // stamp `valid = REQ_FILLED` BEFORE advancing tail. Advance
+        // head past these too (otherwise the synthetic entry would
+        // wedge the ring permanently).
         let v = req.valid.load(Ordering::Acquire);
         if v == REQ_EMPTY {
+            consumed = consumed.wrapping_add(1);
             continue;
         }
-        // M1.2 only emits Apply-kind requests. Compensate is M6.1.
         let kind = req.kind_tag.load(Ordering::Acquire);
         if kind != REQ_KIND_APPLY {
-            // Defensive: skip but still mark in_flight + advance head
-            // so the unknown variant doesn't wedge the ring. M6.1 will
-            // dispatch by kind here.
-            req.valid.store(REQ_IN_FLIGHT, Ordering::Release);
-            continue;
+            // M6.1: stop here. Don't touch valid; don't advance head
+            // past this entry. The Compensate drain will process it.
+            break;
         }
         out.push(DrainedApply {
             slot_idx: req.slot_idx.load(Ordering::Acquire),
@@ -634,10 +640,112 @@ pub fn drain_apply_batch(shard_idx: usize, max_batch: usize) -> Vec<DrainedApply
             user_tx_xid: req.body6.load(Ordering::Acquire),
         });
         req.valid.store(REQ_IN_FLIGHT, Ordering::Release);
+        consumed = consumed.wrapping_add(1);
     }
     shard
         .head
-        .store(head_start.wrapping_add(n as u32), Ordering::Release);
+        .store(head_start.wrapping_add(consumed), Ordering::Release);
+    out
+}
+
+// ── M6.1 (acct-4d4n.16) compensate-variant body layout ───────────────
+//
+// Per spec §1.4 lines 331-342 / §1.7. Compensate entries are
+// fire-and-forget — no slot is allocated and no waiter is registered
+// because the user backend that triggered the abort has already moved
+// on (or died). The committer drains them and INSERTs reversal rows
+// without writing back to a slot.
+//
+//   body0 → user_tx_xid (TransactionId as i64)
+//   body1..8 → reserved (zero)
+
+#[derive(Debug, Clone)]
+pub struct DrainedCompensate {
+    pub request_seq: u64,
+    pub user_tx_xid: i64,
+}
+
+/// Push a Compensate request onto a shard's ring. Caller picks shard
+/// via `hash(user_tx_xid) % POC_SHARD_COUNT` to spread load; correctness
+/// is independent of shard choice because compensation scans cost
+/// tables across all shards by `user_tx_xid` (not partitioned by pool).
+pub fn ring_push_compensate(
+    shard_idx: usize,
+    user_tx_xid: i64,
+) -> Result<u64, ()> {
+    let arena = POC_SHARD_ARENA.exclusive();
+    let shard = &arena.shards[shard_idx];
+    let head = shard.head.load(Ordering::Acquire);
+    let tail = shard.tail.load(Ordering::Acquire);
+    if tail.wrapping_sub(head) >= POC_REQUESTS_PER_SHARD as u32 {
+        return Err(());
+    }
+    let idx = (tail as usize) % POC_REQUESTS_PER_SHARD;
+    let req = &arena.requests[shard_idx][idx];
+    let req_seq = shard.next_request_seq.fetch_add(1, Ordering::AcqRel);
+    req.request_seq.store(req_seq, Ordering::Release);
+    req.pool_hash.store(0, Ordering::Release);
+    req.backend_pid.store(0, Ordering::Release);
+    // u32::MAX sentinel = "no slot" — drain skips slot_idx-side work.
+    req.slot_idx.store(u32::MAX, Ordering::Release);
+    req.kind_tag.store(REQ_KIND_COMPENSATE, Ordering::Release);
+    req.body0.store(user_tx_xid, Ordering::Release);
+    req.body1.store(0, Ordering::Release);
+    req.body2.store(0, Ordering::Release);
+    req.body3.store(0, Ordering::Release);
+    req.body4.store(0, Ordering::Release);
+    req.body5.store(0, Ordering::Release);
+    req.body6.store(0, Ordering::Release);
+    req.body7.store(0, Ordering::Release);
+    req.body8.store(0, Ordering::Release);
+    req.valid.store(REQ_FILLED, Ordering::Release);
+    shard.tail.store(tail.wrapping_add(1), Ordering::Release);
+    Ok(req_seq)
+}
+
+/// Drain up to `max_batch` Compensate requests from the head of the
+/// shard's ring. Mirrors `drain_apply_batch`'s discipline: stops at
+/// the first non-COMPENSATE entry so FIFO ordering with APPLY is
+/// preserved across alternating calls in `drain_and_commit`.
+pub fn drain_compensate_batch(
+    shard_idx: usize,
+    max_batch: usize,
+) -> Vec<DrainedCompensate> {
+    let mut out: Vec<DrainedCompensate> = Vec::new();
+    let arena = POC_SHARD_ARENA.exclusive();
+    let shard = &arena.shards[shard_idx];
+    let head_start = shard.head.load(Ordering::Acquire);
+    let tail = shard.tail.load(Ordering::Acquire);
+    let available = tail.wrapping_sub(head_start) as usize;
+    let n = available.min(max_batch);
+    if n == 0 {
+        return out;
+    }
+    let mut consumed: u32 = 0;
+    for i in 0..n {
+        let pos = head_start.wrapping_add(i as u32);
+        let idx = (pos as usize) % POC_REQUESTS_PER_SHARD;
+        let req = &arena.requests[shard_idx][idx];
+        let v = req.valid.load(Ordering::Acquire);
+        if v == REQ_EMPTY {
+            // Same defensive skip as drain_apply_batch.
+            consumed = consumed.wrapping_add(1);
+            continue;
+        }
+        let kind = req.kind_tag.load(Ordering::Acquire);
+        if kind != REQ_KIND_COMPENSATE {
+            break;
+        }
+        out.push(DrainedCompensate {
+            request_seq: req.request_seq.load(Ordering::Acquire),
+            user_tx_xid: req.body0.load(Ordering::Acquire),
+        });
+        req.valid.store(REQ_IN_FLIGHT, Ordering::Release);
+        consumed = consumed.wrapping_add(1);
+    }
+    shard
+        .head
+        .store(head_start.wrapping_add(consumed), Ordering::Release);
     out
 }
 
