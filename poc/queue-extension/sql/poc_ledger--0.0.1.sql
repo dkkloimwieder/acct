@@ -116,10 +116,31 @@ The ordering of items is not stable, it is driven by a dependency graph.
         effective_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
         posted_by    TEXT
     );
+
+    -- M3.2 (acct-4d4n.8) Q-A pool-lock candidates. Both tables share the
+    -- same (sku_id, location_id) primary key; the committer acquires a
+    -- row-lock here at the top of process_group when there is work to
+    -- plan. The two flavours differ only in payload — `poc_pool_locks`
+    -- carries an audit `lock_version` column; `poc_pool_lock_anchors`
+    -- is minimal. The GUC `poc_ledger.pool_lock_mode` selects which
+    -- table (or 'none' for the no-extra-SPI baseline that relies on
+    -- the cost-table FOR UPDATE inside the snapshot builders).
+    CREATE TABLE poc_pool_locks (
+        sku_id       BIGINT NOT NULL,
+        location_id  BIGINT NOT NULL,
+        lock_version BIGINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (sku_id, location_id)
+    );
+
+    CREATE TABLE poc_pool_lock_anchors (
+        sku_id       BIGINT NOT NULL,
+        location_id  BIGINT NOT NULL,
+        PRIMARY KEY (sku_id, location_id)
+    );
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:866
+-- src/committer.rs:914
 -- poc_ledger::committer::poc_ledger_apply
 CREATE  FUNCTION "poc_ledger_apply"(
 	"sku_id" bigint, /* i64 */
@@ -142,7 +163,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_apply_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1066
+-- src/committer.rs:1114
 -- poc_ledger::committer::poc_ledger_committer_tick
 CREATE  FUNCTION "poc_ledger_committer_tick"(
 	"shard_idx" INT, /* i32 */
@@ -154,7 +175,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_committer_tick_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/cost_method.rs:404
+-- src/cost_method.rs:425
 -- poc_ledger::cost_method::poc_ledger_error_code_to_text
 CREATE  FUNCTION "poc_ledger_error_code_to_text"(
 	"code" INT /* i32 */
@@ -165,7 +186,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_error_code_to_text_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:166
+-- src/lib.rs:192
 -- poc_ledger::poc_ledger_hello
 CREATE  FUNCTION "poc_ledger_hello"() RETURNS TEXT /* &str */
 STRICT
@@ -183,7 +204,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_max_slot_probe_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1006
+-- src/committer.rs:1054
 -- poc_ledger::committer::poc_ledger_push_only
 CREATE  FUNCTION "poc_ledger_push_only"(
 	"sku_id" bigint, /* i64 */
@@ -202,7 +223,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_push_only_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1153
+-- src/committer.rs:1201
 -- poc_ledger::committer::poc_ledger_receive
 CREATE  FUNCTION "poc_ledger_receive"(
 	"sku_id" bigint, /* i64 */
@@ -217,7 +238,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_receive_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1194
+-- src/committer.rs:1242
 -- poc_ledger::committer::poc_ledger_receive_avg
 CREATE  FUNCTION "poc_ledger_receive_avg"(
 	"sku_id" bigint, /* i64 */
@@ -265,7 +286,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_ring_push_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1238
+-- src/committer.rs:1286
 -- poc_ledger::committer::poc_ledger_set_standard_cost
 CREATE  FUNCTION "poc_ledger_set_standard_cost"(
 	"sku_id" bigint, /* i64 */
@@ -277,7 +298,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_set_standard_cost_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1132
+-- src/committer.rs:1180
 -- poc_ledger::committer::poc_ledger_shard_committer_tx_seq
 CREATE  FUNCTION "poc_ledger_shard_committer_tx_seq"(
 	"shard_idx" INT /* i32 */
@@ -308,7 +329,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_shard_depth_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1269
+-- src/committer.rs:1317
 -- poc_ledger::committer::poc_ledger_shard_for
 CREATE  FUNCTION "poc_ledger_shard_for"(
 	"sku_id" bigint, /* i64 */
@@ -422,7 +443,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_slot_recycle_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1119
+-- src/committer.rs:1167
 -- poc_ledger::committer::poc_ledger_slot_recycle_after_read
 CREATE  FUNCTION "poc_ledger_slot_recycle_after_read"(
 	"shard_idx" INT, /* i32 */
@@ -434,7 +455,7 @@ AS 'MODULE_PATHNAME', 'poc_ledger_slot_recycle_after_read_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1087
+-- src/committer.rs:1135
 -- poc_ledger::committer::poc_ledger_slot_result
 CREATE  FUNCTION "poc_ledger_slot_result"(
 	"shard_idx" INT, /* i32 */

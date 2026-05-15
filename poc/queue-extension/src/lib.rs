@@ -63,6 +63,24 @@ static QUEUE_FULL_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
 static SEMANTICS: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"compensation"));
 
+// M3.2 (acct-4d4n.8) Q-A switch. Values: 'none' (default — committer
+// relies on row-level FOR UPDATE inside the snapshot builders) /
+// 'pool_locks' (FOR UPDATE on `poc_pool_locks` row with audit column) /
+// 'pool_lock_anchors' (FOR UPDATE on minimal `poc_pool_lock_anchors`
+// row). Read via `pool_lock_mode_str()` from committer hot path.
+static POOL_LOCK_MODE: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"none"));
+
+/// Read the current `poc_ledger.pool_lock_mode` GUC value, lowercased.
+/// Returns "none" if unset or unparseable.
+pub(crate) fn pool_lock_mode_str() -> String {
+    POOL_LOCK_MODE
+        .get()
+        .as_ref()
+        .map(|c| c.to_string_lossy().to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
 // ── _PG_init ────────────────────────────────────────────────────────
 
 #[pg_guard]
@@ -157,6 +175,14 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Sighup,
         GucFlags::empty(),
     );
+    GucRegistry::define_string_guc(
+        c"poc_ledger.pool_lock_mode",
+        c"Pool-lock granularity (M3.2 Q-A): none | pool_locks | pool_lock_anchors",
+        c"Selects how the committer serializes committer-to-committer work on the same (sku_id, location_id) pool. 'none' relies on the existing FOR UPDATE inside the per-method snapshot builders. 'pool_locks' takes a row lock on `poc_pool_locks` (audit-column flavour) at the top of process_group. 'pool_lock_anchors' takes a row lock on the minimal `poc_pool_lock_anchors` table. M3.2 benches all three under fan_in. Userset so the bench harness can SET it per psql session.",
+        &POOL_LOCK_MODE,
+        GucContext::Userset,
+        GucFlags::empty(),
+    );
 }
 
 // ── SQL surface ─────────────────────────────────────────────────────
@@ -165,5 +191,5 @@ pub extern "C-unwind" fn _PG_init() {
 /// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M3.1 multi-backend coordination (acct-4d4n.7)"
+    "poc_ledger v0.0.1 — M3.2 Q-A resolved: pool_lock_mode default 'none' (acct-4d4n.8)"
 }

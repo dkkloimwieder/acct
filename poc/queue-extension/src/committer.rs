@@ -640,7 +640,14 @@ fn process_group(
         }
     }
 
-    // (3) Build snapshot per method. MOCK ignores it; FIFO reads
+    // (3a) M3.2 Q-A: acquire the pool lock when there is work to plan
+    // and the GUC selects a non-'none' mode. Replay-only groups skip
+    // this SPI. The lock is held until the surrounding txn commits.
+    if !to_plan_events.is_empty() {
+        acquire_pool_lock(pool);
+    }
+
+    // (3b) Build snapshot per method. MOCK ignores it; FIFO reads
     // layers; AVG reads the running aggregate; STD reads the per-SKU
     // standard cost. Skipping SPI when there's nothing to plan
     // (all events were dedup hits) keeps idempotent replays cheap.
@@ -761,6 +768,47 @@ fn process_group(
 //
 // Returns the count of drained requests so callers can detect "no work
 // available" without an extra SQL probe.
+
+// ── M3.2 (acct-4d4n.8) Q-A pool lock ──────────────────────────────────
+//
+// Serializes committer-to-committer work on the same `(sku_id,
+// location_id)` pool when `poc_ledger.pool_lock_mode` is set to a
+// non-'none' value. Called by process_group once dedup-lookup has
+// confirmed there is work to plan; replay-only batches skip the SPI.
+//
+// The two table flavours (`poc_pool_locks` vs `poc_pool_lock_anchors`)
+// share the same SQL shape — INSERT ... ON CONFLICT DO UPDATE acquires
+// a row lock either way. The UPDATE is a no-op self-assignment whose
+// only purpose is to take the row lock. 'pool_locks' bumps an audit
+// `lock_version` column; 'pool_lock_anchors' has no payload.
+fn acquire_pool_lock(pool: PocPoolKey) {
+    let mode = crate::pool_lock_mode_str();
+    let sql: &'static str = match mode.as_str() {
+        "none" => return,
+        "pool_locks" => {
+            "INSERT INTO poc_pool_locks (sku_id, location_id) \
+             VALUES ($1, $2) \
+             ON CONFLICT (sku_id, location_id) DO UPDATE \
+                 SET lock_version = poc_pool_locks.lock_version + 1"
+        }
+        "pool_lock_anchors" => {
+            "INSERT INTO poc_pool_lock_anchors (sku_id, location_id) \
+             VALUES ($1, $2) \
+             ON CONFLICT (sku_id, location_id) DO UPDATE \
+                 SET sku_id = poc_pool_lock_anchors.sku_id"
+        }
+        _ => return,
+    };
+    Spi::connect_mut(|client| {
+        let _ = client
+            .update(
+                sql,
+                None,
+                &[pool.sku_id.into(), pool.location_id.into()],
+            )
+            .expect("acquire_pool_lock: UPDATE failed");
+    });
+}
 
 /// Wake the backend waiting on a slot, if any. Reads the slot's
 /// `waiter_pid` (set by `set_slot_waiter_pid` at acquire time);

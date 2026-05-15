@@ -390,6 +390,27 @@ pgrx::extension_sql!(
         effective_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
         posted_by    TEXT
     );
+
+    -- M3.2 (acct-4d4n.8) Q-A pool-lock candidates. Both tables share the
+    -- same (sku_id, location_id) primary key; the committer acquires a
+    -- row-lock here at the top of process_group when there is work to
+    -- plan. The two flavours differ only in payload — `poc_pool_locks`
+    -- carries an audit `lock_version` column; `poc_pool_lock_anchors`
+    -- is minimal. The GUC `poc_ledger.pool_lock_mode` selects which
+    -- table (or 'none' for the no-extra-SPI baseline that relies on
+    -- the cost-table FOR UPDATE inside the snapshot builders).
+    CREATE TABLE poc_pool_locks (
+        sku_id       BIGINT NOT NULL,
+        location_id  BIGINT NOT NULL,
+        lock_version BIGINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (sku_id, location_id)
+    );
+
+    CREATE TABLE poc_pool_lock_anchors (
+        sku_id       BIGINT NOT NULL,
+        location_id  BIGINT NOT NULL,
+        PRIMARY KEY (sku_id, location_id)
+    );
     "#,
     name = "poc_cost_schema",
     requires = ["poc_test_rows_schema"],
