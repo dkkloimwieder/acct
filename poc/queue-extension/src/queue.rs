@@ -155,7 +155,14 @@ pub struct PocPendingRequest {
 #[repr(C, align(64))]
 pub struct PocResultSlot {
     pub state: AtomicU8,
-    pub _pad0: [u8; 7],
+    pub _pad_s: [u8; 3],
+    /// PID of the backend waiting on this slot. Stamped at acquire time
+    /// by the apply path; the committer reads this after `fill_slot_*`
+    /// and calls `SetLatch` on the matching `PGPROC.procLatch` to wake
+    /// the waiter. Zero = no waiter (push-only paths don't stamp;
+    /// signaller skips). Reset to zero by `recycle_slot`/`shard_reset`.
+    /// (acct-4d4n.7, M3.1)
+    pub waiter_pid: AtomicI32,
     pub applied_unit_cost: AtomicI64,
     pub applied_total_cost: AtomicI64,
     pub committer_tx_id: AtomicI64,
@@ -264,11 +271,33 @@ pub fn recycle_slot(shard_idx: usize, slot_idx: u32) -> Result<u8, u8> {
     slot.error_code.store(0, Ordering::Release);
     slot.depletion_count.store(0, Ordering::Release);
     slot.spillover_offset.store(0, Ordering::Release);
+    slot.waiter_pid.store(0, Ordering::Release);
     for i in 0..32 {
         slot.depletion_ids_inline[i].store(0, Ordering::Release);
     }
     slot.state.store(SLOT_FREE, Ordering::Release);
     Ok(cur)
+}
+
+/// Stamp the PID of the waiter on a slot. Called by the apply path
+/// right after `acquire_slot` so the committer can `SetLatch` the
+/// waiter once the slot is filled (spec §1.6 step 11/18 — wait/wake).
+/// Push-only and other non-waiting paths skip this call; the field
+/// stays 0 and the signaller treats 0 as "no waiter".
+/// (acct-4d4n.7, M3.1)
+pub fn set_slot_waiter_pid(shard_idx: usize, slot_idx: u32, pid: i32) {
+    let arena = POC_SHARD_ARENA.share();
+    let slot = &arena.slots[shard_idx][slot_idx as usize];
+    slot.waiter_pid.store(pid, Ordering::Release);
+}
+
+/// Read the waiter PID stamped on a slot. Returns 0 if no waiter.
+/// (acct-4d4n.7, M3.1)
+pub fn read_slot_waiter_pid(shard_idx: usize, slot_idx: u32) -> i32 {
+    let arena = POC_SHARD_ARENA.share();
+    arena.slots[shard_idx][slot_idx as usize]
+        .waiter_pid
+        .load(Ordering::Acquire)
 }
 
 pub fn mark_slot_filled(shard_idx: usize, slot_idx: u32) -> Result<(), u8> {
@@ -700,6 +729,7 @@ pub fn shard_reset(shard_idx: usize) {
         slot.error_code.store(0, Ordering::Release);
         slot.depletion_count.store(0, Ordering::Release);
         slot.spillover_offset.store(0, Ordering::Release);
+        slot.waiter_pid.store(0, Ordering::Release);
     }
 }
 

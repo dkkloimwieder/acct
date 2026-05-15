@@ -48,11 +48,29 @@ use crate::cost_method::{
 };
 use crate::queue::{
     self, DrainedApply, METHOD_AVG, METHOD_FIFO, METHOD_MOCK, METHOD_STD,
-    POC_SHARD_COUNT, SLOT_FILLED,
+    POC_SHARD_COUNT, SLOT_ABANDONED, SLOT_FILLED,
 };
 use pgrx::prelude::*;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// ── PG Latch wait-event flags (latch.h) ───────────────────────────────
+//
+// Defined locally rather than imported from `pg_sys` so the build
+// doesn't depend on whichever subset of latch.h #defines bindgen
+// happens to export in any given pgrx release. Values match
+// `src/include/storage/latch.h` and have been stable across PG12+.
+const WL_LATCH_SET: i32 = 1 << 0;
+const WL_TIMEOUT: i32 = 1 << 3;
+const WL_POSTMASTER_DEATH: i32 = 1 << 4;
+
+/// Loser-wait timeout in milliseconds. The committer SetLatches the
+/// waiter when the slot is filled, so this only fires when (a) the
+/// signal was dropped (e.g. waiter PID became invalid) or (b) the
+/// loser needs to re-attempt the CAS election because no committer
+/// is currently draining. 100ms is well under the 5-min cache window
+/// from scheduling primitives and gives 10× per-second retry headroom.
+const WAIT_TIMEOUT_MS: i64 = 100;
 
 // ── Schema (poc_test_rows) ────────────────────────────────────────────
 //
@@ -744,6 +762,27 @@ fn process_group(
 // Returns the count of drained requests so callers can detect "no work
 // available" without an extra SQL probe.
 
+/// Wake the backend waiting on a slot, if any. Reads the slot's
+/// `waiter_pid` (set by `set_slot_waiter_pid` at acquire time);
+/// `BackendPidGetProc` returns NULL if the backend has exited or the
+/// PID is stale, in which case the wake is silently skipped (the slot
+/// will be reclaimed by M5c.2's slot-leak audit). `SetLatch` is
+/// idempotent and may target the current backend (committer waking
+/// itself for its own slot) — both cases are safe per PG Latch
+/// semantics. (acct-4d4n.7, M3.1)
+fn signal_waiter(shard_idx: usize, slot_idx: u32) {
+    let pid = queue::read_slot_waiter_pid(shard_idx, slot_idx);
+    if pid == 0 {
+        return;
+    }
+    unsafe {
+        let proc_ = pgrx::pg_sys::BackendPidGetProc(pid);
+        if !proc_.is_null() {
+            pgrx::pg_sys::SetLatch(&mut (*proc_).procLatch);
+        }
+    }
+}
+
 fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
     let drained: Vec<DrainedApply> =
         queue::drain_apply_batch(shard_idx, batch_size_max);
@@ -811,6 +850,10 @@ fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
                 actual
             );
         }
+        // M3.1 (acct-4d4n.7): wake the backend waiting on this slot.
+        // Skipped silently if no waiter was stamped (push-only paths)
+        // or the waiter PID has gone stale (M5c.2 will reap).
+        signal_waiter(shard_idx, slot_idx);
     }
 
     drained.len()
@@ -855,6 +898,8 @@ fn poc_ledger_apply(
     let ph = pool_hash(sku_id, location_id);
     let shard_idx = shard_for(ph);
 
+    let my_pid: i32 = unsafe { pgrx::pg_sys::MyProcPid };
+
     let slot_idx = queue::acquire_slot(shard_idx).unwrap_or_else(|| {
         pgrx::error!(
             "poc_ledger_apply: slot pool exhausted on shard {} \
@@ -863,7 +908,11 @@ fn poc_ledger_apply(
         )
     });
 
-    let my_pid: i32 = unsafe { pgrx::pg_sys::MyProcPid };
+    // M3.1 (acct-4d4n.7): stamp the waiter PID BEFORE the ring push so
+    // a peer committer that drains the request immediately can wake
+    // us via `signal_waiter`.
+    queue::set_slot_waiter_pid(shard_idx, slot_idx, my_pid);
+
     let request_seq = queue::ring_push_apply(
         shard_idx,
         slot_idx,
@@ -885,26 +934,59 @@ fn poc_ledger_apply(
         )
     });
 
-    let won = queue::try_acquire_committer(shard_idx, my_pid, clock_ns());
-    if !won {
-        pgrx::error!(
-            "poc_ledger_apply: committer election lost on shard {} \
-             (M1.2 expects single-backend — M3.1 introduces waiter path)",
-            shard_idx
-        );
-    }
-    let _drained = drain_and_commit(shard_idx, 1024);
-    queue::release_committer(shard_idx);
+    // M3.1 (acct-4d4n.7) wait/wake loop. Spec §1.6 steps 6-14:
+    //
+    // - If we win the committer-PID CAS, drain the batch (which fills
+    //   our own slot among others), release the committer role, loop
+    //   back. The next iteration's state-check breaks out via SLOT_FILLED.
+    // - If we lose, sleep on MyLatch until a peer committer fires
+    //   SetLatch on us (`signal_waiter` in `drain_and_commit`) OR a
+    //   100ms safety timeout. On wake we re-check slot state; if
+    //   still ALLOCATED we retry the CAS election to bypass the
+    //   case where the prior committer drained without our request
+    //   in the batch (lost ring-tail race).
+    //
+    // The ResetLatch-then-check-then-Wait order matches the PG
+    // idiom (parallel.c et al.): SetLatch fires raise the flag,
+    // ResetLatch lowers it, the state check after ResetLatch sees any
+    // committed work, and WaitLatch sleeps with no risk of missed wake.
+    loop {
+        unsafe { pgrx::pg_sys::ResetLatch(pgrx::pg_sys::MyLatch); }
 
-    let (state, applied_unit_cost, applied_total_cost, ctx_id, error_code) =
-        queue::read_slot_result_with_error(shard_idx, slot_idx);
-    if state != SLOT_FILLED {
-        pgrx::error!(
-            "poc_ledger_apply: own slot {} not SLOT_FILLED after drain (state={})",
-            slot_idx,
-            state
-        );
+        let state = queue::slot_state(shard_idx, slot_idx);
+        if state == SLOT_FILLED {
+            break;
+        }
+        if state == SLOT_ABANDONED {
+            pgrx::error!(
+                "poc_ledger_apply: slot {} unexpectedly ABANDONED (M5a.2 path)",
+                slot_idx
+            );
+        }
+
+        if queue::try_acquire_committer(shard_idx, my_pid, clock_ns()) {
+            let _drained = drain_and_commit(shard_idx, 1024);
+            queue::release_committer(shard_idx);
+            continue;
+        }
+
+        unsafe {
+            let _ = pgrx::pg_sys::WaitLatch(
+                pgrx::pg_sys::MyLatch,
+                WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+                WAIT_TIMEOUT_MS,
+                pgrx::pg_sys::PG_WAIT_EXTENSION,
+            );
+            // CHECK_FOR_INTERRUPTS via the InterruptPending guard;
+            // cleaner FFI surface than the C-macro form.
+            if pgrx::pg_sys::InterruptPending != 0 {
+                pgrx::pg_sys::ProcessInterrupts();
+            }
+        }
     }
+
+    let (_state, applied_unit_cost, applied_total_cost, ctx_id, error_code) =
+        queue::read_slot_result_with_error(shard_idx, slot_idx);
     let _ = queue::recycle_slot(shard_idx, slot_idx);
 
     TableIterator::once((

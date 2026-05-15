@@ -165,5 +165,5 @@ pub extern "C-unwind" fn _PG_init() {
 /// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M2.3 AvgMethod + StdMethod + snapshot helpers (acct-4d4n.6)"
+    "poc_ledger v0.0.1 — M3.1 multi-backend coordination (acct-4d4n.7)"
 }
