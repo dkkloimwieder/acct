@@ -27,7 +27,10 @@ pgrx::pg_module_magic!();
 // M1.1 — single-shard queue primitive (PocQueueShard, ring, slot pool).
 mod queue;
 
-// M1.2 — committer election, batch drain, poc_ledger_apply SQL entry.
+// M2.1 — PocCostMethod trait + types + MockMethod + cost-table schema.
+mod cost_method;
+
+// M1.2 + M2.1 — committer election, batch drain, dedup-lookup, dispatch.
 mod committer;
 
 // ── GUCs (spec §1.5) ────────────────────────────────────────────────
@@ -155,5 +158,5 @@ pub extern "C-unwind" fn _PG_init() {
 /// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M1.2 committer drain (acct-4d4n.3)"
+    "poc_ledger v0.0.1 — M2.1 PocCostMethod dispatch (acct-4d4n.4)"
 }

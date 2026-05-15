@@ -528,17 +528,41 @@ pub fn fill_slot_result(
     applied_total_cost: i64,
     committer_tx_id: i64,
 ) -> Result<(), u8> {
+    fill_slot_result_with_error(
+        shard_idx,
+        slot_idx,
+        applied_unit_cost,
+        applied_total_cost,
+        committer_tx_id,
+        0,
+    )
+}
+
+/// M2.1 variant: also stamps `error_code` so per-event errors can ride
+/// alongside the cost fields. `error_code = 0` means "success" — the
+/// cost fields carry the applied result. `error_code != 0` means the
+/// method emitted a per-event error and the cost fields are 0 by
+/// convention (callers should treat them as undefined).
+pub fn fill_slot_result_with_error(
+    shard_idx: usize,
+    slot_idx: u32,
+    applied_unit_cost: i64,
+    applied_total_cost: i64,
+    committer_tx_id: i64,
+    error_code: u16,
+) -> Result<(), u8> {
     let arena = POC_SHARD_ARENA.share();
     let slot = &arena.slots[shard_idx][slot_idx as usize];
-    // Write result fields BEFORE flipping state — caller observing
-    // SLOT_FILLED needs to see the values atomically. The CAS is the
-    // happens-before barrier.
+    // Write result + error fields BEFORE flipping state — caller
+    // observing SLOT_FILLED needs to see the values atomically. The
+    // CAS is the happens-before barrier.
     slot.applied_unit_cost
         .store(applied_unit_cost, Ordering::Release);
     slot.applied_total_cost
         .store(applied_total_cost, Ordering::Release);
     slot.committer_tx_id
         .store(committer_tx_id, Ordering::Release);
+    slot.error_code.store(error_code, Ordering::Release);
     slot.state
         .compare_exchange(
             SLOT_ALLOCATED,
@@ -550,18 +574,31 @@ pub fn fill_slot_result(
         .map_err(|actual| actual)
 }
 
-/// Read a slot's result tuple. Returns
-/// `(state, applied_unit_cost, applied_total_cost, committer_tx_id)`.
+/// Read a slot's result tuple (no error_code). Kept for backward-compat
+/// with M1.1 callers; M2.1+ should prefer `read_slot_result_with_error`.
 pub fn read_slot_result(shard_idx: usize, slot_idx: u32) -> (u8, i64, i64, i64) {
+    let (state, unit, total, ctx, _err) =
+        read_slot_result_with_error(shard_idx, slot_idx);
+    (state, unit, total, ctx)
+}
+
+/// M2.1 variant: returns
+/// `(state, applied_unit_cost, applied_total_cost, committer_tx_id,
+///   error_code)`. state loaded LAST under Acquire so the matching
+/// Release in `fill_slot_result_with_error` establishes happens-before
+/// on the data fields.
+pub fn read_slot_result_with_error(
+    shard_idx: usize,
+    slot_idx: u32,
+) -> (u8, i64, i64, i64, u16) {
     let arena = POC_SHARD_ARENA.share();
     let slot = &arena.slots[shard_idx][slot_idx as usize];
-    // state loaded LAST under Acquire so the matching Release in
-    // fill_slot_result establishes happens-before on the data fields.
     let unit = slot.applied_unit_cost.load(Ordering::Acquire);
     let total = slot.applied_total_cost.load(Ordering::Acquire);
     let ctx = slot.committer_tx_id.load(Ordering::Acquire);
+    let err = slot.error_code.load(Ordering::Acquire);
     let state = slot.state.load(Ordering::Acquire);
-    (state, unit, total, ctx)
+    (state, unit, total, ctx, err)
 }
 
 // ── Committer election ────────────────────────────────────────────────
