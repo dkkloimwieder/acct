@@ -1,25 +1,14 @@
-//! acct-4d4n.1 (M0.1): scaffolding for the queue+committer costing PoC.
+//! poc_ledger: queue+committer costing ledger PoC primitive.
 //!
 //! Authoritative spec: `poc/design_research/poc-validation-spec.md`.
 //!
-//! ## What M0.1 covers
+//! ## Milestone status
 //!
-//! - pgrx crate that builds against PG18.
-//! - `_PG_init` registers the 9 GUCs from spec §1.5 with the exact
-//!   defaults / ranges / reload contexts documented there.
-//! - Shmem reservation wiring exercised via `pg_shmem_init!` on a
-//!   placeholder atomic counter (the real sizing — `PocQueueShard`
-//!   sized from GUCs — lands in M1.1, acct-4d4n.2).
-//! - One `#[pg_extern]` function `poc_ledger_hello()` that returns
-//!   a build identifier, used to confirm SQL surface works.
-//!
-//! ## What M0.1 deliberately does NOT do
-//!
-//! - No PocQueueShard struct (M1.1).
-//! - No committer election or batch drain (M1.2).
-//! - No cost methods (M2.x).
-//! - No bgworker, no recovery worker, no XactCallbacks (later milestones).
-//! - GUC values are visible via `pg_settings` but nothing reads them yet.
+//! - M0.1 (acct-4d4n.1, shipped @ b8ddacb): pgrx scaffolding, 9 GUCs
+//!   from spec §1.5, placeholder shmem, `poc_ledger_hello()` SQL fn.
+//! - **M1.1 (acct-4d4n.2, this commit): single-shard primitive — see
+//!   `queue` module for the data structures and slot/ring algorithms;
+//!   spec §1.4 (shmem layout) and §1.6 step 5 + steps 6-9, 12-14.**
 //!
 //! ## GUC namespace
 //!
@@ -30,11 +19,13 @@
 #![allow(unexpected_cfgs)]
 
 use pgrx::prelude::*;
-use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PgAtomic, pg_shmem_init};
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use std::ffi::CString;
-use std::sync::atomic::AtomicU64;
 
 pgrx::pg_module_magic!();
+
+// M1.1 — single-shard queue primitive (PocQueueShard, ring, slot pool).
+mod queue;
 
 // ── GUCs (spec §1.5) ────────────────────────────────────────────────
 //
@@ -59,21 +50,11 @@ static QUEUE_FULL_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
 static SEMANTICS: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"compensation"));
 
-// ── Shmem placeholder ───────────────────────────────────────────────
-//
-// pg_shmem_init! wires up a shmem segment via PG's RequestAddinShmemSpace
-// + ShmemInitStruct mechanism. M0.1 reserves a single AtomicU64 just to
-// validate the path; M1.1 (acct-4d4n.2) replaces this with the real
-// PocQueueShard array sized from SHARD_COUNT.
-
-static PLACEHOLDER_HEARTBEAT: PgAtomic<AtomicU64> =
-    unsafe { PgAtomic::new(c"poc_ledger_placeholder_heartbeat") };
-
 // ── _PG_init ────────────────────────────────────────────────────────
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
-    pg_shmem_init!(PLACEHOLDER_HEARTBEAT);
+    queue::init();
 
     GucRegistry::define_int_guc(
         c"poc_ledger.shard_count",
