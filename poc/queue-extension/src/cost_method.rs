@@ -269,7 +269,9 @@ pub fn resolve_method(method: &str) -> Option<&'static dyn PocCostMethod> {
     static MOCK: MockMethod = MockMethod;
     match method {
         "fifo" => Some(&crate::fifo::FIFO),
-        "mock" | "avg" | "std" => Some(&MOCK),
+        "avg" => Some(&crate::avg::AVG),
+        "std" => Some(&crate::std_cost::STD),
+        "mock" => Some(&MOCK),
         _ => None,
     }
 }
@@ -366,6 +368,28 @@ pgrx::extension_sql!(
         ON poc_cost_consumptions (issue_id);
     CREATE INDEX poc_cost_consumptions_user_tx
         ON poc_cost_consumptions (user_tx_xid);
+
+    -- M2.3 AVG running aggregate per pool. Receipts UPSERT increment;
+    -- the committer decrements after consumption INSERT (post-plan_apply
+    -- hook in process_group). Snapshot helper reads running_value /
+    -- running_qty under FOR UPDATE.
+    CREATE TABLE poc_cost_avg (
+        sku_id        BIGINT NOT NULL,
+        location_id   BIGINT NOT NULL,
+        running_qty   BIGINT NOT NULL DEFAULT 0 CHECK (running_qty >= 0),
+        running_value BIGINT NOT NULL DEFAULT 0 CHECK (running_value >= 0),
+        last_updated  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        PRIMARY KEY (sku_id, location_id)
+    );
+
+    -- M2.3 STD lookup. One row per SKU; PoC keeps it flat (no time-
+    -- phased revisions). Production would version by effective_at.
+    CREATE TABLE poc_standard_costs (
+        sku_id       BIGINT PRIMARY KEY,
+        unit_cost    BIGINT NOT NULL CHECK (unit_cost > 0),
+        effective_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        posted_by    TEXT
+    );
     "#,
     name = "poc_cost_schema",
     requires = ["poc_test_rows_schema"],

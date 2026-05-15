@@ -33,6 +33,10 @@ mod cost_method;
 // M2.2 — FifoMethod (walks PocSnapshot.layers; emits per-layer depletions).
 mod fifo;
 
+// M2.3 — AvgMethod + StdMethod (running aggregate / standard-cost lookup).
+mod avg;
+mod std_cost;
+
 // M1.2 + M2.1 — committer election, batch drain, dedup-lookup, dispatch.
 mod committer;
 
@@ -161,5 +165,5 @@ pub extern "C-unwind" fn _PG_init() {
 /// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M2.2 FifoMethod + per-layer depletions (acct-4d4n.5)"
+    "poc_ledger v0.0.1 — M2.3 AvgMethod + StdMethod + snapshot helpers (acct-4d4n.6)"
 }

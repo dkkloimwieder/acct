@@ -384,6 +384,109 @@ fn insert_test_rows(
 // return an empty snapshot. M2.3 extends with avg_unit_cost +
 // standard_cost lookups.
 
+/// AVG snapshot: read `poc_cost_avg` for the pool under FOR UPDATE.
+/// Both fields can be NULL when no receipt has ever upserted the row;
+/// AvgMethod surfaces InsufficientInventory in that case.
+fn build_snapshot_avg(pool: PocPoolKey) -> PocSnapshot {
+    let mut avg_unit_cost: Option<i64> = None;
+    let mut total_qty: i64 = 0;
+    Spi::connect(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![
+            pool.sku_id.into(),
+            pool.location_id.into(),
+        ];
+        let tup = client
+            .select(
+                "SELECT running_qty, running_value \
+                   FROM poc_cost_avg \
+                  WHERE sku_id = $1 AND location_id = $2 \
+                  FOR UPDATE",
+                None,
+                &args,
+            )
+            .expect("build_snapshot_avg SPI");
+        for row in tup {
+            let qty: i64 = row["running_qty"].value().unwrap().unwrap_or(0);
+            let value: i64 = row["running_value"].value().unwrap().unwrap_or(0);
+            total_qty = qty;
+            if qty > 0 {
+                avg_unit_cost = Some(value / qty);
+            }
+        }
+    });
+    PocSnapshot {
+        pool,
+        layers: vec![],
+        avg_unit_cost,
+        standard_cost: None,
+        total_available_qty: total_qty,
+    }
+}
+
+/// STD snapshot: read `poc_standard_costs` by sku_id. Pool-key
+/// location is ignored — std lookups are per-SKU only.
+fn build_snapshot_std(pool: PocPoolKey) -> PocSnapshot {
+    let mut standard_cost: Option<i64> = None;
+    Spi::connect(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![pool.sku_id.into()];
+        let tup = client
+            .select(
+                "SELECT unit_cost FROM poc_standard_costs WHERE sku_id = $1",
+                None,
+                &args,
+            )
+            .expect("build_snapshot_std SPI");
+        for row in tup {
+            let uc: i64 = row["unit_cost"].value().unwrap().unwrap();
+            standard_cost = Some(uc);
+        }
+    });
+    PocSnapshot {
+        pool,
+        layers: vec![],
+        avg_unit_cost: None,
+        standard_cost,
+        total_available_qty: 0,
+    }
+}
+
+/// Post-plan_apply hook for AVG: decrement the running aggregate by
+/// the sum of consumption qty + qty·avg from the just-INSERTed rows.
+/// Preserves the avg invariant `(V - q·avg) / (Q - q) = avg`.
+fn decrement_avg_aggregate(pool: PocPoolKey, rows: &[PocConsumptionRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let mut sum_qty: i64 = 0;
+    let mut sum_value: i128 = 0;
+    for r in rows {
+        sum_qty = sum_qty.saturating_add(r.qty);
+        sum_value = sum_value
+            .saturating_add((r.qty as i128) * (r.applied_unit_cost as i128));
+    }
+    let dec_value =
+        sum_value.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    Spi::connect_mut(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![
+            sum_qty.into(),
+            dec_value.into(),
+            pool.sku_id.into(),
+            pool.location_id.into(),
+        ];
+        client
+            .update(
+                "UPDATE poc_cost_avg \
+                    SET running_qty   = running_qty   - $1, \
+                        running_value = running_value - $2, \
+                        last_updated  = clock_timestamp() \
+                  WHERE sku_id = $3 AND location_id = $4",
+                None,
+                &args,
+            )
+            .expect("decrement_avg_aggregate UPDATE");
+    });
+}
+
 fn build_snapshot_fifo(pool: PocPoolKey) -> PocSnapshot {
     let mut layers: Vec<PocLayerView> = Vec::new();
     let mut total_qty: i64 = 0;
@@ -519,15 +622,24 @@ fn process_group(
         }
     }
 
-    // (3) Build snapshot. Only the FIFO branch needs layer data; MOCK
-    // and (until M2.3 lands) AVG / STD ignore the snapshot. Skipping
-    // the SPI keeps the MOCK-only acceptance path SPI-free.
-    let snapshot = if method_name == "fifo" && !to_plan_events.is_empty() {
-        build_snapshot_fifo(pool)
-    } else {
+    // (3) Build snapshot per method. MOCK ignores it; FIFO reads
+    // layers; AVG reads the running aggregate; STD reads the per-SKU
+    // standard cost. Skipping SPI when there's nothing to plan
+    // (all events were dedup hits) keeps idempotent replays cheap.
+    let snapshot = if to_plan_events.is_empty() {
         PocSnapshot {
             pool,
             ..Default::default()
+        }
+    } else {
+        match method_name {
+            "fifo" => build_snapshot_fifo(pool),
+            "avg" => build_snapshot_avg(pool),
+            "std" => build_snapshot_std(pool),
+            _ => PocSnapshot {
+                pool,
+                ..Default::default()
+            },
         }
     };
 
@@ -575,6 +687,12 @@ fn process_group(
             consumed_at_micros,
             0,
         );
+        // AVG running aggregate decrement runs AFTER consumption INSERT
+        // so the next snapshot read reflects the just-committed drain.
+        // Decrementing q×avg preserves running_value/running_qty=avg.
+        if method_name == "avg" {
+            decrement_avg_aggregate(pool, &result.consumption_inserts);
+        }
     }
     if !result.depletion_inserts.is_empty() {
         insert_depletions(
@@ -985,6 +1103,82 @@ fn poc_ledger_receive(
         }
     });
     layer_id
+}
+
+/// AVG receipt: UPSERT `poc_cost_avg` adding qty + qty·unit_cost to
+/// the running aggregate for `(sku, location)`. Distinct from
+/// `poc_ledger_receive` (which is FIFO-shaped layer creation) because
+/// AVG has no per-layer concept — only the rolling totals matter.
+#[pg_extern]
+fn poc_ledger_receive_avg(
+    sku_id: i64,
+    location_id: i64,
+    qty: i64,
+    unit_cost: i64,
+) -> i32 {
+    if qty <= 0 {
+        pgrx::error!("poc_ledger_receive_avg: qty must be > 0 (got {})", qty);
+    }
+    if unit_cost < 0 {
+        pgrx::error!(
+            "poc_ledger_receive_avg: unit_cost must be >= 0 (got {})",
+            unit_cost
+        );
+    }
+    let value = (qty as i128).saturating_mul(unit_cost as i128);
+    let value_i64 = value.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    Spi::connect_mut(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![
+            sku_id.into(),
+            location_id.into(),
+            qty.into(),
+            value_i64.into(),
+        ];
+        client
+            .update(
+                "INSERT INTO poc_cost_avg \
+                   (sku_id, location_id, running_qty, running_value) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (sku_id, location_id) DO UPDATE \
+                   SET running_qty   = poc_cost_avg.running_qty   + EXCLUDED.running_qty, \
+                       running_value = poc_cost_avg.running_value + EXCLUDED.running_value, \
+                       last_updated  = clock_timestamp()",
+                None,
+                &args,
+            )
+            .expect("poc_ledger_receive_avg UPSERT");
+    });
+    0
+}
+
+/// STD seed: set the standard cost for a SKU. Idempotent UPSERT; the
+/// PoC keeps a flat table (no time-phased revisions).
+#[pg_extern]
+fn poc_ledger_set_standard_cost(sku_id: i64, unit_cost: i64) -> i32 {
+    if unit_cost <= 0 {
+        pgrx::error!(
+            "poc_ledger_set_standard_cost: unit_cost must be > 0 (got {})",
+            unit_cost
+        );
+    }
+    Spi::connect_mut(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![
+            sku_id.into(),
+            unit_cost.into(),
+        ];
+        client
+            .update(
+                "INSERT INTO poc_standard_costs (sku_id, unit_cost) \
+                 VALUES ($1, $2) \
+                 ON CONFLICT (sku_id) DO UPDATE \
+                   SET unit_cost    = EXCLUDED.unit_cost, \
+                       effective_at = clock_timestamp()",
+                None,
+                &args,
+            )
+            .expect("poc_ledger_set_standard_cost UPSERT");
+    });
+    0
 }
 
 /// Tests routing a `(sku, location)` pair to its destination shard.
