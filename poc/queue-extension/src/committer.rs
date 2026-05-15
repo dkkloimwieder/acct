@@ -892,11 +892,33 @@ fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
             err_code,
         );
         if let Err(actual) = res {
-            pgrx::error!(
-                "drain_and_commit: slot {} fill CAS failed (actual state {})",
-                slot_idx,
-                actual
-            );
+            // M5a.2 (acct-4d4n.11): a SLOT_ABANDONED CAS failure is
+            // the canceled-caller case — caller marked their slot
+            // abandoned before ProcessInterrupts unwound them. The
+            // committer's durable INSERT just landed (this batch's
+            // SPI INSERT precedes the per-event fill loop), so the
+            // spec-required "committer still INSERTs durable row"
+            // leg of §3.3 is satisfied. Skip the fill, leave the
+            // slot abandoned (later recycled), and continue the
+            // batch — raising would unwind the whole transaction
+            // and roll back the durable row.
+            //
+            // Any other state (FREE / FILLED) is a real invariant
+            // violation: FREE means we drained a phantom entry;
+            // FILLED means double-fill. Both raise.
+            if actual == SLOT_ABANDONED {
+                pgrx::log!(
+                    "drain_and_commit: slot {} was abandoned (caller \
+                     canceled); durable row preserved",
+                    slot_idx
+                );
+            } else {
+                pgrx::error!(
+                    "drain_and_commit: slot {} fill CAS failed (actual state {})",
+                    slot_idx,
+                    actual
+                );
+            }
         }
         // M3.1 (acct-4d4n.7): wake the backend waiting on this slot.
         // Skipped silently if no waiter was stamped (push-only paths)
@@ -1049,6 +1071,33 @@ fn poc_ledger_apply(
             // CHECK_FOR_INTERRUPTS via the InterruptPending guard;
             // cleaner FFI surface than the C-macro form.
             if pgrx::pg_sys::InterruptPending != 0 {
+                // M5a.2 (acct-4d4n.11): cancel cleanup BEFORE
+                // ProcessInterrupts. ProcessInterrupts longjmps via
+                // ereport ERROR and unwinds this function without
+                // reaching the slot read below — without cleanup the
+                // slot stays SLOT_ALLOCATED until shmem reset and
+                // committers leak the lease past their backend's death.
+                //
+                // Best-effort path:
+                //   1. mark_slot_abandoned (CAS allocated → abandoned).
+                //      If the committer already filled the slot the
+                //      CAS fails — fine, the durable row is committed
+                //      and a future retry hits dedup-lookup.
+                //   2. If we currently hold committer (acquire →
+                //      long-wait → cancel race), release_committer
+                //      so a peer can take over the shard.
+                //
+                // signal_waiter on a now-cancelled backend is safe:
+                // BackendPidGetProc returns null once the backend
+                // exits and the SetLatch is gated on that.
+                if pgrx::pg_sys::QueryCancelPending != 0
+                    || pgrx::pg_sys::ProcDiePending != 0
+                {
+                    let _ = queue::mark_slot_abandoned(shard_idx, slot_idx);
+                    if queue::read_committer_pid(shard_idx) == my_pid {
+                        queue::release_committer(shard_idx);
+                    }
+                }
                 pgrx::pg_sys::ProcessInterrupts();
             }
         }
