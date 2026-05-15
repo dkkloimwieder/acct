@@ -9,6 +9,8 @@
 poc/batch-ledger/target/
 poc/ledger-extension/target/
 poc/ledger-extension/Cargo.lock
+poc/queue-extension/target/
+poc/queue-extension/Cargo.lock
 
 # Local env (use .env.example as template)
 .env

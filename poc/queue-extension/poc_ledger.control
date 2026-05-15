@@ -1,0 +1,5 @@
+comment = 'acct-4d4n: queue+committer costing ledger PoC primitive'
+default_version = '0.0.1'
+module_pathname = '$libdir/poc_ledger'
+relocatable = false
+superuser = true
