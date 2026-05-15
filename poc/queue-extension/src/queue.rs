@@ -173,6 +173,18 @@ pub struct PocResultSlot {
     pub depletion_ids_inline: [AtomicI64; 32],
     pub spillover_offset: AtomicU32,
     pub _pad3: [u8; 4],
+    /// Stamped at `ring_push_apply` with the request's `event_issue_id`
+    /// so orphan recovery can look up cost rows for this slot by issue
+    /// id (matches the dedup-lookup shape) without re-reading the
+    /// ring entry — which may be a stale REQ_IN_FLIGHT pointing past
+    /// head. Zero = no request pushed yet for this slot.
+    /// (acct-4d4n.10, M5a.1)
+    pub issue_id: AtomicI64,
+    /// Stamped at `ring_push_apply` with the request's `request_seq`.
+    /// Disambiguates "slot has a live request" from "slot was acquired
+    /// but the caller errored before push". Cleared at recycle.
+    /// (acct-4d4n.10, M5a.1)
+    pub current_request_seq: AtomicU64,
 }
 
 // ── Arena (entire shmem segment, one PgLwLock) ────────────────────────
@@ -272,6 +284,8 @@ pub fn recycle_slot(shard_idx: usize, slot_idx: u32) -> Result<u8, u8> {
     slot.depletion_count.store(0, Ordering::Release);
     slot.spillover_offset.store(0, Ordering::Release);
     slot.waiter_pid.store(0, Ordering::Release);
+    slot.issue_id.store(0, Ordering::Release);
+    slot.current_request_seq.store(0, Ordering::Release);
     for i in 0..32 {
         slot.depletion_ids_inline[i].store(0, Ordering::Release);
     }
@@ -484,6 +498,13 @@ pub fn ring_push_apply(
     req.body6.store(user_tx_xid, Ordering::Release);
     req.body7.store(0, Ordering::Release);
     req.body8.store(0, Ordering::Release);
+    // M5a.1 (acct-4d4n.10): also stamp the slot with issue_id and the
+    // request_seq so orphan recovery can find this slot's work without
+    // re-reading the ring (which can return stale REQ_IN_FLIGHT
+    // entries from prior cycles).
+    let slot = &arena.slots[shard_idx][slot_idx as usize];
+    slot.issue_id.store(event_issue_id, Ordering::Release);
+    slot.current_request_seq.store(req_seq, Ordering::Release);
     // valid stamped LAST — establishes happens-before for the committer
     // reader observing REQ_FILLED, matching ring_push's discipline.
     req.valid.store(REQ_FILLED, Ordering::Release);
@@ -734,6 +755,190 @@ pub fn read_next_slot_seq(shard_idx: usize) -> u64 {
         .load(Ordering::Acquire)
 }
 
+/// Read the per-shard `committer_acquired_at_ns` timestamp. Returns 0
+/// when no committer is currently elected. Combined with the
+/// `poc_ledger.committer_lease_ms` GUC, this is the lease-expiry
+/// signal: `now_ns - acquired_at_ns > lease_ms * 1e6` → lease stale.
+/// (acct-4d4n.10, M5a.1)
+pub fn read_committer_acquired_at_ns(shard_idx: usize) -> u64 {
+    let arena = POC_SHARD_ARENA.share();
+    arena.shards[shard_idx]
+        .committer_acquired_at_ns
+        .load(Ordering::Acquire)
+}
+
+// ── pg_pid_alive ──────────────────────────────────────────────────────
+//
+// Spec §3.2 + bd acct-4d4n.10 description: `kill(pid, 0)` returns 0 if
+// the process exists (regardless of whether we can signal it) and -1
+// with errno=ESRCH if it does not. We treat any non-zero return as
+// "dead" for the M5a.1 takeover decision; M5b.2 (sibling) layers in
+// the EPERM (process exists, owned by other user) refinement. In our
+// single-user PG cluster EPERM should not arise for backend PIDs.
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+/// Returns true if `pid` is a live process this process can identify.
+/// Uses `kill(pid, 0)` — never sends a signal, just probes existence.
+/// `pid <= 0` is treated as dead (kill(0, ...) targets the process
+/// group, kill(-1, ...) signals all permitted processes — neither is a
+/// useful probe here). (acct-4d4n.10, M5a.1)
+pub fn pg_pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let rc = unsafe { kill(pid, 0) };
+    rc == 0
+}
+
+// ── Committer takeover (M5a.1) ────────────────────────────────────────
+//
+// Two-step decision:
+//   1. Lease expired? `now_ns - committer_acquired_at_ns > lease_ns`.
+//   2. PID dead? `pg_pid_alive(stored_pid) == false`.
+//
+// Both must hold before takeover. Either alone is insufficient:
+//   - Lease expired but pid alive → slow committer; do NOT steal
+//     (M5b.2 refines the slow-committer mitigation via shrunk
+//     batch_size_max). M5a.1's conservative behavior is to wait.
+//   - PID dead but lease still warm → committer crashed within the
+//     lease window. Still safe to take over since the committer can't
+//     resume; we just need to wait until the lease expires OR detect
+//     the death immediately. M5a.1 chooses immediate-on-dead: if the
+//     PID is dead, take over regardless of lease state. This is the
+//     responsive behavior that meets the "lease takeover within
+//     2 × committer_lease_ms" acceptance.
+
+#[derive(Debug, Clone, Copy)]
+pub enum TakeoverOutcome {
+    /// No committer held; standard CAS-from-0 acquired.
+    Acquired,
+    /// Stale committer took over; the previous (dead) PID is returned
+    /// so the caller can attribute orphan recovery to it.
+    TookOver { stale_pid: i32 },
+    /// Committer held but lease and PID are valid → no takeover.
+    Held,
+    /// CAS lost to a concurrent acquirer.
+    Lost,
+}
+
+/// Try to acquire the committer either via standard CAS-from-0 OR via
+/// lease-takeover-on-dead-pid. Returns the outcome so the caller can
+/// decide whether to run orphan recovery (TookOver) or proceed normally
+/// (Acquired).
+pub fn try_acquire_or_takeover(
+    shard_idx: usize,
+    my_pid: i32,
+    now_ns: u64,
+    lease_ns: u64,
+) -> TakeoverOutcome {
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx];
+    // Fast path: empty slot.
+    if shard
+        .committer_pid
+        .compare_exchange(0, my_pid, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        shard
+            .committer_acquired_at_ns
+            .store(now_ns, Ordering::Release);
+        return TakeoverOutcome::Acquired;
+    }
+    // Slow path: someone holds it. Check if takeover is warranted.
+    let cur_pid = shard.committer_pid.load(Ordering::Acquire);
+    if cur_pid == 0 {
+        // Window between observation and CAS — race lost.
+        return TakeoverOutcome::Lost;
+    }
+    let acquired_at = shard.committer_acquired_at_ns.load(Ordering::Acquire);
+    let lease_expired = acquired_at == 0
+        || now_ns.saturating_sub(acquired_at) > lease_ns;
+    let pid_dead = !pg_pid_alive(cur_pid);
+    // M5a.1 policy: dead PID is sufficient; lease state is informational.
+    // M5b.2 (sibling) will tighten this to require lease_expired AND
+    // pid_dead, gated on a slow-committer mitigation path.
+    if !pid_dead {
+        return TakeoverOutcome::Held;
+    }
+    let _ = lease_expired;
+    match shard.committer_pid.compare_exchange(
+        cur_pid,
+        my_pid,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            shard
+                .committer_acquired_at_ns
+                .store(now_ns, Ordering::Release);
+            TakeoverOutcome::TookOver { stale_pid: cur_pid }
+        }
+        Err(_) => TakeoverOutcome::Lost,
+    }
+}
+
+/// Test-only: inject a stale committer PID + acquired_at_ns so a
+/// concurrent backend's takeover path is exercised without needing an
+/// actual proc_exit. Sets `committer_pid` and `committer_acquired_at_ns`
+/// unconditionally — caller is responsible for picking a fake_pid that
+/// is genuinely not a live PG backend (spawn a `true` subprocess, wait
+/// for it to exit, then poke its now-dead PID).
+pub fn inject_dead_committer(shard_idx: usize, fake_pid: i32, fake_acquired_at_ns: u64) {
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx];
+    shard.committer_pid.store(fake_pid, Ordering::Release);
+    shard
+        .committer_acquired_at_ns
+        .store(fake_acquired_at_ns, Ordering::Release);
+}
+
+// ── Slot iteration for orphan recovery (M5a.1) ────────────────────────
+//
+// A snapshot of all SLOT_ALLOCATED slots on a shard that carry a
+// non-zero issue_id — i.e. slots with a live request that was already
+// pushed (`current_request_seq > 0`) but not yet filled by a
+// committer. The orphan-recovery path looks these up in the cost
+// tables to decide backfill vs abandoned.
+
+#[derive(Debug, Clone)]
+pub struct OrphanSlot {
+    pub slot_idx: u32,
+    pub issue_id: i64,
+    pub current_request_seq: u64,
+    pub waiter_pid: i32,
+}
+
+/// Walk `slots[shard_idx]` and collect every slot whose
+/// `state == SLOT_ALLOCATED` AND `issue_id != 0`. The caller (typically
+/// the orphan-recovery path inside the new committer) is responsible
+/// for deciding which of these are genuinely orphaned vs concurrently
+/// in-flight; M5a.1's policy is "all of them, since takeover only
+/// happens when the old committer is dead".
+pub fn collect_orphan_slots(shard_idx: usize) -> Vec<OrphanSlot> {
+    let arena = POC_SHARD_ARENA.share();
+    let mut out: Vec<OrphanSlot> = Vec::new();
+    for (idx, slot) in arena.slots[shard_idx].iter().enumerate() {
+        let state = slot.state.load(Ordering::Acquire);
+        if state != SLOT_ALLOCATED {
+            continue;
+        }
+        let issue_id = slot.issue_id.load(Ordering::Acquire);
+        if issue_id == 0 {
+            continue;
+        }
+        out.push(OrphanSlot {
+            slot_idx: idx as u32,
+            issue_id,
+            current_request_seq: slot.current_request_seq.load(Ordering::Acquire),
+            waiter_pid: slot.waiter_pid.load(Ordering::Acquire),
+        });
+    }
+    out
+}
+
 /// Test-only: reset a shard's state. Real workloads never call this.
 pub fn shard_reset(shard_idx: usize) {
     let arena = POC_SHARD_ARENA.exclusive();
@@ -767,6 +972,8 @@ pub fn shard_reset(shard_idx: usize) {
         slot.depletion_count.store(0, Ordering::Release);
         slot.spillover_offset.store(0, Ordering::Release);
         slot.waiter_pid.store(0, Ordering::Release);
+        slot.issue_id.store(0, Ordering::Release);
+        slot.current_request_seq.store(0, Ordering::Release);
     }
 }
 
