@@ -697,6 +697,43 @@ pub fn shard_head_tail(shard_idx: usize) -> (u32, u32) {
     )
 }
 
+/// Read-only accessor for the per-shard committer-PID slot. Returns 0
+/// when no committer is currently elected. Used by M4.1's stats
+/// surface to observe cross-shard parallelism — a snapshot taken
+/// mid-load with multiple non-zero values indicates committers running
+/// independently on multiple shards.
+pub fn read_committer_pid(shard_idx: usize) -> i32 {
+    let arena = POC_SHARD_ARENA.share();
+    arena.shards[shard_idx]
+        .committer_pid
+        .load(Ordering::Acquire)
+}
+
+/// Read-only accessor for the current per-shard `committer_tx_seq`.
+/// Distinct from `next_committer_tx_id` which fetch_adds.
+pub fn read_committer_tx_seq(shard_idx: usize) -> u64 {
+    let arena = POC_SHARD_ARENA.share();
+    arena.shards[shard_idx]
+        .committer_tx_seq
+        .load(Ordering::Acquire)
+}
+
+/// Read-only accessor for `next_request_seq`.
+pub fn read_next_request_seq(shard_idx: usize) -> u64 {
+    let arena = POC_SHARD_ARENA.share();
+    arena.shards[shard_idx]
+        .next_request_seq
+        .load(Ordering::Acquire)
+}
+
+/// Read-only accessor for `next_slot_seq`.
+pub fn read_next_slot_seq(shard_idx: usize) -> u64 {
+    let arena = POC_SHARD_ARENA.share();
+    arena.shards[shard_idx]
+        .next_slot_seq
+        .load(Ordering::Acquire)
+}
+
 /// Test-only: reset a shard's state. Real workloads never call this.
 pub fn shard_reset(shard_idx: usize) {
     let arena = POC_SHARD_ARENA.exclusive();

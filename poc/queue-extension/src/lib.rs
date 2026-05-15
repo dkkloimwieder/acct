@@ -191,5 +191,5 @@ pub extern "C-unwind" fn _PG_init() {
 /// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M3.2 Q-A resolved: pool_lock_mode default 'none' (acct-4d4n.8)"
+    "poc_ledger v0.0.1 — M4.1 multi-shard hash routing + shard_stats_all (acct-4d4n.9)"
 }

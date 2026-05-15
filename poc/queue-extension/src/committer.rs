@@ -1318,3 +1318,41 @@ fn poc_ledger_set_standard_cost(sku_id: i64, unit_cost: i64) -> i32 {
 fn poc_ledger_shard_for(sku_id: i64, location_id: i64) -> i32 {
     shard_for(pool_hash(sku_id, location_id)) as i32
 }
+
+/// M4.1 (acct-4d4n.9): per-shard stats view aggregating head/tail/depth,
+/// the elected committer PID, the per-shard committer_tx_seq, and the
+/// sequence counters into one TableIterator. Used by the multi-shard
+/// bench harness to observe cross-shard parallelism (multiple
+/// `committer_pid != 0` simultaneously) and per-shard fairness
+/// (per-shard `committer_tx_seq` deltas).
+#[pg_extern]
+fn poc_ledger_shard_stats_all() -> TableIterator<
+    'static,
+    (
+        name!(shard_idx, i32),
+        name!(head, i64),
+        name!(tail, i64),
+        name!(depth, i64),
+        name!(committer_pid, i32),
+        name!(committer_tx_seq, i64),
+        name!(next_request_seq, i64),
+        name!(next_slot_seq, i64),
+    ),
+> {
+    // Materialize all rows up front under repeated short critical
+    // sections rather than streaming. POC_SHARD_COUNT is 16, so the
+    // snapshot is cheap and avoids any chance of `share()` interleaving
+    // with concurrent committer activity through TableIterator yields.
+    let mut rows: Vec<(i32, i64, i64, i64, i32, i64, i64, i64)> =
+        Vec::with_capacity(POC_SHARD_COUNT);
+    for shard_idx in 0..POC_SHARD_COUNT {
+        let (h, t) = queue::shard_head_tail(shard_idx);
+        let depth = t.wrapping_sub(h) as i64;
+        let cp = queue::read_committer_pid(shard_idx);
+        let cs = queue::read_committer_tx_seq(shard_idx) as i64;
+        let nrs = queue::read_next_request_seq(shard_idx) as i64;
+        let nss = queue::read_next_slot_seq(shard_idx) as i64;
+        rows.push((shard_idx as i32, h as i64, t as i64, depth, cp, cs, nrs, nss));
+    }
+    TableIterator::new(rows.into_iter())
+}
