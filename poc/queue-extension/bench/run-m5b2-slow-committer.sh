@@ -73,9 +73,12 @@ reset_state
 read sku_a sku_b <<< "$(pick_skus_for_shard "$SHARD")"
 echo "    sku_a=$sku_a sku_b=$sku_b (both hash to shard $SHARD)"
 
-# No log-cursor needed — the entire test runs in well under 1s, so
-# `docker logs --tail 200` after the test is guaranteed to include the
-# full test window. (`--since <ts>` hangs on this host's docker version.)
+# Emit a unique marker into the postmaster log so we can grep
+# strictly within this test's window. `docker logs --since <ts>` and
+# `--since <Ns>` both hang on this host's docker version; `--tail N`
+# works but blends in lines from prior tests run before this script.
+log_marker="M5B2_TEST_START_$(date +%s%N)"
+$PSQL -c "DO \$\$ BEGIN RAISE LOG '$log_marker'; END \$\$;" > /dev/null
 
 # Backend A: SET LOCAL drain_sleep_us inside an explicit txn so the
 # GUC scopes to A's apply call. Backend B's session inherits the
@@ -164,7 +167,7 @@ fi
 # happen.
 # `|| true` keeps grep's no-match (expected outcome) from aborting
 # under pipefail.
-abandoned_lines=$(docker logs --tail 200 acct-postgres 2>&1 | grep -F "drain_and_commit: slot" | grep -F "was abandoned" || true)
+abandoned_lines=$(docker logs --tail 500 acct-postgres 2>&1 | awk -v m="$log_marker" '$0 ~ m {found=1; next} found' | grep -F "drain_and_commit: slot" | grep -F "was abandoned" || true)
 if [[ -z "$abandoned_lines" ]]; then
   echo "  PASS no slot-abandoned log lines in test window (no contender raced A's drain)"
 else

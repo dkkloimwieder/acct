@@ -831,6 +831,26 @@ fn signal_waiter(shard_idx: usize, slot_idx: u32) {
     }
 }
 
+/// M5c.1 (acct-4d4n.14): wake the backend waiting on the ring for a
+/// free slot. Called by `drain_and_commit` after head has been
+/// advanced (i.e. ring capacity has opened up). Single-waiter at MVP:
+/// the wake targets the one PID registered via
+/// `queue::set_ring_full_waiter`; a second waiter that lost the CAS
+/// rides the WaitLatch 100ms timeout and retries the push itself —
+/// correct because the timeout is far below `queue_full_timeout_ms`.
+fn signal_ring_full_waiter(shard_idx: usize) {
+    let pid = queue::read_ring_full_waiter(shard_idx);
+    if pid == 0 {
+        return;
+    }
+    unsafe {
+        let proc_ = pgrx::pg_sys::BackendPidGetProc(pid);
+        if !proc_.is_null() {
+            pgrx::pg_sys::SetLatch(&mut (*proc_).procLatch);
+        }
+    }
+}
+
 fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
     let drained: Vec<DrainedApply> =
         queue::drain_apply_batch(shard_idx, batch_size_max);
@@ -939,6 +959,12 @@ fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
         signal_waiter(shard_idx, slot_idx);
     }
 
+    // M5c.1 (acct-4d4n.14): drain advanced head inside `drain_apply_batch`
+    // (line `shard.head.store(head + n)`), so ring capacity opened up.
+    // Wake the per-shard backpressure waiter (if any) so they can
+    // retry their `ring_push_apply`.
+    signal_ring_full_waiter(shard_idx);
+
     drained.len()
 }
 
@@ -996,26 +1022,98 @@ fn poc_ledger_apply(
     // us via `signal_waiter`.
     queue::set_slot_waiter_pid(shard_idx, slot_idx, my_pid);
 
-    let request_seq = queue::ring_push_apply(
-        shard_idx,
-        slot_idx,
-        ph,
-        my_pid,
-        method_tag,
-        qty,
-        0,
-        issue_id,
-        sku_id,
-        location_id,
-        user_tx_xid,
-    )
-    .unwrap_or_else(|_| {
-        pgrx::error!(
-            "poc_ledger_apply: shard {} ring full (M5c.1 backpressure \
-             not yet implemented)",
-            shard_idx
-        )
-    });
+    // M5c.1 (acct-4d4n.14): backpressure wait around ring_push_apply.
+    // First attempt is non-blocking; on RingFull the wait loop sleeps
+    // on MyLatch up to `queue_full_timeout_ms`, retrying the push on
+    // each wake. A peer committer's `drain_and_commit` wakes us via
+    // `signal_ring_full_waiter` once it advances head (slot freed).
+    //
+    // Slot order rationale (Q3 from the M5c.1 plan): the result-slot
+    // was already acquired above; we hold it through the backpressure
+    // wait. Cancel mid-wait releases the slot best-effort
+    // (mark_slot_abandoned) and a future M5c.2 audit will reap any
+    // slots left ALLOCATED past their backend's death. The alternative
+    // — acquire-slot AFTER backpressure — would require restructuring
+    // the apply path to thread slot_idx deeper into push, and adds
+    // complexity disproportionate to the resource leak window.
+    let timeout_ms = crate::queue_full_timeout_ms_now() as i64;
+    let bp_start_ns = clock_ns();
+    let request_seq: u64;
+    'backpressure: loop {
+        match queue::ring_push_apply(
+            shard_idx,
+            slot_idx,
+            ph,
+            my_pid,
+            method_tag,
+            qty,
+            0,
+            issue_id,
+            sku_id,
+            location_id,
+            user_tx_xid,
+        ) {
+            Ok(seq) => {
+                request_seq = seq;
+                break 'backpressure;
+            }
+            Err(_) => {
+                // Check the budget BEFORE sleeping so a fast caller
+                // with timeout_ms=0 returns immediately rather than
+                // sleeping 100ms.
+                let elapsed_ms =
+                    ((clock_ns() - bp_start_ns) / 1_000_000) as i64;
+                if elapsed_ms >= timeout_ms {
+                    // Best-effort slot cleanup before raising. The
+                    // slot is still SLOT_ALLOCATED — release it so a
+                    // future apply can reuse it. M5c.2's slot-leak
+                    // audit covers stragglers from any path that
+                    // misses this.
+                    let _ = queue::mark_slot_abandoned(shard_idx, slot_idx);
+                    queue::clear_ring_full_waiter_if_self(shard_idx, my_pid);
+                    pgrx::ereport!(
+                        pgrx::PgLogLevel::ERROR,
+                        pgrx::PgSqlErrorCode::ERRCODE_CONFIGURATION_LIMIT_EXCEEDED,
+                        format!(
+                            "poc_ledger_apply: shard {} ring full; \
+                             queue_full_timeout_ms={} exhausted",
+                            shard_idx, timeout_ms
+                        ),
+                    );
+                }
+                // Claim the per-shard waiter slot. CAS-from-0
+                // succeeds for the first contender; subsequent
+                // contenders ride the 100ms WaitLatch timeout and
+                // re-attempt push without claiming.
+                let _ = queue::set_ring_full_waiter(shard_idx, my_pid);
+                unsafe {
+                    pgrx::pg_sys::ResetLatch(pgrx::pg_sys::MyLatch);
+                }
+                // Re-check before sleeping (in case a peer advanced
+                // head between our failed push and the ResetLatch).
+                let remaining_ms = (timeout_ms - elapsed_ms).max(1);
+                let wait_ms = remaining_ms.min(WAIT_TIMEOUT_MS);
+                unsafe {
+                    let _ = pgrx::pg_sys::WaitLatch(
+                        pgrx::pg_sys::MyLatch,
+                        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+                        wait_ms,
+                        pgrx::pg_sys::PG_WAIT_EXTENSION,
+                    );
+                    if pgrx::pg_sys::InterruptPending != 0 {
+                        if pgrx::pg_sys::QueryCancelPending != 0
+                            || pgrx::pg_sys::ProcDiePending != 0
+                        {
+                            let _ = queue::mark_slot_abandoned(shard_idx, slot_idx);
+                            queue::clear_ring_full_waiter_if_self(shard_idx, my_pid);
+                        }
+                        pgrx::pg_sys::ProcessInterrupts();
+                    }
+                }
+            }
+        }
+    }
+    queue::clear_ring_full_waiter_if_self(shard_idx, my_pid);
 
     // M3.1 (acct-4d4n.7) wait/wake loop. Spec §1.6 steps 6-14:
     //

@@ -109,7 +109,13 @@ pub struct PocQueueShard {
     pub committer_tx_seq: AtomicU64,
     pub next_request_seq: AtomicU64,
     pub next_slot_seq: AtomicU64,
-    pub _pad3: [u8; 8],
+    /// M5c.1 (acct-4d4n.14): PID of the backend waiting on the ring
+    /// for a slot to free up (backpressure). Single-slot for MVP; a
+    /// drain that advances head signals this PID via SetLatch on its
+    /// `PGPROC.procLatch`. Multi-waiter coalescing is acct-4d4n.14
+    /// follow-up territory if M9 benches surface contention.
+    pub ring_full_waiter_pid: AtomicI32,
+    pub _pad3: [u8; 4],
 }
 
 // ── PocPendingRequest ─────────────────────────────────────────────────
@@ -311,6 +317,44 @@ pub fn read_slot_waiter_pid(shard_idx: usize, slot_idx: u32) -> i32 {
     let arena = POC_SHARD_ARENA.share();
     arena.slots[shard_idx][slot_idx as usize]
         .waiter_pid
+        .load(Ordering::Acquire)
+}
+
+/// M5c.1 (acct-4d4n.14): claim the per-shard ring-full waiter slot via
+/// CAS-from-0. Returns Ok(()) on claim; Err(prior_pid) if another
+/// backend already occupies the slot. Single-waiter-per-shard at MVP;
+/// a contender that loses the CAS falls back to the WaitLatch timeout
+/// loop and retries the push, which is correct if eventually-slow.
+pub fn set_ring_full_waiter(shard_idx: usize, pid: i32) -> Result<(), i32> {
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx];
+    shard
+        .ring_full_waiter_pid
+        .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|actual| actual)
+}
+
+/// Clear the per-shard ring-full waiter slot IFF this backend owns it.
+/// Safe to call even if another backend has it (CAS-from-`my_pid`
+/// silently fails). Idempotent: clearing an already-zero slot returns
+/// Err but is harmless.
+pub fn clear_ring_full_waiter_if_self(shard_idx: usize, my_pid: i32) {
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx];
+    let _ = shard.ring_full_waiter_pid.compare_exchange(
+        my_pid,
+        0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// Read the per-shard ring-full waiter PID. Returns 0 if no waiter.
+pub fn read_ring_full_waiter(shard_idx: usize) -> i32 {
+    let arena = POC_SHARD_ARENA.share();
+    arena.shards[shard_idx]
+        .ring_full_waiter_pid
         .load(Ordering::Acquire)
 }
 
@@ -537,6 +581,15 @@ pub fn drain_apply_batch(shard_idx: usize, max_batch: usize) -> Vec<DrainedApply
         let pos = head_start.wrapping_add(i as u32);
         let idx = (pos as usize) % POC_REQUESTS_PER_SHARD;
         let req = &arena.requests[shard_idx][idx];
+        // Skip entries whose `valid` is still REQ_EMPTY — covers the
+        // M5c.1 synthetic ring-full test surface (which advances tail
+        // without writing) and any future tail-stamp race between
+        // `ring_push_apply` and a competing drain. Real producers
+        // stamp `valid = REQ_FILLED` BEFORE advancing tail.
+        let v = req.valid.load(Ordering::Acquire);
+        if v == REQ_EMPTY {
+            continue;
+        }
         // M1.2 only emits Apply-kind requests. Compensate is M6.1.
         let kind = req.kind_tag.load(Ordering::Acquire);
         if kind != REQ_KIND_APPLY {
@@ -978,6 +1031,7 @@ pub fn shard_reset(shard_idx: usize) {
     shard
         .capacity
         .store(POC_REQUESTS_PER_SHARD as u32, Ordering::Release);
+    shard.ring_full_waiter_pid.store(0, Ordering::Release);
     for req in &arena.requests[shard_idx] {
         req.valid.store(REQ_EMPTY, Ordering::Release);
         req.request_seq.store(0, Ordering::Release);
@@ -1023,6 +1077,55 @@ fn poc_ledger_slots_per_shard() -> i32 {
 #[pg_extern]
 fn poc_ledger_max_slot_probe() -> i32 {
     POC_MAX_SLOT_PROBE as i32
+}
+
+/// M5c.1 (acct-4d4n.14) test-only: synthesize a ring-full state on
+/// `shard_idx` by advancing `tail` past `head + capacity`. The slot
+/// pool stays at its current occupancy — this is the only way to
+/// exercise the ring-full backpressure path in isolation, since
+/// `push_only` saturates both ring and slot pool in lockstep. Returns
+/// the new `tail` value, or -1 if `shard_idx` is out of range.
+#[pg_extern]
+fn poc_ledger_test_force_ring_full(shard_idx: i32) -> i32 {
+    if shard_idx < 0 || (shard_idx as usize) >= POC_SHARD_COUNT {
+        return -1;
+    }
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx as usize];
+    let head = shard.head.load(Ordering::Acquire);
+    let new_tail = head.wrapping_add(POC_REQUESTS_PER_SHARD as u32);
+    shard.tail.store(new_tail, Ordering::Release);
+    new_tail as i32
+}
+
+/// M5c.1 (acct-4d4n.14) test-only: simulate a committer drain that
+/// advanced `head` by `n` (freeing `n` ring slots). Calls
+/// `set_ring_full_waiter`'s wake (via `SetLatch` on the registered
+/// waiter PID) so a backend currently blocked in
+/// `poc_ledger_apply`'s backpressure loop is woken to retry the push.
+/// Returns the new `head` value.
+#[pg_extern]
+fn poc_ledger_test_advance_head_and_signal(shard_idx: i32, n: i32) -> i32 {
+    if shard_idx < 0 || (shard_idx as usize) >= POC_SHARD_COUNT || n < 0 {
+        return -1;
+    }
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx as usize];
+    let head = shard.head.load(Ordering::Acquire);
+    let new_head = head.wrapping_add(n as u32);
+    shard.head.store(new_head, Ordering::Release);
+    // Wake the per-shard backpressure waiter, if any. Inline because
+    // committer.rs's `signal_ring_full_waiter` isn't visible here.
+    let pid = shard.ring_full_waiter_pid.load(Ordering::Acquire);
+    if pid != 0 {
+        unsafe {
+            let proc_ = pgrx::pg_sys::BackendPidGetProc(pid);
+            if !proc_.is_null() {
+                pgrx::pg_sys::SetLatch(&mut (*proc_).procLatch);
+            }
+        }
+    }
+    new_head as i32
 }
 
 #[pg_extern]

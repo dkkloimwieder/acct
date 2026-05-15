@@ -160,6 +160,13 @@ pub(crate) fn drain_sleep_us_now() -> i32 {
     DRAIN_SLEEP_US.get()
 }
 
+/// Read the M5c.1 (acct-4d4n.14) `queue_full_timeout_ms` GUC. Returns
+/// the default (5000ms) if unset. Used by `poc_ledger_apply` to bound
+/// the backpressure wait when the ring is at capacity.
+pub(crate) fn queue_full_timeout_ms_now() -> i32 {
+    QUEUE_FULL_TIMEOUT_MS.get()
+}
+
 // ── _PG_init ────────────────────────────────────────────────────────
 
 #[pg_guard]
@@ -300,5 +307,5 @@ pub extern "C-unwind" fn _PG_init() {
 /// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M5b.2 lease false-positive protection + slow-committer mitigation (acct-4d4n.13)"
+    "poc_ledger v0.0.1 — M5c.1 backpressure (push blocks on cv with queue_full_timeout_ms) (acct-4d4n.14)"
 }
