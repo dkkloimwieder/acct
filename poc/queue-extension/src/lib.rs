@@ -27,6 +27,9 @@ pgrx::pg_module_magic!();
 // M1.1 — single-shard queue primitive (PocQueueShard, ring, slot pool).
 mod queue;
 
+// M1.2 — committer election, batch drain, poc_ledger_apply SQL entry.
+mod committer;
+
 // ── GUCs (spec §1.5) ────────────────────────────────────────────────
 //
 // Mapping from the spec's table to GucSetting + GucRegistry calls below.
@@ -148,10 +151,9 @@ pub extern "C-unwind" fn _PG_init() {
 
 // ── SQL surface ─────────────────────────────────────────────────────
 
-/// Build identifier for the scaffolding milestone. Lets the acceptance
-/// gate confirm the extension is actually loaded vs the SQL coming back
-/// from some other source.
+/// Build identifier — updated as milestones land so the acceptance gate
+/// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M0.1 scaffolding (acct-4d4n.1)"
+    "poc_ledger v0.0.1 — M1.2 committer drain (acct-4d4n.3)"
 }

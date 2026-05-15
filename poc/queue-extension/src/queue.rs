@@ -1,4 +1,4 @@
-//! acct-4d4n.2 (M1.1): single-shard queue primitive.
+//! acct-4d4n.2 (M1.1) + acct-4d4n.3 (M1.2): shmem primitives + committer.
 //!
 //! Implements the shmem data structures from spec §1.4 — PocQueueShard
 //! header, PocPendingRequest ring, PocResultSlot pool — plus slot
@@ -6,34 +6,37 @@
 //! CAS state transition free→allocated, linear probe ≤16) and ring
 //! buffer push/drain discipline under a PgLwLock.
 //!
-//! ## What M1.1 covers
+//! ## What M1.1 + M1.2 covers
 //!
-//! - `PocQueueShard` header (head, tail, capacity, committer-state
-//!   placeholders, slot/request sequence counters).
+//! - `PocQueueShard` header (head, tail, capacity, committer state,
+//!   per-shard `committer_tx_seq`, slot/request sequence counters).
 //! - `PocPendingRequest` ring buffer with `valid` state machine
-//!   (empty/filled/in-flight/abandoned).
+//!   (empty/filled/in-flight/abandoned) and Apply-variant body layout.
 //! - `PocResultSlot` pool with state machine (free/allocated/filled/
-//!   abandoned).
+//!   abandoned) plus `committer_tx_id` audit field (added by M1.2 so
+//!   callers can read the stamping committer_tx without a secondary
+//!   SPI query into `poc_test_rows`).
 //! - Slot allocation OUTSIDE the LWLock per spec §1.6 step 5; linear
 //!   probe bounded by `POC_MAX_SLOT_PROBE = 16`.
 //! - Ring push/drain under a single global `PgLwLock` (M3.1 swaps to
 //!   per-shard tranches).
 //! - SQL surface for driving the M1.1 acceptance tests from psql.
 //!
-//! ## What M1.1 deliberately defers
+//! ## What M1.2 deliberately defers
 //!
-//! - Committer election (M1.2, acct-4d4n.3).
-//! - Real INSERT into cost tables (M1.2).
 //! - GUC-driven runtime sizing. M1.1 uses compile-time const values;
 //!   spec §1.4 defaults (256×4096×4096) would require a
-//!   shmem_request_hook FFI dance that's out of M1.1 scope. The
-//!   `poc_ledger.*` GUCs registered by M0.1 are advisory at this point.
-//!   Re-baseline if M9 demands spec defaults (file as
-//!   acct-4d4n-followup if so).
-//! - Per-shard LWLock tranches. M1.1 has ONE global lock; M3.1 splits.
-//! - PocApplyPayload / PocCompensatePayload field semantics. M1.1
-//!   stores the body as opaque AtomicI64 slots; M2.x defines the
-//!   variant-specific layout.
+//!   shmem_request_hook FFI dance that's out of M1.x scope. The
+//!   `poc_ledger.*` GUCs registered by M0.1 remain advisory.
+//! - Per-shard LWLock tranches. M1.x has ONE global lock; M3.1 splits.
+//! - `WaitLatch`-based batching (spec §1.6 step 11). M1.2 is
+//!   single-backend so there's no peer push to wait for; the drain
+//!   immediately processes whatever is in the ring. M3.1 introduces
+//!   real batching when multi-backend pushes coexist.
+//! - PocCompensatePayload field semantics (M6.1).
+//! - Real cost-method dispatch + dedup-lookup (M2.x). M1.2 stamps a
+//!   fixed `applied_unit_cost = 100` and writes one row per request
+//!   into `poc_test_rows` to demonstrate the committer round-trip.
 
 // M1.1 reserves several spec-defined constants (REQ_ABANDONED,
 // REQ_KIND_APPLY, REQ_KIND_COMPENSATE) for M2.x / M5+ consumers. The
@@ -141,6 +144,13 @@ pub struct PocPendingRequest {
 //
 // Per spec §1.4 lines 342-354. `depletion_ids_inline` is fixed at 32
 // entries (spec); overflow goes to spillover arena (M5c.2).
+//
+// `committer_tx_id` is an M1.2 audit-field addition (not in the spec's
+// PocResultSlot table). It mirrors the value stamped onto each row in
+// `poc_test_rows` / future `poc_cost_*` tables so callers can read it
+// from the slot without a secondary SPI query. M5b recovery (which scans
+// cost tables by `(user_tx_xid, committer_tx_id)` pairs) needs the same
+// value reachable via the slot for the abandoned-but-committed case.
 
 #[repr(C, align(64))]
 pub struct PocResultSlot {
@@ -148,6 +158,7 @@ pub struct PocResultSlot {
     pub _pad0: [u8; 7],
     pub applied_unit_cost: AtomicI64,
     pub applied_total_cost: AtomicI64,
+    pub committer_tx_id: AtomicI64,
     pub error_code: AtomicU16,
     pub _pad1: [u8; 6],
     pub depletion_count: AtomicU16,
@@ -249,6 +260,7 @@ pub fn recycle_slot(shard_idx: usize, slot_idx: u32) -> Result<u8, u8> {
     // acquirer reads a clean slate.
     slot.applied_unit_cost.store(0, Ordering::Release);
     slot.applied_total_cost.store(0, Ordering::Release);
+    slot.committer_tx_id.store(0, Ordering::Release);
     slot.error_code.store(0, Ordering::Release);
     slot.depletion_count.store(0, Ordering::Release);
     slot.spillover_offset.store(0, Ordering::Release);
@@ -359,6 +371,253 @@ pub fn ring_drain_one(shard_idx: usize) -> Option<u32> {
     Some(slot_idx)
 }
 
+// ── Apply-variant body layout ─────────────────────────────────────────
+//
+// Per spec §1.4 lines 316-329. M1.2 introduces the first concrete body
+// layout. M2.x will likely refine field meanings (e.g., add issue_id
+// generation) but the slot offsets stay stable.
+//
+//   body0 → method_tag (0 = FIFO; spec §1.4 line 305 enumerates kinds)
+//   body1 → event_qty (signed; positive = receipt, negative = issue)
+//   body2 → event_at_micros (caller-supplied timestamp; M1.2 = 0)
+//   body3 → event_issue_id (M1.2 = 0; M2.x: caller-allocated)
+//   body4 → event_sku_id
+//   body5 → event_location_id
+//   body6 → user_tx_xid (TransactionId as i64; M5b needs this)
+//   body7, body8 → reserved for M2.x
+
+/// Spec §1.4 line 305 — `PocRequestKind` discriminator for cost methods.
+/// M1.2 only emits `FIFO` (0). M2.2/M2.3 add AVG/STD.
+pub const METHOD_FIFO: u8 = 0;
+pub const METHOD_AVG: u8 = 1;
+pub const METHOD_STD: u8 = 2;
+
+/// Snapshot of an Apply-variant request copied out of the ring under
+/// LWLock. The committer iterates these without re-touching shmem.
+#[derive(Debug, Clone)]
+pub struct DrainedApply {
+    pub slot_idx: u32,
+    pub request_seq: u64,
+    pub pool_hash: u64,
+    pub backend_pid: i32,
+    pub method_tag: u8,
+    pub event_qty: i64,
+    pub event_at_micros: i64,
+    pub event_issue_id: i64,
+    pub event_sku_id: i64,
+    pub event_location_id: i64,
+    pub user_tx_xid: i64,
+}
+
+/// Push an Apply request onto the ring with the M1.2 body layout. Same
+/// fundamental shape as `ring_push` (LWLock, head/tail check, valid
+/// stamped LAST) but writes the Apply payload into body0..body6.
+#[allow(clippy::too_many_arguments)]
+pub fn ring_push_apply(
+    shard_idx: usize,
+    slot_idx: u32,
+    pool_hash: u64,
+    backend_pid: i32,
+    method_tag: u8,
+    event_qty: i64,
+    event_at_micros: i64,
+    event_issue_id: i64,
+    event_sku_id: i64,
+    event_location_id: i64,
+    user_tx_xid: i64,
+) -> Result<u64, ()> {
+    let arena = POC_SHARD_ARENA.exclusive();
+    let shard = &arena.shards[shard_idx];
+    let head = shard.head.load(Ordering::Acquire);
+    let tail = shard.tail.load(Ordering::Acquire);
+    if tail.wrapping_sub(head) >= POC_REQUESTS_PER_SHARD as u32 {
+        return Err(());
+    }
+    let idx = (tail as usize) % POC_REQUESTS_PER_SHARD;
+    let req = &arena.requests[shard_idx][idx];
+    let req_seq = shard.next_request_seq.fetch_add(1, Ordering::AcqRel);
+    req.request_seq.store(req_seq, Ordering::Release);
+    req.pool_hash.store(pool_hash, Ordering::Release);
+    req.backend_pid.store(backend_pid, Ordering::Release);
+    req.slot_idx.store(slot_idx, Ordering::Release);
+    req.kind_tag.store(REQ_KIND_APPLY, Ordering::Release);
+    // Apply payload — see body layout note above.
+    req.body0.store(method_tag as i64, Ordering::Release);
+    req.body1.store(event_qty, Ordering::Release);
+    req.body2.store(event_at_micros, Ordering::Release);
+    req.body3.store(event_issue_id, Ordering::Release);
+    req.body4.store(event_sku_id, Ordering::Release);
+    req.body5.store(event_location_id, Ordering::Release);
+    req.body6.store(user_tx_xid, Ordering::Release);
+    req.body7.store(0, Ordering::Release);
+    req.body8.store(0, Ordering::Release);
+    // valid stamped LAST — establishes happens-before for the committer
+    // reader observing REQ_FILLED, matching ring_push's discipline.
+    req.valid.store(REQ_FILLED, Ordering::Release);
+    shard.tail.store(tail.wrapping_add(1), Ordering::Release);
+    Ok(req_seq)
+}
+
+/// Drain up to `max_batch` Apply requests from the ring under one
+/// LWLock-EXCLUSIVE critical section. Spec §1.6 steps 12-15: walk
+/// [head, tail), copy out, mark each `REQ_IN_FLIGHT`, advance head.
+///
+/// Returns the drained requests in arrival order. Caller is responsible
+/// for releasing the LWLock implicitly via the function return (the
+/// `exclusive()` guard is scoped to the inner block); subsequent SPI
+/// work runs OUTSIDE the LWLock per spec discipline (LWLocks must not
+/// be held across SPI calls — see PG src/backend/storage/lmgr/lwlock.c
+/// notes on subsystem reentrancy).
+pub fn drain_apply_batch(shard_idx: usize, max_batch: usize) -> Vec<DrainedApply> {
+    let mut out: Vec<DrainedApply> = Vec::new();
+    let arena = POC_SHARD_ARENA.exclusive();
+    let shard = &arena.shards[shard_idx];
+    let head_start = shard.head.load(Ordering::Acquire);
+    let tail = shard.tail.load(Ordering::Acquire);
+    let available = tail.wrapping_sub(head_start) as usize;
+    let n = available.min(max_batch);
+    if n == 0 {
+        return out;
+    }
+    for i in 0..n {
+        let pos = head_start.wrapping_add(i as u32);
+        let idx = (pos as usize) % POC_REQUESTS_PER_SHARD;
+        let req = &arena.requests[shard_idx][idx];
+        // M1.2 only emits Apply-kind requests. Compensate is M6.1.
+        let kind = req.kind_tag.load(Ordering::Acquire);
+        if kind != REQ_KIND_APPLY {
+            // Defensive: skip but still mark in_flight + advance head
+            // so the unknown variant doesn't wedge the ring. M6.1 will
+            // dispatch by kind here.
+            req.valid.store(REQ_IN_FLIGHT, Ordering::Release);
+            continue;
+        }
+        out.push(DrainedApply {
+            slot_idx: req.slot_idx.load(Ordering::Acquire),
+            request_seq: req.request_seq.load(Ordering::Acquire),
+            pool_hash: req.pool_hash.load(Ordering::Acquire),
+            backend_pid: req.backend_pid.load(Ordering::Acquire),
+            method_tag: req.body0.load(Ordering::Acquire) as u8,
+            event_qty: req.body1.load(Ordering::Acquire),
+            event_at_micros: req.body2.load(Ordering::Acquire),
+            event_issue_id: req.body3.load(Ordering::Acquire),
+            event_sku_id: req.body4.load(Ordering::Acquire),
+            event_location_id: req.body5.load(Ordering::Acquire),
+            user_tx_xid: req.body6.load(Ordering::Acquire),
+        });
+        req.valid.store(REQ_IN_FLIGHT, Ordering::Release);
+    }
+    shard
+        .head
+        .store(head_start.wrapping_add(n as u32), Ordering::Release);
+    out
+}
+
+// ── Result-slot writeback (committer-side) ────────────────────────────
+//
+// After the committer commits its sub-tx, it writes the per-request
+// result into each slot and CAS-flips state SLOT_ALLOCATED → SLOT_FILLED
+// (spec §1.6 step 18). M1.2's result is the trio
+// (applied_unit_cost, applied_total_cost, committer_tx_id); M2.x adds
+// depletion_ids_inline / depletion_count populated from FIFO output.
+
+pub fn fill_slot_result(
+    shard_idx: usize,
+    slot_idx: u32,
+    applied_unit_cost: i64,
+    applied_total_cost: i64,
+    committer_tx_id: i64,
+) -> Result<(), u8> {
+    let arena = POC_SHARD_ARENA.share();
+    let slot = &arena.slots[shard_idx][slot_idx as usize];
+    // Write result fields BEFORE flipping state — caller observing
+    // SLOT_FILLED needs to see the values atomically. The CAS is the
+    // happens-before barrier.
+    slot.applied_unit_cost
+        .store(applied_unit_cost, Ordering::Release);
+    slot.applied_total_cost
+        .store(applied_total_cost, Ordering::Release);
+    slot.committer_tx_id
+        .store(committer_tx_id, Ordering::Release);
+    slot.state
+        .compare_exchange(
+            SLOT_ALLOCATED,
+            SLOT_FILLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|actual| actual)
+}
+
+/// Read a slot's result tuple. Returns
+/// `(state, applied_unit_cost, applied_total_cost, committer_tx_id)`.
+pub fn read_slot_result(shard_idx: usize, slot_idx: u32) -> (u8, i64, i64, i64) {
+    let arena = POC_SHARD_ARENA.share();
+    let slot = &arena.slots[shard_idx][slot_idx as usize];
+    // state loaded LAST under Acquire so the matching Release in
+    // fill_slot_result establishes happens-before on the data fields.
+    let unit = slot.applied_unit_cost.load(Ordering::Acquire);
+    let total = slot.applied_total_cost.load(Ordering::Acquire);
+    let ctx = slot.committer_tx_id.load(Ordering::Acquire);
+    let state = slot.state.load(Ordering::Acquire);
+    (state, unit, total, ctx)
+}
+
+// ── Committer election ────────────────────────────────────────────────
+//
+// Spec §1.6 step 10: single-word CAS on `committer_pid` from 0 to
+// `MyProcPid`. On success the winner publishes
+// `committer_acquired_at_ns` via a separate Release store. Readers that
+// observe pid != 0 but timestamp == 0 are inside the "just-acquired"
+// window and must treat the lease as fresh (spec §1.6 step 10 note).
+
+pub fn try_acquire_committer(shard_idx: usize, my_pid: i32, now_ns: u64) -> bool {
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx];
+    match shard.committer_pid.compare_exchange(
+        0,
+        my_pid,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            // Release stamp AFTER CAS win; the "fresh" window is the
+            // gap between the CAS and this store.
+            shard
+                .committer_acquired_at_ns
+                .store(now_ns, Ordering::Release);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+pub fn release_committer(shard_idx: usize) {
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx];
+    // Clear timestamp first, then pid. A subsequent winner overwriting
+    // pid → MyProcPid races their own timestamp-store; either way the
+    // "pid != 0, timestamp == 0" window is benign per spec.
+    shard
+        .committer_acquired_at_ns
+        .store(0, Ordering::Release);
+    shard.committer_pid.store(0, Ordering::Release);
+}
+
+/// Stamp the next committer_tx_id for this shard. Per-shard counter
+/// (spec Q-E resolved 2026-05-11 — see saved memory). Monotonic; never
+/// decreases; reset only by `shard_reset` for tests.
+pub fn next_committer_tx_id(shard_idx: usize) -> i64 {
+    let arena = POC_SHARD_ARENA.share();
+    let shard = &arena.shards[shard_idx];
+    // fetch_add returns the pre-add value; first call returns 0 → +1 → 1.
+    (shard
+        .committer_tx_seq
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)) as i64
+}
+
 pub fn shard_head_tail(shard_idx: usize) -> (u32, u32) {
     let arena = POC_SHARD_ARENA.share();
     let shard = &arena.shards[shard_idx];
@@ -396,6 +655,7 @@ pub fn shard_reset(shard_idx: usize) {
         slot.state.store(SLOT_FREE, Ordering::Release);
         slot.applied_unit_cost.store(0, Ordering::Release);
         slot.applied_total_cost.store(0, Ordering::Release);
+        slot.committer_tx_id.store(0, Ordering::Release);
         slot.error_code.store(0, Ordering::Release);
         slot.depletion_count.store(0, Ordering::Release);
         slot.spillover_offset.store(0, Ordering::Release);
