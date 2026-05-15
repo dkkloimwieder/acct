@@ -391,6 +391,10 @@ pub fn ring_drain_one(shard_idx: usize) -> Option<u32> {
 pub const METHOD_FIFO: u8 = 0;
 pub const METHOD_AVG: u8 = 1;
 pub const METHOD_STD: u8 = 2;
+// M2.1 test-fixture tag. Routed only via the "mock" caller-supplied
+// name. Kept distinct from FIFO so M2.2's FifoMethod swap doesn't
+// capture mock callers.
+pub const METHOD_MOCK: u8 = 3;
 
 /// Snapshot of an Apply-variant request copied out of the ring under
 /// LWLock. The committer iterates these without re-touching shmem.

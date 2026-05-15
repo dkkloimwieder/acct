@@ -44,11 +44,11 @@
 
 use crate::cost_method::{
     self, PocApplyBatch, PocApplyEvent, PocApplyResult, PocConsumptionRow,
-    PocDepletionRow, PocError, PocPoolKey, PocSnapshot,
+    PocDepletionRow, PocError, PocLayerView, PocPoolKey, PocSnapshot,
 };
 use crate::queue::{
-    self, DrainedApply, METHOD_AVG, METHOD_FIFO, METHOD_STD, POC_SHARD_COUNT,
-    SLOT_FILLED,
+    self, DrainedApply, METHOD_AVG, METHOD_FIFO, METHOD_MOCK, METHOD_STD,
+    POC_SHARD_COUNT, SLOT_FILLED,
 };
 use pgrx::prelude::*;
 use std::collections::HashMap;
@@ -111,10 +111,7 @@ fn method_tag_for(method_name: &str) -> Option<u8> {
         "fifo" | "FIFO" => Some(METHOD_FIFO),
         "avg" | "AVG" => Some(METHOD_AVG),
         "std" | "STD" => Some(METHOD_STD),
-        // M2.1 only — "mock" routes to METHOD_FIFO tag for storage
-        // purposes (the method_tag is just a discriminator; resolve_method
-        // dispatches all four to MockMethod for now).
-        "mock" | "MOCK" => Some(METHOD_FIFO),
+        "mock" | "MOCK" => Some(METHOD_MOCK),
         _ => None,
     }
 }
@@ -142,9 +139,11 @@ struct DedupRow {
 /// method)); for depletions there can be N rows (one per layer).
 struct ReplaySummary {
     qty: i64,
-    /// Weighted-average unit cost across all matching rows.
-    /// For consumptions this is the single row's applied_unit_cost.
-    /// For FIFO depletions this is (sum cost_amount) / (sum qty).
+    /// Exact sum-of-products: Σ(layer.qty × layer.unit_cost). Matches
+    /// the fresh `plan_apply` path's `applied_total_cost`.
+    total_cost: i64,
+    /// Truncating integer division of total_cost / qty. Matches the
+    /// fresh path's `applied_unit_cost`.
     weighted_unit_cost: i64,
 }
 
@@ -155,13 +154,15 @@ fn aggregate_replay(rows: &[DedupRow]) -> ReplaySummary {
         sum_qty = sum_qty.saturating_add(r.qty);
         sum_cost = sum_cost.saturating_add((r.qty as i128) * (r.unit_cost as i128));
     }
+    let total_cost = sum_cost.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     let weighted = if sum_qty != 0 {
-        (sum_cost / (sum_qty as i128)) as i64
+        total_cost / sum_qty
     } else {
         0
     };
     ReplaySummary {
         qty: sum_qty,
+        total_cost,
         weighted_unit_cost: weighted,
     }
 }
@@ -371,6 +372,74 @@ fn insert_test_rows(
     });
 }
 
+// ── Snapshot construction (per spec §1.6 R4) ──────────────────────────
+//
+// Reads `poc_cost_layers` for a `(sku_id, location_id)` pool with
+// `effective_qty = layer.qty - SUM(depletion.qty)` per layer. The query
+// holds `FOR UPDATE OF l` so concurrent committers serialize at the
+// layer-row grain — M2.2 single-backend doesn't exercise contention,
+// but the lock acquisition is the structural prep for M3.x.
+//
+// M2.2 only needs the FIFO layer view; AVG/STD/Mock skip the SPI and
+// return an empty snapshot. M2.3 extends with avg_unit_cost +
+// standard_cost lookups.
+
+fn build_snapshot_fifo(pool: PocPoolKey) -> PocSnapshot {
+    let mut layers: Vec<PocLayerView> = Vec::new();
+    let mut total_qty: i64 = 0;
+
+    Spi::connect(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![
+            pool.sku_id.into(),
+            pool.location_id.into(),
+        ];
+        let tup = client
+            .select(
+                "SELECT l.layer_id, l.unit_cost, l.born_seq, \
+                        (l.qty - COALESCE(d.consumed, 0))::BIGINT AS effective_qty, \
+                        (EXTRACT(EPOCH FROM l.born_at) * 1000000)::BIGINT AS born_at_micros \
+                   FROM poc_cost_layers l \
+                   LEFT JOIN LATERAL ( \
+                        SELECT SUM(qty) AS consumed \
+                          FROM poc_cost_depletions \
+                         WHERE layer_id = l.layer_id \
+                   ) d ON true \
+                  WHERE l.sku_id = $1 AND l.location_id = $2 \
+                    AND (l.qty - COALESCE(d.consumed, 0)) > 0 \
+                  ORDER BY l.born_at, l.born_seq \
+                  FOR UPDATE OF l",
+                None,
+                &args,
+            )
+            .expect("build_snapshot_fifo SPI");
+        for row in tup {
+            let layer_id: i64 = row["layer_id"].value().unwrap().unwrap();
+            let unit_cost: i64 = row["unit_cost"].value().unwrap().unwrap();
+            let born_seq: i64 = row["born_seq"].value().unwrap().unwrap();
+            let effective_qty: i64 =
+                row["effective_qty"].value().unwrap().unwrap();
+            let born_at_micros: i64 =
+                row["born_at_micros"].value().unwrap().unwrap_or(0);
+            total_qty = total_qty.saturating_add(effective_qty);
+            layers.push(PocLayerView {
+                layer_id,
+                unit_cost,
+                effective_qty,
+                born_at_micros,
+                born_seq,
+            });
+        }
+    });
+
+    PocSnapshot {
+        pool,
+        layers,
+        avg_unit_cost: None,
+        standard_cost: None,
+        total_available_qty: total_qty,
+    }
+}
+
 // ── Group-level processing ────────────────────────────────────────────
 //
 // One pool × one method = one group. Implements §1.6 step 17 + §3.10
@@ -425,14 +494,16 @@ fn process_group(
     for (idx, d) in drained.iter().enumerate() {
         if let Some(rows) = dedup_rows.get(&d.event_issue_id) {
             // Replayed: aggregate the cached rows and surface result.
+            // Uses exact total_cost (not unit×qty) so replay equals
+            // fresh-path return values byte-for-byte. `_qty` is
+            // unused; ReplaySummary keeps it for diagnostics.
             let agg = aggregate_replay(rows);
+            let _qty = agg.qty;
             replayed.insert(
                 d.slot_idx,
                 SlotResolution::Filled {
                     applied_unit_cost: agg.weighted_unit_cost,
-                    applied_total_cost: agg
-                        .weighted_unit_cost
-                        .saturating_mul(agg.qty),
+                    applied_total_cost: agg.total_cost,
                 },
             );
         } else {
@@ -448,11 +519,16 @@ fn process_group(
         }
     }
 
-    // (3) Build snapshot. M2.1 MockMethod ignores snapshot; M2.3's
-    // AVG / STD will populate it via SPI here, and M2.2 reads layers.
-    let snapshot = PocSnapshot {
-        pool,
-        ..Default::default()
+    // (3) Build snapshot. Only the FIFO branch needs layer data; MOCK
+    // and (until M2.3 lands) AVG / STD ignore the snapshot. Skipping
+    // the SPI keeps the MOCK-only acceptance path SPI-free.
+    let snapshot = if method_name == "fifo" && !to_plan_events.is_empty() {
+        build_snapshot_fifo(pool)
+    } else {
+        PocSnapshot {
+            pool,
+            ..Default::default()
+        }
     };
 
     // (4) Plan. plan_apply is pure; safe to call without sub-tx.
@@ -862,6 +938,53 @@ fn poc_ledger_shard_committer_tx_seq(shard_idx: i32) -> i64 {
     arena.shards[shard_idx as usize]
         .committer_tx_seq
         .load(std::sync::atomic::Ordering::Acquire) as i64
+}
+
+/// Receipt-side entry point: creates a `poc_cost_layers` row directly.
+/// Receipts bypass the queue because there's no contention math —
+/// inserting a layer is a single SQL INSERT, no committer pricing
+/// involved. Returns the new layer_id.
+///
+/// `committer_tx_id` defaults to 0 / `user_tx_xid` defaults to '0'::xid8
+/// via the table defaults; the receipt-time bookkeeping isn't exercised
+/// until M5b recovery (a receipt-layer row without a committer is fine
+/// — only depletions need to round-trip through the committer for the
+/// per-event audit chain).
+#[pg_extern]
+fn poc_ledger_receive(
+    sku_id: i64,
+    location_id: i64,
+    qty: i64,
+    unit_cost: i64,
+    source_kind: default!(String, "'receipt'"),
+) -> i64 {
+    if qty <= 0 {
+        pgrx::error!("poc_ledger_receive: qty must be > 0 (got {})", qty);
+    }
+    let mut layer_id: i64 = 0;
+    Spi::connect_mut(|client| {
+        let args: Vec<pgrx::datum::DatumWithOid> = vec![
+            sku_id.into(),
+            location_id.into(),
+            qty.into(),
+            unit_cost.into(),
+            source_kind.into(),
+        ];
+        let tup = client
+            .update(
+                "INSERT INTO poc_cost_layers \
+                   (sku_id, location_id, qty, unit_cost, source_kind) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 RETURNING layer_id",
+                None,
+                &args,
+            )
+            .expect("poc_ledger_receive: INSERT poc_cost_layers");
+        for row in tup {
+            layer_id = row["layer_id"].value().unwrap().unwrap();
+        }
+    });
+    layer_id
 }
 
 /// Tests routing a `(sku, location)` pair to its destination shard.

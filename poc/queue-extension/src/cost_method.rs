@@ -268,7 +268,8 @@ impl PocCostMethod for MockMethod {
 pub fn resolve_method(method: &str) -> Option<&'static dyn PocCostMethod> {
     static MOCK: MockMethod = MockMethod;
     match method {
-        "mock" | "fifo" | "avg" | "std" => Some(&MOCK),
+        "fifo" => Some(&crate::fifo::FIFO),
+        "mock" | "avg" | "std" => Some(&MOCK),
         _ => None,
     }
 }
@@ -278,11 +279,12 @@ pub fn resolve_method(method: &str) -> Option<&'static dyn PocCostMethod> {
 /// `resolve_method`; the tag → name mapping stays stable so future
 /// methods can register their tag here.
 pub fn method_name_for_tag(method_tag: u8) -> &'static str {
-    use crate::queue::{METHOD_AVG, METHOD_FIFO, METHOD_STD};
+    use crate::queue::{METHOD_AVG, METHOD_FIFO, METHOD_MOCK, METHOD_STD};
     match method_tag {
         METHOD_FIFO => "fifo",
         METHOD_AVG => "avg",
         METHOD_STD => "std",
+        METHOD_MOCK => "mock",
         _ => "mock",
     }
 }
@@ -304,18 +306,20 @@ pub fn method_name_for_tag(method_tag: u8) -> &'static str {
 
 pgrx::extension_sql!(
     r#"
+    CREATE SEQUENCE poc_cost_layers_born_seq;
+
     CREATE TABLE poc_cost_layers (
         layer_id        BIGSERIAL PRIMARY KEY,
         sku_id          BIGINT NOT NULL,
         location_id     BIGINT NOT NULL,
-        qty             BIGINT NOT NULL,
+        qty             BIGINT NOT NULL CHECK (qty > 0),
         unit_cost       BIGINT NOT NULL,
-        born_at         TIMESTAMPTZ NOT NULL,
-        born_seq        BIGINT NOT NULL,
+        born_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        born_seq        BIGINT NOT NULL DEFAULT nextval('poc_cost_layers_born_seq'),
         source_kind     TEXT NOT NULL,
         source_ref      BIGINT,
-        committer_tx_id BIGINT NOT NULL,
-        user_tx_xid     xid8 NOT NULL
+        committer_tx_id BIGINT NOT NULL DEFAULT 0,
+        user_tx_xid     xid8 NOT NULL DEFAULT '0'::xid8
     );
     CREATE INDEX poc_cost_layers_pool
         ON poc_cost_layers (sku_id, location_id, born_at, born_seq);
