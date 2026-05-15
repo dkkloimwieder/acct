@@ -875,9 +875,14 @@ pub fn try_acquire_or_takeover(
     let lease_expired = acquired_at == 0
         || now_ns.saturating_sub(acquired_at) > lease_ns;
     let pid_dead = !pg_pid_alive(cur_pid);
-    // M5a.1 policy: dead PID is sufficient; lease state is informational.
-    // M5b.2 (sibling) will tighten this to require lease_expired AND
-    // pid_dead, gated on a slow-committer mitigation path.
+    // M5a.1 + M5b.2 (acct-4d4n.13) policy: dead PID is sufficient AND
+    // necessary; lease state is informational only. A slow but alive
+    // committer (per-batch wall time > committer_lease_ms) returns
+    // Held → contender backs off via outer wait loop → no takeover.
+    // The lease_ms guidance lives at lib.rs DRAIN_SLEEP_US doc block:
+    // size batch_size_max so worst-case drain stays inside lease_ms;
+    // the pg_pid_alive gate keeps misconfiguration harmless (wasted
+    // CPU on contender, no correctness violation).
     if !pid_dead {
         return TakeoverOutcome::Held;
     }

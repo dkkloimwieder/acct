@@ -838,6 +838,19 @@ fn drain_and_commit(shard_idx: usize, batch_size_max: usize) -> usize {
         return 0;
     }
 
+    // M5b.2 (acct-4d4n.13): test-only slow-committer simulation. When
+    // `poc_ledger.drain_sleep_us` > 0, sleep here AFTER work has been
+    // drained off the ring but BEFORE the per-event SPI INSERTs. The
+    // committer_pid is still set on this shard, so a contender that
+    // probes try_acquire_or_takeover during the sleep sees the lease
+    // (possibly expired) AND pg_pid_alive=true → returns Held → backs
+    // off. No takeover. Production callers leave the GUC at 0; this
+    // branch is a single load + compare → free in the hot path.
+    let sleep_us = crate::drain_sleep_us_now();
+    if sleep_us > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(sleep_us as u64));
+    }
+
     let committer_tx_id = queue::next_committer_tx_id(shard_idx);
     let consumed_at_micros = (clock_ns() / 1_000) as i64;
 

@@ -99,6 +99,67 @@ pub(crate) fn recovery_database_str() -> String {
         .unwrap_or_else(|| "acct_poc_queue".to_string())
 }
 
+// ── M5b.2 (acct-4d4n.13) lease false-positive protection ────────────
+//
+// Failure mode (spec §3.6): a legitimately slow committer whose per-
+// batch wall time exceeds `committer_lease_ms` gets its lease stolen
+// by a contender that observed lease expiry. Result: two committers
+// race on the same shard, one drains a partial batch, the slot-fill
+// CAS path produces log floods, and the stale committer's INSERTs
+// either collide on dedup or are silently overwritten by the
+// takeover's snapshot read.
+//
+// Protection in place (M5a.1):
+//
+//   try_acquire_or_takeover ALWAYS calls pg_pid_alive(committer_pid)
+//   before the takeover CAS. Alive committer → returns Held; takeover
+//   does NOT happen. This is the load-bearing guard.
+//
+// Operator guidance — `committer_lease_ms` ↔ `batch_size_max`:
+//
+//   The two GUCs must be sized together. Pick `batch_size_max` so
+//   that a single drain's worst-case wall time stays well inside
+//   `committer_lease_ms`. Rough budget:
+//
+//     per_batch_wall_time ≈ batch_size_max × per_event_SPI_us
+//
+//   With the M2 SPI shape (~15-25 µs per consumption/depletion row at
+//   the default isolation), the default `batch_size_max=1024` and
+//   `committer_lease_ms=100` give:
+//
+//     1024 × 20 µs = 20.5 ms per batch
+//     20.5 ms ≪ 100 ms lease     → ~5× safety margin
+//
+//   If you raise `batch_size_max` you should raise `committer_lease_ms`
+//   proportionally. The pg_pid_alive guard makes lease expiry
+//   harmless on a healthy cluster (alive committer = no takeover), but
+//   the contender's WaitLatch wake/back-off loop still spins every
+//   ~100 ms during a long drain; tuning the lease keeps that loop
+//   from flapping.
+//
+//   Failure surface if you misconfigure: lease_ms ≪ per-batch
+//   wall time → contender wakes, observes lease expired, pg_pid_alive
+//   reports alive, returns Held, sleeps 100 ms, repeats. No
+//   correctness violation, only wasted CPU on the contender. The
+//   committer completes its batch and signals the contender's slot
+//   normally.
+//
+// `drain_sleep_us` is a TEST-ONLY switch that deterministically
+// extends a single drain's wall time past `committer_lease_ms` so the
+// slow-committer scenario can be reproduced in a bench/test harness.
+// Production deployments leave it at 0. Userset-scope (PGC_USERSET)
+// so bench scripts can SET it per-session, matching how
+// `pool_lock_mode` works for the M3.2 fan-in bench; Sighup would
+// require an ALTER SYSTEM + pg_reload_conf round-trip and apply
+// cluster-wide, which is the wrong shape for a test helper.
+static DRAIN_SLEEP_US: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+/// Read the test-only drain-sleep GUC (microseconds). Returns 0 (the
+/// default — no sleep) on parse failure or unset.
+pub(crate) fn drain_sleep_us_now() -> i32 {
+    DRAIN_SLEEP_US.get()
+}
+
 // ── _PG_init ────────────────────────────────────────────────────────
 
 #[pg_guard]
@@ -209,6 +270,16 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Postmaster,
         GucFlags::empty(),
     );
+    GucRegistry::define_int_guc(
+        c"poc_ledger.drain_sleep_us",
+        c"TEST-ONLY: extend committer drain wall time by this many microseconds (M5b.2)",
+        c"Test-only switch for reproducing the spec §3.6 slow-committer scenario. When > 0, the committer's drain_and_commit path sleeps this many microseconds after draining the ring but before per-event INSERTs. Combined with a small committer_lease_ms it lets a bench harness verify that a live-but-slow committer is NOT preempted by a contender (the pg_pid_alive guard in try_acquire_or_takeover returns Held). Production deployments leave at 0.",
+        &DRAIN_SLEEP_US,
+        0,
+        10_000_000,
+        GucContext::Userset,
+        GucFlags::empty(),
+    );
 
     // M5b.1 (acct-4d4n.12): one-shot startup recovery worker.
     // `restart_time = None` means PG does NOT relaunch after the worker
@@ -229,5 +300,5 @@ pub extern "C-unwind" fn _PG_init() {
 /// can confirm the .so the cluster loaded is the one this code shipped.
 #[pg_extern]
 fn poc_ledger_hello() -> &'static str {
-    "poc_ledger v0.0.1 — M5b.1 startup recovery worker (counter seed + xid scan stub) (acct-4d4n.12)"
+    "poc_ledger v0.0.1 — M5b.2 lease false-positive protection + slow-committer mitigation (acct-4d4n.13)"
 }
