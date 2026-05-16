@@ -213,7 +213,7 @@ pub fn build_zipf_cdf(g: usize, alpha: f64) -> Vec<f64> {
     cdf
 }
 
-fn pick_sku(
+pub fn pick_sku(
     shape: Shape,
     backend_idx: usize,
     n_backends: usize,
@@ -243,14 +243,14 @@ fn pick_sku(
     }
 }
 
-fn pick_method(shape: Shape, iter: usize) -> &'static str {
+pub fn pick_method(shape: Shape, iter: usize) -> &'static str {
     match shape {
         Shape::MixedMethod => ["fifo", "avg", "std"][iter % 3],
         _ => "mock",
     }
 }
 
-async fn fetch_snapshot(pool: &PgPool) -> sqlx::types::Json<serde_json::Value> {
+pub async fn fetch_snapshot(pool: &PgPool) -> sqlx::types::Json<serde_json::Value> {
     let row: (sqlx::types::Json<serde_json::Value>,) =
         sqlx::query_as("SELECT poc_ledger_bottleneck_snapshot()")
             .fetch_one(pool)
@@ -259,7 +259,7 @@ async fn fetch_snapshot(pool: &PgPool) -> sqlx::types::Json<serde_json::Value> {
     row.0
 }
 
-async fn fetch_classifier_label(
+pub async fn fetch_classifier_label(
     pool: &PgPool,
     snap_start: &serde_json::Value,
     snap_end: &serde_json::Value,
@@ -596,7 +596,7 @@ async fn run_shape_h(
     (merged, total_applies, total_errors, label, total_methods)
 }
 
-async fn fetch_deadlocks(pool: &PgPool) -> i64 {
+pub async fn fetch_deadlocks(pool: &PgPool) -> i64 {
     let row: (i64,) = sqlx::query_as(
         "SELECT COALESCE(deadlocks, 0)::BIGINT FROM pg_stat_database WHERE datname = 'acct_poc_queue'"
     )

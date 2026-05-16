@@ -199,3 +199,15 @@ The P1 miss is admissible as a CONDITIONAL PASS per spec §5.8 — root cause id
 - `acct-hjoq` — shard_count GUC sweep to find ≥24× scaling configuration
 
 Generated: 2026-05-16T15:46:21Z
+
+## Caller-side batching follow-up (acct-22xt)
+
+The verdict above stands at b=1 per spec §5.2 ("b=1 for the PoC; multi-item batches deferred"). Scope-narrow follow-up `acct-22xt` characterized the gap to the shmem-rollup PoC at b=1000 — see `bench/results-m10-batch-rpc.md` for the full per-cell numbers. Headline (median of 5×60s @ b=1000, default GUCs, 30 runs / zero deadlocks):
+
+| shape | N | b=1 baseline (M9.2/M9.3) | b=1000 (acct-22xt) | lift | shmem rollup ref | % ceiling |
+|---|---|---|---|---|---|---|
+| fan_in | 128 | 11878 evps (N=256) | 49050 evps | 4.1× | 67000 | 73% |
+| fan_out | 128 | 6379 evps | 17050 evps | 2.7× | 43500 | 39% |
+| small_batch | 128 | 8017 evps | 50000 evps | 6.2× | — | — |
+
+Caller-side batching at b=1000 closes 4–6× of the throughput gap purely from RPC amortization. The remaining gap to the shmem rollup PoC is committer + SPI write overhead, not RPC. New `poc_ledger_apply_batch(events JSONB)` entrypoint uses a streamed push-with-harvest pattern (no all-at-once slot acquisition) to stay correctness-safe under POC_SLOTS_PER_SHARD=512 with N≥32 fan_in. Design-v2 implication: caller-side batch RPC is a load-bearing surface for bulk workloads; single-event b=1 leaves 4–6× throughput on the table.

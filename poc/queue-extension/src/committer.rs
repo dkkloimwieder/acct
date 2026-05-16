@@ -1562,6 +1562,414 @@ fn poc_ledger_apply(
     ))
 }
 
+/// acct-22xt (caller-side batch RPC, b=N): take a JSON array of
+/// `{sku_id, location_id, qty, issue_id, method}` envelopes, push all N
+/// into their natural shards, then drive committer election and gather
+/// results in one PG round-trip. Spec §5.2 deferred caller-side batching
+/// for the validation PoC ("b=1 for the PoC; multi-item batches
+/// deferred"); this entrypoint characterizes the RPC-amortization gap
+/// against the shmem-rollup PoC at b=1000.
+///
+/// Design calls (per the acct-22xt plan leans):
+/// - Q1 multi-shard: events hash to their natural shard (no forced
+///   single-shard routing). A b=1000 fan_in still all routes to one
+///   shard naturally; a b=1000 fan_out spreads across shards and lets
+///   per-shard committers parallelize.
+/// - Q2 wait pattern: per-call slot collector. Push all N first, then
+///   loop (a) scan pending slots for SLOT_FILLED + recycle, (b) drive
+///   committer election for shards with pending work, (c) WaitLatch.
+/// - Q3 return shape: SETOF, one row per event in input order.
+/// - Q4 error semantics: same as single-event variant. Per-event errors
+///   surface in `error_code`; per-batch failures (slot exhaustion,
+///   backpressure timeout, etc.) raise.
+#[pg_extern]
+fn poc_ledger_apply_batch(
+    events: pgrx::JsonB,
+) -> TableIterator<
+    'static,
+    (
+        name!(shard_idx, i32),
+        name!(slot_idx, i32),
+        name!(request_seq, i64),
+        name!(committer_tx_id, i64),
+        name!(applied_unit_cost, i64),
+        name!(applied_total_cost, i64),
+        name!(error_code, i32),
+    ),
+> {
+    // Parse + validate the envelope array up front so a bad arg aborts
+    // before any slot is acquired.
+    let arr = match events.0.as_array() {
+        Some(a) => a,
+        None => pgrx::error!(
+            "poc_ledger_apply_batch: expected JSON array, got {}",
+            events.0
+        ),
+    };
+    if arr.is_empty() {
+        return TableIterator::new(Vec::new().into_iter());
+    }
+
+    struct Evt {
+        sku: i64,
+        loc: i64,
+        qty: i64,
+        issue: i64,
+        method_tag: u8,
+    }
+    let mut evts: Vec<Evt> = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let obj = match v.as_object() {
+            Some(o) => o,
+            None => pgrx::error!(
+                "poc_ledger_apply_batch: event[{}] not an object",
+                i
+            ),
+        };
+        let sku = obj
+            .get("sku_id")
+            .and_then(|x| x.as_i64())
+            .unwrap_or_else(|| {
+                pgrx::error!("poc_ledger_apply_batch: event[{}] missing sku_id", i)
+            });
+        let loc = obj
+            .get("location_id")
+            .and_then(|x| x.as_i64())
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "poc_ledger_apply_batch: event[{}] missing location_id",
+                    i
+                )
+            });
+        let qty = obj
+            .get("qty")
+            .and_then(|x| x.as_i64())
+            .unwrap_or_else(|| {
+                pgrx::error!("poc_ledger_apply_batch: event[{}] missing qty", i)
+            });
+        let issue = obj.get("issue_id").and_then(|x| x.as_i64()).unwrap_or(0);
+        let method_str = obj
+            .get("method")
+            .and_then(|x| x.as_str())
+            .unwrap_or("fifo");
+        let method_tag = match method_tag_for(method_str) {
+            Some(t) => t,
+            None => pgrx::error!(
+                "poc_ledger_apply_batch: event[{}] unknown method '{}' \
+                 (expected fifo/avg/std/mock)",
+                i,
+                method_str
+            ),
+        };
+        evts.push(Evt {
+            sku,
+            loc,
+            qty,
+            issue,
+            method_tag,
+        });
+    }
+
+    let user_tx_xid: i64 = unsafe {
+        let full = pgrx::pg_sys::GetCurrentFullTransactionId();
+        full.value as i64
+    };
+    ensure_xact_cb_registered();
+    mark_dirty_xid(user_tx_xid);
+
+    let my_pid: i32 = unsafe { pgrx::pg_sys::MyProcPid };
+    let timeout_ms = crate::queue_full_timeout_ms_now() as i64;
+
+    // Streamed push-with-harvest. Slot pool sizing (POC_SLOTS_PER_SHARD
+    // = 512) limits how many slots a backend can hold simultaneously.
+    // At b >> slot_pool / live_backends, all-at-once push exhausts the
+    // pool. Solution: as we push, drain any slots that flipped to
+    // SLOT_FILLED — recycling them frees pool space for subsequent
+    // pushes. results[i] preserves input order via Pending.input_idx.
+    struct Pending {
+        shard: usize,
+        slot: u32,
+        request_seq: u64,
+        input_idx: usize,
+    }
+    let mut pending: Vec<Pending> = Vec::with_capacity(evts.len().min(2048));
+    let mut results: Vec<Option<(i32, i32, i64, i64, i64, i64, i32)>> =
+        (0..evts.len()).map(|_| None).collect();
+    let mut filled_count: usize = 0;
+
+    // Inline "harvest" macro: walk pending, recycle any SLOT_FILLED,
+    // populate results[input_idx]. Returns number harvested. Removes
+    // harvested entries from pending in-place (swap_remove preserves
+    // correctness because input_idx is carried on Pending).
+    macro_rules! harvest {
+        () => {{
+            let mut harvested: usize = 0;
+            let mut i: usize = 0;
+            while i < pending.len() {
+                let p = &pending[i];
+                let state = queue::slot_state(p.shard, p.slot);
+                if state == SLOT_FILLED {
+                    let stamped =
+                        queue::read_set_latched_at_ns(p.shard, p.slot);
+                    if stamped > 0 {
+                        let now = clock_ns();
+                        if now > stamped {
+                            queue::record_b5_wake_sample(now - stamped);
+                        }
+                    }
+                    let (_st, au, at, ctx, ec) = queue::read_slot_result_with_error(p.shard, p.slot);
+                    let _ = queue::recycle_slot(p.shard, p.slot);
+                    results[p.input_idx] = Some((
+                        p.shard as i32,
+                        p.slot as i32,
+                        p.request_seq as i64,
+                        ctx,
+                        au,
+                        at,
+                        ec as i32,
+                    ));
+                    harvested += 1;
+                    pending.swap_remove(i);
+                } else if state == SLOT_ABANDONED {
+                    pgrx::error!(
+                        "poc_ledger_apply_batch: slot {} on shard {} \
+                         unexpectedly ABANDONED",
+                        p.slot,
+                        p.shard
+                    );
+                } else {
+                    i += 1;
+                }
+            }
+            filled_count += harvested;
+            harvested
+        }};
+    }
+
+    macro_rules! drive_committers_for_pending {
+        () => {{
+            let mut shards: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for p in &pending {
+                shards.insert(p.shard);
+            }
+            let lease_ms = committer_lease_ms_now();
+            let lease_ns: u64 =
+                (lease_ms.max(1) as u64).saturating_mul(1_000_000);
+            let mut any = false;
+            for &shard_idx in &shards {
+                match queue::try_acquire_or_takeover(
+                    shard_idx,
+                    my_pid,
+                    clock_ns(),
+                    lease_ns,
+                ) {
+                    TakeoverOutcome::Acquired => {
+                        let _ = drain_and_commit(shard_idx, 1024);
+                        queue::release_committer(shard_idx);
+                        any = true;
+                    }
+                    TakeoverOutcome::TookOver { stale_pid: _ } => {
+                        let _ = orphan_recovery(shard_idx);
+                        let _ = drain_and_commit(shard_idx, 1024);
+                        queue::release_committer(shard_idx);
+                        any = true;
+                    }
+                    TakeoverOutcome::Held | TakeoverOutcome::Lost => {}
+                }
+            }
+            any
+        }};
+    }
+
+    macro_rules! abandon_pending_and_raise {
+        ($msg:expr) => {{
+            for p in &pending {
+                let _ = queue::mark_slot_abandoned(p.shard, p.slot);
+            }
+            pgrx::error!("{}", $msg);
+        }};
+    }
+
+    // ── Streamed push phase ────────────────────────────────────────
+    for (ei, e) in evts.iter().enumerate() {
+        let ph = pool_hash(e.sku, e.loc);
+        let shard_idx = shard_for(ph);
+
+        // Acquire a slot, harvesting filled slots + driving committers
+        // when pool is saturated. Bounded by `timeout_ms`.
+        let acquire_start_ns = clock_ns();
+        let slot_idx: u32 = loop {
+            if let Some(s) = queue::acquire_slot(shard_idx) {
+                break s;
+            }
+            // Pool saturated on this shard. Harvest any FILLED slots
+            // we own (frees pool); on no progress, drive committer;
+            // last resort wait. Cancel-safe via CHECK_FOR_INTERRUPTS.
+            if harvest!() > 0 {
+                continue;
+            }
+            if drive_committers_for_pending!() {
+                continue;
+            }
+            let elapsed_ms =
+                ((clock_ns() - acquire_start_ns) / 1_000_000) as i64;
+            if elapsed_ms >= timeout_ms {
+                abandon_pending_and_raise!(format!(
+                    "poc_ledger_apply_batch: slot pool exhausted on shard {} \
+                     at event[{}]; queue_full_timeout_ms={} exhausted",
+                    shard_idx, ei, timeout_ms
+                ));
+            }
+            unsafe {
+                pgrx::pg_sys::ResetLatch(pgrx::pg_sys::MyLatch);
+                let remaining_ms = (timeout_ms - elapsed_ms).max(1);
+                let wait_ms = remaining_ms.min(WAIT_TIMEOUT_MS);
+                let _ = pgrx::pg_sys::WaitLatch(
+                    pgrx::pg_sys::MyLatch,
+                    WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+                    wait_ms,
+                    pgrx::pg_sys::PG_WAIT_EXTENSION,
+                );
+                if pgrx::pg_sys::InterruptPending != 0 {
+                    if pgrx::pg_sys::QueryCancelPending != 0
+                        || pgrx::pg_sys::ProcDiePending != 0
+                    {
+                        for p in &pending {
+                            let _ = queue::mark_slot_abandoned(p.shard, p.slot);
+                        }
+                    }
+                    pgrx::pg_sys::ProcessInterrupts();
+                }
+            }
+        };
+        queue::set_slot_waiter_pid(shard_idx, slot_idx, my_pid);
+
+        // ring_push_apply with backpressure (same shape as single-event).
+        let bp_start_ns = clock_ns();
+        let mut bp_bumped: bool = false;
+        let request_seq: u64;
+        'backpressure: loop {
+            match queue::ring_push_apply(
+                shard_idx,
+                slot_idx,
+                ph,
+                my_pid,
+                e.method_tag,
+                e.qty,
+                0,
+                e.issue,
+                e.sku,
+                e.loc,
+                user_tx_xid,
+            ) {
+                Ok(seq) => {
+                    request_seq = seq;
+                    break 'backpressure;
+                }
+                Err(_) => {
+                    let elapsed_ms =
+                        ((clock_ns() - bp_start_ns) / 1_000_000) as i64;
+                    if elapsed_ms >= timeout_ms {
+                        let _ = queue::mark_slot_abandoned(shard_idx, slot_idx);
+                        queue::clear_ring_full_waiter_if_self(shard_idx, my_pid);
+                        abandon_pending_and_raise!(format!(
+                            "poc_ledger_apply_batch: shard {} ring full at \
+                             event[{}]; queue_full_timeout_ms={} exhausted",
+                            shard_idx, ei, timeout_ms
+                        ));
+                    }
+                    if !bp_bumped {
+                        queue::bump_backpressure();
+                        bp_bumped = true;
+                    }
+                    let _ = queue::set_ring_full_waiter(shard_idx, my_pid);
+                    unsafe {
+                        pgrx::pg_sys::ResetLatch(pgrx::pg_sys::MyLatch);
+                    }
+                    let remaining_ms = (timeout_ms - elapsed_ms).max(1);
+                    let wait_ms = remaining_ms.min(WAIT_TIMEOUT_MS);
+                    unsafe {
+                        let _ = pgrx::pg_sys::WaitLatch(
+                            pgrx::pg_sys::MyLatch,
+                            WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+                            wait_ms,
+                            pgrx::pg_sys::PG_WAIT_EXTENSION,
+                        );
+                        if pgrx::pg_sys::InterruptPending != 0 {
+                            if pgrx::pg_sys::QueryCancelPending != 0
+                                || pgrx::pg_sys::ProcDiePending != 0
+                            {
+                                let _ = queue::mark_slot_abandoned(
+                                    shard_idx, slot_idx,
+                                );
+                                queue::clear_ring_full_waiter_if_self(
+                                    shard_idx, my_pid,
+                                );
+                                for p in &pending {
+                                    let _ = queue::mark_slot_abandoned(
+                                        p.shard, p.slot,
+                                    );
+                                }
+                            }
+                            pgrx::pg_sys::ProcessInterrupts();
+                        }
+                    }
+                }
+            }
+        }
+        queue::clear_ring_full_waiter_if_self(shard_idx, my_pid);
+        pending.push(Pending {
+            shard: shard_idx,
+            slot: slot_idx,
+            request_seq,
+            input_idx: ei,
+        });
+
+        // Opportunistically harvest if pending has grown large. This
+        // bounds peak slot occupancy and keeps the committer pipeline
+        // flowing while we push the rest of the batch.
+        if pending.len() >= 64 {
+            let _ = harvest!();
+        }
+    }
+
+    // ── Final wait-and-collect ────────────────────────────────────
+    while !pending.is_empty() {
+        unsafe {
+            pgrx::pg_sys::ResetLatch(pgrx::pg_sys::MyLatch);
+        }
+        if harvest!() > 0 {
+            continue;
+        }
+        if drive_committers_for_pending!() {
+            continue;
+        }
+        unsafe {
+            let _ = pgrx::pg_sys::WaitLatch(
+                pgrx::pg_sys::MyLatch,
+                WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+                WAIT_TIMEOUT_MS,
+                pgrx::pg_sys::PG_WAIT_EXTENSION,
+            );
+            if pgrx::pg_sys::InterruptPending != 0 {
+                if pgrx::pg_sys::QueryCancelPending != 0
+                    || pgrx::pg_sys::ProcDiePending != 0
+                {
+                    for p in &pending {
+                        let _ = queue::mark_slot_abandoned(p.shard, p.slot);
+                    }
+                }
+                pgrx::pg_sys::ProcessInterrupts();
+            }
+        }
+    }
+
+    let _ = filled_count;
+    let rows: Vec<_> = results.into_iter().map(|r| r.unwrap()).collect();
+    TableIterator::new(rows.into_iter())
+}
+
 /// Push a request without electing the committer. Used by M2.1 tests
 /// to assemble multi-event batches that one subsequent
 /// `poc_ledger_committer_tick` drains together.
