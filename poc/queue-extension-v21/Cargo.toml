@@ -1,0 +1,40 @@
+[package]
+name = "queue-extension-v21"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.87"
+publish = false
+description = "acct-gx1z (queue v2.1 PoC): pgrx 0.18 extension scaffolding for the two-queue + router costing primitive per poc/design_research/poc-v2.1.md"
+
+[lib]
+name = "poc_v21_ledger"
+crate-type = ["cdylib"]
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.18.0"
+
+[dev-dependencies]
+pgrx-tests = "=0.18.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+] }
+rand = "0.9"
+hdrhistogram = "7"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

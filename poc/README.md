@@ -11,7 +11,7 @@ Nothing under `poc/` imports from the main acct crate, and the main acct codebas
 | `batch-ledger/` | `acct-togd` / `acct-qdp5` | bench phase complete | Pure-SQL batch-ledger PoC measuring per-row hot-path costs across cost methods at fan-in/fan-out shapes. |
 | `ledger-extension/` | `acct-sw4i` | closed; M10 hardening in `acct-tpqw` | Shmem rollup + bgworker drain pgrx extension; replaces UPDATE accounts with cache-line-aligned bucket CAS. |
 | `queue-extension/` | `acct-4d4n` | CONDITIONAL PASS (2026-05-16) | Queue + per-shard committer pattern (v2 of the queue costing primitive). |
-| `queue-extension-v21/` | `acct-gx1z` | epic + 28 sub-issues filed; M0.1 ready | Two-queue + router pattern (v2.1) — staging + committer queues with Greedy Window Router middleware. |
+| `queue-extension-v21/` | `acct-gx1z` | M0.1 scaffolding shipped; M1.1 next | Two-queue + router pattern (v2.1) — staging + committer queues with Greedy Window Router middleware. |
 
 ## Specs
 
@@ -29,7 +29,7 @@ Each stream has its own `README.md` with build/setup/bench instructions and phas
 - `batch-ledger/README.md` — phases P1–P8 + HC1–HC12 hard cases.
 - `ledger-extension/README.md` — M0–M10 milestones for the shmem extension.
 - `queue-extension/BENCHMARK_RESULTS.md` — pinned v2 PoC verdict + numbers.
-- `queue-extension-v21/` — to be scaffolded under sub-issue `acct-jux2` (M0.1).
+- `queue-extension-v21/` — pgrx 0.18 scaffold (M0.1 acct-jux2); `bash poc/queue-extension-v21/scripts/install-into-container.sh` then `bash scripts/create-poc-v21-db.sh`.
 
 ## Integration posture
 

@@ -1,0 +1,5 @@
+comment = 'acct-gx1z: two-queue + router lexicographical ledger PoC v2.1 primitive'
+default_version = '0.0.1'
+module_pathname = '$libdir/poc_v21_ledger'
+relocatable = false
+superuser = true
