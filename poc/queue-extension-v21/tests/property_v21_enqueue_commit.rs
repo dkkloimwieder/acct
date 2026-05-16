@@ -1,21 +1,32 @@
-//! Property test for the M1.3 (acct-wrwf) FIFO enqueue→commit pipeline.
+//! Property test for the M1.3 (acct-wrwf) FIFO + M2.1 (acct-hmuf) AVG
+//! enqueue→commit pipeline.
 //!
 //! Probes random sequences of single envelopes against the v2.1 PoC's
 //! end-to-end path and asserts the I1–I7 / class-confusion invariants
-//! that bind correlation_id to its cost rows:
+//! that bind correlation_id to its cost rows. SKU 1+2 → FIFO; SKU 3+4
+//! → AVG (seeded via sku_method_assignments at scenario 0).
 //!
-//!  P1 — every committed envelope has a 1:1 status row with state in
-//!       {committed, replayed, failed}; every row tagged with the
-//!       superbatch_id pair stamped on its correlation.
-//!  P2 — committer_tx_id + superbatch_id stamps are CONSISTENT across
-//!       all cost rows attributed to the same correlation_id (no
-//!       split-batch attribution drift, no cross-stamping).
+//!  P1 — every envelope has a 1:1 status row in {committed, replayed,
+//!       failed}; every committed/replayed row carries committer_tx_id
+//!       and superbatch_id stamps.
+//!  P2 — committer_tx_id + superbatch_id stamps CONSISTENT across all
+//!       cost rows attributed to the same correlation_id (covers
+//!       cost_layers, cost_depletions, cost_consumptions, posting_lines —
+//!       no split-batch attribution drift, no cross-stamping).
 //!  P3 — FIFO pool integrity: SUM(layer.qty) - SUM(depletion.qty) ≥ 0
-//!       for every (sku, location); insufficient-inventory events
-//!       reach state='failed' and do NOT leave partial depletion rows.
-//!  P4 — Dedup correctness: every (issue_id, method_used='fifo')
-//!       appears at most once across all cost_depletions; replayed
-//!       correlations leave NO additional depletion rows.
+//!       for every FIFO (sku, location); insufficient events reach
+//!       state='failed' and leave NO partial depletion rows.
+//!  P4 — Dedup correctness: (issue_id, method_used) appears at most
+//!       once across cost_depletions AND cost_consumptions; replayed
+//!       correlations leave no additional rows on either table.
+//!  P5 — AVG pool integrity: avg_pool_state.total_qty ≥ 0 for every
+//!       AVG (sku, location); avg_unit_cost ≥ 0; insufficient events
+//!       reach state='failed'.
+//!  P6 — AVG running-average consistency: at end-of-scenario,
+//!       avg_pool_state.total_qty for any AVG SKU equals
+//!       SUM(cost_layers.qty) - SUM(cost_consumptions.qty) over that
+//!       same (sku, location). (Method dispatch correctness — AVG
+//!       never writes to cost_depletions; AVG layers track inflows.)
 //!
 //! Run via:
 //!   cargo test --release --test property_v21_enqueue_commit \
@@ -28,7 +39,7 @@
 
 mod common;
 
-use common::{connect_pool, reset_state, wait_for_terminal};
+use common::{connect_pool, reset_state, seed_method_assignments, wait_for_terminal};
 use proptest::prelude::*;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -159,12 +170,15 @@ async fn run_scenario(pool: &PgPool, events: Vec<SyntheticEvent>) {
     }
 
     // ── P2: cost rows for one correlation have a single (committer_tx_id,
-    //         superbatch_id) pair.
+    //         superbatch_id) pair across cost_layers, cost_depletions,
+    //         cost_consumptions, and posting_lines.
     let pair_per_corr: Vec<(Uuid, i64)> = sqlx::query_as(
         "WITH all_rows AS (\
            SELECT correlation_id, committer_tx_id, superbatch_id FROM poc_v21_cost_layers \
            UNION ALL \
            SELECT correlation_id, committer_tx_id, superbatch_id FROM poc_v21_cost_depletions \
+           UNION ALL \
+           SELECT correlation_id, committer_tx_id, superbatch_id FROM poc_v21_cost_consumptions \
            UNION ALL \
            SELECT correlation_id, committer_tx_id, superbatch_id FROM poc_v21_posting_lines\
          ) \
@@ -185,7 +199,7 @@ async fn run_scenario(pool: &PgPool, events: Vec<SyntheticEvent>) {
         );
     }
 
-    // ── P3: FIFO pool integrity ─────────────────────────────────────────
+    // ── P3: FIFO pool integrity (FIFO-method SKUs only) ────────────────
     let pool_balances: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT l.sku_id, l.location_id, \
                 COALESCE(SUM(l.qty), 0)::BIGINT AS layer_qty, \
@@ -194,6 +208,8 @@ async fn run_scenario(pool: &PgPool, events: Vec<SyntheticEvent>) {
                     WHERE l2.sku_id=l.sku_id AND l2.location_id=l.location_id)), 0)::BIGINT \
                 AS dep_qty \
            FROM poc_v21_cost_layers l \
+           JOIN poc_v21_sku_method_assignments a ON a.sku_id = l.sku_id \
+          WHERE a.method_id = 'fifo' \
           GROUP BY l.sku_id, l.location_id",
     )
     .fetch_all(pool)
@@ -210,8 +226,8 @@ async fn run_scenario(pool: &PgPool, events: Vec<SyntheticEvent>) {
         );
     }
 
-    // ── P4: dedup correctness ──────────────────────────────────────────
-    let dup_rows: (i64,) = sqlx::query_as(
+    // ── P4: dedup correctness across both consumption tables ───────────
+    let dup_depletions: (i64,) = sqlx::query_as(
         "WITH g AS (\
            SELECT issue_id, method_used, layer_id, COUNT(*) AS c \
              FROM poc_v21_cost_depletions \
@@ -220,8 +236,70 @@ async fn run_scenario(pool: &PgPool, events: Vec<SyntheticEvent>) {
     )
     .fetch_one(pool)
     .await
-    .expect("dedup read");
-    assert_eq!(dup_rows.0, 0, "P4: found duplicate (issue_id, method, layer_id) keys");
+    .expect("dedup depletions read");
+    assert_eq!(
+        dup_depletions.0, 0,
+        "P4: duplicate (issue_id, method, layer_id) keys in cost_depletions"
+    );
+    let dup_consumptions: (i64,) = sqlx::query_as(
+        "WITH g AS (\
+           SELECT issue_id, method_used, COUNT(*) AS c \
+             FROM poc_v21_cost_consumptions \
+            GROUP BY issue_id, method_used\
+         ) SELECT COALESCE(SUM(CASE WHEN c > 1 THEN 1 ELSE 0 END), 0)::BIGINT FROM g",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("dedup consumptions read");
+    assert_eq!(
+        dup_consumptions.0, 0,
+        "P4: duplicate (issue_id, method) keys in cost_consumptions"
+    );
+
+    // ── P5: AVG pool non-negative ──────────────────────────────────────
+    let avg_pools: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT sku_id, location_id, avg_unit_cost, total_qty FROM poc_v21_avg_pool_state",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("avg pool read");
+    for (sku, loc, avg_cost, total_qty) in &avg_pools {
+        assert!(*total_qty >= 0, "P5: avg pool sku={} loc={} total_qty<0 ({})", sku, loc, total_qty);
+        assert!(*avg_cost >= 0, "P5: avg pool sku={} loc={} avg_unit_cost<0 ({})", sku, loc, avg_cost);
+    }
+
+    // ── P6: AVG running-avg consistency. avg_pool_state.total_qty for
+    //         an AVG SKU must equal SUM(layers.qty) - SUM(consumptions.qty)
+    //         over the same (sku, location). Catches dispatch errors that
+    //         would route an AVG event to FIFO (depletions table) or vice
+    //         versa, and catches snapshot UPSERT divergence.
+    let avg_recon: Vec<(i64, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT l.sku_id, l.location_id, \
+                COALESCE(SUM(l.qty), 0)::BIGINT AS layer_qty, \
+                COALESCE(( \
+                  SELECT SUM(c.qty)::BIGINT FROM poc_v21_cost_consumptions c \
+                   WHERE c.sku_id=l.sku_id AND c.location_id=l.location_id \
+                ), 0)::BIGINT AS consumed_qty, \
+                COALESCE(( \
+                  SELECT a.total_qty FROM poc_v21_avg_pool_state a \
+                   WHERE a.sku_id=l.sku_id AND a.location_id=l.location_id \
+                ), 0)::BIGINT AS pool_total_qty \
+           FROM poc_v21_cost_layers l \
+           JOIN poc_v21_sku_method_assignments m ON m.sku_id = l.sku_id \
+          WHERE m.method_id = 'avg' \
+          GROUP BY l.sku_id, l.location_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("avg recon read");
+    for (sku, loc, layer_qty, consumed_qty, pool_total) in &avg_recon {
+        let expected = layer_qty - consumed_qty;
+        assert_eq!(
+            *pool_total, expected,
+            "P6: AVG sku={} loc={} pool_total={} ≠ layer_qty({}) - consumed_qty({}) = {}",
+            sku, loc, pool_total, layer_qty, consumed_qty, expected
+        );
+    }
 }
 
 #[test]
@@ -237,6 +315,14 @@ fn prop_v21_enqueue_commit() {
         .build()
         .unwrap();
     let pool = runtime.block_on(connect_pool());
+
+    // Seed method assignments once at test start. SKU 1+2 → FIFO,
+    // SKU 3+4 → AVG. reset_state leaves sku_method_assignments alone
+    // so this survives scenarios.
+    runtime.block_on(seed_method_assignments(
+        &pool,
+        &[(1, "fifo"), (2, "fifo"), (3, "avg"), (4, "avg")],
+    ));
 
     let cases: u32 = std::env::var("PROPTEST_CASES")
         .ok()

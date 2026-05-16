@@ -5,8 +5,10 @@
 //! committer pool + CAS election at M4.1; per-envelope failure
 //! isolation via sub-tx at M6.2.
 
+use crate::avg::AVG_METHOD;
 use crate::cost_method::{
-    PocV21CostMethod, PocV21Event, PocV21EventType, PocV21Snapshot, SkuPoolState,
+    PocV21ApplyResult, PocV21CostMethod, PocV21Event, PocV21EventType, PocV21Snapshot,
+    SkuPoolState,
 };
 use crate::fifo::FIFO_METHOD;
 use crate::{
@@ -218,21 +220,60 @@ fn run_pipeline_inside_subtx(
             .store(committer_tx_id, Relaxed);
     }
 
-    // STEP 2.5: dedup. Collect (issue_id, method_used) pairs from events.
-    let dedup_pairs: Vec<(i64, String)> = events
+    // STEP 2.4 (new at M2.1): hydrate per-SKU method assignments from
+    // poc_v21_sku_method_assignments. SKUs without a row default to
+    // "fifo" — this preserves M1.3 test convenience and matches the
+    // bake-off setup convention (only AVG/STD SKUs need explicit rows).
+    let mut method_for_sku: HashMap<i64, &'static str> = HashMap::new();
+    if !sku_pool_keys.is_empty() {
+        let sku_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.0).collect();
+        let assigned: Vec<(i64, String)> = Spi::connect(|client| {
+            let mut out: Vec<(i64, String)> = Vec::new();
+            let mut t = client
+                .select(
+                    "SELECT sku_id, method_id FROM poc_v21_sku_method_assignments \
+                       WHERE sku_id = ANY($1::bigint[])",
+                    None,
+                    &[sku_ids.into()],
+                )
+                .ok()?;
+            while let Some(row) = t.next() {
+                let sku_id: i64 = row.get::<i64>(1).ok()??;
+                let method: String = row.get::<String>(2).ok()??;
+                out.push((sku_id, method));
+            }
+            Some(out)
+        })
+        .unwrap_or_default();
+        for (sku_id, method) in assigned {
+            let m: &'static str = match method.as_str() {
+                "avg" => "avg",
+                "std" => "std",
+                _ => "fifo",
+            };
+            method_for_sku.insert(sku_id, m);
+        }
+    }
+    let method_of = |sku_id: i64| -> &'static str {
+        *method_for_sku.get(&sku_id).unwrap_or(&"fifo")
+    };
+
+    // STEP 2.5: dedup. Collect (issue_id, method_used) pairs per event's
+    // SKU method assignment (AVG events check cost_consumptions; FIFO
+    // checks cost_depletions; UNION below covers both).
+    let dedup_pairs: Vec<(i64, &'static str)> = events
         .iter()
         .filter(|e| matches!(
             e.event_type,
             PocV21EventType::InvIssue | PocV21EventType::SoShipment
         ) || (matches!(e.event_type, PocV21EventType::InvAdjust) && e.qty < 0))
-        .map(|e| (e.issue_id, "fifo".to_string()))
+        .map(|e| (e.issue_id, method_of(e.sku_id)))
         .collect();
 
     let mut replayed_correlation_ids: Vec<pgrx::Uuid> = Vec::new();
     if !dedup_pairs.is_empty() {
         let issue_ids: Vec<i64> = dedup_pairs.iter().map(|p| p.0).collect();
-        let methods: Vec<&str> = dedup_pairs.iter().map(|p| p.1.as_str()).collect();
-        let methods_owned: Vec<String> = methods.iter().map(|s| s.to_string()).collect();
+        let methods_owned: Vec<String> = dedup_pairs.iter().map(|p| p.1.to_string()).collect();
 
         // Check both cost_depletions and cost_consumptions for prior writes.
         let existing: Vec<i64> = Spi::connect(|client| {
@@ -282,15 +323,41 @@ fn run_pipeline_inside_subtx(
         .cloned()
         .collect();
 
-    // STEP 3: snapshot hydration. FIFO layers only at M1.3.
+    // STEP 3: snapshot hydration. FIFO loads cost_layers; AVG loads
+    // avg_pool_state. Each only hydrates the pools its method covers
+    // (the dispatch on event.sku_id at Step 4 reads the right slot).
     let mut snapshot = PocV21Snapshot::default();
+    for (sku, &m) in method_for_sku.iter() {
+        snapshot.method_assignments.insert(*sku, m);
+    }
     if !sku_pool_keys.is_empty() {
-        let sku_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.0).collect();
-        let location_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.1).collect();
-        hydrate_fifo_layers(&mut snapshot, &sku_ids, &location_ids)?;
+        let fifo_pools: Vec<(i64, i64)> = sku_pool_keys
+            .iter()
+            .filter(|(s, _)| method_of(*s) == "fifo")
+            .copied()
+            .collect();
+        if !fifo_pools.is_empty() {
+            let sku_ids: Vec<i64> = fifo_pools.iter().map(|k| k.0).collect();
+            let location_ids: Vec<i64> = fifo_pools.iter().map(|k| k.1).collect();
+            hydrate_fifo_layers(&mut snapshot, &sku_ids, &location_ids)?;
+        }
+        let avg_pools: Vec<(i64, i64)> = sku_pool_keys
+            .iter()
+            .filter(|(s, _)| method_of(*s) == "avg")
+            .copied()
+            .collect();
+        if !avg_pools.is_empty() {
+            let sku_ids: Vec<i64> = avg_pools.iter().map(|k| k.0).collect();
+            let location_ids: Vec<i64> = avg_pools.iter().map(|k| k.1).collect();
+            hydrate_avg_pools(&mut snapshot, &sku_ids, &location_ids)?;
+        }
     }
 
-    // STEP 4: dispatch. Sort events by chronological key; call FIFO.plan_apply.
+    // STEP 4: per-event dispatch. Sort by chronological key, then
+    // route each event to its SKU's method's apply_one. Methods
+    // interleave freely within one batch — AVG event then FIFO event
+    // then AVG event is supported (each method touches its own
+    // snapshot slot).
     let mut sorted_events = events_to_plan.clone();
     sorted_events.sort_by_key(|e| {
         (
@@ -300,7 +367,19 @@ fn run_pipeline_inside_subtx(
             e.sub_priority,
         )
     });
-    let result = FIFO_METHOD.plan_apply(&sorted_events, &mut snapshot);
+    let mut result = PocV21ApplyResult::default();
+    for event in &sorted_events {
+        let m = method_of(event.sku_id);
+        let event_result = match m {
+            "avg" => AVG_METHOD.apply_one(event, &mut snapshot, &mut result),
+            "std" => crate::cost_method::PocV21EventResult {
+                correlation_id: event.correlation_id,
+                error_code: Some("std_not_implemented_until_M2_2".to_string()),
+            },
+            _ => FIFO_METHOD.apply_one(event, &mut snapshot, &mut result),
+        };
+        result.per_event.push(event_result);
+    }
 
     // Drop envelopes whose per_event reported an error.
     let mut failed_correlation_ids: Vec<(pgrx::Uuid, String)> = Vec::new();
@@ -443,6 +522,40 @@ fn run_pipeline_inside_subtx(
         .map_err(|e| format!("cost_depletions INSERT: {e}"))?;
     }
 
+    // 5c'. cost_consumptions — AVG (and at M2.2 STD) write here instead
+    // of cost_depletions. UNIQUE (issue_id, method_used) is the dedup
+    // contract; ON CONFLICT DO NOTHING covers concurrent retry from
+    // an orphan-recovered committer that already committed once.
+    let consumption_rows: Vec<_> = result
+        .consumption_inserts
+        .iter()
+        .filter(|r| succeeded_set.contains(&r.correlation_id))
+        .cloned()
+        .collect();
+    for cr in &consumption_rows {
+        Spi::run_with_args(
+            "INSERT INTO poc_v21_cost_consumptions \
+               (sku_id, location_id, qty, applied_unit_cost, consumed_at, consumed_seq, issue_id, method_used, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
+             VALUES ($1, $2, $3, $4, to_timestamp($5::double precision / 1000000), $6, $7, $8, $9, $10::text::xid8, $11, $12) \
+             ON CONFLICT (issue_id, method_used) DO NOTHING",
+            &[
+                cr.sku_id.into(),
+                cr.location_id.into(),
+                cr.qty.into(),
+                cr.unit_cost.into(),
+                cr.consumed_at_micros.into(),
+                cr.consumed_seq.into(),
+                cr.issue_id.into(),
+                cr.method_used.into(),
+                cr.correlation_id.into(),
+                (cr.user_tx_xid as i64).into(),
+                (committer_tx_id as i64).into(),
+                (superbatch_id as i64).into(),
+            ],
+        )
+        .map_err(|e| format!("cost_consumptions INSERT: {e}"))?;
+    }
+
     // 5d. posting_line_inventory — link to posting_line_id via the
     // per-correlation pop order.
     let mut pop_cursor: HashMap<pgrx::Uuid, usize> = HashMap::new();
@@ -480,6 +593,44 @@ fn run_pipeline_inside_subtx(
             ],
         )
         .map_err(|e| format!("posting_line_inventory INSERT: {e}"))?;
+    }
+
+    // 5e. avg_pool_state UPSERT — persist running average state for
+    // every AVG-method pool that this batch touched. Race-free: pool_lock
+    // held in Step 2 covers concurrent committer access on the same pool.
+    // "NEVER reconstruct AVG from cost_layers history" — this UPSERT is
+    // the contract (spec §1.3).
+    let mut avg_dirty_pools: Vec<(i64, i64, i64, i64)> = Vec::new(); // (sku, loc, avg_unit_cost, total_qty)
+    for ((sku, loc), pool) in snapshot.sku_pools.iter() {
+        if pool.avg_dirty {
+            avg_dirty_pools.push((*sku, *loc, pool.avg_unit_cost, pool.avg_total_qty));
+        }
+    }
+    if !avg_dirty_pools.is_empty() {
+        let sku_ids: Vec<i64> = avg_dirty_pools.iter().map(|t| t.0).collect();
+        let loc_ids: Vec<i64> = avg_dirty_pools.iter().map(|t| t.1).collect();
+        let units: Vec<i64> = avg_dirty_pools.iter().map(|t| t.2).collect();
+        let qtys: Vec<i64> = avg_dirty_pools.iter().map(|t| t.3).collect();
+        Spi::run_with_args(
+            "INSERT INTO poc_v21_avg_pool_state \
+               (sku_id, location_id, avg_unit_cost, total_qty, last_updated_at, last_committer_tx_id) \
+             SELECT sku_id, location_id, avg_unit_cost, total_qty, now(), $5::bigint \
+               FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[]) \
+                    AS t(sku_id, location_id, avg_unit_cost, total_qty) \
+             ON CONFLICT (sku_id, location_id) DO UPDATE SET \
+               avg_unit_cost=EXCLUDED.avg_unit_cost, \
+               total_qty=EXCLUDED.total_qty, \
+               last_updated_at=EXCLUDED.last_updated_at, \
+               last_committer_tx_id=EXCLUDED.last_committer_tx_id",
+            &[
+                sku_ids.into(),
+                loc_ids.into(),
+                units.into(),
+                qtys.into(),
+                (committer_tx_id as i64).into(),
+            ],
+        )
+        .map_err(|e| format!("avg_pool_state UPSERT: {e}"))?;
     }
 
     // STEP 12: status updates.
@@ -532,6 +683,44 @@ fn run_pipeline_inside_subtx(
         .map_err(|e| format!("status replayed UPDATE: {e}"))?;
     }
 
+    Ok(())
+}
+
+fn hydrate_avg_pools(
+    snapshot: &mut PocV21Snapshot,
+    sku_ids: &[i64],
+    location_ids: &[i64],
+) -> Result<(), String> {
+    // Load avg_unit_cost + total_qty for AVG-method pools. Pools with
+    // no row in avg_pool_state get default (0, 0) — first receipt
+    // initializes; first consumption hits the insufficient-inventory
+    // path.
+    Spi::connect(|client| -> Result<(), String> {
+        let mut t = client
+            .select(
+                "SELECT sku_id, location_id, avg_unit_cost, total_qty \
+                   FROM poc_v21_avg_pool_state \
+                  WHERE (sku_id, location_id) IN \
+                        (SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id))",
+                None,
+                &[sku_ids.to_vec().into(), location_ids.to_vec().into()],
+            )
+            .map_err(|e| format!("snapshot SELECT avg_pool_state: {e}"))?;
+        while let Some(row) = t.next() {
+            let sku_id: i64 = row.get::<i64>(1).map_err(|e| format!("sku_id: {e}"))?.unwrap_or(0);
+            let location_id: i64 = row.get::<i64>(2).map_err(|e| format!("location_id: {e}"))?.unwrap_or(0);
+            let avg_unit_cost: i64 = row.get::<i64>(3).map_err(|e| format!("avg_unit_cost: {e}"))?.unwrap_or(0);
+            let total_qty: i64 = row.get::<i64>(4).map_err(|e| format!("total_qty: {e}"))?.unwrap_or(0);
+
+            let pool = snapshot
+                .sku_pools
+                .entry((sku_id, location_id))
+                .or_insert_with(SkuPoolState::default);
+            pool.avg_unit_cost = avg_unit_cost;
+            pool.avg_total_qty = total_qty;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 

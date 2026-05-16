@@ -45,6 +45,9 @@ mod cost_method;
 mod fifo;
 mod router;
 
+// M2.1 (acct-hmuf): AVG running-average method + per-event dispatch.
+mod avg;
+
 // ── Compile-time shmem sizing constants (spec §1.6) ─────────────────
 //
 // The matching Postmaster-scope GUCs (`poc_v21.staging_queue_size`,

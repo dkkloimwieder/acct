@@ -1,12 +1,15 @@
 //! PocV21CostMethod trait + event/snapshot types per spec §1.3.
 //!
 //! M1.3 (acct-wrwf). FIFO is the first concrete impl (in `fifo.rs`).
-//! AVG and STD slot in at M2.1 / M2.2.
+//! M2.1 (acct-hmuf) adds AVG (in `avg.rs`); STD at M2.2.
 //!
-//! The trait is pure: `plan_apply` reads snapshot + events, returns row
-//! vectors, mutates snapshot in-memory. Zero SPI, zero shmem mutation.
-//! The committer pipeline (Step 5) writes the result vectors to disk
-//! via bulk UNNEST INSERT.
+//! The trait is pure: `apply_one` reads snapshot + one event, mutates
+//! snapshot in-memory, pushes row vectors onto an accumulator.
+//! Zero SPI, zero shmem mutation. The committer pipeline (Step 5)
+//! writes the result vectors to disk via bulk UNNEST INSERT.
+//!
+//! `plan_apply` is a convenience wrapper that loops; the per-event
+//! shape lets the committer dispatch per-SKU method without grouping.
 
 use pgrx::Uuid;
 use std::collections::HashMap;
@@ -58,6 +61,17 @@ pub struct SkuPoolState {
     /// Highest born_seq observed for this pool. Used by FIFO to assign
     /// new layer born_seq = max(existing) + 1.
     pub max_born_seq: i64,
+    /// AVG method running state. `avg_unit_cost` is the weighted-average
+    /// unit cost; `avg_total_qty` is the pool's signed quantity. Both
+    /// hydrated from `poc_v21_avg_pool_state` at Step 3 for AVG-method
+    /// pools; mutated by `AvgMethod::apply_one`; UPSERTed back at
+    /// Step 5 for any pool with `avg_dirty=true`. `avg_dirty` is the
+    /// "this batch touched the AVG state" flag — covers both receipts
+    /// (which shift avg_unit_cost) and consumptions (which only
+    /// decrement avg_total_qty).
+    pub avg_unit_cost: i64,
+    pub avg_total_qty: i64,
+    pub avg_dirty: bool,
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +91,7 @@ pub struct PocV21ApplyResult {
     pub per_event: Vec<PocV21EventResult>,
     pub layer_inserts: Vec<PocV21LayerRow>,
     pub depletion_inserts: Vec<PocV21DepletionRow>,
+    pub consumption_inserts: Vec<PocV21ConsumptionRow>,
     pub posting_line_inserts: Vec<PocV21PostingLineRow>,
     pub posting_line_inventory_inserts: Vec<PocV21PostingLineInventoryRow>,
 }
@@ -97,6 +112,21 @@ pub struct PocV21LayerRow {
     pub born_seq: i64,
     pub source_kind: &'static str,
     pub source_ref: Option<i64>,
+    pub correlation_id: Uuid,
+    pub user_tx_xid: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PocV21ConsumptionRow {
+    /// AVG-style consumption: no layer_id; emits at running pool avg.
+    pub sku_id: i64,
+    pub location_id: i64,
+    pub qty: i64,
+    pub unit_cost: i64,
+    pub consumed_at_micros: i64,
+    pub consumed_seq: i64,
+    pub issue_id: i64,
+    pub method_used: &'static str,
     pub correlation_id: Uuid,
     pub user_tx_xid: u64,
 }
@@ -147,9 +177,16 @@ pub struct PocV21PostingLineInventoryRow {
 
 pub trait PocV21CostMethod: Send + Sync {
     fn method_id(&self) -> &'static str;
-    fn plan_apply(
+
+    /// Apply a single event to the snapshot; push row vectors onto
+    /// `result`. Returns the per-event result (correlation_id + optional
+    /// error_code). The committer dispatcher picks the method per-SKU
+    /// and calls `apply_one` event-by-event, so a batch may interleave
+    /// methods (FIFO event then AVG event then FIFO event again).
+    fn apply_one(
         &self,
-        events: &[PocV21Event],
+        event: &PocV21Event,
         snapshot: &mut PocV21Snapshot,
-    ) -> PocV21ApplyResult;
+        result: &mut PocV21ApplyResult,
+    ) -> PocV21EventResult;
 }
