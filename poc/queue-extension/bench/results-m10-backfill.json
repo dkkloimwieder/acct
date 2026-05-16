@@ -1,0 +1,179 @@
+{
+  "cells": [
+    {
+      "deadlocks_med": 0,
+      "guc": {
+        "batch_size_max": 1024,
+        "batch_window_us": 500,
+        "synchronous_commit": "on"
+      },
+      "n_backends": 1,
+      "p50_med_us": 2617,
+      "p999_med_us": 6647,
+      "p99_iqr_us": 54,
+      "p99_med_us": 3445,
+      "runs": [
+        {
+          "applies": 22449,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2625,
+          "p999_us": 6727,
+          "p99_us": 3495,
+          "run_idx": 0,
+          "throughput": 374.15
+        },
+        {
+          "applies": 22545,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2617,
+          "p999_us": 6723,
+          "p99_us": 3445,
+          "run_idx": 1,
+          "throughput": 375.75
+        },
+        {
+          "applies": 22538,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2625,
+          "p999_us": 6383,
+          "p99_us": 3367,
+          "run_idx": 2,
+          "throughput": 375.6333333333333
+        },
+        {
+          "applies": 22544,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2615,
+          "p999_us": 6639,
+          "p99_us": 3447,
+          "run_idx": 3,
+          "throughput": 375.73333333333335
+        },
+        {
+          "applies": 22599,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2615,
+          "p999_us": 6647,
+          "p99_us": 3393,
+          "run_idx": 4,
+          "throughput": 376.65
+        }
+      ],
+      "shape": "fan_out",
+      "throughput_iqr": 0.11666666666667425,
+      "throughput_med": 375.73333333333335
+    },
+    {
+      "deadlocks_med": 0,
+      "guc": {
+        "batch_size_max": 1024,
+        "batch_window_us": 500,
+        "synchronous_commit": "on"
+      },
+      "n_backends": 16,
+      "p50_med_us": 4091,
+      "p999_med_us": 27935,
+      "p99_iqr_us": 3688,
+      "p99_med_us": 15695,
+      "runs": [
+        {
+          "applies": 199493,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 4091,
+          "p999_us": 27935,
+          "p99_us": 15695,
+          "run_idx": 0,
+          "throughput": 3324.883333333333
+        },
+        {
+          "applies": 182958,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 4267,
+          "p999_us": 31727,
+          "p99_us": 17743,
+          "run_idx": 1,
+          "throughput": 3049.3
+        },
+        {
+          "applies": 182902,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 4259,
+          "p999_us": 32415,
+          "p99_us": 17727,
+          "run_idx": 2,
+          "throughput": 3048.366666666667
+        },
+        {
+          "applies": 213456,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 4001,
+          "p999_us": 25407,
+          "p99_us": 14039,
+          "run_idx": 3,
+          "throughput": 3557.6
+        },
+        {
+          "applies": 222467,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3973,
+          "p999_us": 23967,
+          "p99_us": 13383,
+          "run_idx": 4,
+          "throughput": 3707.7833333333333
+        }
+      ],
+      "shape": "fan_out",
+      "throughput_iqr": 508.2999999999997,
+      "throughput_med": 3324.883333333333
+    }
+  ],
+  "config": {
+    "duration_secs": 60,
+    "guc": {
+      "batch_size_max": 1024,
+      "batch_window_us": 500,
+      "synchronous_commit": "on"
+    },
+    "ns": [
+      1,
+      16
+    ],
+    "runs_per_cell": 5,
+    "settle_secs": 30,
+    "shape": "fan_out"
+  },
+  "evaluations": {
+    "p1": {
+      "n1_tps": 375.73333333333335,
+      "n32_best_tps_m93": 5337.0,
+      "pass": false,
+      "ratio": 14.204222853087295
+    },
+    "p3": {
+      "bar_ms": 50.0,
+      "n16_p99_ms": 15.695,
+      "pass": true
+    }
+  },
+  "spec": "M10.1 P1/P3 backfill"
+}

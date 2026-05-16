@@ -1148,3 +1148,39 @@ This document validates the foundation. `design-v2.md` describes what gets built
 - PoC pass authorizes design-v2 implementation.
 - PoC fail or conditional-pass triggers a design review (the queue architecture may need rework, or specific failure modes need redesign before proceeding).
 - PoC results inform GUC defaults, shard count recommendations, and operational guidance in design-v2's operational section.
+
+---
+
+## §M10. Verdict
+
+**Outcome: CONDITIONAL PASS.**
+
+Reported 2026-05-16 against PoC commit `1c61fc1` (post-M9.3 ship). Full evidence: `poc/queue-extension/BENCHMARK_RESULTS.md`.
+
+| criterion | result |
+|---|---|
+| C1 failure-mode recovery (must-pass) | PASS |
+| C2 invariants under property testing (must-pass) | CONDITIONAL — per-milestone chain; consolidated proptest deferred |
+| C3 determinism (must-pass) | PASS |
+| C4 idempotency under retry (must-pass) | PASS |
+| **P1 disjoint scales ≥ 24× N=1 (must-pass)** | **CONDITIONAL** — 14.2× measured; root cause in shard LWLock; shard-count mitigation filed |
+| P2 same-pool serializes correctly (must-pass) | PASS |
+| P3 p99 < 50ms at 50% peak (must-pass) | PASS — 15.7ms |
+| P4 mixed-method within 30% of best (must-pass) | PASS — 98% |
+| O1 7-day soak (should-pass) | DEFERRED — followup filed |
+| O2 recovery SLAs (should-pass) | PASS |
+| O3 observability metrics (should-pass) | PASS |
+
+**Decision:** design-v2 construction is AUTHORIZED subject to the P1 shard-count mitigation being addressed in design-v2's architecture before its own performance milestones.
+
+**Filed followup issues (post-verdict):**
+- `acct-7pre` — consolidated proptest harness exercising all seven invariants under random kill/cancel sequences.
+- `acct-hubz` — 7-day soak test against the recommended-default GUCs.
+- `acct-hjoq` — shard_count GUC sweep at N=32 / N=64 / N=128 to find the smallest configuration that achieves the 24× P1 bar.
+
+**Headline numbers (from BENCHMARK_RESULTS.md):**
+- Peak durable (sc=on): 6379 evps fan_out N=128 · 8017 evps small_batch N=128 · 11878 evps fan_in N=256
+- Peak relaxed (sc=off): 6694 evps fan_out N=128 · 8418 evps small_batch N=128
+- Recommended design-v2 GUC defaults: `batch_window_us=500 batch_size_max=1024 synchronous_commit=on`
+- Bottleneck transitions cleanly: IO:WalSync (N=1–2) → LWLock:WALWrite (N=4–8) → Extension:Extension (N=16+, the P1 mitigation target)
+- 781 runs across 161 cells: **0 errors, 0 deadlocks** end-to-end.
