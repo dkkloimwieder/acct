@@ -48,6 +48,9 @@ mod router;
 // M2.1 (acct-hmuf): AVG running-average method + per-event dispatch.
 mod avg;
 
+// M2.2 (acct-lgll): STD standard-cost method + 6-target bulk UNNEST.
+mod standard;
+
 // ── Compile-time shmem sizing constants (spec §1.6) ─────────────────
 //
 // The matching Postmaster-scope GUCs (`poc_v21.staging_queue_size`,

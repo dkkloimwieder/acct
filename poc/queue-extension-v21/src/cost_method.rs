@@ -84,6 +84,11 @@ pub struct PocV21Snapshot {
     /// max consumed_seq per layer_id (seeded from
     /// poc_v21_cost_depletions).
     pub max_consumed_seq_per_layer: HashMap<i64, i64>,
+    /// Latest effective standard cost per (sku, location), hydrated
+    /// by the committer at Step 3 via DISTINCT ON … ORDER BY
+    /// effective_from DESC. STD events fail with
+    /// `standard_cost_missing` if the (sku, location) is absent.
+    pub standard_costs: HashMap<(i64, i64), i64>,
 }
 
 #[derive(Debug, Default)]

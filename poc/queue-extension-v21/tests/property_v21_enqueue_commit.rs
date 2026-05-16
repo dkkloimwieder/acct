@@ -1,10 +1,11 @@
 //! Property test for the M1.3 (acct-wrwf) FIFO + M2.1 (acct-hmuf) AVG
-//! enqueue→commit pipeline.
+//! + M2.2 (acct-lgll) STD enqueue→commit pipeline.
 //!
 //! Probes random sequences of single envelopes against the v2.1 PoC's
 //! end-to-end path and asserts the I1–I7 / class-confusion invariants
-//! that bind correlation_id to its cost rows. SKU 1+2 → FIFO; SKU 3+4
-//! → AVG (seeded via sku_method_assignments at scenario 0).
+//! that bind correlation_id to its cost rows. SKU 1+2 → FIFO, SKU 3+4
+//! → AVG, SKU 5+6 → STD (seeded via sku_method_assignments +
+//! seed_standard_costs at test setup).
 //!
 //!  P1 — every envelope has a 1:1 status row in {committed, replayed,
 //!       failed}; every committed/replayed row carries committer_tx_id
@@ -27,6 +28,13 @@
 //!       SUM(cost_layers.qty) - SUM(cost_consumptions.qty) over that
 //!       same (sku, location). (Method dispatch correctness — AVG
 //!       never writes to cost_depletions; AVG layers track inflows.)
+//!  P7 — STD cost dispatch: every cost_consumptions row with
+//!       method_used='std' has applied_unit_cost equal to the
+//!       (sku, location)'s configured standard cost; every
+//!       cost_layers row written for STD SKUs has unit_cost equal
+//!       to that same standard cost (receipts post at std_cost,
+//!       not caller-supplied unit_cost). STD never writes to
+//!       cost_depletions.
 //!
 //! Run via:
 //!   cargo test --release --test property_v21_enqueue_commit \
@@ -39,7 +47,9 @@
 
 mod common;
 
-use common::{connect_pool, reset_state, seed_method_assignments, wait_for_terminal};
+use common::{
+    connect_pool, reset_state, seed_method_assignments, seed_standard_costs, wait_for_terminal,
+};
 use proptest::prelude::*;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -52,10 +62,13 @@ enum SyntheticEvent {
 }
 
 fn event_strategy() -> impl Strategy<Value = SyntheticEvent> {
+    // SKU 1+2 → FIFO, 3+4 → AVG, 5+6 → STD (see seed_method_assignments
+    // call in prop_v21_enqueue_commit). seed_standard_costs separately
+    // initialises std_cost for the STD SKUs.
     prop_oneof![
-        (1i64..=4, 1i64..=50, 100i64..=999)
+        (1i64..=6, 1i64..=50, 100i64..=999)
             .prop_map(|(sku, qty, unit_cost)| SyntheticEvent::Receipt { sku, qty, unit_cost }),
-        (1i64..=4, 1i64..=20, 1i64..=200, any::<bool>())
+        (1i64..=6, 1i64..=20, 1i64..=200, any::<bool>())
             .prop_map(|(sku, qty, issue_id, replay)| SyntheticEvent::Consume {
                 sku,
                 qty,
@@ -300,6 +313,65 @@ async fn run_scenario(pool: &PgPool, events: Vec<SyntheticEvent>) {
             sku, loc, pool_total, layer_qty, consumed_qty, expected
         );
     }
+
+    // ── P7: STD cost dispatch ──────────────────────────────────────────
+    //   For every cost_consumptions row with method_used='std',
+    //   applied_unit_cost equals the (sku, location)'s configured std
+    //   cost from poc_v21_standard_costs (latest effective).
+    //   For every cost_layers row whose sku is STD, unit_cost equals
+    //   that same standard cost.
+    //   For every STD SKU, ZERO cost_depletions rows exist (STD never
+    //   depletes).
+    let std_consumption_mismatches: (i64,) = sqlx::query_as(
+        "WITH std_costs AS (\
+           SELECT DISTINCT ON (sku_id, location_id) sku_id, location_id, unit_cost \
+             FROM poc_v21_standard_costs \
+            WHERE effective_from <= now() \
+            ORDER BY sku_id, location_id, effective_from DESC \
+         ) \
+         SELECT COUNT(*)::BIGINT FROM poc_v21_cost_consumptions c \
+           JOIN std_costs s ON s.sku_id=c.sku_id AND s.location_id=c.location_id \
+          WHERE c.method_used='std' AND c.applied_unit_cost <> s.unit_cost",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("std consumption mismatch read");
+    assert_eq!(
+        std_consumption_mismatches.0, 0,
+        "P7: STD consumption applied_unit_cost mismatch vs standard_costs"
+    );
+    let std_layer_mismatches: (i64,) = sqlx::query_as(
+        "WITH std_costs AS (\
+           SELECT DISTINCT ON (sku_id, location_id) sku_id, location_id, unit_cost \
+             FROM poc_v21_standard_costs \
+            WHERE effective_from <= now() \
+            ORDER BY sku_id, location_id, effective_from DESC \
+         ) \
+         SELECT COUNT(*)::BIGINT FROM poc_v21_cost_layers l \
+           JOIN poc_v21_sku_method_assignments m ON m.sku_id=l.sku_id \
+           JOIN std_costs s ON s.sku_id=l.sku_id AND s.location_id=l.location_id \
+          WHERE m.method_id='std' AND l.unit_cost <> s.unit_cost",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("std layer mismatch read");
+    assert_eq!(
+        std_layer_mismatches.0, 0,
+        "P7: STD layer unit_cost mismatch vs standard_costs"
+    );
+    let std_depletions: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT FROM poc_v21_cost_depletions d \
+           JOIN poc_v21_cost_layers l ON l.layer_id=d.layer_id \
+           JOIN poc_v21_sku_method_assignments m ON m.sku_id=l.sku_id \
+          WHERE m.method_id='std'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("std depletion read");
+    assert_eq!(
+        std_depletions.0, 0,
+        "P7: STD method must not write to cost_depletions"
+    );
 }
 
 #[test]
@@ -317,12 +389,16 @@ fn prop_v21_enqueue_commit() {
     let pool = runtime.block_on(connect_pool());
 
     // Seed method assignments once at test start. SKU 1+2 → FIFO,
-    // SKU 3+4 → AVG. reset_state leaves sku_method_assignments alone
-    // so this survives scenarios.
+    // SKU 3+4 → AVG, SKU 5+6 → STD. reset_state leaves
+    // sku_method_assignments + standard_costs alone so this survives
+    // scenarios. STD SKUs need a configured standard cost: 5 → 500,
+    // 6 → 700 (arbitrary; tested for STD consumption.applied_unit_cost
+    // landing at the configured value).
     runtime.block_on(seed_method_assignments(
         &pool,
-        &[(1, "fifo"), (2, "fifo"), (3, "avg"), (4, "avg")],
+        &[(1, "fifo"), (2, "fifo"), (3, "avg"), (4, "avg"), (5, "std"), (6, "std")],
     ));
+    runtime.block_on(seed_standard_costs(&pool, &[(5, 1, 500), (6, 1, 700)]));
 
     let cases: u32 = std::env::var("PROPTEST_CASES")
         .ok()

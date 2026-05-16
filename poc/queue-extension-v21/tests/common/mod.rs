@@ -55,6 +55,32 @@ pub async fn seed_method_assignments(pool: &PgPool, assignments: &[(i64, &str)])
     .expect("seed_method_assignments UPSERT");
 }
 
+/// Seed standard costs for STD-method SKUs. Each row uses
+/// `effective_from = now() - 1 day` so it's always live for the test
+/// window. Caller passes `[(sku, location, unit_cost), ...]`.
+pub async fn seed_standard_costs(pool: &PgPool, costs: &[(i64, i64, i64)]) {
+    // Clear first so the test's DISTINCT ON read returns a deterministic
+    // single cost per (sku, location).
+    sqlx::query("TRUNCATE poc_v21_standard_costs")
+        .execute(pool)
+        .await
+        .expect("seed_standard_costs TRUNCATE");
+    let sku_ids: Vec<i64> = costs.iter().map(|(s, _, _)| *s).collect();
+    let loc_ids: Vec<i64> = costs.iter().map(|(_, l, _)| *l).collect();
+    let unit_costs: Vec<i64> = costs.iter().map(|(_, _, c)| *c).collect();
+    sqlx::query(
+        "INSERT INTO poc_v21_standard_costs (sku_id, location_id, unit_cost, effective_from) \
+         SELECT sku_id, location_id, unit_cost, now() - interval '1 day' \
+           FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[]) AS t(sku_id, location_id, unit_cost)",
+    )
+    .bind(&sku_ids)
+    .bind(&loc_ids)
+    .bind(&unit_costs)
+    .execute(pool)
+    .await
+    .expect("seed_standard_costs INSERT");
+}
+
 /// Poll submission_status until all `correlation_ids` are in a terminal
 /// state (committed / failed / replayed) or until `timeout` elapses.
 /// Returns the count of rows reaching terminal state.

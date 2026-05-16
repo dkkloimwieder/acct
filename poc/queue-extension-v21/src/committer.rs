@@ -11,6 +11,7 @@ use crate::cost_method::{
     SkuPoolState,
 };
 use crate::fifo::FIFO_METHOD;
+use crate::standard::STANDARD_METHOD;
 use crate::{
     COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE,
     target_database_str,
@@ -351,6 +352,16 @@ fn run_pipeline_inside_subtx(
             let location_ids: Vec<i64> = avg_pools.iter().map(|k| k.1).collect();
             hydrate_avg_pools(&mut snapshot, &sku_ids, &location_ids)?;
         }
+        let std_pools: Vec<(i64, i64)> = sku_pool_keys
+            .iter()
+            .filter(|(s, _)| method_of(*s) == "std")
+            .copied()
+            .collect();
+        if !std_pools.is_empty() {
+            let sku_ids: Vec<i64> = std_pools.iter().map(|k| k.0).collect();
+            let location_ids: Vec<i64> = std_pools.iter().map(|k| k.1).collect();
+            hydrate_standard_costs(&mut snapshot, &sku_ids, &location_ids)?;
+        }
     }
 
     // STEP 4: per-event dispatch. Sort by chronological key, then
@@ -372,10 +383,7 @@ fn run_pipeline_inside_subtx(
         let m = method_of(event.sku_id);
         let event_result = match m {
             "avg" => AVG_METHOD.apply_one(event, &mut snapshot, &mut result),
-            "std" => crate::cost_method::PocV21EventResult {
-                correlation_id: event.correlation_id,
-                error_code: Some("std_not_implemented_until_M2_2".to_string()),
-            },
+            "std" => STANDARD_METHOD.apply_one(event, &mut snapshot, &mut result),
             _ => FIFO_METHOD.apply_one(event, &mut snapshot, &mut result),
         };
         result.per_event.push(event_result);
@@ -428,150 +436,256 @@ fn run_pipeline_inside_subtx(
         })
         .collect();
 
-    // STEP 5: bulk UNNEST inserts.
-    // 5a. posting_lines — INSERT ... RETURNING posting_line_id so we can
-    // emit posting_line_inventory rows linked by id. M1.3 size-1 batch
-    // has at most a small number of posting lines; we'll loop instead of
-    // UNNEST to keep the code simple. M2+ moves to UNNEST.
-    let mut posting_line_ids_by_corr: HashMap<pgrx::Uuid, Vec<i64>> = HashMap::new();
-    for pl in &posting_line_rows {
-        let row: Option<i64> = Spi::get_one_with_args(
-            "INSERT INTO poc_v21_posting_lines \
-               (business_date, doc_chrono, document_id, sub_priority, event_type, amount, \
-                debit_account, credit_account, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
-             VALUES ('2000-01-01'::date + $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text::xid8, $11, $12) \
-             RETURNING posting_line_id",
-            &[
-                pl.business_date_jdate.into(),
-                pl.doc_chrono.into(),
-                pl.document_id.into(),
-                pl.sub_priority.into(),
-                pl.event_type.into(),
-                pl.amount.into(),
-                pl.debit_account.into(),
-                pl.credit_account.into(),
-                pl.correlation_id.into(),
-                (pl.user_tx_xid as i64).into(),
-                (committer_tx_id as i64).into(),
-                (superbatch_id as i64).into(),
-            ],
-        )
-        .map_err(|e| format!("posting_lines INSERT: {e}"))?;
-        if let Some(id) = row {
-            posting_line_ids_by_corr
-                .entry(pl.correlation_id)
-                .or_default()
-                .push(id);
+    // STEP 5: bulk UNNEST inserts. Six target tables; this is the
+    // load-bearing throughput primitive measured by P5 (spec §4.2):
+    // 5a posting_lines, 5b cost_layers, 5c cost_depletions,
+    // 5c' cost_consumptions, 5d posting_line_inventory, 5e
+    // avg_pool_state UPSERT. Each writes one SuperBatch's rows in
+    // a single bulk statement; per-row chatter is gone.
+    //
+    // posting_lines + cost_layers use RETURNING to surface BIGSERIAL
+    // ids for downstream linking (posting_line_id → inventory; new
+    // layer_id → inv.layer_id for receipt-side rows). PG returns
+    // RETURNING rows in insertion order; the input array order is
+    // preserved.
+    //
+    // posting_line_inventory carries posting_line_ordinal (the index
+    // into result.posting_line_inserts where the originating
+    // posting line lives). We build an `ordinal → posting_line_id`
+    // resolver from the RETURNING output, then UNNEST-INSERT the
+    // inventory rows with resolved ids.
+
+    let (posting_line_ords_for_rows, posting_line_input): (
+        Vec<usize>,
+        Vec<&crate::cost_method::PocV21PostingLineRow>,
+    ) = result
+        .posting_line_inserts
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| succeeded_set.contains(&r.correlation_id))
+        .map(|(i, r)| (i, r))
+        .unzip();
+
+    let mut ordinal_to_pl_id: Vec<i64> = vec![0; result.posting_line_inserts.len()];
+    if !posting_line_input.is_empty() {
+        // Build parallel arrays from the input rows.
+        let bd: Vec<i32> = posting_line_input.iter().map(|r| r.business_date_jdate).collect();
+        let chrono: Vec<i64> = posting_line_input.iter().map(|r| r.doc_chrono).collect();
+        let doc_id: Vec<i64> = posting_line_input.iter().map(|r| r.document_id).collect();
+        let sub_pri: Vec<i32> = posting_line_input.iter().map(|r| r.sub_priority).collect();
+        let event_type_v: Vec<String> = posting_line_input.iter().map(|r| r.event_type.to_string()).collect();
+        let amount: Vec<i64> = posting_line_input.iter().map(|r| r.amount).collect();
+        let debit_acct: Vec<Option<i64>> = posting_line_input.iter().map(|r| r.debit_account).collect();
+        let credit_acct: Vec<Option<i64>> = posting_line_input.iter().map(|r| r.credit_account).collect();
+        let corr: Vec<pgrx::Uuid> = posting_line_input.iter().map(|r| r.correlation_id).collect();
+        let user_xid: Vec<i64> = posting_line_input.iter().map(|r| r.user_tx_xid as i64).collect();
+
+        let returned: Vec<i64> = Spi::connect(|client| -> Option<Vec<i64>> {
+            let mut out: Vec<i64> = Vec::with_capacity(posting_line_input.len());
+            let mut t = client
+                .select(
+                    "INSERT INTO poc_v21_posting_lines \
+                       (business_date, doc_chrono, document_id, sub_priority, event_type, amount, \
+                        debit_account, credit_account, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
+                     SELECT '2000-01-01'::date + bd, chrono, doc_id, sub_pri, et, amt, deb, cred, c, uxid::text::xid8, $11, $12 \
+                       FROM UNNEST($1::int[], $2::bigint[], $3::bigint[], $4::int[], $5::text[], $6::bigint[], \
+                                   $7::bigint[], $8::bigint[], $9::uuid[], $10::bigint[]) \
+                            AS t(bd, chrono, doc_id, sub_pri, et, amt, deb, cred, c, uxid) \
+                     RETURNING posting_line_id",
+                    None,
+                    &[
+                        bd.into(),
+                        chrono.into(),
+                        doc_id.into(),
+                        sub_pri.into(),
+                        event_type_v.into(),
+                        amount.into(),
+                        debit_acct.into(),
+                        credit_acct.into(),
+                        corr.into(),
+                        user_xid.into(),
+                        (committer_tx_id as i64).into(),
+                        (superbatch_id as i64).into(),
+                    ],
+                )
+                .ok()?;
+            while let Some(row) = t.next() {
+                if let Ok(Some(id)) = row.get::<i64>(1) {
+                    out.push(id);
+                }
+            }
+            Some(out)
+        })
+        .ok_or_else(|| "posting_lines bulk INSERT failed".to_string())?;
+        if returned.len() != posting_line_input.len() {
+            return Err(format!(
+                "posting_lines: expected {} ids, got {}",
+                posting_line_input.len(),
+                returned.len()
+            ));
+        }
+        for (ordinal, id) in posting_line_ords_for_rows.iter().zip(returned.iter()) {
+            ordinal_to_pl_id[*ordinal] = *id;
         }
     }
 
-    // 5b. cost_layers — INSERT ... RETURNING layer_id (so we can stamp
-    // depletions that reference them; not used at M1.3 since depletions
-    // reference pre-existing layers).
+    // 5b. cost_layers — bulk INSERT RETURNING layer_id. We need
+    // per-correlation queues of new layer ids so posting_line_inventory
+    // can pop one per receipt-side row.
     let mut new_layer_ids_by_corr: HashMap<pgrx::Uuid, Vec<i64>> = HashMap::new();
-    for lr in &layer_rows {
-        let row: Option<i64> = Spi::get_one_with_args(
-            "INSERT INTO poc_v21_cost_layers \
-               (sku_id, location_id, qty, unit_cost, born_at, born_seq, source_kind, source_ref, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
-             VALUES ($1, $2, $3, $4, to_timestamp($5::double precision / 1000000), $6, $7, $8, $9, $10::text::xid8, $11, $12) \
-             RETURNING layer_id",
-            &[
-                lr.sku_id.into(),
-                lr.location_id.into(),
-                lr.qty.into(),
-                lr.unit_cost.into(),
-                lr.born_at_micros.into(),
-                lr.born_seq.into(),
-                lr.source_kind.into(),
-                lr.source_ref.into(),
-                lr.correlation_id.into(),
-                (lr.user_tx_xid as i64).into(),
-                (committer_tx_id as i64).into(),
-                (superbatch_id as i64).into(),
-            ],
+    if !layer_rows.is_empty() {
+        let sku: Vec<i64> = layer_rows.iter().map(|r| r.sku_id).collect();
+        let loc: Vec<i64> = layer_rows.iter().map(|r| r.location_id).collect();
+        let qty: Vec<i64> = layer_rows.iter().map(|r| r.qty).collect();
+        let unit_cost: Vec<i64> = layer_rows.iter().map(|r| r.unit_cost).collect();
+        let born_at: Vec<i64> = layer_rows.iter().map(|r| r.born_at_micros).collect();
+        let born_seq: Vec<i64> = layer_rows.iter().map(|r| r.born_seq).collect();
+        let source_kind: Vec<String> = layer_rows.iter().map(|r| r.source_kind.to_string()).collect();
+        let source_ref: Vec<Option<i64>> = layer_rows.iter().map(|r| r.source_ref).collect();
+        let corr: Vec<pgrx::Uuid> = layer_rows.iter().map(|r| r.correlation_id).collect();
+        let user_xid: Vec<i64> = layer_rows.iter().map(|r| r.user_tx_xid as i64).collect();
+
+        let returned_pairs: Vec<(i64, pgrx::Uuid)> = Spi::connect(
+            |client| -> Option<Vec<(i64, pgrx::Uuid)>> {
+                let mut out: Vec<(i64, pgrx::Uuid)> = Vec::with_capacity(layer_rows.len());
+                let mut t = client
+                    .select(
+                        "INSERT INTO poc_v21_cost_layers \
+                           (sku_id, location_id, qty, unit_cost, born_at, born_seq, source_kind, source_ref, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
+                         SELECT sku, loc, q, u, to_timestamp(b::double precision / 1000000), bs, sk, sr, c, uxid::text::xid8, $11, $12 \
+                           FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], \
+                                       $7::text[], $8::bigint[], $9::uuid[], $10::bigint[]) \
+                                AS t(sku, loc, q, u, b, bs, sk, sr, c, uxid) \
+                         RETURNING layer_id, correlation_id",
+                        None,
+                        &[
+                            sku.into(),
+                            loc.into(),
+                            qty.into(),
+                            unit_cost.into(),
+                            born_at.into(),
+                            born_seq.into(),
+                            source_kind.into(),
+                            source_ref.into(),
+                            corr.into(),
+                            user_xid.into(),
+                            (committer_tx_id as i64).into(),
+                            (superbatch_id as i64).into(),
+                        ],
+                    )
+                    .ok()?;
+                while let Some(row) = t.next() {
+                    let id = row.get::<i64>(1).ok()??;
+                    let c = row.get::<pgrx::Uuid>(2).ok()??;
+                    out.push((id, c));
+                }
+                Some(out)
+            },
         )
-        .map_err(|e| format!("cost_layers INSERT: {e}"))?;
-        if let Some(id) = row {
-            new_layer_ids_by_corr
-                .entry(lr.correlation_id)
-                .or_default()
-                .push(id);
+        .ok_or_else(|| "cost_layers bulk INSERT failed".to_string())?;
+        for (id, c) in returned_pairs {
+            new_layer_ids_by_corr.entry(c).or_default().push(id);
         }
     }
 
-    // 5c. cost_depletions.
-    for dr in &depletion_rows {
+    // 5c. cost_depletions — bulk UNNEST INSERT. No RETURNING needed.
+    if !depletion_rows.is_empty() {
+        let layer: Vec<i64> = depletion_rows.iter().map(|r| r.layer_id).collect();
+        let qty: Vec<i64> = depletion_rows.iter().map(|r| r.qty).collect();
+        let unit_cost: Vec<i64> = depletion_rows.iter().map(|r| r.unit_cost).collect();
+        let consumed_at: Vec<i64> = depletion_rows.iter().map(|r| r.consumed_at_micros).collect();
+        let consumed_seq: Vec<i64> = depletion_rows.iter().map(|r| r.consumed_seq).collect();
+        let issue: Vec<i64> = depletion_rows.iter().map(|r| r.issue_id).collect();
+        let method: Vec<String> = depletion_rows.iter().map(|r| r.method_used.to_string()).collect();
+        let corr: Vec<pgrx::Uuid> = depletion_rows.iter().map(|r| r.correlation_id).collect();
+        let user_xid: Vec<i64> = depletion_rows.iter().map(|r| r.user_tx_xid as i64).collect();
+
         Spi::run_with_args(
             "INSERT INTO poc_v21_cost_depletions \
                (layer_id, qty, unit_cost, consumed_at, consumed_seq, issue_id, method_used, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
-             VALUES ($1, $2, $3, to_timestamp($4::double precision / 1000000), $5, $6, $7, $8, $9::text::xid8, $10, $11)",
+             SELECT layer, q, u, to_timestamp(ca::double precision / 1000000), cs, i, m, c, uxid::text::xid8, $10, $11 \
+               FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], \
+                           $7::text[], $8::uuid[], $9::bigint[]) \
+                    AS t(layer, q, u, ca, cs, i, m, c, uxid)",
             &[
-                dr.layer_id.into(),
-                dr.qty.into(),
-                dr.unit_cost.into(),
-                dr.consumed_at_micros.into(),
-                dr.consumed_seq.into(),
-                dr.issue_id.into(),
-                dr.method_used.into(),
-                dr.correlation_id.into(),
-                (dr.user_tx_xid as i64).into(),
+                layer.into(),
+                qty.into(),
+                unit_cost.into(),
+                consumed_at.into(),
+                consumed_seq.into(),
+                issue.into(),
+                method.into(),
+                corr.into(),
+                user_xid.into(),
                 (committer_tx_id as i64).into(),
                 (superbatch_id as i64).into(),
             ],
         )
-        .map_err(|e| format!("cost_depletions INSERT: {e}"))?;
+        .map_err(|e| format!("cost_depletions bulk INSERT: {e}"))?;
     }
 
-    // 5c'. cost_consumptions — AVG (and at M2.2 STD) write here instead
-    // of cost_depletions. UNIQUE (issue_id, method_used) is the dedup
-    // contract; ON CONFLICT DO NOTHING covers concurrent retry from
-    // an orphan-recovered committer that already committed once.
+    // 5c'. cost_consumptions — bulk UNNEST with ON CONFLICT
+    // (issue_id, method_used) DO NOTHING for replay-safety.
     let consumption_rows: Vec<_> = result
         .consumption_inserts
         .iter()
         .filter(|r| succeeded_set.contains(&r.correlation_id))
         .cloned()
         .collect();
-    for cr in &consumption_rows {
+    if !consumption_rows.is_empty() {
+        let sku: Vec<i64> = consumption_rows.iter().map(|r| r.sku_id).collect();
+        let loc: Vec<i64> = consumption_rows.iter().map(|r| r.location_id).collect();
+        let qty: Vec<i64> = consumption_rows.iter().map(|r| r.qty).collect();
+        let unit_cost: Vec<i64> = consumption_rows.iter().map(|r| r.unit_cost).collect();
+        let consumed_at: Vec<i64> = consumption_rows.iter().map(|r| r.consumed_at_micros).collect();
+        let consumed_seq: Vec<i64> = consumption_rows.iter().map(|r| r.consumed_seq).collect();
+        let issue: Vec<i64> = consumption_rows.iter().map(|r| r.issue_id).collect();
+        let method: Vec<String> = consumption_rows.iter().map(|r| r.method_used.to_string()).collect();
+        let corr: Vec<pgrx::Uuid> = consumption_rows.iter().map(|r| r.correlation_id).collect();
+        let user_xid: Vec<i64> = consumption_rows.iter().map(|r| r.user_tx_xid as i64).collect();
+
         Spi::run_with_args(
             "INSERT INTO poc_v21_cost_consumptions \
                (sku_id, location_id, qty, applied_unit_cost, consumed_at, consumed_seq, issue_id, method_used, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
-             VALUES ($1, $2, $3, $4, to_timestamp($5::double precision / 1000000), $6, $7, $8, $9, $10::text::xid8, $11, $12) \
+             SELECT sku, loc, q, u, to_timestamp(ca::double precision / 1000000), cs, i, m, c, uxid::text::xid8, $11, $12 \
+               FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], \
+                           $7::bigint[], $8::text[], $9::uuid[], $10::bigint[]) \
+                    AS t(sku, loc, q, u, ca, cs, i, m, c, uxid) \
              ON CONFLICT (issue_id, method_used) DO NOTHING",
             &[
-                cr.sku_id.into(),
-                cr.location_id.into(),
-                cr.qty.into(),
-                cr.unit_cost.into(),
-                cr.consumed_at_micros.into(),
-                cr.consumed_seq.into(),
-                cr.issue_id.into(),
-                cr.method_used.into(),
-                cr.correlation_id.into(),
-                (cr.user_tx_xid as i64).into(),
+                sku.into(),
+                loc.into(),
+                qty.into(),
+                unit_cost.into(),
+                consumed_at.into(),
+                consumed_seq.into(),
+                issue.into(),
+                method.into(),
+                corr.into(),
+                user_xid.into(),
                 (committer_tx_id as i64).into(),
                 (superbatch_id as i64).into(),
             ],
         )
-        .map_err(|e| format!("cost_consumptions INSERT: {e}"))?;
+        .map_err(|e| format!("cost_consumptions bulk INSERT: {e}"))?;
     }
 
-    // 5d. posting_line_inventory — link to posting_line_id via the
-    // per-correlation pop order.
-    let mut pop_cursor: HashMap<pgrx::Uuid, usize> = HashMap::new();
+    // 5d. posting_line_inventory — resolve posting_line_id via the
+    // ordinal map + layer_id via the per-correlation new-layer queue;
+    // bulk UNNEST INSERT the resolved rows.
+    let mut inv_pl_ids: Vec<i64> = Vec::new();
+    let mut inv_sku: Vec<i64> = Vec::new();
+    let mut inv_loc: Vec<i64> = Vec::new();
+    let mut inv_qty: Vec<i64> = Vec::new();
+    let mut inv_layer: Vec<Option<i64>> = Vec::new();
     for (inv_row, corr) in &posting_inventory_rows {
-        let cursor = pop_cursor.entry(*corr).or_insert(0);
-        let pl_ids = posting_line_ids_by_corr.get(corr).cloned().unwrap_or_default();
-        let pl_id = match pl_ids.get(*cursor) {
-            Some(&id) => id,
-            None => continue,
-        };
-        *cursor += 1;
+        let pl_id = ordinal_to_pl_id[inv_row.posting_line_ordinal];
+        if pl_id == 0 {
+            continue;
+        }
         let layer_id = if let Some(real_id) = inv_row.layer_id {
             Some(real_id)
         } else {
-            // Receipt-side row references a new layer: pop the next new
-            // layer_id for this correlation_id.
             new_layer_ids_by_corr.get_mut(corr).and_then(|v| {
                 if v.is_empty() {
                     None
@@ -580,19 +694,28 @@ fn run_pipeline_inside_subtx(
                 }
             })
         };
+        inv_pl_ids.push(pl_id);
+        inv_sku.push(inv_row.sku_id);
+        inv_loc.push(inv_row.location_id);
+        inv_qty.push(inv_row.qty);
+        inv_layer.push(layer_id);
+    }
+    if !inv_pl_ids.is_empty() {
         Spi::run_with_args(
             "INSERT INTO poc_v21_posting_line_inventory \
                (posting_line_id, sku_id, location_id, qty, layer_id) \
-             VALUES ($1, $2, $3, $4, $5)",
+             SELECT pl, sku, loc, q, layer \
+               FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[]) \
+                    AS t(pl, sku, loc, q, layer)",
             &[
-                pl_id.into(),
-                inv_row.sku_id.into(),
-                inv_row.location_id.into(),
-                inv_row.qty.into(),
-                layer_id.into(),
+                inv_pl_ids.into(),
+                inv_sku.into(),
+                inv_loc.into(),
+                inv_qty.into(),
+                inv_layer.into(),
             ],
         )
-        .map_err(|e| format!("posting_line_inventory INSERT: {e}"))?;
+        .map_err(|e| format!("posting_line_inventory bulk INSERT: {e}"))?;
     }
 
     // 5e. avg_pool_state UPSERT — persist running average state for
@@ -683,6 +806,38 @@ fn run_pipeline_inside_subtx(
         .map_err(|e| format!("status replayed UPDATE: {e}"))?;
     }
 
+    Ok(())
+}
+
+fn hydrate_standard_costs(
+    snapshot: &mut PocV21Snapshot,
+    sku_ids: &[i64],
+    location_ids: &[i64],
+) -> Result<(), String> {
+    // DISTINCT ON returns the latest effective row per (sku, location).
+    // `effective_from <= now()` filter excludes future-dated rolls.
+    Spi::connect(|client| -> Result<(), String> {
+        let mut t = client
+            .select(
+                "SELECT DISTINCT ON (sku_id, location_id) \
+                        sku_id, location_id, unit_cost \
+                   FROM poc_v21_standard_costs \
+                  WHERE (sku_id, location_id) IN \
+                        (SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id)) \
+                    AND effective_from <= now() \
+                  ORDER BY sku_id, location_id, effective_from DESC",
+                None,
+                &[sku_ids.to_vec().into(), location_ids.to_vec().into()],
+            )
+            .map_err(|e| format!("snapshot SELECT standard_costs: {e}"))?;
+        while let Some(row) = t.next() {
+            let sku_id: i64 = row.get::<i64>(1).map_err(|e| format!("sku_id: {e}"))?.unwrap_or(0);
+            let location_id: i64 = row.get::<i64>(2).map_err(|e| format!("location_id: {e}"))?.unwrap_or(0);
+            let unit_cost: i64 = row.get::<i64>(3).map_err(|e| format!("unit_cost: {e}"))?.unwrap_or(0);
+            snapshot.standard_costs.insert((sku_id, location_id), unit_cost);
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
