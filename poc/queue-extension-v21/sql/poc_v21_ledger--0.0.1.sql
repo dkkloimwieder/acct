@@ -31,7 +31,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:453
+-- src/lib.rs:499
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT
@@ -49,6 +49,15 @@ AS 'MODULE_PATHNAME', 'poc_v21_staging_state_counts_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/committer.rs:766
+-- poc_v21_ledger::committer::poc_v21_test_committer_tick
+CREATE  FUNCTION "poc_v21_test_committer_tick"() RETURNS bool /* bool */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_committer_tick_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/enqueue.rs:250
 -- poc_v21_ledger::enqueue::poc_v21_test_release_slot
 CREATE  FUNCTION "poc_v21_test_release_slot"(
@@ -57,6 +66,15 @@ CREATE  FUNCTION "poc_v21_test_release_slot"(
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_test_release_slot_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:235
+-- poc_v21_ledger::router::poc_v21_test_router_tick
+CREATE  FUNCTION "poc_v21_test_router_tick"() RETURNS bool /* bool */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_router_tick_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */

@@ -357,9 +357,9 @@ fn event_type_to_id(event_type: &str) -> u16 {
         "inv_adjust" => 1,
         "wo_complete" => 2,
         "wo_start" => 3,
-        "scrap" => 4,
-        "receipt" => 5,
-        // Unknown event types pass through; committer (M1.3+) will validate.
+        "so_shipment" => 6,
+        "inv_issue" => 7,
+        "po_receipt" => 5,
         _ => 0,
     }
 }

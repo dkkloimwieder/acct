@@ -27,9 +27,12 @@ sqlx = { version = "0.8", default-features = false, features = [
     "tls-rustls",
     "postgres",
     "macros",
+    "uuid",
 ] }
 rand = "0.9"
 hdrhistogram = "7"
+proptest = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.dev]
 panic = "unwind"

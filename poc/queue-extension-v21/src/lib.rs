@@ -39,6 +39,12 @@ mod arena;
 mod enqueue;
 mod staging;
 
+// M1.3 (acct-wrwf): end-to-end FIFO pipeline.
+mod committer;
+mod cost_method;
+mod fifo;
+mod router;
+
 // ── Compile-time shmem sizing constants (spec §1.6) ─────────────────
 //
 // The matching Postmaster-scope GUCs (`poc_v21.staging_queue_size`,
@@ -221,6 +227,21 @@ static STATUS_INSERT_MODE: GucSetting<Option<CString>> =
 // Bool GUC. `persistent_staging=on` enables the durable_queue=true
 // path (spec §1.9) and unlocks committer_lazy mode (§3.4).
 static PERSISTENT_STAGING: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+// Operational GUC (not in §1.7's runtime config table): which DB the
+// committer BGWorker connects to via SPI. Default targets the PoC's
+// dedicated database (acct_poc_queue_v21); test deployments may
+// override. Postmaster-scope (BGWorker reads at startup).
+static TARGET_DATABASE: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"acct_poc_queue_v21"));
+
+pub(crate) fn target_database_str() -> String {
+    TARGET_DATABASE
+        .get()
+        .as_ref()
+        .map(|c| c.to_string_lossy().to_string())
+        .unwrap_or_else(|| "acct_poc_queue_v21".to_string())
+}
 
 /// Read `poc_v21.status_insert_mode` lowercased. Defaults to
 /// "caller_intx" on parse failure.
@@ -416,6 +437,16 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::empty(),
     );
 
+    // ── Operational GUC ────────────────────────────────────────────
+    GucRegistry::define_string_guc(
+        c"poc_v21.target_database",
+        c"Database the committer BGWorker connects to via SPI",
+        c"The committer + router BGWorkers attach to this database. Set this to the PoC DB you created via scripts/create-poc-v21-db.sh.",
+        &TARGET_DATABASE,
+        GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+
     // ── Startup validation (spec §1.7) ─────────────────────────────
     //
     // The unsafe combinations are gated at extension load time. PG
@@ -442,8 +473,23 @@ pub extern "C-unwind" fn _PG_init() {
     // at enqueue time (raises ERRCODE_FEATURE_NOT_SUPPORTED), not
     // here — durable_queue is a per-call argument, not a GUC.
 
-    // M1.2 / M1.3 / M3.x BGWorkers are not registered at M0.1; the
-    // scaffold only loads, validates, and reserves shmem.
+    // M1.3 BGWorkers: stub router + single committer.
+    use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
+    use std::time::Duration;
+    BackgroundWorkerBuilder::new("poc_v21_router")
+        .set_function("poc_v21_router_main")
+        .set_library("poc_v21_ledger")
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(Duration::from_secs(5)))
+        .enable_shmem_access(None)
+        .load();
+    BackgroundWorkerBuilder::new("poc_v21_committer")
+        .set_function("poc_v21_committer_main")
+        .set_library("poc_v21_ledger")
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(Duration::from_secs(5)))
+        .enable_spi_access()
+        .load();
 }
 
 // ── Smoke entry point ───────────────────────────────────────────────
