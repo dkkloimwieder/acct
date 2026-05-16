@@ -31,12 +31,48 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:505
+-- src/lib.rs:523
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_hello_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:443
+-- poc_v21_ledger::router::poc_v21_router_max_envelope_count
+CREATE  FUNCTION "poc_v21_router_max_envelope_count"() RETURNS INT /* i32 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_router_max_envelope_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:427
+-- poc_v21_ledger::router::poc_v21_router_stats_reset
+CREATE  FUNCTION "poc_v21_router_stats_reset"() RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_router_stats_reset_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:436
+-- poc_v21_ledger::router::poc_v21_router_superbatch_count
+CREATE  FUNCTION "poc_v21_router_superbatch_count"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_router_superbatch_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:450
+-- poc_v21_ledger::router::poc_v21_router_total_envelopes
+CREATE  FUNCTION "poc_v21_router_total_envelopes"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_router_total_envelopes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -69,7 +105,16 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_release_slot_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:235
+-- src/router.rs:469
+-- poc_v21_ledger::router::poc_v21_test_router_drain
+CREATE  FUNCTION "poc_v21_test_router_drain"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_router_drain_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:461
 -- poc_v21_ledger::router::poc_v21_test_router_tick
 CREATE  FUNCTION "poc_v21_test_router_tick"() RETURNS bool /* bool */
 STRICT

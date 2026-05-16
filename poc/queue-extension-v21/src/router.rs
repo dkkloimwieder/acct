@@ -1,25 +1,44 @@
-//! Stub router BGWorker. M1.3 only — Greedy Window Router at M3.1.
+//! Greedy Window Router BGWorker (M3.1, acct-r29s).
 //!
-//! Pulls ONE pending StagingEntry per tick, assembles a size-1
-//! CommitterQueueEntry. Real packing (router_window_size,
-//! batch_size_max, fairness backstop) lands at M3.x.
+//! Scans up to `router_window_size` pending staging entries per tick,
+//! packs them into SuperBatches by greedy disjoint pool-key cover, and
+//! pushes each SuperBatch onto the committer queue. WIP pool keys are
+//! carried through but NOT consulted at routing (spec §1.5 — WIP pools
+//! uncontended by construction).
 //!
 //! ## Data-before-flag invariant (spec §1.6, §3.3)
 //!
-//! The router stores `superbatch_id` with **Release** semantics BEFORE
-//! CAS-ing `valid` from 2→3. Readers (recovery sweep) use **Acquire**
-//! when loading `superbatch_id` AFTER confirming `valid==3`. This is
-//! the load-bearing ordering that makes recovery correct under router
-//! crash between push and CAS. M3.1 preserves the same invariant; M5b
-//! adds the crash-recovery sweep.
+//! For every packed staging entry, `superbatch_id` is stored with
+//! **Release** semantics BEFORE the CAS `valid` 2→3 (also Release).
+//! Readers (recovery sweep) use **Acquire** when loading
+//! `superbatch_id` AFTER confirming `valid==3`. Reversing the order
+//! creates a window where a router crash leaves `valid=3` with
+//! `superbatch_id=0`; the sweep's classification logic depends on
+//! seeing them consistent. M5b.2 (`acct-rxax`) ships the dedicated
+//! ordering stress test.
+//!
+//! ## Q-E (head-scan vs sliding cursor)
+//!
+//! M3.1 lean: head-scan per spec §1.8. Sliding-cursor alternative is
+//! filed as `acct-v21-fu-router-sliding-window` for measurement.
+//! Head-scan walks the ring from `staging.head` for at most
+//! `staging_capacity` slots, collecting up to `router_window_size`
+//! pending candidates per tick. Routed/empty slots are O(1) skips
+//! (atomic load + compare).
+//!
+//! ## Q-F (committer/router architecture)
+//!
+//! M3.1 lean: option (a) — dedicated router BGWorker + N committer
+//! BGWorkers (each a separate process; no caller-promotion).
 
 use crate::{
-    COMMITTER_QUEUE, CommitterQueueEntry, POC_V21_COMMITTER_QUEUE_SIZE,
-    POC_V21_STAGING_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE,
+    COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, POC_V21_STAGING_QUEUE_SIZE, SPILLOVER_ARENA,
+    STAGING_QUEUE, batch_size_max_now, router_window_size_now,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::time::Duration;
 
@@ -31,208 +50,431 @@ pub extern "C-unwind" fn poc_v21_router_main(_arg: pg_sys::Datum) {
 
     // No SPI access required for the router; pure shmem orchestration.
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
-        loop {
-            if !try_route_one() {
-                break;
-            }
-        }
+        // Drain SuperBatches until the queue is empty (or committer
+        // queue is full / arena is exhausted; those conditions roll
+        // back partial work and return 0 from this tick).
+        while router_tick() > 0 {}
     }
 }
 
-/// Try to route exactly one pending staging entry into a size-1
-/// SuperBatch. Returns true if work was done; false if no pending
-/// entry or no free CommitterQueue slot.
-fn try_route_one() -> bool {
+/// One scan-and-pack iteration. Returns the number of SuperBatches
+/// produced (0 or 1 in M3.1 — looping happens in the BGWorker).
+fn router_tick() -> u32 {
     let staging_capacity = POC_V21_STAGING_QUEUE_SIZE as u32;
     let committer_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
+    let window_limit = router_window_size_now().max(1) as u32;
+    let batch_max = batch_size_max_now().max(1) as u16;
 
-    // 1. Scan staging for a pending (valid==1) entry; CAS 1→2 (processing).
-    let claim = {
-        let queue = STAGING_QUEUE.share();
-        let head = queue.head.load(Relaxed);
-        let mut found: Option<u32> = None;
-        for i in 0..staging_capacity {
-            let idx = ((head + i) % staging_capacity) as usize;
-            let slot = &queue.entries[idx];
-            if slot.valid.load(Relaxed) == 1
-                && slot
-                    .valid
-                    .compare_exchange(1, 2, Acquire, Relaxed)
-                    .is_ok()
-            {
-                found = Some(idx as u32);
-                break;
-            }
+    // --- Phase 1: scan staging head; collect candidate metadata. ---
+    let candidates_meta = collect_candidates(staging_capacity, window_limit);
+    if candidates_meta.is_empty() {
+        return 0;
+    }
+
+    // --- Phase 2: hydrate pool keys for each candidate from arena. ---
+    let candidates = hydrate_candidates(&candidates_meta);
+
+    // --- Phase 3: greedy disjoint pack on SKU pool keys. ---
+    let mut lock_set: HashSet<(i64, i64)> = HashSet::new();
+    let mut wip_union: HashSet<(i64, i64)> = HashSet::new();
+    let mut packed: Vec<Candidate> = Vec::new();
+
+    for cand in candidates.into_iter() {
+        if (packed.len() as u16) >= batch_max {
+            break;
         }
-        if let Some(idx) = found {
-            queue.head.store((head + 1) % staging_capacity, Relaxed);
-            // Read the fields we need before releasing the share lock.
-            let slot = &queue.entries[idx as usize];
-            let sku_pool_count = slot.sku_pool_count;
-            let wip_pool_count = slot.wip_pool_count;
-            let sku_pool_keys_offset = slot.sku_pool_keys_offset;
-            let wip_pool_keys_offset = slot.wip_pool_keys_offset;
-            Some((idx, sku_pool_count, wip_pool_count, sku_pool_keys_offset, wip_pool_keys_offset))
-        } else {
-            None
+        // Disjoint check: candidate's SKU pool keys must not intersect
+        // the SuperBatch's accumulated lock set.
+        if cand.sku_pool_keys.iter().any(|k| lock_set.contains(k)) {
+            continue;
         }
-    };
+        // CAS valid 1→2 (pending → processing). Acquire on success so
+        // subsequent reads from this staging entry see the caller's
+        // payload writes.
+        let cas_ok = {
+            let queue = STAGING_QUEUE.share();
+            queue.entries[cand.staging_idx as usize]
+                .valid
+                .compare_exchange(1, 2, Acquire, Relaxed)
+                .is_ok()
+        };
+        if !cas_ok {
+            // Lost the race (another router tick? recovery sweep?).
+            // Don't extend lock_set since we don't own this entry.
+            continue;
+        }
+        for k in &cand.sku_pool_keys {
+            lock_set.insert(*k);
+        }
+        for k in &cand.wip_pool_keys {
+            wip_union.insert(*k);
+        }
+        packed.push(cand);
+    }
 
-    let (staging_idx, sku_pool_count, wip_pool_count, sku_keys_off, wip_keys_off) =
-        match claim {
-            Some(t) => t,
-            None => return false,
-        };
+    if packed.is_empty() {
+        return 0;
+    }
 
-    // 2. Allocate spillover-arena storage for the CommitterQueueEntry's
-    // arrays: (a) staging_entry_offsets (single u32 = 4 bytes;
-    // round up to 8), (b) deduplicated/sorted sku_pool_keys mirror
-    // of the staging entry's, (c) same for wip_pool_keys.
-    let (staging_offsets_off, sku_keys_copy_off, wip_keys_copy_off) = {
-        let mut arena = SPILLOVER_ARENA.exclusive();
-        let staging_off = arena.alloc(8); // single u32 padded
-        let sku_off = if sku_pool_count > 0 {
-            arena.alloc(sku_pool_count as u32 * 16)
-        } else {
-            Some(0u32)
-        };
-        let wip_off = if wip_pool_count > 0 {
-            arena.alloc(wip_pool_count as u32 * 16)
-        } else {
-            Some(0u32)
-        };
-        match (staging_off, sku_off, wip_off) {
-            (Some(s_off), Some(sku), Some(wip)) => {
-                // Copy staging_idx (size-1 batch) into the staging_offsets
-                // arena block.
-                let idx_bytes = (staging_idx as u32).to_le_bytes();
-                arena.write_bytes(s_off, &idx_bytes);
-                // Copy pool keys from the staging-entry's blocks. For
-                // size-1 SuperBatch these are already sorted and dedup'd
-                // by the caller; M3.1 dedups across multiple envelopes.
-                if sku_pool_count > 0 && sku_keys_off != 0 {
-                    let bytes = arena.read_bytes(sku_keys_off, sku_pool_count as u32 * 16);
-                    arena.write_bytes(sku, &bytes);
-                }
-                if wip_pool_count > 0 && wip_keys_off != 0 {
-                    let bytes = arena.read_bytes(wip_keys_off, wip_pool_count as u32 * 16);
-                    arena.write_bytes(wip, &bytes);
-                }
-                (s_off, sku, wip)
-            }
-            _ => {
-                // Arena exhausted; CAS staging back to pending. The next
-                // tick will retry.
-                let queue = STAGING_QUEUE.share();
-                let _ = queue.entries[staging_idx as usize]
-                    .valid
-                    .compare_exchange(2, 1, Release, Relaxed);
-                return false;
-            }
+    // --- Phase 4: arena alloc for SuperBatch-owned blocks. ---
+    let envelope_count = packed.len() as u16;
+    let mut sku_union_sorted: Vec<(i64, i64)> = lock_set.into_iter().collect();
+    sku_union_sorted.sort();
+    let mut wip_union_sorted: Vec<(i64, i64)> = wip_union.into_iter().collect();
+    wip_union_sorted.sort();
+    let sku_count = sku_union_sorted.len() as u16;
+    let wip_count = wip_union_sorted.len() as u16;
+
+    let arena_alloc = allocate_superbatch_arena(
+        envelope_count,
+        &packed,
+        sku_count,
+        &sku_union_sorted,
+        wip_count,
+        &wip_union_sorted,
+    );
+    let (staging_offsets_off, sku_keys_off, wip_keys_off) = match arena_alloc {
+        Some(t) => t,
+        None => {
+            // Arena exhausted; roll back the CAS 1→2's so the next
+            // tick (or the next router after free-list churn) can retry.
+            rollback_packed_to_pending(&packed);
+            return 0;
         }
     };
 
-    // 3. Find free CommitterQueueEntry; write fields; CAS valid 0→1 (ready).
-    let cq_idx: Option<u32> = {
+    // --- Phase 5: claim a free CommitterQueueEntry, write fields, CAS 0→1. ---
+    let cq_result = {
         let mut queue = COMMITTER_QUEUE.exclusive();
         let tail = queue.tail.load(Relaxed);
         let mut found: Option<u32> = None;
         for i in 0..committer_capacity {
             let idx = ((tail + i) % committer_capacity) as usize;
-            let slot = &queue.entries[idx];
-            if slot.valid.load(Relaxed) == 0 {
+            if queue.entries[idx].valid.load(Relaxed) == 0 {
                 found = Some(idx as u32);
                 break;
             }
         }
-        if let Some(idx) = found {
-            let superbatch_id = queue.next_superbatch_id.fetch_add(1, Relaxed) + 1;
-            let entry = CommitterQueueEntry {
-                valid: std::sync::atomic::AtomicU8::new(0),
-                _pad: [0; 7],
-                superbatch_id,
-                envelope_count: 1,
-                _pad_env: [0; 2],
-                staging_entry_offsets: staging_offsets_off,
-                sku_pool_keys_offset: sku_keys_copy_off,
-                sku_pool_keys_count: sku_pool_count,
-                _pad_sku: [0; 2],
-                wip_pool_keys_offset: wip_keys_copy_off,
-                wip_pool_keys_count: wip_pool_count,
-                _pad_wip: [0; 2],
-                committer_pid: std::sync::atomic::AtomicI32::new(0),
-                _pad_pid: [0; 4],
-                committer_acquired_at_ns: std::sync::atomic::AtomicU64::new(0),
-                committer_tx_id: std::sync::atomic::AtomicU64::new(0),
-                enqueued_at_micros: unsafe { pg_sys::GetCurrentTimestamp() as u64 },
-            };
-            write_committer_entry(&mut queue.entries[idx as usize], &entry);
-            // CAS valid 0→1 (ready). M3.1 packed router does this once
-            // per SuperBatch; here it's once per staging entry.
-            let _ = queue.entries[idx as usize]
-                .valid
-                .compare_exchange(0, 1, Release, Relaxed);
+        if let Some(cq_idx) = found {
+            let sb_id = queue.next_superbatch_id.fetch_add(1, Relaxed) + 1;
+            let now_micros = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+            let slot = &mut queue.entries[cq_idx as usize];
+            slot.superbatch_id = sb_id;
+            slot.envelope_count = envelope_count;
+            slot.staging_entry_offsets = staging_offsets_off;
+            slot.sku_pool_keys_offset = sku_keys_off;
+            slot.sku_pool_keys_count = sku_count;
+            slot.wip_pool_keys_offset = wip_keys_off;
+            slot.wip_pool_keys_count = wip_count;
+            slot.committer_pid.store(0, Relaxed);
+            slot.committer_acquired_at_ns.store(0, Relaxed);
+            slot.committer_tx_id.store(0, Relaxed);
+            slot.enqueued_at_micros = now_micros;
+            let _ = slot.valid.compare_exchange(0, 1, Release, Relaxed);
             queue.tail.store((tail + 1) % committer_capacity, Relaxed);
-            // Read superbatch_id back for staging stamping.
-            queue.entries[idx as usize].committer_pid.store(0, Relaxed);
-            // Return the idx so staging stamping below uses the right superbatch_id.
-            // We need superbatch_id; read it back.
-            let sb = queue.entries[idx as usize].superbatch_id;
-            // Store it on the staging entry with Release semantics
-            // BEFORE the CAS valid 2→3. This is the data-before-flag
-            // invariant for the recovery sweep.
-            {
-                let staging = STAGING_QUEUE.share();
-                let s = &staging.entries[staging_idx as usize];
-                s.superbatch_id.store(sb, Release);
-                let _ = s.valid.compare_exchange(2, 3, Release, Relaxed);
-            }
-            Some(idx)
+            Some(sb_id)
         } else {
             None
         }
     };
 
-    if cq_idx.is_none() {
-        // CommitterQueue full; CAS staging back to pending.
+    let sb_id = match cq_result {
+        Some(id) => id,
+        None => {
+            // Committer queue full. Roll back the CAS 1→2's; free the
+            // arena blocks we just allocated. Next tick will retry.
+            rollback_packed_to_pending(&packed);
+            free_superbatch_arena(staging_offsets_off, sku_keys_off, wip_keys_off);
+            return 0;
+        }
+    };
+
+    // --- Phase 6: stamp staging entries with sb_id; CAS valid 2→3. ---
+    //
+    // Data-before-flag invariant: superbatch_id MUST be stored BEFORE
+    // the valid CAS, both with Release ordering. The recovery sweep
+    // (§3.3) Acquires `valid` first; if it sees 3, it then Acquires
+    // `superbatch_id` and trusts that the store is visible. Reversing
+    // these gives a recovery window where valid=3 with stale sb_id=0.
+    {
         let queue = STAGING_QUEUE.share();
-        let _ = queue.entries[staging_idx as usize]
-            .valid
-            .compare_exchange(2, 1, Release, Relaxed);
-        // Free the arena blocks we allocated.
-        let mut arena = SPILLOVER_ARENA.exclusive();
-        if staging_offsets_off != 0 {
-            arena.free(staging_offsets_off);
+        for cand in &packed {
+            let slot = &queue.entries[cand.staging_idx as usize];
+            slot.superbatch_id.store(sb_id, Release);
+            let _ = slot.valid.compare_exchange(2, 3, Release, Relaxed);
         }
-        if sku_keys_copy_off != 0 {
-            arena.free(sku_keys_copy_off);
-        }
-        if wip_keys_copy_off != 0 {
-            arena.free(wip_keys_copy_off);
-        }
-        return false;
     }
 
-    true
+    // --- Phase 7: stats. ---
+    record_superbatch_stats(envelope_count);
+
+    // M3.1 punts on SetLatch broadcast — committer BGWorker wakes on
+    // its 50ms tick. Spec §1.8 calls for SetLatch on idle committers;
+    // proper PID registry is M4.1 / M3.2-followup work since latency
+    // here is bounded by the committer tick anyway (50ms p99 vs
+    // ~500us router tick).
+
+    1
 }
 
-fn write_committer_entry(dst: &mut CommitterQueueEntry, src: &CommitterQueueEntry) {
-    dst.superbatch_id = src.superbatch_id;
-    dst.envelope_count = src.envelope_count;
-    dst.staging_entry_offsets = src.staging_entry_offsets;
-    dst.sku_pool_keys_offset = src.sku_pool_keys_offset;
-    dst.sku_pool_keys_count = src.sku_pool_keys_count;
-    dst.wip_pool_keys_offset = src.wip_pool_keys_offset;
-    dst.wip_pool_keys_count = src.wip_pool_keys_count;
-    dst.committer_pid.store(0, Relaxed);
-    dst.committer_acquired_at_ns.store(0, Relaxed);
-    dst.committer_tx_id.store(0, Relaxed);
-    dst.enqueued_at_micros = src.enqueued_at_micros;
+#[derive(Debug)]
+struct CandidateMeta {
+    staging_idx: u32,
+    sku_pool_keys_offset: u32,
+    sku_pool_count: u16,
+    wip_pool_keys_offset: u32,
+    wip_pool_count: u16,
 }
 
-/// Synchronous router-tick helper exposed to tests + SQL: drains one
-/// pending entry into a SuperBatch. Returns true if work was done.
+#[derive(Debug)]
+struct Candidate {
+    staging_idx: u32,
+    sku_pool_keys: Vec<(i64, i64)>,
+    wip_pool_keys: Vec<(i64, i64)>,
+}
+
+/// Walk the staging ring from `head` and collect up to `window_limit`
+/// pending (valid==1) entries' metadata. Bounded at staging_capacity
+/// total slot inspections per call.
+fn collect_candidates(staging_capacity: u32, window_limit: u32) -> Vec<CandidateMeta> {
+    let mut out: Vec<CandidateMeta> = Vec::new();
+    let queue = STAGING_QUEUE.share();
+    let head = queue.head.load(Relaxed);
+    let mut scanned: u32 = 0;
+    while scanned < staging_capacity && (out.len() as u32) < window_limit {
+        let idx = ((head + scanned) % staging_capacity) as usize;
+        let slot = &queue.entries[idx];
+        if slot.valid.load(Relaxed) == 1 {
+            out.push(CandidateMeta {
+                staging_idx: idx as u32,
+                sku_pool_keys_offset: slot.sku_pool_keys_offset,
+                sku_pool_count: slot.sku_pool_count,
+                wip_pool_keys_offset: slot.wip_pool_keys_offset,
+                wip_pool_count: slot.wip_pool_count,
+            });
+        }
+        scanned += 1;
+    }
+    out
+}
+
+/// Read each candidate's SKU + WIP pool keys from the arena. Holds
+/// the arena share lock once for the whole batch.
+fn hydrate_candidates(metas: &[CandidateMeta]) -> Vec<Candidate> {
+    let arena = SPILLOVER_ARENA.share();
+    metas
+        .iter()
+        .map(|m| {
+            let sku_pool_keys: Vec<(i64, i64)> =
+                if m.sku_pool_count > 0 && m.sku_pool_keys_offset != 0 {
+                    let bytes = arena.read_bytes(m.sku_pool_keys_offset, m.sku_pool_count as u32 * 16);
+                    bytes
+                        .chunks_exact(16)
+                        .map(|c| {
+                            let a = i64::from_le_bytes(c[0..8].try_into().unwrap());
+                            let b = i64::from_le_bytes(c[8..16].try_into().unwrap());
+                            (a, b)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let wip_pool_keys: Vec<(i64, i64)> =
+                if m.wip_pool_count > 0 && m.wip_pool_keys_offset != 0 {
+                    let bytes = arena.read_bytes(m.wip_pool_keys_offset, m.wip_pool_count as u32 * 16);
+                    bytes
+                        .chunks_exact(16)
+                        .map(|c| {
+                            let a = i64::from_le_bytes(c[0..8].try_into().unwrap());
+                            let b = i64::from_le_bytes(c[8..16].try_into().unwrap());
+                            (a, b)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            Candidate {
+                staging_idx: m.staging_idx,
+                sku_pool_keys,
+                wip_pool_keys,
+            }
+        })
+        .collect()
+}
+
+/// Allocate the three SuperBatch-owned arena blocks atomically — if
+/// any fails, free whatever succeeded and return None. Writes the
+/// block contents on success.
+fn allocate_superbatch_arena(
+    envelope_count: u16,
+    packed: &[Candidate],
+    sku_count: u16,
+    sku_sorted: &[(i64, i64)],
+    wip_count: u16,
+    wip_sorted: &[(i64, i64)],
+) -> Option<(u32, u32, u32)> {
+    let mut arena = SPILLOVER_ARENA.exclusive();
+    let offsets_bytes = (envelope_count as u32) * 4;
+    let so_off = arena.alloc(offsets_bytes)?;
+    let sku_off = if sku_count > 0 {
+        match arena.alloc(sku_count as u32 * 16) {
+            Some(v) => v,
+            None => {
+                arena.free(so_off);
+                return None;
+            }
+        }
+    } else {
+        0
+    };
+    let wip_off = if wip_count > 0 {
+        match arena.alloc(wip_count as u32 * 16) {
+            Some(v) => v,
+            None => {
+                arena.free(so_off);
+                if sku_off != 0 {
+                    arena.free(sku_off);
+                }
+                return None;
+            }
+        }
+    } else {
+        0
+    };
+
+    // Write staging-entry indices in pack order.
+    let mut so_buf: Vec<u8> = Vec::with_capacity(offsets_bytes as usize);
+    for cand in packed {
+        so_buf.extend_from_slice(&cand.staging_idx.to_le_bytes());
+    }
+    arena.write_bytes(so_off, &so_buf);
+
+    // Write deduplicated/sorted SKU pool keys.
+    if sku_count > 0 {
+        let mut sku_buf: Vec<u8> = Vec::with_capacity(sku_count as usize * 16);
+        for k in sku_sorted {
+            sku_buf.extend_from_slice(&k.0.to_le_bytes());
+            sku_buf.extend_from_slice(&k.1.to_le_bytes());
+        }
+        arena.write_bytes(sku_off, &sku_buf);
+    }
+
+    // Write deduplicated/sorted WIP pool keys.
+    if wip_count > 0 {
+        let mut wip_buf: Vec<u8> = Vec::with_capacity(wip_count as usize * 16);
+        for k in wip_sorted {
+            wip_buf.extend_from_slice(&k.0.to_le_bytes());
+            wip_buf.extend_from_slice(&k.1.to_le_bytes());
+        }
+        arena.write_bytes(wip_off, &wip_buf);
+    }
+
+    Some((so_off, sku_off, wip_off))
+}
+
+/// CAS each packed staging entry's valid 2→1 (processing → pending).
+/// Used when arena alloc or CommitterQueue claim fails post-CAS.
+fn rollback_packed_to_pending(packed: &[Candidate]) {
+    let queue = STAGING_QUEUE.share();
+    for cand in packed {
+        let _ = queue.entries[cand.staging_idx as usize]
+            .valid
+            .compare_exchange(2, 1, Release, Relaxed);
+    }
+}
+
+fn free_superbatch_arena(staging_offsets_off: u32, sku_keys_off: u32, wip_keys_off: u32) {
+    let mut arena = SPILLOVER_ARENA.exclusive();
+    if staging_offsets_off != 0 {
+        arena.free(staging_offsets_off);
+    }
+    if sku_keys_off != 0 {
+        arena.free(sku_keys_off);
+    }
+    if wip_keys_off != 0 {
+        arena.free(wip_keys_off);
+    }
+}
+
+// ── Router stats (lightweight; M3.3 builds the proper API) ──────────
+//
+// Counters live in shmem on CommitterQueue (not process-local statics)
+// so the router BGWorker's increments are visible from any backend
+// that reads via the SQL accessors. All atomics — no LWLock contention
+// on the hot path.
+
+fn record_superbatch_stats(envelope_count: u16) {
+    let queue = COMMITTER_QUEUE.share();
+    queue.router_superbatch_count.fetch_add(1, Relaxed);
+    queue
+        .router_total_envelopes
+        .fetch_add(envelope_count as u64, Relaxed);
+    let mut prev = queue.router_max_envelope_count.load(Relaxed);
+    while envelope_count > prev {
+        match queue.router_max_envelope_count.compare_exchange(
+            prev,
+            envelope_count,
+            Relaxed,
+            Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => prev = observed,
+        }
+    }
+}
+
+/// Reset router counters; for test fixtures.
+#[pg_extern]
+fn poc_v21_router_stats_reset() {
+    let queue = COMMITTER_QUEUE.share();
+    queue.router_superbatch_count.store(0, Relaxed);
+    queue.router_total_envelopes.store(0, Relaxed);
+    queue.router_max_envelope_count.store(0, Relaxed);
+}
+
+/// Total SuperBatches assembled since last reset.
+#[pg_extern]
+fn poc_v21_router_superbatch_count() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.router_superbatch_count.load(Relaxed) as i64
+}
+
+/// Largest envelope_count observed in a single SuperBatch.
+#[pg_extern]
+fn poc_v21_router_max_envelope_count() -> i32 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.router_max_envelope_count.load(Relaxed) as i32
+}
+
+/// Total envelopes packed across all SuperBatches.
+#[pg_extern]
+fn poc_v21_router_total_envelopes() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.router_total_envelopes.load(Relaxed) as i64
+}
+
+// ── Test SQL surface ────────────────────────────────────────────────
+
+/// Run one router tick. Returns true if at least one SuperBatch was
+/// assembled this call. Used by tests to drive the router
+/// deterministically.
 #[pg_extern]
 fn poc_v21_test_router_tick() -> bool {
-    try_route_one()
+    router_tick() > 0
+}
+
+/// Drain the router until no pending entry remains. Returns the count
+/// of SuperBatches assembled. Used by the property test fixture to
+/// flush quickly without waiting on the BGWorker's 50ms tick.
+#[pg_extern]
+fn poc_v21_test_router_drain() -> i64 {
+    let mut total: u64 = 0;
+    loop {
+        let n = router_tick();
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+    }
+    total as i64
 }
