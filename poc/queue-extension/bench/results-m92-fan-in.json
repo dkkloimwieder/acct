@@ -1,0 +1,886 @@
+{
+  "cells": [
+    {
+      "deadlocks_med": 0,
+      "n_backends": 1,
+      "p50_iqr_us": 34,
+      "p50_med_us": 2697,
+      "p999_iqr_us": 320,
+      "p999_med_us": 6831,
+      "p99_iqr_us": 12,
+      "p99_med_us": 3625,
+      "runs": [
+        {
+          "applies": 22121,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2663,
+          "p999_us": 6519,
+          "p99_us": 3587,
+          "run_idx": 0,
+          "throughput": 368.68333333333334,
+          "top_wait_event": {
+            "sum_backends": 377,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        },
+        {
+          "applies": 21974,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2675,
+          "p999_us": 6839,
+          "p99_us": 3725,
+          "run_idx": 1,
+          "throughput": 366.23333333333335,
+          "top_wait_event": {
+            "sum_backends": 373,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        },
+        {
+          "applies": 21858,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2697,
+          "p999_us": 6831,
+          "p99_us": 3623,
+          "run_idx": 2,
+          "throughput": 364.3,
+          "top_wait_event": {
+            "sum_backends": 358,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        },
+        {
+          "applies": 21741,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2715,
+          "p999_us": 6931,
+          "p99_us": 3625,
+          "run_idx": 3,
+          "throughput": 362.35,
+          "top_wait_event": {
+            "sum_backends": 378,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        },
+        {
+          "applies": 21818,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2709,
+          "p999_us": 6459,
+          "p99_us": 3635,
+          "run_idx": 4,
+          "throughput": 363.6333333333333,
+          "top_wait_event": {
+            "sum_backends": 383,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        }
+      ],
+      "sampler_enabled": true,
+      "shape": "fan_in",
+      "throughput_iqr": 2.6000000000000227,
+      "throughput_med": 364.3
+    },
+    {
+      "deadlocks_med": 0,
+      "n_backends": 2,
+      "p50_iqr_us": 4,
+      "p50_med_us": 3913,
+      "p999_iqr_us": 64,
+      "p999_med_us": 11111,
+      "p99_iqr_us": 12,
+      "p99_med_us": 4511,
+      "runs": [
+        {
+          "applies": 30459,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3917,
+          "p999_us": 11111,
+          "p99_us": 4523,
+          "run_idx": 0,
+          "throughput": 507.65,
+          "top_wait_event": {
+            "sum_backends": 580,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        },
+        {
+          "applies": 30525,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3909,
+          "p999_us": 10943,
+          "p99_us": 4495,
+          "run_idx": 1,
+          "throughput": 508.75,
+          "top_wait_event": {
+            "sum_backends": 581,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        },
+        {
+          "applies": 30446,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3915,
+          "p999_us": 11191,
+          "p99_us": 4543,
+          "run_idx": 2,
+          "throughput": 507.43333333333334,
+          "top_wait_event": {
+            "sum_backends": 579,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        },
+        {
+          "applies": 30492,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3913,
+          "p999_us": 11127,
+          "p99_us": 4511,
+          "run_idx": 3,
+          "throughput": 508.2,
+          "top_wait_event": {
+            "sum_backends": 572,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        },
+        {
+          "applies": 30504,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3911,
+          "p999_us": 11063,
+          "p99_us": 4511,
+          "run_idx": 4,
+          "throughput": 508.4,
+          "top_wait_event": {
+            "sum_backends": 574,
+            "wait_event": "WalSync",
+            "wait_event_type": "IO"
+          }
+        }
+      ],
+      "sampler_enabled": true,
+      "shape": "fan_in",
+      "throughput_iqr": 0.75,
+      "throughput_med": 508.2
+    },
+    {
+      "deadlocks_med": 0,
+      "n_backends": 4,
+      "p50_iqr_us": 4,
+      "p50_med_us": 3015,
+      "p999_iqr_us": 8,
+      "p999_med_us": 7683,
+      "p99_iqr_us": 40,
+      "p99_med_us": 4235,
+      "runs": [
+        {
+          "applies": 100816,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2993,
+          "p999_us": 7683,
+          "p99_us": 4167,
+          "run_idx": 0,
+          "throughput": 1680.2666666666667,
+          "top_wait_event": {
+            "sum_backends": 1065,
+            "wait_event": "WALWrite",
+            "wait_event_type": "LWLock"
+          }
+        },
+        {
+          "applies": 100434,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3015,
+          "p999_us": 7691,
+          "p99_us": 4235,
+          "run_idx": 1,
+          "throughput": 1673.9,
+          "top_wait_event": {
+            "sum_backends": 1018,
+            "wait_event": "WALWrite",
+            "wait_event_type": "LWLock"
+          }
+        },
+        {
+          "applies": 100627,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3017,
+          "p999_us": 7663,
+          "p99_us": 4235,
+          "run_idx": 2,
+          "throughput": 1677.1166666666666,
+          "top_wait_event": {
+            "sum_backends": 1020,
+            "wait_event": "WALWrite",
+            "wait_event_type": "LWLock"
+          }
+        },
+        {
+          "applies": 101033,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3013,
+          "p999_us": 7683,
+          "p99_us": 4195,
+          "run_idx": 3,
+          "throughput": 1683.8833333333334,
+          "top_wait_event": {
+            "sum_backends": 1055,
+            "wait_event": "WALWrite",
+            "wait_event_type": "LWLock"
+          }
+        },
+        {
+          "applies": 100222,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3019,
+          "p999_us": 8015,
+          "p99_us": 4347,
+          "run_idx": 4,
+          "throughput": 1670.3666666666666,
+          "top_wait_event": {
+            "sum_backends": 1005,
+            "wait_event": "WALWrite",
+            "wait_event_type": "LWLock"
+          }
+        }
+      ],
+      "sampler_enabled": true,
+      "shape": "fan_in",
+      "throughput_iqr": 6.366666666666561,
+      "throughput_med": 1677.1166666666666
+    },
+    {
+      "deadlocks_med": 0,
+      "n_backends": 8,
+      "p50_iqr_us": 9,
+      "p50_med_us": 1408,
+      "p999_iqr_us": 304,
+      "p999_med_us": 7143,
+      "p99_iqr_us": 12,
+      "p99_med_us": 4507,
+      "runs": [
+        {
+          "applies": 240332,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 1501,
+          "p999_us": 7963,
+          "p99_us": 4655,
+          "run_idx": 0,
+          "throughput": 4005.5333333333333,
+          "top_wait_event": {
+            "sum_backends": 1524,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 251862,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 1405,
+          "p999_us": 7143,
+          "p99_us": 4507,
+          "run_idx": 1,
+          "throughput": 4197.7,
+          "top_wait_event": {
+            "sum_backends": 1394,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 252087,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 1405,
+          "p999_us": 7235,
+          "p99_us": 4503,
+          "run_idx": 2,
+          "throughput": 4201.45,
+          "top_wait_event": {
+            "sum_backends": 1431,
+            "wait_event": "WALWrite",
+            "wait_event_type": "LWLock"
+          }
+        },
+        {
+          "applies": 251823,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 1408,
+          "p999_us": 6931,
+          "p99_us": 4507,
+          "run_idx": 3,
+          "throughput": 4197.05,
+          "top_wait_event": {
+            "sum_backends": 1460,
+            "wait_event": "WALWrite",
+            "wait_event_type": "LWLock"
+          }
+        },
+        {
+          "applies": 251058,
+          "classifier": "idle",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 1414,
+          "p999_us": 6927,
+          "p99_us": 4519,
+          "run_idx": 4,
+          "throughput": 4184.3,
+          "top_wait_event": {
+            "sum_backends": 1441,
+            "wait_event": "WALWrite",
+            "wait_event_type": "LWLock"
+          }
+        }
+      ],
+      "sampler_enabled": true,
+      "shape": "fan_in",
+      "throughput_iqr": 13.399999999999636,
+      "throughput_med": 4197.05
+    },
+    {
+      "deadlocks_med": 0,
+      "n_backends": 16,
+      "p50_iqr_us": 96,
+      "p50_med_us": 2077,
+      "p999_iqr_us": 112,
+      "p999_med_us": 6551,
+      "p99_iqr_us": 72,
+      "p99_med_us": 4879,
+      "runs": [
+        {
+          "applies": 409594,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2179,
+          "p999_us": 6551,
+          "p99_us": 4879,
+          "run_idx": 0,
+          "throughput": 6826.566666666667,
+          "top_wait_event": {
+            "sum_backends": 6328,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 422706,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2077,
+          "p999_us": 6587,
+          "p99_us": 4907,
+          "run_idx": 1,
+          "throughput": 7045.1,
+          "top_wait_event": {
+            "sum_backends": 6224,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 412178,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2159,
+          "p999_us": 6907,
+          "p99_us": 4911,
+          "run_idx": 2,
+          "throughput": 6869.633333333333,
+          "top_wait_event": {
+            "sum_backends": 6319,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 430856,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2042,
+          "p999_us": 6475,
+          "p99_us": 4835,
+          "run_idx": 3,
+          "throughput": 7180.933333333333,
+          "top_wait_event": {
+            "sum_backends": 6170,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 430636,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 2063,
+          "p999_us": 6355,
+          "p99_us": 4831,
+          "run_idx": 4,
+          "throughput": 7177.266666666666,
+          "top_wait_event": {
+            "sum_backends": 6275,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        }
+      ],
+      "sampler_enabled": true,
+      "shape": "fan_in",
+      "throughput_iqr": 307.6333333333332,
+      "throughput_med": 7045.1
+    },
+    {
+      "deadlocks_med": 0,
+      "n_backends": 32,
+      "p50_iqr_us": 54,
+      "p50_med_us": 3415,
+      "p999_iqr_us": 7692,
+      "p999_med_us": 10487,
+      "p99_iqr_us": 116,
+      "p99_med_us": 6095,
+      "runs": [
+        {
+          "applies": 538984,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3535,
+          "p999_us": 7563,
+          "p99_us": 5891,
+          "run_idx": 0,
+          "throughput": 8983.066666666668,
+          "top_wait_event": {
+            "sum_backends": 15653,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 560069,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3365,
+          "p999_us": 7851,
+          "p99_us": 5979,
+          "run_idx": 1,
+          "throughput": 9334.483333333334,
+          "top_wait_event": {
+            "sum_backends": 15377,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 557459,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3359,
+          "p999_us": 10487,
+          "p99_us": 6095,
+          "run_idx": 2,
+          "throughput": 9290.983333333334,
+          "top_wait_event": {
+            "sum_backends": 15529,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 547562,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3415,
+          "p999_us": 19743,
+          "p99_us": 6147,
+          "run_idx": 3,
+          "throughput": 9126.033333333333,
+          "top_wait_event": {
+            "sum_backends": 15211,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 548288,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 3419,
+          "p999_us": 15543,
+          "p99_us": 6095,
+          "run_idx": 4,
+          "throughput": 9138.133333333333,
+          "top_wait_event": {
+            "sum_backends": 15233,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        }
+      ],
+      "sampler_enabled": true,
+      "shape": "fan_in",
+      "throughput_iqr": 164.95000000000073,
+      "throughput_med": 9138.133333333333
+    },
+    {
+      "deadlocks_med": 0,
+      "n_backends": 64,
+      "p50_iqr_us": 12,
+      "p50_med_us": 6027,
+      "p999_iqr_us": 656,
+      "p999_med_us": 13751,
+      "p99_iqr_us": 48,
+      "p99_med_us": 9879,
+      "runs": [
+        {
+          "applies": 604548,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 6255,
+          "p999_us": 13847,
+          "p99_us": 9855,
+          "run_idx": 0,
+          "throughput": 10075.8,
+          "top_wait_event": {
+            "sum_backends": 31893,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 623933,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 6023,
+          "p999_us": 14871,
+          "p99_us": 10079,
+          "run_idx": 1,
+          "throughput": 10398.883333333333,
+          "top_wait_event": {
+            "sum_backends": 31837,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 624647,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 6023,
+          "p999_us": 13191,
+          "p99_us": 9879,
+          "run_idx": 2,
+          "throughput": 10410.783333333333,
+          "top_wait_event": {
+            "sum_backends": 31810,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 624862,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 6027,
+          "p999_us": 13751,
+          "p99_us": 9903,
+          "run_idx": 3,
+          "throughput": 10414.366666666667,
+          "top_wait_event": {
+            "sum_backends": 32273,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 623503,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 6035,
+          "p999_us": 12999,
+          "p99_us": 9847,
+          "run_idx": 4,
+          "throughput": 10391.716666666667,
+          "top_wait_event": {
+            "sum_backends": 31893,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        }
+      ],
+      "sampler_enabled": true,
+      "shape": "fan_in",
+      "throughput_iqr": 19.066666666665697,
+      "throughput_med": 10398.883333333333
+    },
+    {
+      "deadlocks_med": 0,
+      "n_backends": 128,
+      "p50_iqr_us": 240,
+      "p50_med_us": 11335,
+      "p999_iqr_us": 1376,
+      "p999_med_us": 23231,
+      "p99_iqr_us": 672,
+      "p99_med_us": 18383,
+      "runs": [
+        {
+          "applies": 638890,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 11799,
+          "p999_us": 25551,
+          "p99_us": 19039,
+          "run_idx": 0,
+          "throughput": 10648.166666666666,
+          "top_wait_event": {
+            "sum_backends": 66102,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 649263,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 11559,
+          "p999_us": 24607,
+          "p99_us": 19535,
+          "run_idx": 1,
+          "throughput": 10821.05,
+          "top_wait_event": {
+            "sum_backends": 65703,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 665584,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 11335,
+          "p999_us": 23231,
+          "p99_us": 18367,
+          "run_idx": 2,
+          "throughput": 11093.066666666668,
+          "top_wait_event": {
+            "sum_backends": 66864,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 666239,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 11319,
+          "p999_us": 23183,
+          "p99_us": 18207,
+          "run_idx": 3,
+          "throughput": 11103.983333333334,
+          "top_wait_event": {
+            "sum_backends": 66212,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 665526,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 11319,
+          "p999_us": 23231,
+          "p99_us": 18383,
+          "run_idx": 4,
+          "throughput": 11092.1,
+          "top_wait_event": {
+            "sum_backends": 66063,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        }
+      ],
+      "sampler_enabled": true,
+      "shape": "fan_in",
+      "throughput_iqr": 272.01666666666824,
+      "throughput_med": 11092.1
+    },
+    {
+      "deadlocks_med": 0,
+      "n_backends": 256,
+      "p50_iqr_us": 1216,
+      "p50_med_us": 21167,
+      "p999_iqr_us": 2272,
+      "p999_med_us": 45983,
+      "p99_iqr_us": 1376,
+      "p99_med_us": 34687,
+      "runs": [
+        {
+          "applies": 679161,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 22255,
+          "p999_us": 44831,
+          "p99_us": 36031,
+          "run_idx": 0,
+          "throughput": 11319.35,
+          "top_wait_event": {
+            "sum_backends": 136487,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 712652,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 21167,
+          "p999_us": 47103,
+          "p99_us": 34655,
+          "run_idx": 1,
+          "throughput": 11877.533333333333,
+          "top_wait_event": {
+            "sum_backends": 138755,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 716715,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 21039,
+          "p999_us": 45983,
+          "p99_us": 34687,
+          "run_idx": 2,
+          "throughput": 11945.25,
+          "top_wait_event": {
+            "sum_backends": 136172,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 669218,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 22255,
+          "p999_us": 51679,
+          "p99_us": 38495,
+          "run_idx": 3,
+          "throughput": 11153.633333333333,
+          "top_wait_event": {
+            "sum_backends": 137669,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        },
+        {
+          "applies": 719042,
+          "classifier": "B5:wake",
+          "deadlocks_delta": 0,
+          "errors": 0,
+          "p50_us": 20991,
+          "p999_us": 43967,
+          "p99_us": 33951,
+          "run_idx": 4,
+          "throughput": 11984.033333333333,
+          "top_wait_event": {
+            "sum_backends": 138687,
+            "wait_event": "Extension",
+            "wait_event_type": "Extension"
+          }
+        }
+      ],
+      "sampler_enabled": true,
+      "shape": "fan_in",
+      "throughput_iqr": 625.8999999999996,
+      "throughput_med": 11877.533333333333
+    }
+  ],
+  "config": {
+    "duration_secs": 60,
+    "n_sweep": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "runs_per_cell": 5,
+    "settle_secs": 30,
+    "shape": "fan_in"
+  },
+  "spec": "M9.2 acct-4d4n.21 fan_in statistical sweep"
+}

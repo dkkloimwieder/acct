@@ -36,6 +36,7 @@
 //!                burst).
 //! - mixed:       uniform random over 1..=g; method rotates fifo→avg→std.
 
+use hdrhistogram::Histogram;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use sqlx::postgres::PgPoolOptions;
@@ -44,6 +45,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Barrier;
+
+use super::pg_locks_sampler::{PgLocksSampler, SamplerReport};
 
 pub const DSN: &str = "postgres://acct:acct_dev@localhost:5111/acct_poc_queue";
 pub const LOCATION_ID: i64 = 1;
@@ -411,6 +414,323 @@ pub async fn run_shape(pool: Arc<PgPool>, cfg: &WorkloadConfig) -> ShapeResult {
         },
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// M9.2 (acct-4d4n.21): statistical runner — histogram-based capture +
+// 5×60s replication + IQR aggregation + optional pg_locks sampler.
+// ──────────────────────────────────────────────────────────────────────
+
+const HIST_HIGH_US: u64 = 60 * 60 * 1_000_000; // 1h in µs — generous ceiling
+const HIST_SIG_FIG: u8 = 3;
+
+/// One 60s run of a workload cell. Histograms capture per-call latency
+/// with bounded memory; counters track throughput + errors. Sampler
+/// report is present only when the cell ran with sampling enabled.
+#[derive(Debug, Clone)]
+pub struct CellRun {
+    pub run_idx: usize,
+    pub total_applies: u64,
+    pub errors: u64,
+    pub throughput: f64,
+    pub p50_us: u64,
+    pub p99_us: u64,
+    pub p999_us: u64,
+    pub deadlocks_delta: i64,
+    pub classifier_label: String,
+    pub sampler: Option<SamplerReport>,
+}
+
+/// Per-N aggregate. Median + IQR (Q3 − Q1) per metric over the N runs.
+#[derive(Debug, Clone)]
+pub struct CellResult {
+    pub shape: String,
+    pub n_backends: usize,
+    pub runs: Vec<CellRun>,
+    pub throughput_med: f64,
+    pub throughput_iqr: f64,
+    pub p50_med_us: u64,
+    pub p50_iqr_us: u64,
+    pub p99_med_us: u64,
+    pub p99_iqr_us: u64,
+    pub p999_med_us: u64,
+    pub p999_iqr_us: u64,
+    pub deadlocks_med: i64,
+    pub sampler_enabled: bool,
+}
+
+pub struct CellConfig {
+    pub shape: Shape,
+    pub n_backends: usize,
+    pub duration_secs: u64,
+    pub runs: usize,
+    pub settle_secs: u64,
+    pub with_sampler: bool,
+    pub sampler_interval_ms: u64,
+}
+
+impl Default for CellConfig {
+    fn default() -> Self {
+        Self {
+            shape: Shape::FanIn,
+            n_backends: 4,
+            duration_secs: 60,
+            runs: 5,
+            settle_secs: 30,
+            with_sampler: true,
+            sampler_interval_ms: 100,
+        }
+    }
+}
+
+/// Histogram-based variant of `run_shape`. Returns hdrhistogram for
+/// merged-cross-task latency + counters + classifier label.
+async fn run_shape_h(
+    pool: Arc<PgPool>,
+    cfg: &CellConfig,
+) -> (Histogram<u64>, u64, u64, String, HashMap<String, u64>) {
+    let n = cfg.n_backends;
+    let duration = Duration::from_secs(cfg.duration_secs);
+    let barrier = Arc::new(Barrier::new(n));
+    let zipf_cdf: Option<Arc<Vec<f64>>> = if cfg.shape == Shape::Zipfian {
+        Some(Arc::new(build_zipf_cdf(cfg.shape.g(), 1.0)))
+    } else {
+        None
+    };
+
+    let snap_start = fetch_snapshot(&pool).await;
+    let wall_t0 = Instant::now();
+
+    let mut handles = Vec::with_capacity(n);
+    for backend_idx in 0..n {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        let zipf = zipf_cdf.clone();
+        let shape = cfg.shape;
+        handles.push(tokio::spawn(async move {
+            let mut hist: Histogram<u64> =
+                Histogram::new_with_bounds(1, HIST_HIGH_US, HIST_SIG_FIG)
+                    .expect("histogram bounds");
+            let mut applies: u64 = 0;
+            let mut errors: u64 = 0;
+            let mut method_counts: HashMap<String, u64> = HashMap::new();
+
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+                .wrapping_add(
+                    (backend_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                );
+            let mut rng = SmallRng::seed_from_u64(seed);
+
+            barrier.wait().await;
+            let start = Instant::now();
+            let mut iter: usize = 0;
+            while start.elapsed() < duration {
+                let sku = pick_sku(
+                    shape,
+                    backend_idx,
+                    n,
+                    iter,
+                    &mut rng,
+                    zipf.as_deref().map(|v| v.as_slice()),
+                );
+                let method = pick_method(shape, iter);
+                if shape == Shape::MixedMethod {
+                    *method_counts.entry(method.to_string()).or_insert(0) += 1;
+                }
+                let issue_id: i64 =
+                    (backend_idx as i64) * 10_000_000_000 + iter as i64;
+                let t0 = Instant::now();
+                let r: Result<(i32,), sqlx::Error> = sqlx::query_as(
+                    "SELECT error_code FROM poc_ledger_apply($1, $2, $3, $4, $5)",
+                )
+                .bind(sku)
+                .bind(LOCATION_ID)
+                .bind(1_i64)
+                .bind(issue_id)
+                .bind(method)
+                .fetch_one(&*pool)
+                .await;
+                let dt_us = (t0.elapsed().as_nanos() / 1000) as u64;
+                match r {
+                    Ok((ec,)) => {
+                        if ec == 0 {
+                            let _ = hist.record(dt_us.max(1).min(HIST_HIGH_US));
+                            applies += 1;
+                        } else {
+                            errors += 1;
+                        }
+                    }
+                    Err(_) => {
+                        errors += 1;
+                    }
+                }
+                iter += 1;
+            }
+            (hist, applies, errors, method_counts)
+        }));
+    }
+
+    let mut merged: Histogram<u64> =
+        Histogram::new_with_bounds(1, HIST_HIGH_US, HIST_SIG_FIG).unwrap();
+    let mut total_applies: u64 = 0;
+    let mut total_errors: u64 = 0;
+    let mut total_methods: HashMap<String, u64> = HashMap::new();
+    for h in handles {
+        let (hist, applies, errors, methods) =
+            h.await.expect("backend task panicked");
+        merged.add(&hist).expect("histogram merge");
+        total_applies += applies;
+        total_errors += errors;
+        for (k, v) in methods {
+            *total_methods.entry(k).or_insert(0) += v;
+        }
+    }
+
+    let wall_ms = wall_t0.elapsed().as_millis() as i64;
+    let snap_end = fetch_snapshot(&pool).await;
+    let label =
+        fetch_classifier_label(&pool, &snap_start.0, &snap_end.0, wall_ms).await;
+    let _ = total_errors;
+    (merged, total_applies, total_errors, label, total_methods)
+}
+
+async fn fetch_deadlocks(pool: &PgPool) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(deadlocks, 0)::BIGINT FROM pg_stat_database WHERE datname = 'acct_poc_queue'"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|_| (0,));
+    row.0
+}
+
+/// Run a single cell — `runs` × duration_secs with `settle_secs` gap.
+pub async fn run_cell(pool: Arc<PgPool>, cfg: &CellConfig) -> CellResult {
+    let mut runs: Vec<CellRun> = Vec::with_capacity(cfg.runs);
+    for r in 0..cfg.runs {
+        reset_state(&pool).await.expect("reset_state");
+        pre_seed(&pool, cfg.shape).await.expect("pre_seed");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let dl_before = fetch_deadlocks(&pool).await;
+        let sampler = if cfg.with_sampler {
+            Some(
+                PgLocksSampler::spawn((*pool).clone(), cfg.sampler_interval_ms)
+                    .await,
+            )
+        } else {
+            None
+        };
+
+        let (hist, applies, errors, label, _methods) =
+            run_shape_h(pool.clone(), cfg).await;
+        let dl_after = fetch_deadlocks(&pool).await;
+
+        let report = if let Some(s) = sampler {
+            Some(s.shutdown().await)
+        } else {
+            None
+        };
+
+        let p50 = hist.value_at_quantile(0.50);
+        let p99 = hist.value_at_quantile(0.99);
+        let p999 = hist.value_at_quantile(0.999);
+        let throughput = (applies as f64) / cfg.duration_secs as f64;
+
+        runs.push(CellRun {
+            run_idx: r,
+            total_applies: applies,
+            errors,
+            throughput,
+            p50_us: p50,
+            p99_us: p99,
+            p999_us: p999,
+            deadlocks_delta: dl_after - dl_before,
+            classifier_label: label,
+            sampler: report,
+        });
+
+        if r + 1 < cfg.runs {
+            tokio::time::sleep(Duration::from_secs(cfg.settle_secs)).await;
+        }
+    }
+
+    // Per-metric median + IQR over the N runs.
+    let throughputs: Vec<f64> = runs.iter().map(|r| r.throughput).collect();
+    let p50s: Vec<u64> = runs.iter().map(|r| r.p50_us).collect();
+    let p99s: Vec<u64> = runs.iter().map(|r| r.p99_us).collect();
+    let p999s: Vec<u64> = runs.iter().map(|r| r.p999_us).collect();
+    let dls: Vec<i64> = runs.iter().map(|r| r.deadlocks_delta).collect();
+
+    let (t_med, t_iqr) = stats_f64(&throughputs);
+    let (p50_med, p50_iqr) = stats_u64(&p50s);
+    let (p99_med, p99_iqr) = stats_u64(&p99s);
+    let (p999_med, p999_iqr) = stats_u64(&p999s);
+    let dl_med = median_i64(&dls);
+
+    CellResult {
+        shape: cfg.shape.name().to_string(),
+        n_backends: cfg.n_backends,
+        runs,
+        throughput_med: t_med,
+        throughput_iqr: t_iqr,
+        p50_med_us: p50_med,
+        p50_iqr_us: p50_iqr,
+        p99_med_us: p99_med,
+        p99_iqr_us: p99_iqr,
+        p999_med_us: p999_med,
+        p999_iqr_us: p999_iqr,
+        deadlocks_med: dl_med,
+        sampler_enabled: cfg.with_sampler,
+    }
+}
+
+fn quantile_sorted_f64(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = (q * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn quantile_sorted_u64(sorted: &[u64], q: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = (q * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn stats_f64(vs: &[f64]) -> (f64, f64) {
+    let mut s = vs.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = quantile_sorted_f64(&s, 0.50);
+    let q1 = quantile_sorted_f64(&s, 0.25);
+    let q3 = quantile_sorted_f64(&s, 0.75);
+    (med, q3 - q1)
+}
+
+fn stats_u64(vs: &[u64]) -> (u64, u64) {
+    let mut s = vs.to_vec();
+    s.sort_unstable();
+    let med = quantile_sorted_u64(&s, 0.50);
+    let q1 = quantile_sorted_u64(&s, 0.25);
+    let q3 = quantile_sorted_u64(&s, 0.75);
+    (med, q3.saturating_sub(q1))
+}
+
+fn median_i64(vs: &[i64]) -> i64 {
+    if vs.is_empty() {
+        return 0;
+    }
+    let mut s = vs.to_vec();
+    s.sort_unstable();
+    s[s.len() / 2]
+}
+
+// ──────────────────────────────────────────────────────────────────────
 
 /// Format a result block for human reading + persistence.
 pub fn fmt_result(r: &ShapeResult) -> String {
