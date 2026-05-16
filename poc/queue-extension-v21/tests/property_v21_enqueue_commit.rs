@@ -227,6 +227,11 @@ async fn run_scenario(pool: &PgPool, events: Vec<SyntheticEvent>) {
 #[test]
 #[ignore]
 fn prop_v21_enqueue_commit() {
+    // Current-thread runtime + Handle::block_on inside the proptest
+    // closure deadlocks: a current-thread runtime can't drive I/O via
+    // Handle::block_on once the outer block_on returns. Use the
+    // runtime directly via a reference (the proptest Fn closure
+    // borrows it instead of taking the cloned Handle).
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -243,11 +248,10 @@ fn prop_v21_enqueue_commit() {
         ..proptest::test_runner::Config::default()
     });
     let strategy = scenario_strategy();
-    let handle = runtime.handle().clone();
     runner
         .run(&strategy, |events| {
             let pool = pool.clone();
-            handle.block_on(async move {
+            runtime.block_on(async move {
                 run_scenario(&pool, events).await;
             });
             Ok(())
