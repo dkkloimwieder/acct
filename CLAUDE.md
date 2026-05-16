@@ -2,69 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repository status
+## What the project is
 
-**Phase 0 + Phase 1 cost-method matrix + Slice A inflow + Slice B conversion + BOM2 + WAC-on-WIP coverage + Slice C outflow + by-products + state-aware return routing + standalone memos + tolerance windows + Phases B/C/D/E1/E2 (lot-and-serial) + F (services-domain wrappers) + partition lifecycle (acct-sbr2) + perf instrumentation + caller-side batch RPC PoC follow-up (acct-22xt) are functionally complete.** The consolidated schema started as **21 cohesive migration files** under `db/migrations/` (the `acct-dhzc` consolidation, 2026-05-07; the original 104 incremental migrations preserved verbatim in `db/archive_migrations/`). Subsequent phases layered migrations 0022–0070 on top: D (inventory_movements subledger), E1 (FIFO cost layers + depletions), E2 + sxl2 (lot + lot-and-serial), F1–F3 (post_journal_entry, post_service_bill, post_expense_report), and the audit / perf / partition-registry / wrapper-instrumentation / customer_invoice batching / shape-L psync work. The schema-consolidation event baked all naming unifications into the schema from the first migration:
+An ERP ledger and inventory system: SKU × location quantity tracking, per-routing-step WIP, document lifecycle (WO/SO/TO/PO), double-entry GL, multi-currency, reservations, commodity provisional pricing, period close. The design has gone through one full review cycle and has converged on a **Postgres-native v0.2** target (consolidated doc Part IV) — explicitly not a TigerBeetle drop-in or hybrid system.
 
-- `posting_lines` (formerly `transfers`), `posting_line_reason`, `posting_lines_provisional`, `posting_line_sources`, `post_posting_lines`, `_post_posting_lines_*`, `block_posting_line_modifications`, `trg_posting_lines_append_only`
-- `_bom_header_at`, `_resolve_standard_cost_at` (internal helpers prefixed)
-- `vendor_pool` (formerly `supplier_pool`), `stock_consigned` (formerly `stock_consigned_at_vendor`)
-- `variance_wac_periodic`, `variance_cost_adjust_retroactive` (suffix-completed)
-- `bom_lines.yield_pct` (formerly `scrap_pct`; semantics inverted: yield_pct=100 means full yield, default 100, CHECK `> 0 AND <= 100`)
-- `reconciliation_alerts.alert_kind` (was `alert_type`)
-- Per-event `document_kind` text literals: WO callers set `'wo_start'` / `'op_move'` / `'wo_complete'` / `'scrap'` / `'wo_close_unproduced'` / `'osp_ship'` / `'osp_receive'`; `post_so_ship` writes `'so_ship'` (not the generic `'wo_event'` or `'so_shipment'` of the pre-consolidation history)
-- `accounts.ledger_kind` is a PG ENUM (`qty` / `value`), not TEXT
-- `bom_headers.effective_at` / `obsolete_at` and `engineering_change_orders.effective_at` are DATE (were TIMESTAMPTZ; always 00:00 UTC in practice)
+Four PoC research streams under `poc/` characterize architectural alternatives in parallel (separate crates, separate databases, off the production critical path). See `poc/README.md` for the catalog.
 
-All R1–R7 class-confusion fixes (acct-rgb / acct-fii / acct-69e / acct-7py / acct-69p / acct-smn / acct-rso / acct-5prc / acct-quca and the broader acct-du2 audit) are preserved by replicating the latest function bodies; the audit trail of *how* we got there lives in git log on `db/archive_migrations/` plus bd issues plus `REVIEW.md`. The consolidation is purely structural — no behavioral changes; the test oracle (656 / 0 / 9) was held flat across the cutover.
-
-**What was shipped before consolidation, by feature area** (cited by bd issue ID; consult `bd show <id>` or `git log -- db/archive_migrations/` for the full rationale):
-
-- **Phase 0 foundation**: `post_posting_lines` (extracted helpers `_post_posting_lines_lock_pre_scan`, `_post_posting_lines_apply_event`), `reserve_inventory`, `run_daily_reconciliation`, the period-lock invariant, and the standard-cost dispatcher. Append-only via trigger. Single inventory class per SKU was retired by `acct-75z` (per-event `posting_lines.qty`).
-- **Phase 1 cost methods**: `wac_perpetual` / `wac_periodic` / `wac_retroactive` dispatch, all driven by the `cost_method_strategies` registry (`acct-w0lo`). `close_period` driven by the `close_hooks` registry (same epic). `wac_periodic_close_hook` is a topological per-pool recompute (`acct-qfj` then refactored under `acct-smn`); `wac_retroactive_close_hook` adds per-event chronological replay with merged value/qty stream (`acct-9tw` then `acct-rso`). Retroactive cost-adjust via queue-then-flush-at-close (`acct-og1`). Mixed parent/component cost methods route variance through `variance_material_mixed` (`acct-7eo`). `'fifo'` / `'lot'` still raise P0006 pending `acct-8gg` / `acct-uze` / `acct-0kz` (all blocked-by `acct-2c1m`).
-- **Standard cost as separate entity** (`acct-hlr`): `standard_costs` append-only table; canonical lookup `_resolve_standard_cost_at(sku, date)` raises **P0018** if no standard at business_date. `post_standard_cost_roll` revalues raw + fg pools; WIP excluded by default but opt-in via `p_revalue_wip` (`acct-bru`, posts `pool_qty × Δstd` against `variance_wip_revaluation`). Retroactive rolls blocked (P0019); optimistic concurrency via P0017.
-- **Slice A inflow** (`acct-7mg`, vendor terminology baked in via `acct-397`): `purchase_order_lines`, `po_receipts` + `po_receipt_lines` (with `cost_method_at_receipt` snapshot, `acct-6d8`), `vendor_bills`, `ap_payments` (`acct-bvh`), `po_returns` + `po_return_lines` (with state-aware routing via `qty_to_ap_unsettled` / `qty_to_ap` columns, `acct-tk7` + `acct-dso`). GRNI semantics: `post_po_receipt` accrues to `ap_unsettled`; `post_ap_bill` clears to `ap` with strict three-way match on (sku, location, qty, unit_cost). Cross-period PPV adjustment via `variance_ppv_prior_period_adj` (`acct-b8n`). Tolerance windows via `vendors.unit_cost_tolerance_pct` → `variance_match_tolerance` (`acct-7mc`).
-- **Slice B conversion** (`acct-h7j` then `acct-b82`): `work_orders` with per-WO `wo_routings` (no shared template at MVP), `wo_events`, `post_wo_start` / `post_op_move` / `post_wo_complete` / `post_scrap` / `post_wo_close_unproduced` / `post_osp_ship` / `post_osp_receive` / `post_eco_approve`. WO parents accept all four cost methods (`acct-wig` / `acct-bol` / `acct-smn` / `acct-rso`). `op_move_v` / `wo_complete_v` / `scrap_v` / `rm_issue_to_wo` are caller-supplied-amount reasons that bypass the dispatcher's auto-pricing. Idempotency replay race fixed in `acct-69p` (dual-check pattern).
-- **BOM2** (`acct-jg2` + `acct-6jq`): `bom_headers` + `bom_lines` + `absorption_classes` + `engineering_change_orders` + `wo_outputs` + `bom_by_products` + `wo_by_products`. Phantom expansion (16-level cap), alternates, time-phased revisions via ECOs, runtime-configurable absorption taxonomy, `fire_at` scrap-aware semantics, `default_lot_size` per-lot amortization, dual-mode yield (`skus.yield_mode ∈ {plan_only, absorbed}`). Pre-balance step at final WO close reconciles pool@last_op vs `parent_std × qty` BEFORE per-output drain; `acct-69e` gates pre-balance + residual sweep on **solo-at-pool** so interleaved multi-WO scenarios don't contaminate variance attribution.
-- **rm_issue actual-cost dispatch** (`acct-rgb` umbrella): tier 1 (`acct-24b`) handles wac_perpetual components by reading source-pool running avg under FOR UPDATE at issue time; tier 2 (`acct-7py`) handles wac_periodic / wac_retroactive components — flags rm_issue value-leg into `posting_lines_provisional` and extends close-hook topological pool walks to include `rm_issue_to_wo` edges (raw_component → destination_WIP). Switched `_post_posting_lines_apply_event`'s SKU resolution to credit-first (R2; depletion source drives flagging across all flagged reasons; latent multi-output `wo_complete_v` output_sku-vs-parent_sku bug fixed in passing).
-- **Slice C outflow** (`acct-th7`): `customers`, `sales_order_lines`, `so_allocations` (`acct-mv8` — pre-ship reservation flip from `'active'` to `'allocated'`), `so_shipments` + `so_shipment_lines` (with `cost_method_at_ship` snapshot, `acct-6d8`), `customer_invoices` (with tolerance window, `acct-7mc`), `ar_payments`, `customer_returns` + `customer_return_lines` (state-aware routing via `qty_to_ar_unsettled` / `qty_to_ar`, `acct-tk7` + `acct-dso`). GRNI symmetry: `post_so_ship` accrues to `ar_unsettled`; `post_customer_invoice` clears to `ar`. Reservation lifecycle gained `'shipped'`. Standalone credit / debit memos: `customer_credit_memos` / `vendor_debit_memos` (`acct-tae` + `acct-b6e` — always route to cleared account; financial vs goods-return line kinds).
-- **By-products epic** (`acct-7t4`, sub-issues `acct-ksnh` / `v5r6` / `u1n9` / `6g47` shipped): three treatments (`nrv_credit` / `negligible` / `disposal_cost`); `accrued_disposal_liability` (vendor-partitioned, GRNI-style); per-line `inventoriable` vs `period` disposal basis. `post_ap_bill kind='disposal_match'` drains the AP-side liability (`acct-3yno`); yield variance via `variance_yield_byproduct` (`acct-a41h`).
-- **Architecture-additive columns**: `posting_lines.posting_layer` (`acct-chzx` — IFRS / local-GAAP / tax-basis tagging via bitmask, default 1, partial index on `WHERE posting_layer != 1`), `posting_lines.legal_entity_id` + `accounts.legal_entity_id` + `legal_entities` table.
-- **Phase B convergence (shipped)**: `posting_line_sources` (B1 — reversal pointer / parent-document linkage / intercompany-pair correlation / process-name audit), `posting_line_currencies` + functional-currency-per-LE (B2), `posting_line_dimensions` + `dimension_types` (B3), `posting_line_inventory` (C). All under the `acct-wb75` architecture-synthesis epic (now auto-closed).
-- **Phase D + E1 + E2/sxl2 + F**: `inventory_movements` keystone subledger (D, partitioned monthly), `cost_layers` + `cost_layer_depletions` FIFO (E1), `inventory_lots` + `inventory_lot_events` (E2) + `inventory_units` + `inventory_unit_events` for lot-and-serial dual tracking (sxl2). Services-domain wrappers F1–F3: `post_journal_entry` (generic), `post_service_bill` (vendor service invoice, bypasses GRNI), `post_expense_report` (employee reimbursement with new `ap_employee` account_kind).
-- **Audit + perf + ops** (post-Phase-F): architectural audit `acct-8hv2` codified the noise band (combined p99 IQR ~30%, throughput IQR ~8.5%) + hot-row contention findings on `accounts.tuple`; shape-L pseudo-sync infrastructure shipped as `post_so_ship_psync` (acct-c4p); partition-rollover hardening + central registry + recon check #15 (acct-sbr2); end-to-end mixed-workload load test (acct-1s6r → `perf_baseline_v2.md`).
-
-The remaining open bd issues are all P3 — Phase 2 epics and infrastructure deferrals — plus the v2.1 PoC validation epic `acct-gx1z` (P1) and its follow-ups (see "PoC research streams" below).
-
-## What exists now
-
-- Postgres 18 dev environment in Docker (`docker-compose.yml`, `db/Dockerfile`, `db/init/`).
-- Helper scripts (`scripts/dev-up.sh`, `scripts/dev-down.sh`, `scripts/run-migrations.sh`, `scripts/run-tests.sh`, `scripts/ci-check.sh`, `scripts/run-perf-baseline.sh`).
-- Rust crate root (`Cargo.toml`, `src/lib.rs`) — library only, sqlx + tokio.
-- **70 migration files** under `db/migrations/` (`0001_extensions` through `0070_post_so_ship_psync`). The original 104 incremental migrations are preserved verbatim in `db/archive_migrations/`; the consolidation (0001–0021) flattened multi-revision function bodies into a single CREATE OR REPLACE per function and baked the renames in from the start. Mig 0022 onward layered the Phase B/C/D/E1/E2/F + sxl2 + sbr2 + audit/perf + caller-side-batch-RPC work on top:
-  - **Consolidated foundation** (0001–0008): extensions, types and enums, periods (with `periods_no_overlap` EXCLUDE constraint), fx_rates, legal_entities, reference stubs (skus / locations / vendors / customers), accounts, standard_costs.
-  - **Consolidated posting layer** (0009–0011): `posting_lines` + append-only trigger, `inventory_reservations` + `reserve_inventory` + pg_cron expiry job.
-  - **Consolidated period close + cost-method dispatch** (0012–0015): `posting_lines_provisional` + `inventory_cost_adjustments_retroactive` + `close_hooks` registry + `close_period`; `cost_method_strategies` registry + 4 `_compute_amount_<method>_outbound` functions; the keystone `post_posting_lines` (with `_post_posting_lines_*` helpers); the three close hooks (`wac_periodic_close_hook` / `wac_retroactive_close_hook` / `cost_adjust_retroactive_hook`).
-  - **Consolidated document layer** (0016–0018): inflow (Slice A + standalone Phase 1 inv/cost adjustment workflows), conversion (BOM2 schema + WO lifecycle + by-products + OSP + `post_ap_bill` `disposal_match` extension), outflow (Slice C).
-  - **Consolidated extensions + infrastructure** (0019–0021): `posting_line_sources` (B1), `run_daily_reconciliation` + alerts table + cron, `close_hooks` seeds + `ledger_outbox`.
-  - **Post-consolidation work** (0022–0070): Phase B2/B3 (currencies, dimensions), Phase C (`posting_line_inventory`), Phase D (`inventory_movements` keystone subledger, partitioned monthly), Phase E1 (FIFO `cost_layers` + `cost_layer_depletions`), Phase E2 / sxl2 (lot + lot-and-serial via `inventory_lots`, `inventory_lot_events`, `inventory_units`, `inventory_unit_events`), Phase F (services-domain wrappers `post_journal_entry` / `post_service_bill` / `post_expense_report`), partition lifecycle (`partitioned_tables_registry` + recon check #15), wrapper instrumentation, customer_invoice aggregate batching, `post_so_ship_psync` (shape-L pseudo-sync).
-- **147 integration test binaries** under `tests/` (24 `property_*.rs` per the property-test-per-entry-point convention; balance T1 invariant probes / T2 workflow matrices / T5 conformance / load matrices). See "Property-test-per-entry-point convention" below.
-- `db/fixtures/small/seed.sql` — minimal-but-realistic seed for `cargo test`.
-- `perf_baseline_v0.md` / `perf_baseline_v1.md` / `perf_baseline_v2.md` — three baseline matrices. v0 (2026-04-29) is the 13-shape pre-consolidation foundation. v1 (2026-05-01) is the post-Slice-A re-measurement. v2 (2026-05-11) is the end-to-end mixed-workload baseline on a 67-mig schema; this is the first realistic-mix baseline and the trigger surface for `acct-c4p` (pseudo-sync pivot) and `acct-e8g` (posting_lines partitioning). Re-baselining against the latest schema is a future task; no triggering regression has surfaced yet.
-- The design spec (`ledger_design_consolidated_v0.md`) and `ARCHIVE/` of predecessor docs.
-
-When adding new categories of code, update this file.
-
-## PoC research streams (under `poc/`)
-
-Parallel to the main acct ledger, four research streams live under `poc/`. Each is a separate Cargo crate / separate Postgres database / separate scope. None are on the production critical path; their purpose is to characterize architectural alternatives ahead of integration decisions.
-
-- **`poc/batch-ledger/`** — pure-SQL batch-ledger PoC (epic `acct-togd` / `acct-qdp5`). Measured per-row hot-path costs across cost methods (simple/append-only/WAC/FIFO/specific) at fan-in vs fan-out shapes. Findings: UPDATE `accounts` is ~half the per-row cost in the simple-transfer path; append-only INSERT doubles throughput; FIFO is plpgsql + jsonb O(n²) and structurally caps near 1K tps; specific-costing UPDATE→INSERT pattern doubles. Drove the `acct-sw4i` shmem direction.
-- **`poc/ledger-extension/`** — shmem rollup + bgworker drain pgrx extension PoC (epic `acct-sw4i`, closed). Replaces UPDATE `accounts` with cache-line-aligned shmem bucket CAS + 100ms drain to durable rollup. Validated: fan-in 67K evps (2.16× mutable, 96% of append-only ceiling), fan-out 43.5K (5.55× mutable). M10 hardening (epic `acct-tpqw`) covers XactCallback-deferred apply (correctness fix), seqlock reads, error-handling edges.
-- **`poc/queue-extension/`** — queue+committer costing PoC (v2; epic `acct-4d4n`, closed CONDITIONAL PASS 2026-05-16; verdict in `BENCHMARK_RESULTS.md` + `poc/design_research/poc-validation-spec.md` §M10). Single-queue + per-shard committer pattern. Headline: fan_in N=256 ≈ 11878 evps; fan_out N=128 ≈ 6379; small_batch N=128 ≈ 8017 (b=1). Conditional pass: P1 14.2× scaling vs 24× bar (root cause shard LWLock saturation at `shard_count=16`; mitigation tracked as `acct-hjoq`). Caller-side b=1000 batch RPC follow-up (`acct-22xt`) closed the b=1 vs shmem-rollup gap to 4–6× lift / 73% of shmem ceiling at fan_in.
-- **`poc/queue-extension-v21/`** — v2.1 async lexicographical ledger queue PoC validation (epic `acct-gx1z`, P1, 28 sub-issues + 7 follow-ups filed 2026-05-16). Two-queue pipeline (staging + committer) with a Greedy Window Router as middleware, two-domain lex-locking (SKU + WIP), caller-tx coupling via `pg_xact` ejection (committer NEVER sleeps for callers), persistent staging (`durable_queue=true`), `wo_complete` multi-pool atomic event, multi-target bulk UNNEST writes across 6 tables. Standalone from v2's PoC; new extension `poc_v21_ledger`; new DB `acct_poc_queue_v21`; pgrx 0.18. M9.1's verdict gates `design-v2.1.md` construction.
-
-Specs live under `poc/design_research/`: `poc-validation-spec.md` (v2 PoC gate), `design-v2.md` (v2 reference architecture, partly deferred), `poc-v2.1.md` (v2.1 PoC gate), `design-v2.1.md` (v2.1 reference architecture, deferred until M9.1 verdict). The main acct schema and any production decision are unaffected by PoC work until an explicit integration epic is filed (currently `acct-zkb6` — v2.1 → acct integration, blocked-by `acct-gx1z`).
+State summary (count of files, list of shipped phases, etc.) lives in `README.md` and `db/README.md` plus the bd issue history — derive from there rather than from this file. `git log -- db/migrations/` and `bd list --status=closed` are the canonical history.
 
 ## Implementation stack
 
@@ -109,10 +53,6 @@ This repo uses **`bd` (beads)** for issue tracking. See `AGENTS.md` for the full
 Treat `ARCHIVE/` as historical record. Do not propose changes there. If a question can be answered from the consolidated doc, do not reach into the archive.
 
 `db/archive_migrations/` is similar: the original 104 incremental migrations are preserved verbatim for git-blame fidelity and rationale recovery, but they are **not run** (`sqlx migrate run` reads only `db/migrations/`). When you need the rationale for a function body, reach for `bd show <id>` first; the migration file in the archive is a secondary source.
-
-## What the project is
-
-An ERP ledger and inventory system: SKU × location quantity tracking, per-routing-step WIP, document lifecycle (WO/SO/TO/PO), double-entry GL, multi-currency, reservations, commodity provisional pricing, period close. The design has gone through one full review cycle and has converged on a **Postgres-native v0.2** target (consolidated doc Part IV) — explicitly not a TigerBeetle drop-in or hybrid system.
 
 ## Load-bearing design decisions (do not re-litigate without cause)
 
@@ -167,30 +107,14 @@ These are decisions the consolidated doc commits to. If a task touches one of th
 
   Full audit trail and per-function 7-question walk in `REVIEW.md` at repo root.
 
-## Partition lifecycle (`acct-sbr2`)
+## Partition lifecycle conventions (`acct-sbr2`)
 
-Six parent tables ship as `PARTITION BY RANGE` (monthly granularity):
+Partitioned-by-range tables (monthly granularity) follow a uniform pattern; the canonical inventory is `SELECT * FROM partitioned_tables_registry`. New partitioned tables MUST register themselves there.
 
-| Table | Partition column | Helper | Cron job | Origin |
-|---|---|---|---|---|
-| `inventory_movements` | `movement_date` | `_create_inventory_movements_partition` | `inventory_movements_partition_rollover` | Phase D (mig 0025) |
-| `cost_layers` | `receipt_date` | `_create_cost_layers_partition` | `cost_layers_partition_rollover` | Phase E1 (mig 0031) |
-| `cost_layer_depletions` | `issue_date` | `_create_cost_layer_depletions_partition` | (shared with `cost_layers`) | Phase E1 (mig 0031) |
-| `inventory_lots` | `receipt_date` | `_create_inventory_lots_partition` | `inventory_lots_partition_rollover` | Phase E2 (mig 0044) |
-| `inventory_lot_events` | `event_date` | `_create_inventory_lot_events_partition` | (shared with `inventory_lots`) | Phase E2 (mig 0044) |
-| `inventory_unit_events` | `event_date` | `_create_inventory_unit_events_partition` | `inventory_unit_events_partition_rollover` | sxl2 (mig 0061) |
-
-Each table's source migration bakes 24 months of partitions at deploy (2026-01 through 2027-12, `WHILE v_d < DATE '2028-01-01'`) and registers a `pg_cron` job at `'0 0 25 * *'` UTC that creates next-month + month-after partitions. Cron blocks are wrapped in `DO ... EXCEPTION WHEN OTHERS THEN RAISE NOTICE` so test/CI databases without `pg_cron` install cleanly (same tolerance pattern as `0011_inventory_reservations`' expiry job).
-
-**Central registry**: `partitioned_tables_registry` (mig 0067) holds one row per partitioned parent — `(table_name, partition_helper_fn, partition_column, cron_job_name, bake_start, bake_end, min_horizon_months, notes)`. `min_horizon_months` defaults to 3, giving the monthly cron one-miss buffer above its 2-month look-ahead. **Adding a new partitioned table is an INSERT into the registry plus its own bake loop + cron block.** Mig-time INSERTs only; the registry is admin-managed config (no append-only trigger).
-
-**Operator escape hatches**:
-- `SELECT _partition_max_upper_bound('<table>')` returns the latest `TO` bound across the parent's child partitions (parses `pg_get_expr(c.relpartbound, c.oid)` via regex — `FOR VALUES FROM ('YYYY-MM-DD') TO ('YYYY-MM-DD')`). Works on registered AND non-registered partitioned tables.
-- `SELECT _extend_partition_horizon('<table>', <months>)` calls the registered helper for the next N months starting from the current max upper bound. Idempotent at the SQL level (helpers use `CREATE TABLE IF NOT EXISTS`).
-
-**Recon signal**: `run_daily_reconciliation` check #15 `partition_horizon_low` fires for any registry row whose `_partition_max_upper_bound(table_name)` is NULL OR less than `current_date + min_horizon_months`. Catches: cron disabled, helper raising, multiple missed cron runs, or a registry row pointing at a renamed/dropped table.
-
-**Out of scope** (file as `acct-sbr2-followup` if a real driver surfaces): archival of old partitions, per-table compression policies, multi-tenant per-tenant partitions, cross-region replication of partitions.
+- **Adding a new partitioned table**: INSERT into `partitioned_tables_registry` (table_name, partition_helper_fn, partition_column, cron_job_name, bake_start, bake_end, min_horizon_months, notes) + ship a per-table bake loop (`WHILE v_d < bake_end LOOP CREATE TABLE IF NOT EXISTS ...`) + register a `pg_cron` job at `'0 0 25 * *'` UTC that creates next-month + month-after partitions. Wrap cron registrations in `DO ... EXCEPTION WHEN OTHERS THEN RAISE NOTICE` so test/CI databases without `pg_cron` install cleanly. `min_horizon_months` defaults to 3 (one-miss buffer above the 2-month cron look-ahead).
+- **Operator escape hatches**: `SELECT _partition_max_upper_bound('<table>')` returns the latest `TO` bound (works on registered AND non-registered partitioned tables); `SELECT _extend_partition_horizon('<table>', <months>)` calls the registered helper for the next N months (idempotent — helpers use `CREATE TABLE IF NOT EXISTS`).
+- **Recon signal**: `run_daily_reconciliation` check #15 `partition_horizon_low` fires when any registry row's `_partition_max_upper_bound(table_name)` is NULL OR less than `current_date + min_horizon_months`. Catches cron disabled, helper raising, missed cron runs, or a registry row pointing at a renamed table.
+- **Out of scope** (file as `acct-sbr2-followup`): archival of old partitions, per-table compression, multi-tenant partitions, cross-region replication.
 
 ## Open questions that gate work
 
