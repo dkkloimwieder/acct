@@ -731,6 +731,118 @@ fn median_i64(vs: &[i64]) -> i64 {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// M9.3 (acct-4d4n.22): GUC sweep — apply ALTER SYSTEM + pg_reload_conf
+// per cell across (batch_window_us × batch_size_max × synchronous_commit)
+// for fan_out + small_batch shapes. Both poc_ledger.batch_window_us and
+// poc_ledger.batch_size_max are GucContext::Sighup (verified in src/lib.rs),
+// so the reload propagates to the committer bgworker + new pool conns.
+// synchronous_commit is PG-builtin userset; ALTER SYSTEM SET + reload
+// updates the cluster default which any session without a SET LOCAL picks
+// up.
+// ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub struct GucCombo {
+    pub batch_window_us: i32,
+    pub batch_size_max: i32,
+    pub sync_commit: bool,
+}
+
+impl GucCombo {
+    pub fn label(&self) -> String {
+        format!(
+            "bw={}us bs={} sc={}",
+            self.batch_window_us,
+            self.batch_size_max,
+            if self.sync_commit { "on" } else { "off" }
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct GucSweepCell {
+    pub shape: String,
+    pub guc: GucCombo,
+    pub cell: CellResult,
+}
+
+/// Apply one GUC combo cluster-wide via ALTER SYSTEM + pg_reload_conf.
+/// Each statement runs on its own pool connection (sqlx auto-commit per
+/// `query`), avoiding the multi-stmt-in-one-txn pitfall noted in
+/// `feedback_psql_c_single_transaction`. ALTER SYSTEM can't legally run
+/// inside a transaction block anyway. Settles 500ms after reload so the
+/// committer bgworker observes the new values before the workload starts.
+pub async fn apply_gucs(pool: &PgPool, c: GucCombo) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "ALTER SYSTEM SET poc_ledger.batch_window_us = {}",
+        c.batch_window_us
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER SYSTEM SET poc_ledger.batch_size_max = {}",
+        c.batch_size_max
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER SYSTEM SET synchronous_commit = '{}'",
+        if c.sync_commit { "on" } else { "off" }
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query("SELECT pg_reload_conf()")
+        .execute(pool)
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// Reset all three GUCs to their compiled-in defaults via ALTER SYSTEM
+/// RESET + pg_reload_conf. Called once at sweep end so subsequent
+/// non-sweep work doesn't inherit the last cell's GUCs.
+pub async fn reset_gucs(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("ALTER SYSTEM RESET poc_ledger.batch_window_us")
+        .execute(pool)
+        .await?;
+    sqlx::query("ALTER SYSTEM RESET poc_ledger.batch_size_max")
+        .execute(pool)
+        .await?;
+    sqlx::query("ALTER SYSTEM RESET synchronous_commit")
+        .execute(pool)
+        .await?;
+    sqlx::query("SELECT pg_reload_conf()")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Read back the live GUC values (post-reload). Used by callers that
+/// want to log the observed values into the per-cell JSON for audit.
+pub async fn observed_gucs(pool: &PgPool) -> (i32, i32, String) {
+    let bw: (String,) =
+        sqlx::query_as("SELECT current_setting('poc_ledger.batch_window_us')")
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|_| ("0".to_string(),));
+    let bs: (String,) =
+        sqlx::query_as("SELECT current_setting('poc_ledger.batch_size_max')")
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|_| ("0".to_string(),));
+    let sc: (String,) =
+        sqlx::query_as("SELECT current_setting('synchronous_commit')")
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|_| ("?".to_string(),));
+    (
+        bw.0.parse().unwrap_or(0),
+        bs.0.parse().unwrap_or(0),
+        sc.0,
+    )
+}
+
+// ──────────────────────────────────────────────────────────────────────
 
 /// Format a result block for human reading + persistence.
 pub fn fmt_result(r: &ShapeResult) -> String {
