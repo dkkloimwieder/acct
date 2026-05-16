@@ -34,6 +34,11 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64};
 
 pgrx::pg_module_magic!();
 
+// M1.2 (acct-q3nm): caller-side path.
+mod arena;
+mod enqueue;
+mod staging;
+
 // ── Compile-time shmem sizing constants (spec §1.6) ─────────────────
 //
 // The matching Postmaster-scope GUCs (`poc_v21.staging_queue_size`,
@@ -152,14 +157,19 @@ unsafe impl PGRXSharedMemory for CommitterQueue {}
 // Spillover arena: a flat byte buffer, indexed by u32 offsets stored
 // in `StagingEntry.payload_offset / sku_pool_keys_offset / ...` and
 // `CommitterQueueEntry.staging_entry_offsets / sku_pool_keys_offset / ...`.
-// M1.2 ships the freelist allocator + coalesce; M0.1 just reserves
-// the buffer.
+// M1.2 ships a simple bump + LIFO freelist allocator (see arena.rs);
+// coalesce + slab variants deferred per follow-up acct-v21-fu-arena-fragmentation.
 
 #[repr(C, align(64))]
 pub struct SpilloverArena {
-    pub next_free_offset: AtomicU32,
-    pub _pad: [u8; 4],
-    pub freelist_head: AtomicU64, // M1.2 fills this in
+    /// Offset of head-of-freelist block header (0 = empty list).
+    pub freelist_head_offset: AtomicU32,
+    /// Next never-touched byte (high-water mark for bump alloc).
+    pub bump_offset: AtomicU32,
+    /// Lifetime alloc counter (observability).
+    pub total_allocs: AtomicU64,
+    /// Lifetime free counter (observability).
+    pub total_frees: AtomicU64,
     pub bytes: [u8; POC_V21_SPILLOVER_ARENA_BYTES],
 }
 
@@ -225,6 +235,11 @@ pub(crate) fn status_insert_mode_str() -> String {
 /// Read `poc_v21.persistent_staging`. Defaults to `false`.
 pub(crate) fn persistent_staging_enabled() -> bool {
     PERSISTENT_STAGING.get()
+}
+
+/// Read `poc_v21.queue_full_timeout_ms`. Defaults to 5000.
+pub(crate) fn queue_full_timeout_ms_now() -> i32 {
+    QUEUE_FULL_TIMEOUT_MS.get()
 }
 
 // ── _PG_init ────────────────────────────────────────────────────────

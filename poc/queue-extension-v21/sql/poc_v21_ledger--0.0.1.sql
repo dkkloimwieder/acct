@@ -7,11 +7,64 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:438
+-- src/enqueue.rs:293
+-- poc_v21_ledger::enqueue::poc_v21_arena_stats
+CREATE  FUNCTION "poc_v21_arena_stats"() RETURNS json /* Json */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_arena_stats_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/enqueue.rs:33
+-- poc_v21_ledger::enqueue::poc_v21_enqueue
+CREATE  FUNCTION "poc_v21_enqueue"(
+	"correlation_id" uuid, /* Uuid */
+	"event_type" TEXT, /* & str */
+	"payload" jsonb, /* JsonB */
+	"pool_keys" jsonb, /* JsonB */
+	"durable_queue" bool DEFAULT false /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_enqueue_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:453
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_hello_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/enqueue.rs:276
+-- poc_v21_ledger::enqueue::poc_v21_staging_state_counts
+CREATE  FUNCTION "poc_v21_staging_state_counts"() RETURNS json /* Json */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_staging_state_counts_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/enqueue.rs:250
+-- poc_v21_ledger::enqueue::poc_v21_test_release_slot
+CREATE  FUNCTION "poc_v21_test_release_slot"(
+	"slot_index" bigint /* i64 */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_release_slot_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/enqueue.rs:242
+-- poc_v21_ledger::enqueue::poc_v21_test_take_pending
+CREATE  FUNCTION "poc_v21_test_take_pending"() RETURNS bigint /* Option < i64 > */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_take_pending_wrapper';
 /* </end connected objects> */
 
