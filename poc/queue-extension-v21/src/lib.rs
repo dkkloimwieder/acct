@@ -545,12 +545,17 @@ pub extern "C-unwind" fn _PG_init() {
     // do NOT respawn workers. Restart required to apply a new value.
     use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
     use std::time::Duration;
+    // M5b.1 (acct-k7b2): router now needs SPI access for the boot
+    // recovery sweep's submission_status UPSERT (Phase 2 take-over of
+    // a completed queue entry whose committer died mid-cleanup).
+    // enable_spi_access() implies shmem access, so the pure-shmem
+    // router_tick path keeps working.
     BackgroundWorkerBuilder::new("poc_v21_router")
         .set_function("poc_v21_router_main")
         .set_library("poc_v21_ledger")
         .set_start_time(BgWorkerStartTime::RecoveryFinished)
         .set_restart_time(Some(Duration::from_secs(5)))
-        .enable_shmem_access(None)
+        .enable_spi_access()
         .load();
     let n_committers = COMMITTER_COUNT.get().max(1) as usize;
     for i in 0..n_committers {

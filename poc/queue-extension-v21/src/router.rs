@@ -34,7 +34,7 @@
 use crate::{
     COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, POC_V21_STAGING_QUEUE_SIZE, SPILLOVER_ARENA,
     STAGING_QUEUE, batch_size_max_now, router_starvation_threshold_ticks_now,
-    router_window_size_now,
+    router_window_size_now, target_database_str,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
@@ -49,8 +49,20 @@ use std::time::Duration;
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn poc_v21_router_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    let dbname = target_database_str();
+    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
 
-    // No SPI access required for the router; pure shmem orchestration.
+    // M5b.1 (acct-k7b2): boot-time recovery sweep. Run once before
+    // entering the wait-latch loop so any router-orphaned state from
+    // a prior router crash is reconciled before the new router starts
+    // packing. The committer pool may already be running and claiming
+    // queue entries; the cleanup CAS 2→0 fallback in
+    // cleanup_after_superbatch (mirrored here) handles staging
+    // entries the old router never reached in Phase 6.
+    BackgroundWorker::transaction(|| {
+        let _ = try_recover_router_orphan();
+    });
+
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
         // Drain SuperBatches until the queue is empty (or committer
         // queue is full / arena is exhausted; those conditions roll
@@ -664,4 +676,487 @@ fn poc_v21_test_router_drain() -> i64 {
         total += n as u64;
     }
     total as i64
+}
+
+// ── M5b.1 (acct-k7b2): router boot recovery sweep ───────────────────
+//
+// Recover from router BGWorker SIGKILL or panic per spec §3.3.
+// Postmaster restarts the router; the new router runs this sweep
+// before resuming packing.
+//
+// Three-phase shape:
+//
+//   Phase 1 (queue-driven re-stamp): for each CommitterQueueEntry at
+//     valid==1 (ready, no committer claim yet), iterate linked staging
+//     entries. Any linked staging at (valid==2, sb_id==0) means the
+//     old router pushed the queue entry (Phase 5) but died before
+//     completing the per-entry stamp+CAS (Phase 6). Roll FORWARD:
+//     store sb_id (Release) + CAS staging 2→3 (Release). The
+//     committer's normal cleanup will free arena correctly.
+//
+//   Phase 2 (queue-driven take-over): for each CommitterQueueEntry at
+//     valid==3 (completed) with a dead committer_pid (kill(0)==ESRCH),
+//     sweep takes ownership: walks linked staging entries, frees
+//     per-entry arena, CAS staging 3→0 (fallback 2→0). Frees the
+//     queue-entry-owned arena (staging_entry_offsets + sorted
+//     sku/wip pool-keys mirrors). CAS queue 3→0. UPSERT
+//     submission_status='committed' for the SuperBatch's
+//     correlation_ids (idempotent — typically already set by the
+//     committer's pre-death tx commit, but defensive).
+//
+//   Phase 3 (staging-driven orphan-no-queue): for each StagingEntry
+//     at valid==2 where no active CommitterQueueEntry references it
+//     (sb_id==0, OR sb_id != 0 but no queue at that sb_id). Either
+//     the router died before pushing the queue (Phase 5) or a fast
+//     committer drained the queue entirely while this staging slot
+//     was somehow stranded. CAS valid 2→1 + reset sb_id to 0;
+//     re-routing happens on the next router tick.
+//
+// Memory ordering: the Acquire load on staging.superbatch_id pairs
+// with the Release store in router_tick's Phase 6 (data-before-flag
+// invariant per §1.6, §3.3). The Acquire load on staging.valid pairs
+// with the Release store in router_tick's Phase 3 CAS 1→2 (Acquire
+// on success).
+//
+// Idempotent under repeated firings — CAS election semantics mean a
+// second call finds the slots already at their post-recovery state
+// and skips.
+//
+// Per §3.10 lifecycle-coupling: every arena block allocated by the
+// router on behalf of a SuperBatch is freed by this sweep when it
+// takes ownership. Verified end-to-end by the acceptance suite's
+// arena-leak audit (outstanding_allocs returns to baseline).
+
+/// Run one full router-orphan recovery sweep. Returns the number of
+/// shmem slots reconciled (staging entries re-stamped, staging
+/// entries reverted to pending, queue entries swept). Idempotent.
+pub(crate) fn try_recover_router_orphan() -> u64 {
+    let mut recovered: u64 = 0;
+    recovered += sweep_queue_phase();
+    recovered += sweep_staging_phase();
+    recovered
+}
+
+fn sweep_queue_phase() -> u64 {
+    let mut recovered: u64 = 0;
+    let queue_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
+    let my_pid = unsafe { pg_sys::MyProcPid };
+
+    for q_idx in 0..queue_capacity {
+        // Snapshot queue fields under share lock.
+        let (q_valid, q_sb_id, q_envelope_count, q_so_off, q_sku_off, q_wip_off, q_committer_pid) = {
+            let queue = COMMITTER_QUEUE.share();
+            let slot = &queue.entries[q_idx as usize];
+            let v = slot.valid.load(Acquire);
+            (
+                v,
+                slot.superbatch_id,
+                slot.envelope_count,
+                slot.staging_entry_offsets,
+                slot.sku_pool_keys_offset,
+                slot.wip_pool_keys_offset,
+                slot.committer_pid.load(Relaxed),
+            )
+        };
+
+        match q_valid {
+            1 => {
+                // Phase 1: re-stamp any linked staging entries the old
+                // router never reached in Phase 6.
+                if q_envelope_count == 0 || q_so_off == 0 {
+                    continue;
+                }
+                let staging_indices = read_staging_indices(q_so_off, q_envelope_count);
+                let queue = STAGING_QUEUE.share();
+                for s_idx in staging_indices {
+                    let slot = &queue.entries[s_idx as usize];
+                    if slot.valid.load(Acquire) != 2 {
+                        continue;
+                    }
+                    let s_sb = slot.superbatch_id.load(Acquire);
+                    if s_sb != 0 && s_sb != q_sb_id {
+                        continue; // belongs to a different (later) SuperBatch
+                    }
+                    // Complete the router's interrupted Phase 6 stamp.
+                    slot.superbatch_id.store(q_sb_id, Release);
+                    if slot.valid.compare_exchange(2, 3, Release, Relaxed).is_ok() {
+                        recovered += 1;
+                    }
+                }
+            }
+            2 => {
+                // In flight; M5a.1 committer-side recovery handles dead
+                // committers in this state. Leave alone.
+            }
+            3 => {
+                // Phase 2: completed. Check committer liveness.
+                if q_committer_pid == 0 || q_committer_pid == my_pid {
+                    continue;
+                }
+                let kill_rc = unsafe { libc::kill(q_committer_pid, 0) };
+                if kill_rc == 0 {
+                    continue; // still alive
+                }
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno != libc::ESRCH {
+                    continue; // EPERM etc. — be conservative
+                }
+                // Sweep takes ownership.
+                let staging_indices = if q_so_off != 0 && q_envelope_count > 0 {
+                    read_staging_indices(q_so_off, q_envelope_count)
+                } else {
+                    Vec::new()
+                };
+                let mut correlation_ids: Vec<pgrx::Uuid> =
+                    Vec::with_capacity(staging_indices.len());
+                for s_idx in staging_indices {
+                    let (payload_off, sku_off, wip_off, corr, did_cas) = {
+                        let queue = STAGING_QUEUE.share();
+                        let slot = &queue.entries[s_idx as usize];
+                        let p = slot.payload_offset;
+                        let s = slot.sku_pool_keys_offset;
+                        let w = slot.wip_pool_keys_offset;
+                        let c = pgrx::Uuid::from_bytes(slot.correlation_id);
+                        let did = slot.valid.compare_exchange(3, 0, Release, Relaxed).is_ok()
+                            || slot.valid.compare_exchange(2, 0, Release, Relaxed).is_ok();
+                        (p, s, w, c, did)
+                    };
+                    correlation_ids.push(corr);
+                    if did_cas {
+                        let mut arena = SPILLOVER_ARENA.exclusive();
+                        if payload_off != 0 {
+                            arena.free(payload_off);
+                        }
+                        if sku_off != 0 {
+                            arena.free(sku_off);
+                        }
+                        if wip_off != 0 {
+                            arena.free(wip_off);
+                        }
+                    }
+                }
+                // Free queue-entry-owned arena blocks (the leak source
+                // spec §3.3 explicitly calls out as easy-to-miss).
+                {
+                    let mut arena = SPILLOVER_ARENA.exclusive();
+                    if q_so_off != 0 {
+                        arena.free(q_so_off);
+                    }
+                    if q_sku_off != 0 {
+                        arena.free(q_sku_off);
+                    }
+                    if q_wip_off != 0 {
+                        arena.free(q_wip_off);
+                    }
+                }
+                // CAS queue 3→0; clear pid/lease.
+                {
+                    let queue = COMMITTER_QUEUE.share();
+                    let slot = &queue.entries[q_idx as usize];
+                    let _ = slot.valid.compare_exchange(3, 0, Release, Relaxed);
+                    slot.committer_pid.store(0, Relaxed);
+                    slot.committer_acquired_at_ns.store(0, Relaxed);
+                    slot.committer_tx_id.store(0, Relaxed);
+                }
+                // UPSERT submission_status defensively. Idempotent —
+                // typically already 'committed' from the committer's
+                // pre-death tx, but covers the edge case where the
+                // committer aborted but a separate path needs reconciling.
+                if !correlation_ids.is_empty() {
+                    let _ = Spi::run_with_args(
+                        "UPDATE poc_v21_submission_status \
+                           SET state='committed', processed_at=now() \
+                         WHERE correlation_id = ANY($1::uuid[]) \
+                           AND state NOT IN ('committed', 'failed')",
+                        &[correlation_ids.into()],
+                    );
+                }
+                recovered += 1;
+            }
+            _ => {}
+        }
+    }
+
+    recovered
+}
+
+fn sweep_staging_phase() -> u64 {
+    let mut recovered: u64 = 0;
+    let staging_capacity = POC_V21_STAGING_QUEUE_SIZE as u32;
+    let queue_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
+
+    // Build a set of sb_ids that currently have a live queue entry.
+    // Staging at valid==2 whose sb_id is in this set was handled (or
+    // intentionally left alone) by sweep_queue_phase. Anything else
+    // is genuinely orphaned and gets reverted to pending.
+    let active_sb_ids: HashSet<u64> = {
+        let queue = COMMITTER_QUEUE.share();
+        let mut s = HashSet::new();
+        for q_idx in 0..queue_capacity {
+            let slot = &queue.entries[q_idx as usize];
+            if slot.valid.load(Acquire) != 0 {
+                s.insert(slot.superbatch_id);
+            }
+        }
+        s
+    };
+
+    let staging = STAGING_QUEUE.share();
+    for s_idx in 0..staging_capacity {
+        let slot = &staging.entries[s_idx as usize];
+        if slot.valid.load(Acquire) != 2 {
+            continue;
+        }
+        let s_sb = slot.superbatch_id.load(Acquire);
+        if s_sb != 0 && active_sb_ids.contains(&s_sb) {
+            continue;
+        }
+        // Revert to pending. CAS 2→1 first, then reset sb_id under the
+        // pending-state ownership (no concurrent router pack on boot).
+        if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
+            slot.superbatch_id.store(0, Release);
+            recovered += 1;
+        }
+    }
+
+    recovered
+}
+
+/// Read an envelope_count-length array of u32 staging indices from the
+/// spillover arena at `offset`.
+fn read_staging_indices(offset: u32, envelope_count: u16) -> Vec<u32> {
+    let arena = SPILLOVER_ARENA.share();
+    let bytes = arena.read_bytes(offset, envelope_count as u32 * 4);
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+// ── M5b.1 test SQL surface ──────────────────────────────────────────
+
+/// Test-only: synthetically inject a staging-side orphan into an EMPTY
+/// staging slot by stamping (valid=2, superbatch_id=sb_id, correlation_id).
+/// Bypasses the normal enqueue path so tests can exercise the recovery
+/// sweep without racing the live router/committer flow. Returns false
+/// if the target slot is not currently valid==0.
+///
+/// Use `sb_id=0` for the Phase A scenario (router died pre-Phase-6).
+/// Use a non-zero `sb_id` that matches NO live queue entry for the
+/// Phase B scenario (orphaned link).
+#[pg_extern]
+fn poc_v21_test_inject_staging_orphan(
+    staging_idx: i64,
+    sb_id: i64,
+    correlation_id: pgrx::Uuid,
+) -> bool {
+    let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
+    if staging_idx < 0 || staging_idx >= capacity {
+        return false;
+    }
+    // Try to claim the empty slot.
+    {
+        let queue = STAGING_QUEUE.share();
+        let slot = &queue.entries[staging_idx as usize];
+        if slot.valid.compare_exchange(0, 2, Acquire, Relaxed).is_err() {
+            return false;
+        }
+    }
+    // Set non-atomic fields under exclusive lock. payload_offset etc.
+    // are left at 0 — Phase A/B scenarios don't allocate arena.
+    {
+        let mut q = STAGING_QUEUE.exclusive();
+        let slot = &mut q.entries[staging_idx as usize];
+        slot.correlation_id = *correlation_id.as_bytes();
+        slot.payload_offset = 0;
+        slot.payload_length = 0;
+        slot.sku_pool_keys_offset = 0;
+        slot.sku_pool_count = 0;
+        slot.wip_pool_keys_offset = 0;
+        slot.wip_pool_count = 0;
+        slot.event_type_id = 0;
+        slot.backend_pid = 0;
+        slot.user_tx_xid = 0;
+        slot.request_seq = 0;
+        slot.enqueued_at_micros = 0;
+        slot.eject_count.store(0, Relaxed);
+    }
+    // Stamp atomic sb_id with Release. Pairs with Acquire in the sweep.
+    {
+        let queue = STAGING_QUEUE.share();
+        let slot = &queue.entries[staging_idx as usize];
+        slot.superbatch_id.store(sb_id as u64, Release);
+    }
+    true
+}
+
+/// Test-only: synthetically inject a completed-state CommitterQueueEntry
+/// with a definitely-dead committer_pid and arena-backed staging-entry
+/// offsets. Each `staging_indices` entry should already be injected via
+/// `poc_v21_test_inject_staging_orphan` with sb_id matching this call's
+/// sb_id BEFORE this call — so the sweep can walk the chain.
+///
+/// Allocates real arena blocks (staging_entry_offsets) so the §3.10
+/// lifecycle-coupling audit can verify the sweep frees them.
+#[pg_extern]
+fn poc_v21_test_inject_orphaned_queue(
+    queue_idx: i64,
+    sb_id: i64,
+    fake_pid: i32,
+    staging_indices: Vec<i64>,
+) -> bool {
+    let queue_capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
+    if queue_idx < 0 || queue_idx >= queue_capacity {
+        return false;
+    }
+    if staging_indices.is_empty() || staging_indices.len() > 65535 {
+        return false;
+    }
+    let envelope_count = staging_indices.len() as u16;
+    let staging_capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
+    for &s in &staging_indices {
+        if s < 0 || s >= staging_capacity {
+            return false;
+        }
+    }
+
+    // Allocate arena for staging_entry_offsets array.
+    let so_off = {
+        let mut arena = SPILLOVER_ARENA.exclusive();
+        let off = match arena.alloc(envelope_count as u32 * 4) {
+            Some(o) => o,
+            None => return false,
+        };
+        let mut buf: Vec<u8> = Vec::with_capacity(envelope_count as usize * 4);
+        for &s in &staging_indices {
+            buf.extend_from_slice(&(s as u32).to_le_bytes());
+        }
+        arena.write_bytes(off, &buf);
+        off
+    };
+
+    // Stamp queue entry under exclusive lock; transition empty→completed.
+    {
+        let mut q = COMMITTER_QUEUE.exclusive();
+        let slot = &mut q.entries[queue_idx as usize];
+        if slot.valid.load(Relaxed) != 0 {
+            let mut arena = SPILLOVER_ARENA.exclusive();
+            arena.free(so_off);
+            return false;
+        }
+        slot.superbatch_id = sb_id as u64;
+        slot.envelope_count = envelope_count;
+        slot.staging_entry_offsets = so_off;
+        slot.sku_pool_keys_offset = 0;
+        slot.sku_pool_keys_count = 0;
+        slot.wip_pool_keys_offset = 0;
+        slot.wip_pool_keys_count = 0;
+        slot.committer_pid.store(fake_pid, Relaxed);
+        let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+        slot.committer_acquired_at_ns.store(now_ns, Relaxed);
+        slot.committer_tx_id.store(0, Relaxed);
+        slot.enqueued_at_micros = now_ns / 1000;
+        slot.valid.store(3, Release);
+    }
+    true
+}
+
+/// Test-only: read a staging entry's state as
+/// "(valid, superbatch_id)". Useful for asserting state transitions.
+#[pg_extern]
+fn poc_v21_test_staging_state(staging_idx: i64) -> String {
+    let queue = STAGING_QUEUE.share();
+    let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
+    if staging_idx < 0 || staging_idx >= capacity {
+        return "out_of_range".to_string();
+    }
+    let slot = &queue.entries[staging_idx as usize];
+    format!(
+        "({}, {})",
+        slot.valid.load(Relaxed),
+        slot.superbatch_id.load(Relaxed)
+    )
+}
+
+/// Test-only: force-reset a staging slot to valid==0 (empty).
+#[pg_extern]
+fn poc_v21_test_force_reset_staging(staging_idx: i64) -> i32 {
+    let queue = STAGING_QUEUE.share();
+    let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
+    if staging_idx < 0 || staging_idx >= capacity {
+        return -1;
+    }
+    let slot = &queue.entries[staging_idx as usize];
+    let prev = slot.valid.swap(0, Release);
+    slot.superbatch_id.store(0, Release);
+    prev as i32
+}
+
+/// Test-only: force-reset a queue slot whose state was synthetically
+/// injected via `poc_v21_test_inject_orphaned_queue`. Frees the
+/// arena-backed staging_entry_offsets, sku_pool_keys, wip_pool_keys
+/// blocks the injection allocated, then CASs the slot to valid==0
+/// and clears committer fields. Mirrors what the recovery sweep does
+/// to the queue's own arena; idempotent if called after the sweep.
+/// Returns previous valid value.
+#[pg_extern]
+fn poc_v21_test_force_reset_injected_queue(queue_idx: i64) -> i32 {
+    let capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
+    if queue_idx < 0 || queue_idx >= capacity {
+        return -1;
+    }
+    let (prev, so_off, sku_off, wip_off) = {
+        let mut q = COMMITTER_QUEUE.exclusive();
+        let slot = &mut q.entries[queue_idx as usize];
+        let prev = slot.valid.swap(0, Release);
+        let so = slot.staging_entry_offsets;
+        let sku = slot.sku_pool_keys_offset;
+        let wip = slot.wip_pool_keys_offset;
+        slot.staging_entry_offsets = 0;
+        slot.sku_pool_keys_offset = 0;
+        slot.wip_pool_keys_offset = 0;
+        slot.committer_pid.store(0, Relaxed);
+        slot.committer_acquired_at_ns.store(0, Relaxed);
+        slot.committer_tx_id.store(0, Relaxed);
+        (prev, so, sku, wip)
+    };
+    if prev != 0 {
+        let mut arena = SPILLOVER_ARENA.exclusive();
+        if so_off != 0 {
+            arena.free(so_off);
+        }
+        if sku_off != 0 {
+            arena.free(sku_off);
+        }
+        if wip_off != 0 {
+            arena.free(wip_off);
+        }
+    }
+    prev as i32
+}
+
+/// Test-only: read a queue-entry's state as "(valid, superbatch_id,
+/// committer_pid)". Distinct from `poc_v21_test_slot_state` which
+/// returns only (valid, committer_pid) per M5a.1 convention.
+#[pg_extern]
+fn poc_v21_test_queue_state(queue_idx: i64) -> String {
+    let queue = COMMITTER_QUEUE.share();
+    let capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
+    if queue_idx < 0 || queue_idx >= capacity {
+        return "out_of_range".to_string();
+    }
+    let slot = &queue.entries[queue_idx as usize];
+    format!(
+        "({}, {}, {})",
+        slot.valid.load(Relaxed),
+        slot.superbatch_id,
+        slot.committer_pid.load(Relaxed),
+    )
+}
+
+/// Test-only: run one router-orphan recovery sweep. Returns the count
+/// of slots reconciled.
+#[pg_extern]
+fn poc_v21_test_router_recover_tick() -> i64 {
+    try_recover_router_orphan() as i64
 }

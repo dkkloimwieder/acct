@@ -7,7 +7,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:597
+-- src/lib.rs:602
 -- poc_v21_ledger::poc_v21_arena_bump_offset
 CREATE  FUNCTION "poc_v21_arena_bump_offset"() RETURNS bigint /* i64 */
 STRICT
@@ -16,7 +16,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_bump_offset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:603
+-- src/lib.rs:608
 -- poc_v21_ledger::poc_v21_arena_freelist_count
 CREATE  FUNCTION "poc_v21_arena_freelist_count"() RETURNS bigint /* i64 */
 STRICT
@@ -25,7 +25,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_freelist_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:590
+-- src/lib.rs:595
 -- poc_v21_ledger::poc_v21_arena_outstanding
 CREATE  FUNCTION "poc_v21_arena_outstanding"() RETURNS bigint /* i64 */
 STRICT
@@ -43,7 +43,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_stats_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:576
+-- src/lib.rs:581
 -- poc_v21_ledger::poc_v21_arena_total_allocs
 CREATE  FUNCTION "poc_v21_arena_total_allocs"() RETURNS bigint /* i64 */
 STRICT
@@ -52,7 +52,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_total_allocs_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:582
+-- src/lib.rs:587
 -- poc_v21_ledger::poc_v21_arena_total_frees
 CREATE  FUNCTION "poc_v21_arena_total_frees"() RETURNS bigint /* i64 */
 STRICT
@@ -76,7 +76,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:610
+-- src/lib.rs:615
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT
@@ -85,7 +85,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_hello_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:564
+-- src/router.rs:576
 -- poc_v21_ledger::router::poc_v21_router_force_pack_count
 CREATE  FUNCTION "poc_v21_router_force_pack_count"() RETURNS bigint /* i64 */
 STRICT
@@ -94,7 +94,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_force_pack_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:548
+-- src/router.rs:560
 -- poc_v21_ledger::router::poc_v21_router_max_envelope_count
 CREATE  FUNCTION "poc_v21_router_max_envelope_count"() RETURNS INT /* i32 */
 STRICT
@@ -103,7 +103,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_max_envelope_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:590
+-- src/router.rs:602
 -- poc_v21_ledger::router::poc_v21_router_stats
 CREATE  FUNCTION "poc_v21_router_stats"() RETURNS TABLE (
 	"stat_name" TEXT,  /* String */
@@ -115,7 +115,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_stats_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:522
+-- src/router.rs:534
 -- poc_v21_ledger::router::poc_v21_router_stats_reset
 CREATE  FUNCTION "poc_v21_router_stats_reset"() RETURNS void
 STRICT
@@ -124,7 +124,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_stats_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:541
+-- src/router.rs:553
 -- poc_v21_ledger::router::poc_v21_router_superbatch_count
 CREATE  FUNCTION "poc_v21_router_superbatch_count"() RETURNS bigint /* i64 */
 STRICT
@@ -133,7 +133,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_superbatch_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:555
+-- src/router.rs:567
 -- poc_v21_ledger::router::poc_v21_router_total_envelopes
 CREATE  FUNCTION "poc_v21_router_total_envelopes"() RETURNS bigint /* i64 */
 STRICT
@@ -151,12 +151,23 @@ AS 'MODULE_PATHNAME', 'poc_v21_staging_state_counts_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1315
+-- src/committer.rs:1325
 -- poc_v21_ledger::committer::poc_v21_test_committer_tick
 CREATE  FUNCTION "poc_v21_test_committer_tick"() RETURNS bool /* bool */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_test_committer_tick_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:1102
+-- poc_v21_ledger::router::poc_v21_test_force_reset_injected_queue
+CREATE  FUNCTION "poc_v21_test_force_reset_injected_queue"(
+	"queue_idx" bigint /* i64 */
+) RETURNS INT /* i32 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_injected_queue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -168,6 +179,17 @@ CREATE  FUNCTION "poc_v21_test_force_reset_slot"(
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_slot_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:1082
+-- poc_v21_ledger::router::poc_v21_test_force_reset_staging
+CREATE  FUNCTION "poc_v21_test_force_reset_staging"(
+	"staging_idx" bigint /* i64 */
+) RETURNS INT /* i32 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_staging_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -184,12 +206,50 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_inject_orphan_into_empty_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/router.rs:1001
+-- poc_v21_ledger::router::poc_v21_test_inject_orphaned_queue
+CREATE  FUNCTION "poc_v21_test_inject_orphaned_queue"(
+	"queue_idx" bigint, /* i64 */
+	"sb_id" bigint, /* i64 */
+	"fake_pid" INT, /* i32 */
+	"staging_indices" bigint[] /* Vec < i64 > */
+) RETURNS bool /* bool */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_inject_orphaned_queue_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:947
+-- poc_v21_ledger::router::poc_v21_test_inject_staging_orphan
+CREATE  FUNCTION "poc_v21_test_inject_staging_orphan"(
+	"staging_idx" bigint, /* i64 */
+	"sb_id" bigint, /* i64 */
+	"correlation_id" uuid /* pgrx :: Uuid */
+) RETURNS bool /* bool */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_inject_staging_orphan_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/committer.rs:210
 -- poc_v21_ledger::committer::poc_v21_test_orphan_recover_tick
 CREATE  FUNCTION "poc_v21_test_orphan_recover_tick"() RETURNS bigint /* i64 */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_test_orphan_recover_tick_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:1141
+-- poc_v21_ledger::router::poc_v21_test_queue_state
+CREATE  FUNCTION "poc_v21_test_queue_state"(
+	"queue_idx" bigint /* i64 */
+) RETURNS TEXT /* String */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_queue_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -204,7 +264,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_release_slot_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:656
+-- src/router.rs:668
 -- poc_v21_ledger::router::poc_v21_test_router_drain
 CREATE  FUNCTION "poc_v21_test_router_drain"() RETURNS bigint /* i64 */
 STRICT
@@ -213,7 +273,16 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_router_drain_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:648
+-- src/router.rs:1159
+-- poc_v21_ledger::router::poc_v21_test_router_recover_tick
+CREATE  FUNCTION "poc_v21_test_router_recover_tick"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_router_recover_tick_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:660
 -- poc_v21_ledger::router::poc_v21_test_router_tick
 CREATE  FUNCTION "poc_v21_test_router_tick"() RETURNS bool /* bool */
 STRICT
@@ -230,6 +299,17 @@ CREATE  FUNCTION "poc_v21_test_slot_state"(
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_test_slot_state_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:1066
+-- poc_v21_ledger::router::poc_v21_test_staging_state
+CREATE  FUNCTION "poc_v21_test_staging_state"(
+	"staging_idx" bigint /* i64 */
+) RETURNS TEXT /* String */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_staging_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */

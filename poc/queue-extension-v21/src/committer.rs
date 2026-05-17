@@ -1251,6 +1251,18 @@ fn cleanup_after_superbatch(
     sku_keys_off: u32,
 ) {
     // Free staging-entry arena blocks; CAS staging.valid 3→0.
+    //
+    // R7-shaped invariant (M5b.1 acct-k7b2): the router's Phase 6
+    // stamps superbatch_id (Release) then CAS valid 2→3 (Release).
+    // If the router dies between those two stores for SOME of the
+    // packed entries, the queue still references them via
+    // staging_entry_offsets and the committer can read their payload
+    // from arena, BUT the CAS 3→0 in cleanup will fail because they
+    // are still at valid==2. Fall back to CAS 2→0 so we still free
+    // the arena for those entries — otherwise the slot leaks.
+    // Either CAS succeeding means "this committer owns the cleanup
+    // of this staging entry"; both releases are the post-batch
+    // visible state of "slot empty".
     for &s_idx in staging_indices {
         let (payload_off, sku_off, wip_off, cas_ok) = {
             let queue = STAGING_QUEUE.share();
@@ -1258,10 +1270,8 @@ fn cleanup_after_superbatch(
             let p = slot.payload_offset;
             let s = slot.sku_pool_keys_offset;
             let w = slot.wip_pool_keys_offset;
-            let ok = slot
-                .valid
-                .compare_exchange(3, 0, Release, Relaxed)
-                .is_ok();
+            let ok = slot.valid.compare_exchange(3, 0, Release, Relaxed).is_ok()
+                || slot.valid.compare_exchange(2, 0, Release, Relaxed).is_ok();
             (p, s, w, ok)
         };
         if cas_ok {
