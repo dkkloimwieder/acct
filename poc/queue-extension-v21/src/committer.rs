@@ -1132,20 +1132,28 @@ fn run_pipeline_inside_subtx(
         .map_err(|e| format!("avg_pool_state UPSERT: {e}"))?;
     }
 
-    // STEP 12: status updates.
+    // STEP 12: status updates. INSERT ON CONFLICT DO UPDATE for
+    // committed + replayed paths so committer_lazy mode (no
+    // pre-existing 'queued' row from enqueue) creates a row at
+    // terminal state. caller_intx / caller_subtx modes hit the
+    // ON CONFLICT branch which UPDATEs the pre-existing row.
     if !succeeded.is_empty() {
         Spi::run_with_args(
-            "UPDATE poc_v21_submission_status \
-               SET state='committed', committed_at=now(), processed_at=now(), \
-                   committer_tx_id=$1, superbatch_id=$2 \
-             WHERE correlation_id = ANY($3::uuid[])",
+            "INSERT INTO poc_v21_submission_status \
+               (correlation_id, state, enqueued_at, processed_at, committed_at, committer_tx_id, superbatch_id) \
+             SELECT corr, 'committed', now(), now(), now(), $1, $2 \
+               FROM UNNEST($3::uuid[]) AS t(corr) \
+             ON CONFLICT (correlation_id) DO UPDATE SET \
+               state='committed', committed_at=now(), processed_at=now(), \
+               committer_tx_id=EXCLUDED.committer_tx_id, \
+               superbatch_id=EXCLUDED.superbatch_id",
             &[
                 (committer_tx_id as i64).into(),
                 (superbatch_id as i64).into(),
                 succeeded.clone().into(),
             ],
         )
-        .map_err(|e| format!("status committed UPDATE: {e}"))?;
+        .map_err(|e| format!("status committed UPSERT: {e}"))?;
     }
     for (corr, code) in &failed_correlation_ids {
         let detail = pgrx::JsonB(serde_json::json!({ "phase": "plan_apply", "detail": code }));
@@ -1169,17 +1177,21 @@ fn run_pipeline_inside_subtx(
     }
     if !replayed_correlation_ids.is_empty() {
         Spi::run_with_args(
-            "UPDATE poc_v21_submission_status \
-               SET state='replayed', processed_at=now(), \
-                   committer_tx_id=$1, superbatch_id=$2 \
-             WHERE correlation_id = ANY($3::uuid[])",
+            "INSERT INTO poc_v21_submission_status \
+               (correlation_id, state, enqueued_at, processed_at, committer_tx_id, superbatch_id) \
+             SELECT corr, 'replayed', now(), now(), $1, $2 \
+               FROM UNNEST($3::uuid[]) AS t(corr) \
+             ON CONFLICT (correlation_id) DO UPDATE SET \
+               state='replayed', processed_at=now(), \
+               committer_tx_id=EXCLUDED.committer_tx_id, \
+               superbatch_id=EXCLUDED.superbatch_id",
             &[
                 (committer_tx_id as i64).into(),
                 (superbatch_id as i64).into(),
                 replayed_correlation_ids.clone().into(),
             ],
         )
-        .map_err(|e| format!("status replayed UPDATE: {e}"))?;
+        .map_err(|e| format!("status replayed UPSERT: {e}"))?;
     }
 
     Ok(())

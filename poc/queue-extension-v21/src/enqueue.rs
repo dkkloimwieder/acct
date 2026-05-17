@@ -55,19 +55,27 @@ fn poc_v21_enqueue(
     // Parse pool_keys JSONB once on the caller side to fail fast.
     let (sku_pool_keys, wip_pool_keys) = parse_pool_keys(&pool_keys);
 
-    // 4. Status row INSERT — caller_intx mode (default).
+    // 4. Status row INSERT — dispatch on poc_v21.status_insert_mode.
+    // caller_intx (default): INSERT inside caller user-tx; cheapest.
+    //                         On caller abort, the row is lost; the
+    //                         committer's pg_xact check + lazy INSERT
+    //                         creates a 'failed' row with caller_tx_aborted.
+    // committer_lazy: skip — committer creates row at terminal-state
+    //                 determination. _PG_init gated this on persistent_staging=on.
+    //
+    // (caller_subtx was specified pre-M5c.3 but dropped: BeginInternalSubTransaction
+    // is a savepoint, not an autonomous tx — writes still fold into the
+    // parent and are lost on parent abort. The promise was non-deliverable
+    // and the residual differentiator (error isolation on status INSERT)
+    // is absorbed by ON CONFLICT DO NOTHING.)
     let mode = status_insert_mode_str();
     match mode.as_str() {
         "caller_intx" => {
             insert_status_row_caller_intx(correlation_id);
         }
-        "caller_subtx" | "committer_lazy" => {
-            ereport!(
-                ERROR,
-                PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
-                format!("poc_v21_enqueue: status_insert_mode={mode} not implemented at M1.2"),
-                "M5c.3 (acct-nidw) lands caller_subtx + committer_lazy modes. Set poc_v21.status_insert_mode=caller_intx for now."
-            );
+        "committer_lazy" => {
+            // No-op. Committer's Step 12 INSERT ON CONFLICT path
+            // (committed/failed/replayed) creates the row.
         }
         other => {
             ereport!(

@@ -130,9 +130,17 @@ async fn acceptance_v21_concurrent_orphan_rescue_race() {
         .fetch_one(&pool)
         .await
         .expect("slot_state");
+    // Rescue is observable via committer_pid changing from the injected
+    // fake (i32::MAX = 2147483647) to ANY other value. The slot may
+    // legitimately be back at valid=2 if a real BGWorker committer
+    // CASed it claim_next_committer_entry-style right after the
+    // rescuer freed it (valid 2→1→2 sequence under regression load
+    // where the committer pool is hot). What we must NOT see is the
+    // injected pid still in place.
+    let injected_pid_str = format!(", {})", i32::MAX);
     assert!(
-        !slot_state.starts_with("(2,"),
-        "slot must have been rescued by SOMEONE (test backend or BGWorker); got {}",
+        !slot_state.ends_with(&injected_pid_str),
+        "slot must have been rescued by SOMEONE (injected pid no longer present); got {}",
         slot_state
     );
 
