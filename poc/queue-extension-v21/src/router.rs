@@ -33,13 +33,15 @@
 
 use crate::{
     COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, POC_V21_STAGING_QUEUE_SIZE, SPILLOVER_ARENA,
-    STAGING_QUEUE, batch_size_max_now, router_window_size_now,
+    STAGING_QUEUE, batch_size_max_now, router_starvation_threshold_ticks_now,
+    router_window_size_now,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Router BGWorker entry point.
@@ -58,12 +60,13 @@ pub extern "C-unwind" fn poc_v21_router_main(_arg: pg_sys::Datum) {
 }
 
 /// One scan-and-pack iteration. Returns the number of SuperBatches
-/// produced (0 or 1 in M3.1 — looping happens in the BGWorker).
+/// produced (0 or 1 — looping happens in the BGWorker).
 fn router_tick() -> u32 {
     let staging_capacity = POC_V21_STAGING_QUEUE_SIZE as u32;
     let committer_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
     let window_limit = router_window_size_now().max(1) as u32;
     let batch_max = batch_size_max_now().max(1) as u16;
+    let starvation_threshold = router_starvation_threshold_ticks_now().max(1) as u32;
 
     // --- Phase 1: scan staging head; collect candidate metadata. ---
     let candidates_meta = collect_candidates(staging_capacity, window_limit);
@@ -74,20 +77,62 @@ fn router_tick() -> u32 {
     // --- Phase 2: hydrate pool keys for each candidate from arena. ---
     let candidates = hydrate_candidates(&candidates_meta);
 
-    // --- Phase 3: greedy disjoint pack on SKU pool keys. ---
+    // --- Phase 3: greedy disjoint pack with fairness backstop. ---
+    //
+    // Per spec §1.8: when a candidate's starvation_count >= threshold
+    // AND the current SuperBatch is empty, force-pack as size-1
+    // SuperBatch and break (don't add other candidates this tick;
+    // ensure the starved entry gets through without further contention).
+    // Skipped candidates (intersecting lock_set OR losing the CAS race)
+    // get their starvation counter incremented. Packed candidates
+    // (normal or forced) have their counter cleared.
     let mut lock_set: HashSet<(i64, i64)> = HashSet::new();
     let mut wip_union: HashSet<(i64, i64)> = HashSet::new();
     let mut packed: Vec<Candidate> = Vec::new();
+    let mut forced = false;
+    let mut starv = starvation_map().lock().expect("starvation_map lock");
 
     for cand in candidates.into_iter() {
         if (packed.len() as u16) >= batch_max {
             break;
         }
-        // Disjoint check: candidate's SKU pool keys must not intersect
-        // the SuperBatch's accumulated lock set.
+
+        // Force-pack gate (runs only when SuperBatch is still empty).
+        if packed.is_empty() {
+            let current = *starv.get(&cand.request_seq).unwrap_or(&0);
+            if current >= starvation_threshold {
+                let cas_ok = {
+                    let queue = STAGING_QUEUE.share();
+                    queue.entries[cand.staging_idx as usize]
+                        .valid
+                        .compare_exchange(1, 2, Acquire, Relaxed)
+                        .is_ok()
+                };
+                if cas_ok {
+                    for k in &cand.sku_pool_keys {
+                        lock_set.insert(*k);
+                    }
+                    for k in &cand.wip_pool_keys {
+                        wip_union.insert(*k);
+                    }
+                    starv.remove(&cand.request_seq);
+                    packed.push(cand);
+                    forced = true;
+                    break; // size-1 forced SuperBatch
+                } else {
+                    // CAS race lost (another tick took this entry).
+                    starv.remove(&cand.request_seq);
+                    continue;
+                }
+            }
+        }
+
+        // Disjoint check.
         if cand.sku_pool_keys.iter().any(|k| lock_set.contains(k)) {
+            *starv.entry(cand.request_seq).or_insert(0) += 1;
             continue;
         }
+
         // CAS valid 1→2 (pending → processing). Acquire on success so
         // subsequent reads from this staging entry see the caller's
         // payload writes.
@@ -101,6 +146,7 @@ fn router_tick() -> u32 {
         if !cas_ok {
             // Lost the race (another router tick? recovery sweep?).
             // Don't extend lock_set since we don't own this entry.
+            *starv.entry(cand.request_seq).or_insert(0) += 1;
             continue;
         }
         for k in &cand.sku_pool_keys {
@@ -109,8 +155,11 @@ fn router_tick() -> u32 {
         for k in &cand.wip_pool_keys {
             wip_union.insert(*k);
         }
+        starv.remove(&cand.request_seq);
         packed.push(cand);
     }
+
+    drop(starv); // release before arena/queue work
 
     if packed.is_empty() {
         return 0;
@@ -206,7 +255,7 @@ fn router_tick() -> u32 {
     }
 
     // --- Phase 7: stats. ---
-    record_superbatch_stats(envelope_count);
+    record_superbatch_stats(envelope_count, forced);
 
     // M3.1 punts on SetLatch broadcast — committer BGWorker wakes on
     // its 50ms tick. Spec §1.8 calls for SetLatch on idle committers;
@@ -220,6 +269,7 @@ fn router_tick() -> u32 {
 #[derive(Debug)]
 struct CandidateMeta {
     staging_idx: u32,
+    request_seq: u64,
     sku_pool_keys_offset: u32,
     sku_pool_count: u16,
     wip_pool_keys_offset: u32,
@@ -229,6 +279,7 @@ struct CandidateMeta {
 #[derive(Debug)]
 struct Candidate {
     staging_idx: u32,
+    request_seq: u64,
     sku_pool_keys: Vec<(i64, i64)>,
     wip_pool_keys: Vec<(i64, i64)>,
 }
@@ -247,6 +298,7 @@ fn collect_candidates(staging_capacity: u32, window_limit: u32) -> Vec<Candidate
         if slot.valid.load(Relaxed) == 1 {
             out.push(CandidateMeta {
                 staging_idx: idx as u32,
+                request_seq: slot.request_seq,
                 sku_pool_keys_offset: slot.sku_pool_keys_offset,
                 sku_pool_count: slot.sku_pool_count,
                 wip_pool_keys_offset: slot.wip_pool_keys_offset,
@@ -295,6 +347,7 @@ fn hydrate_candidates(metas: &[CandidateMeta]) -> Vec<Candidate> {
                 };
             Candidate {
                 staging_idx: m.staging_idx,
+                request_seq: m.request_seq,
                 sku_pool_keys,
                 wip_pool_keys,
             }
@@ -396,6 +449,20 @@ fn free_superbatch_arena(staging_offsets_off: u32, sku_keys_off: u32, wip_keys_o
     }
 }
 
+// ── Starvation map (M3.2 acct-evyq) ─────────────────────────────────
+//
+// Per-envelope tick counters keyed by request_seq. Process-local — the
+// router BGWorker's instance is the load-bearing one for production
+// fairness; the test backend's instance is incidental (cleared on each
+// test reset_state since envelopes get fresh request_seqs). Lost on
+// router death (acceptable per spec §7 Q-B; production hardening filed
+// as acct-v21-fu-router-starvation-persistent).
+
+fn starvation_map() -> &'static Mutex<HashMap<u64, u32>> {
+    static MAP: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 // ── Router stats (lightweight; M3.3 builds the proper API) ──────────
 //
 // Counters live in shmem on CommitterQueue (not process-local statics)
@@ -403,12 +470,15 @@ fn free_superbatch_arena(staging_offsets_off: u32, sku_keys_off: u32, wip_keys_o
 // that reads via the SQL accessors. All atomics — no LWLock contention
 // on the hot path.
 
-fn record_superbatch_stats(envelope_count: u16) {
+fn record_superbatch_stats(envelope_count: u16, forced: bool) {
     let queue = COMMITTER_QUEUE.share();
     queue.router_superbatch_count.fetch_add(1, Relaxed);
     queue
         .router_total_envelopes
         .fetch_add(envelope_count as u64, Relaxed);
+    if forced {
+        queue.router_force_pack_count.fetch_add(1, Relaxed);
+    }
     let mut prev = queue.router_max_envelope_count.load(Relaxed);
     while envelope_count > prev {
         match queue.router_max_envelope_count.compare_exchange(
@@ -430,6 +500,10 @@ fn poc_v21_router_stats_reset() {
     queue.router_superbatch_count.store(0, Relaxed);
     queue.router_total_envelopes.store(0, Relaxed);
     queue.router_max_envelope_count.store(0, Relaxed);
+    queue.router_force_pack_count.store(0, Relaxed);
+    if let Ok(mut m) = starvation_map().lock() {
+        m.clear();
+    }
 }
 
 /// Total SuperBatches assembled since last reset.
@@ -451,6 +525,15 @@ fn poc_v21_router_max_envelope_count() -> i32 {
 fn poc_v21_router_total_envelopes() -> i64 {
     let queue = COMMITTER_QUEUE.share();
     queue.router_total_envelopes.load(Relaxed) as i64
+}
+
+/// Total force-packs (starvation fairness backstop triggered). Each
+/// counts one SuperBatch where the starvation threshold was met and a
+/// candidate was force-packed as size-1.
+#[pg_extern]
+fn poc_v21_router_force_pack_count() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.router_force_pack_count.load(Relaxed) as i64
 }
 
 // ── Test SQL surface ────────────────────────────────────────────────

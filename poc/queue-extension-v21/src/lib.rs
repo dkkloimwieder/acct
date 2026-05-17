@@ -155,12 +155,13 @@ pub struct CommitterQueue {
     pub lock_tranche_id: u32,
     pub _pad: [u8; 4],
     pub next_superbatch_id: AtomicU64,
-    // ── Router stats (M3.1 acct-r29s) ─────────────────────────────
+    // ── Router stats (M3.1 acct-r29s, M3.2 acct-evyq) ─────────────
     // Counters live in shmem (not process-local statics) so the
     // router BGWorker's increments are visible from any backend
     // that reads via SQL accessor. Atomics — no LWLock needed.
     pub router_superbatch_count: AtomicU64,
     pub router_total_envelopes: AtomicU64,
+    pub router_force_pack_count: AtomicU64,
     pub router_max_envelope_count: AtomicU16,
     pub _pad_stats: [u8; 6],
     pub entries: [CommitterQueueEntry; POC_V21_COMMITTER_QUEUE_SIZE],
@@ -285,6 +286,11 @@ pub(crate) fn batch_size_max_now() -> i32 {
 /// Read `poc_v21.router_window_size`. Defaults to 1000.
 pub(crate) fn router_window_size_now() -> i32 {
     ROUTER_WINDOW_SIZE.get()
+}
+
+/// Read `poc_v21.router_starvation_threshold_ticks`. Defaults to 10.
+pub(crate) fn router_starvation_threshold_ticks_now() -> i32 {
+    ROUTER_STARVATION_THRESHOLD_TICKS.get()
 }
 
 // ── _PG_init ────────────────────────────────────────────────────────
