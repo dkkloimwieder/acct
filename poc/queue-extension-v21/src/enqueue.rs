@@ -93,9 +93,20 @@ fn poc_v21_enqueue(
     let wip_keys_size: u32 = (wip_pool_keys.len() * 16) as u32;
 
     // Try until we succeed in arena+ring, or until the timeout fires.
+    //
+    // M5c.1 (acct-r0aa): wait loop is signal-driven via PG's
+    // ConditionVariable. PrepareToSleep registers this backend in the
+    // CV's proclist BEFORE we observe queue state — so a broadcast
+    // that fires between our check and TimedSleep still wakes us.
+    // The committer (cleanup_after_superbatch) and the router (rollback
+    // + recovery sweep) broadcast on slot-free; any waiter in TimedSleep
+    // wakes immediately, retries the push, returns.
     let timeout_ms = crate::queue_full_timeout_ms_now();
     let deadline_micros = (now_micros() as i128) + (timeout_ms as i128) * 1000;
-    let mut iter_count: u32 = 0;
+    let cv = crate::backpressure_cv_ptr();
+    unsafe {
+        pg_sys::ConditionVariablePrepareToSleep(cv);
+    }
 
     loop {
         // Check for caller interrupt (Ctrl-C, query_cancel) before sleeping.
@@ -160,13 +171,14 @@ fn poc_v21_enqueue(
             None => {
                 // Arena exhausted; treat like queue-full backpressure.
                 if past_deadline(deadline_micros) {
+                    unsafe { pg_sys::ConditionVariableCancelSleep() };
                     ereport!(
                         ERROR,
                         PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
                         format!("poc_v21_enqueue: spillover arena exhausted and backpressure timeout elapsed ({timeout_ms}ms)")
                     );
                 }
-                sleep_until_retry(deadline_micros, &mut iter_count);
+                cv_wait_for_slot(cv, deadline_micros);
                 continue;
             }
         };
@@ -216,20 +228,42 @@ fn poc_v21_enqueue(
                 drop(arena_guard);
 
                 if past_deadline(deadline_micros) {
+                    unsafe { pg_sys::ConditionVariableCancelSleep() };
                     ereport!(
                         ERROR,
                         PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
                         format!("poc_v21_enqueue: staging queue full and backpressure timeout elapsed ({timeout_ms}ms)")
                     );
                 }
-                sleep_until_retry(deadline_micros, &mut iter_count);
+                cv_wait_for_slot(cv, deadline_micros);
                 continue;
             }
         }
     }
 
+    unsafe { pg_sys::ConditionVariableCancelSleep() };
     // 7. (Router wake — SetLatch on the router BGWorker — lands at M3.1.)
     // For M1.2 the router is stubbed; setting the latch is a no-op.
+}
+
+/// Wait for a slot-freed signal or the per-batch deadline, whichever
+/// comes first. ConditionVariableTimedSleep handles CHECK_FOR_INTERRUPTS
+/// internally (a query cancel sets the backend's latch which the CV's
+/// inner WaitLatch picks up). Returns true if the wait timed out;
+/// returns false if signaled.
+fn cv_wait_for_slot(cv: *mut pg_sys::ConditionVariable, deadline_micros: i128) -> bool {
+    let remaining_micros = (deadline_micros - now_micros() as i128).max(0) as u64;
+    // Cap each TimedSleep at 1s so deadline-passed cases get re-checked
+    // even if the signaler is unusually quiet. Inside that cap, the wake
+    // is signal-driven (broadcast) so latency is ~OS-scheduler quantum.
+    let ms = ((remaining_micros / 1000) as i64).min(1000).max(1);
+    unsafe {
+        pg_sys::ConditionVariableTimedSleep(
+            cv,
+            ms as std::ffi::c_long,
+            pg_sys::PG_WAIT_EXTENSION,
+        )
+    }
 }
 
 fn return_to_retry() {
@@ -374,25 +408,4 @@ fn past_deadline(deadline_micros: i128) -> bool {
     (now_micros() as i128) >= deadline_micros
 }
 
-fn sleep_until_retry(deadline_micros: i128, iter_count: &mut u32) {
-    // Bounded short sleep (10ms); CHECK_FOR_INTERRUPTS via WaitLatch.
-    // M3.1 will replace this with a ConditionVariable wait keyed to
-    // router-side slot-freed signals.
-    *iter_count = iter_count.saturating_add(1);
-    let remaining_micros = (deadline_micros - now_micros() as i128).max(0) as u64;
-    let sleep_micros = remaining_micros.min(10_000);
-    if sleep_micros == 0 {
-        return;
-    }
-    let sleep_ms = (sleep_micros / 1000).max(1) as i64;
-    unsafe {
-        let _ = pg_sys::WaitLatch(
-            pg_sys::MyLatch,
-            (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_EXIT_ON_PM_DEATH) as i32,
-            sleep_ms,
-            pg_sys::PG_WAIT_EXTENSION,
-        );
-        pg_sys::ResetLatch(pg_sys::MyLatch);
-    }
-}
 

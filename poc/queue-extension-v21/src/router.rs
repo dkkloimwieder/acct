@@ -34,7 +34,7 @@
 use crate::{
     COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, POC_V21_STAGING_QUEUE_SIZE, SPILLOVER_ARENA,
     STAGING_QUEUE, batch_size_max_now, router_starvation_threshold_ticks_now,
-    router_window_size_now, target_database_str,
+    router_window_size_now, signal_staging_slot_freed, target_database_str,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
@@ -841,6 +841,11 @@ fn sweep_queue_phase() -> u64 {
                         let c = pgrx::Uuid::from_bytes(slot.correlation_id);
                         let did = slot.valid.compare_exchange(3, 0, Release, Relaxed).is_ok()
                             || slot.valid.compare_exchange(2, 0, Release, Relaxed).is_ok();
+                        if did {
+                            // M5c.1: this is a staging slot becoming
+                            // available — wake any backpressure waiter.
+                            signal_staging_slot_freed(&queue);
+                        }
                         (p, s, w, c, did)
                     };
                     correlation_ids.push(corr);

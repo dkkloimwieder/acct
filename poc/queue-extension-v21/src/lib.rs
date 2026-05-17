@@ -26,6 +26,7 @@
 
 #![allow(unexpected_cfgs)]
 
+use pgrx::pg_sys;
 use pgrx::prelude::*;
 use pgrx::shmem::PGRXSharedMemory;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PgLwLock, pg_shmem_init};
@@ -116,6 +117,30 @@ pub struct StagingQueue {
     pub next_request_seq: AtomicU64,
     pub backpressure_cv_tranche_id: u32,
     pub _pad2: [u8; 4],
+    // ── M5c.1 (acct-r0aa): backpressure signal mechanism ───────────
+    // `backpressure_cv` is PG's ConditionVariable — zero-initialized
+    // at shmem allocation; `ConditionVariableInit` is idempotent and
+    // not required because both `slock_t` and `proclist_head` are
+    // zero-init-valid. Waiters call ConditionVariableTimedSleep;
+    // committer cleanup + router rollback call ConditionVariableBroadcast
+    // when a slot becomes empty.
+    //
+    // `free_slot_wake_count` is an observability counter — incremented
+    // each time a signaler broadcasts. Tests assert it grew during a
+    // drain to confirm the signal mechanism actually fired.
+    pub free_slot_wake_count: AtomicU64,
+    /// 3-state CAS gate for lazy ConditionVariableInit. 0=uninit,
+    /// 1=init-in-progress, 2=initialized. The CV's `wakeup` field
+    /// (proclist_head) is NOT valid zero-init — its sentinels are
+    /// INVALID_PROC_NUMBER (-1 in PG18), not 0. Without explicit
+    /// ConditionVariableInit, Broadcast walks proclist starting from
+    /// head=0 which interprets as a real PGPROC slot → corrupt state /
+    /// hung backends. ensure_backpressure_cv_initialized() does the
+    /// CAS-gated init at first use.
+    pub backpressure_cv_initialized: AtomicU8,
+    pub _pad_cv_init: [u8; 7],
+    pub backpressure_cv: pg_sys::ConditionVariable,
+    pub _pad_cv: [u8; 8],
     pub entries: [StagingEntry; POC_V21_STAGING_QUEUE_SIZE],
 }
 
@@ -326,6 +351,97 @@ pub(crate) fn router_starvation_threshold_ticks_now() -> i32 {
 /// overhead.
 pub(crate) fn skip_wip_locks() -> bool {
     SKIP_WIP_LOCKS.get()
+}
+
+// ── M5c.1 (acct-r0aa): backpressure CV signal mechanism ─────────────
+
+/// CAS-gated lazy initialization of the backpressure ConditionVariable.
+/// pgrx's PGRXSharedMemory zero-fills shmem at allocation, but PG's
+/// `proclist_head` (inside ConditionVariable.wakeup) is NOT valid
+/// zero-init — its sentinel for "empty list" is INVALID_PROC_NUMBER
+/// (-1 in PG18), not 0. Without explicit ConditionVariableInit,
+/// ConditionVariableBroadcast would walk a "proclist" starting from
+/// head=0 (ProcNumber 0 = a real PGPROC slot), corrupt state, and
+/// hang random backends.
+///
+/// Three-state CAS:
+///   0 = uninitialized
+///   1 = init in progress (some backend won the CAS; others spin)
+///   2 = initialized (skip)
+///
+/// Called from every caller that touches the CV (enqueue's wait path,
+/// signal_staging_slot_freed). Cheap fast path: single Acquire load,
+/// no-op if state==2.
+fn ensure_backpressure_cv_initialized(queue: &StagingQueue) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    loop {
+        let cur = queue.backpressure_cv_initialized.load(Acquire);
+        if cur == 2 {
+            return;
+        }
+        if cur == 0
+            && queue
+                .backpressure_cv_initialized
+                .compare_exchange(0, 1, AcqRel, Acquire)
+                .is_ok()
+        {
+            // We own the init. CV is shmem-resident; cast to *mut for FFI.
+            let cv = &queue.backpressure_cv as *const pg_sys::ConditionVariable
+                as *mut pg_sys::ConditionVariable;
+            unsafe {
+                pg_sys::ConditionVariableInit(cv);
+            }
+            queue.backpressure_cv_initialized.store(2, Release);
+            return;
+        }
+        // cur == 1: another backend is initializing. Spin until done.
+        std::hint::spin_loop();
+    }
+}
+
+/// Raw pointer to the shmem-resident backpressure ConditionVariable,
+/// after ensuring it has been initialized. The shmem address is stable
+/// for the cluster lifetime, so this can be used outside the LWLock
+/// guard for FFI calls (CV operations have their own internal slock;
+/// the outer LWLock is NOT held while a backend is in
+/// ConditionVariableTimedSleep — otherwise the signaler would deadlock
+/// trying to free a slot).
+pub(crate) fn backpressure_cv_ptr() -> *mut pg_sys::ConditionVariable {
+    let queue = STAGING_QUEUE.share();
+    ensure_backpressure_cv_initialized(&queue);
+    &queue.backpressure_cv as *const pg_sys::ConditionVariable as *mut pg_sys::ConditionVariable
+}
+
+/// Signal "a staging slot was freed" — increment the wake counter for
+/// observability + broadcast on the CV so any backend in
+/// poc_v21_enqueue's backpressure wait loop wakes immediately. Idempotent;
+/// safe to call whether or not any waiters are sleeping.
+///
+/// Caller passes an already-held `&StagingQueue` (via share OR exclusive
+/// guard's deref) — the function does NOT re-acquire the LWLock to
+/// avoid recursive-acquire deadlocks. The CV has its own slock internally,
+/// so the outer LWLock is irrelevant to broadcast correctness.
+pub fn signal_staging_slot_freed(queue: &StagingQueue) {
+    queue
+        .free_slot_wake_count
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    ensure_backpressure_cv_initialized(queue);
+    let cv = &queue.backpressure_cv as *const pg_sys::ConditionVariable
+        as *mut pg_sys::ConditionVariable;
+    unsafe {
+        pg_sys::ConditionVariableBroadcast(cv);
+    }
+}
+
+/// Observability: cumulative count of `signal_staging_slot_freed` calls
+/// since cluster startup. Tests assert this grew during a drain to
+/// confirm the signal actually fired.
+#[pg_extern]
+fn poc_v21_backpressure_wake_count() -> i64 {
+    STAGING_QUEUE
+        .share()
+        .free_slot_wake_count
+        .load(std::sync::atomic::Ordering::Acquire) as i64
 }
 
 // ── _PG_init ────────────────────────────────────────────────────────

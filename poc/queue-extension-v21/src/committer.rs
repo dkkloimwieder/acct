@@ -14,7 +14,7 @@ use crate::fifo::FIFO_METHOD;
 use crate::standard::STANDARD_METHOD;
 use crate::{
     COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE,
-    committer_lease_ms_now, skip_wip_locks, target_database_str,
+    committer_lease_ms_now, signal_staging_slot_freed, skip_wip_locks, target_database_str,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
@@ -1272,6 +1272,13 @@ fn cleanup_after_superbatch(
             let w = slot.wip_pool_keys_offset;
             let ok = slot.valid.compare_exchange(3, 0, Release, Relaxed).is_ok()
                 || slot.valid.compare_exchange(2, 0, Release, Relaxed).is_ok();
+            if ok {
+                // M5c.1 (acct-r0aa): wake any waiter on backpressure CV.
+                // Broadcast inside the share guard — the CV has its own
+                // internal slock and re-acquiring STAGING_QUEUE.share()
+                // here would be a no-op-but-confusing nested lock.
+                signal_staging_slot_freed(&queue);
+            }
             (p, s, w, ok)
         };
         if cas_ok {
