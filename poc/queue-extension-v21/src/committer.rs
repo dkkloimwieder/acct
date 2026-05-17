@@ -25,6 +25,44 @@ use std::ffi::CString;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::time::Duration;
 
+/// M7.1 (acct-byue): map a method string ("fifo" / "avg" / "std") to the
+/// per-method histogram index. Returns None for unknown methods (defensive
+/// — keeps the unknown-method case out of the histogram rather than
+/// silently bucketing into FIFO).
+fn method_index(method: &str) -> Option<usize> {
+    match method {
+        "fifo" => Some(0),
+        "avg" => Some(1),
+        "std" => Some(2),
+        _ => None,
+    }
+}
+
+/// M7.1 (acct-byue): bucket a nanosecond latency into the per-method
+/// log2-spaced histogram. Bucket i covers [2^(9+i), 2^(10+i)) ns; bucket
+/// 15 is the >= 16ms overflow. Increments dispatch_count + (optionally)
+/// error_count + the latency bucket.
+fn record_method_latency(method: &str, elapsed_ns: u64, errored: bool) {
+    let Some(mi) = method_index(method) else {
+        return;
+    };
+    let queue = COMMITTER_QUEUE.share();
+    queue.method_dispatch_counts[mi].fetch_add(1, Relaxed);
+    if errored {
+        queue.method_error_counts[mi].fetch_add(1, Relaxed);
+    }
+    // Bucket index: clamp(floor(log2(ns)) - 9, 0..=15). For ns < 512 we
+    // floor to bucket 0; for ns >= 16ms we cap at 15.
+    let bucket = if elapsed_ns < 512 {
+        0
+    } else {
+        let lg = 63 - elapsed_ns.leading_zeros() as usize;
+        let raw = lg.saturating_sub(9);
+        raw.min(15)
+    };
+    queue.method_latency_hist[mi][bucket].fetch_add(1, Relaxed);
+}
+
 /// Committer BGWorker entry point.
 #[pg_guard]
 #[unsafe(no_mangle)]
@@ -134,6 +172,10 @@ pub(crate) fn try_recover_orphan() -> u32 {
             .valid
             .compare_exchange(2, 1, Release, Relaxed);
         recovered += 1;
+        // M7.1 (acct-byue): record the takeover for committer-pool
+        // observability (distinct from claim_count — takeovers indicate
+        // committer death + rescue, not normal claim path).
+        queue.committer_takeover_count.fetch_add(1, Relaxed);
     }
     recovered
 }
@@ -237,6 +279,9 @@ fn claim_next_committer_entry() -> Option<u32> {
                 let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
                 slot.committer_acquired_at_ns.store(now_ns, Relaxed);
                 queue.head.store((head + 1) % capacity, Relaxed);
+                // M7.1 (acct-byue): record the CAS-win for committer-pool
+                // throughput observability.
+                queue.committer_claim_count.fetch_add(1, Relaxed);
                 return Some(idx as u32);
             } else {
                 // Rare race: another committer flipped valid first; release
@@ -363,6 +408,14 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
         }
         Err(err) => {
             unsafe { pg_sys::RollbackAndReleaseCurrentSubTransaction() };
+            // M7.1 (acct-byue): whole-batch failure (sub-tx aborted on
+            // bulk INSERT error). Distinct from per-envelope failures
+            // which mark individual `submission_status` rows but don't
+            // abort the sub-tx.
+            COMMITTER_QUEUE
+                .share()
+                .committer_tx_failures
+                .fetch_add(1, Relaxed);
             // Mark all envelopes failed.
             for event in &events {
                 let corr = event.correlation_id;
@@ -902,6 +955,11 @@ fn run_pipeline_inside_subtx(
             let cons_before = result.consumption_inserts.len();
 
             let m = method_of(event_for_dispatch.sku_id);
+            // M7.1 (acct-byue): per-method dispatch latency + count. Time
+            // the apply_one call only — outside the result-vector accounting.
+            // std::time::Instant ~25ns/call on x86_64; acceptable overhead
+            // relative to apply_one's ~µs-scale work.
+            let t_start = std::time::Instant::now();
             let event_result = match m {
                 "avg" => AVG_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
                 "std" => {
@@ -909,6 +967,8 @@ fn run_pipeline_inside_subtx(
                 }
                 _ => FIFO_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
             };
+            let elapsed_ns = t_start.elapsed().as_nanos() as u64;
+            record_method_latency(m, elapsed_ns, event_result.error_code.is_some());
 
             if event_result.error_code.is_some() {
                 // Mark the envelope failed; record the failing per_event

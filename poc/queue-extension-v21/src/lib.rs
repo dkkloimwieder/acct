@@ -55,6 +55,9 @@ mod standard;
 // M5d.1 (acct-y0bp): postmaster-startup recovery worker (non-durable path).
 mod recovery;
 
+// M7.1 (acct-byue): per-queue + per-method + router observability surface.
+mod stats;
+
 // ── Compile-time shmem sizing constants (spec §1.6) ─────────────────
 //
 // The matching Postmaster-scope GUCs (`poc_v21.staging_queue_size`,
@@ -219,6 +222,33 @@ pub struct CommitterQueue {
     pub audit_orphans_recovered_count: AtomicU64,
     pub audit_lost_envelopes_count: AtomicU64,
     pub audit_last_run_at_ns: AtomicU64,
+    // ── M7.1 (acct-byue): committer pool + per-method observability ──
+    // Counters live in shmem so any backend can read via SQL accessor
+    // without holding a lock. Increments use Relaxed; reads use Relaxed
+    // — eventual consistency is acceptable for observability.
+    /// CAS wins on `claim_next_committer_entry`. Counts envelopes
+    /// claimed by ANY committer (the pool's aggregate throughput
+    /// trigger). One increment per successful Step 2 claim.
+    pub committer_claim_count: AtomicU64,
+    /// Orphan rescues from `try_recover_orphan` (M5a.1). One increment
+    /// per stale-lease + dead-pid takeover.
+    pub committer_takeover_count: AtomicU64,
+    /// Step-5 sub-tx aborts (process_superbatch returning Err). Distinct
+    /// from per-envelope `state='failed'` rows — this counts whole-batch
+    /// failures (constraint violations, SPI errors during INSERT).
+    pub committer_tx_failures: AtomicU64,
+    /// Per-method dispatch counters: index 0=FIFO, 1=AVG, 2=STD.
+    /// Incremented once per `apply_one` call in committer Step 4.
+    pub method_dispatch_counts: [AtomicU64; 3],
+    /// Per-method error counters (same indexing). Incremented when
+    /// `apply_one` returns a non-None error_code.
+    pub method_error_counts: [AtomicU64; 3],
+    /// Per-method nanosecond latency histogram. 16 log2-spaced buckets;
+    /// bucket i covers [2^(9+i), 2^(10+i)) ns — i.e., 512ns..16ms. Bucket
+    /// 15 is the overflow (>= 2^24 ns = 16ms). Sized for typical apply_one
+    /// latencies; bake-off can re-bucket if measured distribution sits in
+    /// a different band. Stored as [method][bucket].
+    pub method_latency_hist: [[AtomicU64; 16]; 3],
     pub entries: [CommitterQueueEntry; POC_V21_COMMITTER_QUEUE_SIZE],
 }
 

@@ -712,6 +712,14 @@ fn poc_v21_router_stats() -> TableIterator<
         0.0
     };
 
+    // M7.1 (acct-byue): envelopes-per-SuperBatch p50/p99 derived from the
+    // 8-bucket log2 histogram. Bucket i covers [2^i, 2^(i+1)) envelopes;
+    // bucket 7 is the >=128 overflow. Quantile output is the bucket's
+    // midpoint; ballpark resolution is adequate for §4.3 R1/R2 reporting.
+    let total_sb_in_hist: u64 = histogram.iter().sum();
+    let envelopes_per_sb_p50 = router_hist_quantile_midpoint(&histogram, total_sb_in_hist, 0.50);
+    let envelopes_per_sb_p99 = router_hist_quantile_midpoint(&histogram, total_sb_in_hist, 0.99);
+
     let mut rows: Vec<(String, f64)> = vec![
         ("superbatch_count".into(), sb_count as f64),
         ("total_envelopes".into(), total_env as f64),
@@ -724,11 +732,36 @@ fn poc_v21_router_stats() -> TableIterator<
         ("packing_efficiency".into(), packing_efficiency),
         ("pack_yield_per_tick".into(), pack_yield_per_tick),
         ("batch_size_max_guc".into(), batch_max as f64),
+        ("envelopes_per_sb_p50".into(), envelopes_per_sb_p50),
+        ("envelopes_per_sb_p99".into(), envelopes_per_sb_p99),
     ];
     for (i, count) in histogram.iter().enumerate() {
         rows.push((format!("histogram_bucket_{}", i), *count as f64));
     }
     TableIterator::new(rows.into_iter())
+}
+
+/// M7.1: bucket-quantile midpoint for the 8-bucket SuperBatch envelope
+/// histogram. Bucket i covers [2^i, 2^(i+1)) envelopes; midpoint is
+/// 1.5 × 2^i. Bucket 7 is the >=128 overflow — its "midpoint" is reported
+/// as 192 (a conservative single-step estimate; actual values can be
+/// arbitrarily larger but the bake-off's batch_size_max GUC caps real
+/// envelopes-per-sb well below this in practice).
+fn router_hist_quantile_midpoint(hist: &[u64; 8], total: u64, q: f64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let target = (total as f64 * q).ceil() as u64;
+    let mut cum: u64 = 0;
+    for (i, &c) in hist.iter().enumerate() {
+        cum += c;
+        if cum >= target {
+            let lo = 1u64 << i;
+            let hi = 1u64 << (i + 1);
+            return (lo + hi) as f64 / 2.0;
+        }
+    }
+    192.0
 }
 
 // ── Test SQL surface ────────────────────────────────────────────────
