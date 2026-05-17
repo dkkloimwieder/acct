@@ -14,7 +14,7 @@ use crate::fifo::FIFO_METHOD;
 use crate::standard::STANDARD_METHOD;
 use crate::{
     COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE,
-    target_database_str,
+    skip_wip_locks, target_database_str,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
@@ -87,7 +87,7 @@ fn claim_next_committer_entry() -> Option<u32> {
 /// Run the 5-step pipeline for one CommitterQueueEntry.
 fn process_superbatch(cq_idx: u32) -> Result<(), String> {
     // Snapshot the CommitterQueueEntry's fields we need.
-    let (superbatch_id, envelope_count, staging_offsets_off, sku_keys_off, sku_count, _wip_off, _wip_count) = {
+    let (superbatch_id, envelope_count, staging_offsets_off, sku_keys_off, sku_count, wip_off, wip_count) = {
         let queue = COMMITTER_QUEUE.share();
         let slot = &queue.entries[cq_idx as usize];
         (
@@ -127,6 +127,23 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
         Vec::new()
     };
 
+    // Read wip_pool_keys from arena (M4.1 acct-1c23 — two-domain
+    // lex-locking adds the symmetric WIP path).
+    let wip_pool_keys: Vec<(i64, i64)> = if wip_count > 0 && wip_off != 0 {
+        let arena = SPILLOVER_ARENA.share();
+        let bytes = arena.read_bytes(wip_off, wip_count as u32 * 16);
+        bytes
+            .chunks_exact(16)
+            .map(|c| {
+                let a = i64::from_le_bytes(c[0..8].try_into().unwrap());
+                let b = i64::from_le_bytes(c[8..16].try_into().unwrap());
+                (a, b)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Build events from each staging entry's payload.
     let mut events: Vec<PocV21Event> = Vec::with_capacity(staging_indices.len());
     for &s_idx in &staging_indices {
@@ -145,6 +162,7 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
         superbatch_id,
         &staging_indices,
         &sku_pool_keys,
+        &wip_pool_keys,
         &events,
     );
 
@@ -183,10 +201,13 @@ fn run_pipeline_inside_subtx(
     superbatch_id: u64,
     _staging_indices: &[u32],
     sku_pool_keys: &[(i64, i64)],
+    wip_pool_keys: &[(i64, i64)],
     events: &[PocV21Event],
 ) -> Result<(), String> {
-    // STEP 2: locks. SPI INSERT ON CONFLICT DO NOTHING into pool_locks,
-    // then SELECT FOR UPDATE in lex order.
+    // STEP 2: locks. Two-domain lex-locking — SKU pool keys always,
+    // WIP pool keys gated on poc_v21.skip_wip_locks (M4.1 acct-1c23,
+    // §1.5). For each domain: INSERT ON CONFLICT DO NOTHING (creates
+    // row if missing), then SELECT FOR UPDATE in lex order.
     if !sku_pool_keys.is_empty() {
         let sku_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.0).collect();
         let location_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.1).collect();
@@ -205,6 +226,25 @@ fn run_pipeline_inside_subtx(
             &[sku_ids.into(), location_ids.into()],
         )
         .map_err(|e| format!("pool_locks SELECT FOR UPDATE: {e}"))?;
+    }
+    if !wip_pool_keys.is_empty() && !skip_wip_locks() {
+        let wo_ids: Vec<i64> = wip_pool_keys.iter().map(|k| k.0).collect();
+        let op_ids: Vec<i64> = wip_pool_keys.iter().map(|k| k.1).collect();
+        Spi::run_with_args(
+            "INSERT INTO poc_v21_wip_pool_locks (work_order_id, operation_id) \
+             SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id) \
+             ON CONFLICT (work_order_id, operation_id) DO NOTHING",
+            &[wo_ids.clone().into(), op_ids.clone().into()],
+        )
+        .map_err(|e| format!("wip_pool_locks INSERT: {e}"))?;
+        Spi::run_with_args(
+            "SELECT 1 FROM poc_v21_wip_pool_locks \
+             WHERE (work_order_id, operation_id) IN (SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id)) \
+             ORDER BY work_order_id, operation_id \
+             FOR UPDATE",
+            &[wo_ids.into(), op_ids.into()],
+        )
+        .map_err(|e| format!("wip_pool_locks SELECT FOR UPDATE: {e}"))?;
     }
 
     // Force XID allocation via a tiny no-op write (option Q-D(b) — robust

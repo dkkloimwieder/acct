@@ -249,6 +249,14 @@ static STATUS_INSERT_MODE: GucSetting<Option<CString>> =
 // path (spec §1.9) and unlocks committer_lazy mode (§3.4).
 static PERSISTENT_STAGING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+// Test-only Bool GUC (M4.1 acct-1c23). `skip_wip_locks=on` causes
+// committers to SKIP the WIP pool_locks INSERT ON CONFLICT + SELECT
+// FOR UPDATE in Step 2 of the pipeline. Default off (defensive).
+// M8.3 sweeps {false, true} on shape S2 to measure the WIP-locks
+// overhead per spec §5.5 / §7 Q-G; production deployment decision
+// filed as acct-v21-fu-skip-wip-locks-prod.
+static SKIP_WIP_LOCKS: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 // Operational GUC (not in §1.7's runtime config table): which DB the
 // committer BGWorker connects to via SPI. Default targets the PoC's
 // dedicated database (acct_poc_queue_v21); test deployments may
@@ -297,6 +305,14 @@ pub(crate) fn router_window_size_now() -> i32 {
 /// Read `poc_v21.router_starvation_threshold_ticks`. Defaults to 10.
 pub(crate) fn router_starvation_threshold_ticks_now() -> i32 {
     ROUTER_STARVATION_THRESHOLD_TICKS.get()
+}
+
+/// Read `poc_v21.skip_wip_locks`. Defaults to `false`. When true, the
+/// committer pipeline skips the WIP pool_locks INSERT + SELECT FOR
+/// UPDATE; test-only knob for M8.3 measurement of WIP-locking
+/// overhead.
+pub(crate) fn skip_wip_locks() -> bool {
+    SKIP_WIP_LOCKS.get()
 }
 
 // ── _PG_init ────────────────────────────────────────────────────────
@@ -463,13 +479,21 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::empty(),
     );
 
-    // ── Bool GUC (1) ───────────────────────────────────────────────
+    // ── Bool GUCs ──────────────────────────────────────────────────
     GucRegistry::define_bool_guc(
         c"poc_v21.persistent_staging",
         c"Enable durable WAL-backed staging table (spec §1.9)",
         c"When ON, callers may pass durable_queue=true to enqueue; envelopes ride to durability with the caller's user-tx commit. Also unlocks status_insert_mode=committer_lazy. Postmaster-scope: requires restart to toggle.",
         &PERSISTENT_STAGING,
         GucContext::Postmaster,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
+        c"poc_v21.skip_wip_locks",
+        c"Test-only: skip WIP pool_locks acquisition in committer Step 2 (M4.1 acct-1c23)",
+        c"When ON, the committer pipeline skips the INSERT ON CONFLICT + SELECT FOR UPDATE against poc_v21_wip_pool_locks. Spec §1.5 reasons WIP pools are uncontended by construction; this GUC lets M8.3 measure the cost of being defensive. Production decision deferred to acct-v21-fu-skip-wip-locks-prod.",
+        &SKIP_WIP_LOCKS,
+        GucContext::Sighup,
         GucFlags::empty(),
     );
 
@@ -509,7 +533,10 @@ pub extern "C-unwind" fn _PG_init() {
     // at enqueue time (raises ERRCODE_FEATURE_NOT_SUPPORTED), not
     // here — durable_queue is a per-call argument, not a GUC.
 
-    // M1.3 BGWorkers: stub router + single committer.
+    // M1.3 BGWorkers: router + committer pool (M4.1 acct-1c23).
+    //
+    // committer_count is read here at _PG_init; runtime SIGHUP changes
+    // do NOT respawn workers. Restart required to apply a new value.
     use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
     use std::time::Duration;
     BackgroundWorkerBuilder::new("poc_v21_router")
@@ -519,13 +546,16 @@ pub extern "C-unwind" fn _PG_init() {
         .set_restart_time(Some(Duration::from_secs(5)))
         .enable_shmem_access(None)
         .load();
-    BackgroundWorkerBuilder::new("poc_v21_committer")
-        .set_function("poc_v21_committer_main")
-        .set_library("poc_v21_ledger")
-        .set_start_time(BgWorkerStartTime::RecoveryFinished)
-        .set_restart_time(Some(Duration::from_secs(5)))
-        .enable_spi_access()
-        .load();
+    let n_committers = COMMITTER_COUNT.get().max(1) as usize;
+    for i in 0..n_committers {
+        BackgroundWorkerBuilder::new(&format!("poc_v21_committer_{}", i))
+            .set_function("poc_v21_committer_main")
+            .set_library("poc_v21_ledger")
+            .set_start_time(BgWorkerStartTime::RecoveryFinished)
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .enable_spi_access()
+            .load();
+    }
 }
 
 // ── Smoke entry point ───────────────────────────────────────────────
