@@ -393,6 +393,11 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
         pg_sys::BeginInternalSubTransaction(savepoint_name.as_ptr());
     }
 
+    // M7.2 (acct-fln5): time the whole pipeline body (Step 2 through
+    // Step 12) for §5.6 B2 (SPI-time) classifier. Most of this duration
+    // is SPI; in-memory dispatch time is recoverable separately via
+    // method_latency_hist sums.
+    let pipeline_t0 = std::time::Instant::now();
     let pipeline_result = run_pipeline_inside_subtx(
         cq_idx,
         superbatch_id,
@@ -401,6 +406,10 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
         &wip_pool_keys,
         &events,
     );
+    let pipeline_ns = pipeline_t0.elapsed().as_nanos() as u64;
+    let cq = COMMITTER_QUEUE.share();
+    cq.committer_pipeline_ns_total.fetch_add(pipeline_ns, Relaxed);
+    cq.committer_pipeline_count.fetch_add(1, Relaxed);
 
     match pipeline_result {
         Ok(_) => {
@@ -613,6 +622,13 @@ fn run_pipeline_inside_subtx(
                     let queue = STAGING_QUEUE.share();
                     let slot = &queue.entries[s_idx as usize];
                     let prev = slot.eject_count.fetch_add(1, Release);
+                    // M7.2 (acct-fln5): global eject counter for the
+                    // classifier (high eject rate suggests caller-side
+                    // contention forcing committer re-routes).
+                    COMMITTER_QUEUE
+                        .share()
+                        .eject_total_count
+                        .fetch_add(1, Relaxed);
                     let new_count = (prev as i32).saturating_add(1);
                     let enqueued_at = slot.enqueued_at_micros;
                     drop(queue);

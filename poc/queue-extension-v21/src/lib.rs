@@ -249,6 +249,23 @@ pub struct CommitterQueue {
     /// latencies; bake-off can re-bucket if measured distribution sits in
     /// a different band. Stored as [method][bucket].
     pub method_latency_hist: [[AtomicU64; 16]; 3],
+    // ── M7.2 (acct-fln5): bottleneck-classifier instrumentation ──
+    /// Total ejections across all staging entries since extension load.
+    /// Each eject (committer caller-tx coupling, in_progress branch)
+    /// increments. Used by §5.6 B6-or-B5 classification — a high eject
+    /// rate suggests caller-side contention forcing repeated re-routes.
+    pub eject_total_count: AtomicU64,
+    /// Cumulative committer pipeline wall-clock ns across all
+    /// SuperBatches. Spans Step 2 (lex-lock) through Step 12 (status
+    /// UPSERTs), all inside the sub-tx. Most of this time is SPI;
+    /// in-memory dispatch is recoverable separately from method_latency_hist
+    /// totals. Used by §5.6 B2 classifier as the SPI-time numerator
+    /// (SPI_time / wall_time per committer).
+    pub committer_pipeline_ns_total: AtomicU64,
+    /// Number of pipeline executions that contributed to
+    /// `committer_pipeline_ns_total`. Pairs with the ns counter to give
+    /// avg pipeline ns per batch.
+    pub committer_pipeline_count: AtomicU64,
     pub entries: [CommitterQueueEntry; POC_V21_COMMITTER_QUEUE_SIZE],
 }
 

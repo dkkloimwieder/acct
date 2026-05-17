@@ -212,6 +212,97 @@ fn poc_v21_committer_tx_seq() -> i64 {
     hi as i64
 }
 
+// ── M7.2 (acct-fln5): scalar getters for the §5.6 bottleneck classifier ──
+//
+// All values are atomic loads of shmem counters wired by:
+//   - committer.rs (claim_count, takeover_count, tx_failures, eject_total,
+//                   pipeline_ns_total, pipeline_count, drains_total)
+//   - lib.rs / enqueue.rs (free_slot_wake_count)
+//
+// Exposed as scalars (not part of a TableIterator) so harness code can
+// SELECT one at a time and capture deltas cheaply. The TableIterator
+// forms (poc_v21_committer_stats / poc_v21_staging_stats) remain the
+// composite view for human-driven inspection.
+
+/// Total backpressure CV broadcasts since extension load. Each broadcast
+/// fires when a staging slot transitions to empty (committer cleanup or
+/// router rollback). High values during a load cell suggest the staging
+/// queue is the throughput bottleneck.
+#[pg_extern]
+fn poc_v21_backpressure_count() -> i64 {
+    let queue = STAGING_QUEUE.share();
+    queue.free_slot_wake_count.load(Relaxed) as i64
+}
+
+/// Total Step-5 sub-tx aborts (process_superbatch returning Err).
+#[pg_extern]
+fn poc_v21_committer_tx_failures() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.committer_tx_failures.load(Relaxed) as i64
+}
+
+/// Total committer death recoveries via M5a.1's `try_recover_orphan`.
+/// Counts CAS-rescue wins; one rescue per stale-lease + dead-pid takeover.
+#[pg_extern]
+fn poc_v21_orphan_recoveries() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.committer_takeover_count.load(Relaxed) as i64
+}
+
+/// Alias for `poc_v21_orphan_recoveries` per spec §4.4 O3. Both names
+/// surface the same counter — "orphan_recoveries" reads naturally for
+/// failure-mode docs; "lease_takeovers" reads naturally for committer-pool
+/// docs. Same atomic, different mental model.
+#[pg_extern]
+fn poc_v21_lease_takeovers() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.committer_takeover_count.load(Relaxed) as i64
+}
+
+/// Total ejections (committer caller-tx coupling, in_progress branch
+/// CAS 3→1 rollbacks for backoff). High values suggest caller-side
+/// contention forcing repeated re-routes.
+#[pg_extern]
+fn poc_v21_eject_count() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.eject_total_count.load(Relaxed) as i64
+}
+
+/// Average envelopes per SuperBatch over the lifetime of the extension
+/// (since last `poc_v21_router_stats_reset`). Derived as
+/// `router_total_envelopes / router_superbatch_count`; returns 0 if no
+/// SuperBatches have been assembled.
+#[pg_extern]
+fn poc_v21_avg_batch_size() -> f64 {
+    let queue = COMMITTER_QUEUE.share();
+    let total = queue.router_total_envelopes.load(Relaxed);
+    let sb = queue.router_superbatch_count.load(Relaxed);
+    if sb == 0 {
+        0.0
+    } else {
+        total as f64 / sb as f64
+    }
+}
+
+/// Total committer pipeline ns (Step 2 .. Step 12) across all
+/// SuperBatches. Used by §5.6 B2 classifier as the SPI-time numerator
+/// (most of this duration is SPI; in-memory dispatch is recoverable via
+/// method_latency_hist sums).
+#[pg_extern]
+fn poc_v21_committer_pipeline_ns_total() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.committer_pipeline_ns_total.load(Relaxed) as i64
+}
+
+/// Number of pipeline executions that contributed to
+/// `poc_v21_committer_pipeline_ns_total`. Pairs with the ns counter to
+/// compute avg pipeline ns per batch.
+#[pg_extern]
+fn poc_v21_committer_pipeline_count() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.committer_pipeline_count.load(Relaxed) as i64
+}
+
 /// Depth lookup by queue name. Accepts 'staging' or 'committer'; any
 /// other value returns -1 to signal "unknown queue". Implementations
 /// reuse the per-queue stats logic but project a single integer.

@@ -16,7 +16,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_apply_seq_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:799
+-- src/lib.rs:816
 -- poc_v21_ledger::poc_v21_arena_bump_offset
 CREATE  FUNCTION "poc_v21_arena_bump_offset"() RETURNS bigint /* i64 */
 STRICT
@@ -25,7 +25,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_bump_offset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:805
+-- src/lib.rs:822
 -- poc_v21_ledger::poc_v21_arena_freelist_count
 CREATE  FUNCTION "poc_v21_arena_freelist_count"() RETURNS bigint /* i64 */
 STRICT
@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_freelist_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:792
+-- src/lib.rs:809
 -- poc_v21_ledger::poc_v21_arena_outstanding
 CREATE  FUNCTION "poc_v21_arena_outstanding"() RETURNS bigint /* i64 */
 STRICT
@@ -52,7 +52,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_stats_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:778
+-- src/lib.rs:795
 -- poc_v21_ledger::poc_v21_arena_total_allocs
 CREATE  FUNCTION "poc_v21_arena_total_allocs"() RETURNS bigint /* i64 */
 STRICT
@@ -61,7 +61,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_total_allocs_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:784
+-- src/lib.rs:801
 -- poc_v21_ledger::poc_v21_arena_total_frees
 CREATE  FUNCTION "poc_v21_arena_total_frees"() RETURNS bigint /* i64 */
 STRICT
@@ -106,12 +106,48 @@ AS 'MODULE_PATHNAME', 'poc_v21_audit_reclaims_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:500
+-- src/stats.rs:275
+-- poc_v21_ledger::stats::poc_v21_avg_batch_size
+CREATE  FUNCTION "poc_v21_avg_batch_size"() RETURNS double precision /* f64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_avg_batch_size_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/stats.rs:231
+-- poc_v21_ledger::stats::poc_v21_backpressure_count
+CREATE  FUNCTION "poc_v21_backpressure_count"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_backpressure_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:517
 -- poc_v21_ledger::poc_v21_backpressure_wake_count
 CREATE  FUNCTION "poc_v21_backpressure_wake_count"() RETURNS bigint /* i64 */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_backpressure_wake_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/stats.rs:300
+-- poc_v21_ledger::stats::poc_v21_committer_pipeline_count
+CREATE  FUNCTION "poc_v21_committer_pipeline_count"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_committer_pipeline_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/stats.rs:291
+-- poc_v21_ledger::stats::poc_v21_committer_pipeline_ns_total
+CREATE  FUNCTION "poc_v21_committer_pipeline_ns_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_committer_pipeline_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -127,12 +163,30 @@ AS 'MODULE_PATHNAME', 'poc_v21_committer_stats_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/stats.rs:238
+-- poc_v21_ledger::stats::poc_v21_committer_tx_failures
+CREATE  FUNCTION "poc_v21_committer_tx_failures"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_committer_tx_failures_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/stats.rs:201
 -- poc_v21_ledger::stats::poc_v21_committer_tx_seq
 CREATE  FUNCTION "poc_v21_committer_tx_seq"() RETURNS bigint /* i64 */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_committer_tx_seq_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/stats.rs:265
+-- poc_v21_ledger::stats::poc_v21_eject_count
+CREATE  FUNCTION "poc_v21_eject_count"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_eject_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -151,12 +205,21 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:812
+-- src/lib.rs:829
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_hello_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/stats.rs:256
+-- poc_v21_ledger::stats::poc_v21_lease_takeovers
+CREATE  FUNCTION "poc_v21_lease_takeovers"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_lease_takeovers_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -172,7 +235,16 @@ AS 'MODULE_PATHNAME', 'poc_v21_method_stats_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/stats.rs:218
+-- src/stats.rs:246
+-- poc_v21_ledger::stats::poc_v21_orphan_recoveries
+CREATE  FUNCTION "poc_v21_orphan_recoveries"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_orphan_recoveries_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/stats.rs:309
 -- poc_v21_ledger::stats::poc_v21_queue_depth
 CREATE  FUNCTION "poc_v21_queue_depth"(
 	"queue_name" TEXT /* & str */
@@ -321,7 +393,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_check_release_acquire_invariant_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1956
+-- src/committer.rs:1972
 -- poc_v21_ledger::committer::poc_v21_test_committer_tick
 CREATE  FUNCTION "poc_v21_test_committer_tick"() RETURNS bool /* bool */
 STRICT
