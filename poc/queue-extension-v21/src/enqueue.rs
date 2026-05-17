@@ -496,4 +496,117 @@ fn past_deadline(deadline_micros: i128) -> bool {
     (now_micros() as i128) >= deadline_micros
 }
 
+// ── M5e.3 (acct-6isq): re-enqueue from persistent_staging ───────────
+//
+// Used by the postmaster-restart recovery sweep. The shmem state is empty
+// (postmaster crash wiped it). The persistent_staging row carries the full
+// envelope. We allocate arena blocks + push a fresh StagingEntry with the
+// SAVED user_tx_xid (NOT a new one) and the SAVED correlation_id. Caller
+// (recovery.rs) handles state transitions on persistent_staging itself.
+//
+// No CV wait: post-restart the queues are empty; arena/queue should have
+// capacity. If they don't, we return an error and let the caller surface
+// it (this is an operational error, not a normal-path backpressure case).
+pub(crate) fn re_enqueue_from_persistent_staging(
+    correlation_id: Uuid,
+    user_tx_xid: u64,
+    event_type: &str,
+    payload_bytes: &[u8],
+    sku_pool_keys: &[(i64, i64)],
+    wip_pool_keys: &[(i64, i64)],
+) -> Result<u32, String> {
+    let payload_len: u32 = payload_bytes
+        .len()
+        .try_into()
+        .map_err(|_| format!("payload too large: {}", payload_bytes.len()))?;
+    let sku_keys_size: u32 = (sku_pool_keys.len() * 16) as u32;
+    let wip_keys_size: u32 = (wip_pool_keys.len() * 16) as u32;
+
+    // Allocate arena blocks.
+    let (payload_offset, sku_keys_offset, wip_keys_offset) = {
+        let mut arena = SPILLOVER_ARENA.exclusive();
+        let payload_offset = arena
+            .alloc(payload_len.max(1))
+            .ok_or_else(|| "spillover arena exhausted (payload)".to_string())?;
+        arena.write_bytes(payload_offset, payload_bytes);
+
+        let sku_keys_offset = if sku_keys_size > 0 {
+            let off = arena.alloc(sku_keys_size).ok_or_else(|| {
+                arena.free(payload_offset);
+                "spillover arena exhausted (sku_keys)".to_string()
+            })?;
+            arena.write_bytes(off, &pool_keys_to_bytes(sku_pool_keys));
+            off
+        } else {
+            0
+        };
+
+        let wip_keys_offset = if wip_keys_size > 0 {
+            let off = arena.alloc(wip_keys_size).ok_or_else(|| {
+                arena.free(payload_offset);
+                if sku_keys_offset != 0 {
+                    arena.free(sku_keys_offset);
+                }
+                "spillover arena exhausted (wip_keys)".to_string()
+            })?;
+            arena.write_bytes(off, &pool_keys_to_bytes(wip_pool_keys));
+            off
+        } else {
+            0
+        };
+        (payload_offset, sku_keys_offset, wip_keys_offset)
+    };
+
+    // Push the staging entry.
+    let mut queue_guard = STAGING_QUEUE.exclusive();
+    let queue = &mut *queue_guard;
+    let request_seq = queue.next_request_seq.fetch_add(1, Relaxed);
+    let entry = StagingEntry {
+        valid: std::sync::atomic::AtomicU8::new(0),
+        _pad: [0; 7],
+        request_seq,
+        correlation_id: *correlation_id.as_bytes(),
+        user_tx_xid,
+        event_type_id: event_type_to_id(event_type),
+        _pad_event: [0; 2],
+        payload_offset,
+        payload_length: payload_len,
+        sku_pool_count: sku_pool_keys.len() as u16,
+        wip_pool_count: wip_pool_keys.len() as u16,
+        sku_pool_keys_offset: sku_keys_offset,
+        wip_pool_keys_offset: wip_keys_offset,
+        enqueued_at_micros: now_micros(),
+        backend_pid: 0, // No live caller backend; recovery worker is doing this.
+        _pad_pid: [0; 4],
+        superbatch_id: std::sync::atomic::AtomicU64::new(0),
+        eject_count: std::sync::atomic::AtomicU16::new(0),
+        _pad2: [0; 6],
+    };
+
+    match staging::push_entry(queue, entry) {
+        Ok(slot_idx) => Ok(slot_idx),
+        Err(staging::StagingPushError::QueueFull) => {
+            drop(queue_guard);
+            let mut arena = SPILLOVER_ARENA.exclusive();
+            arena.free(payload_offset);
+            if sku_keys_offset != 0 {
+                arena.free(sku_keys_offset);
+            }
+            if wip_keys_offset != 0 {
+                arena.free(wip_keys_offset);
+            }
+            Err("staging queue full during recovery re-enqueue".to_string())
+        }
+    }
+}
+
+/// Parse `{"sku": [[...]], "wip": [[...]]}` from a serde_json::Value.
+/// Crate-internal version for recovery.rs to use after reading the
+/// JSONB column from persistent_staging.
+pub(crate) fn parse_pool_keys_array(arr: &serde_json::Value) -> Vec<(i64, i64)> {
+    arr.as_array()
+        .map(|a| parse_key_array(a))
+        .unwrap_or_default()
+}
+
 

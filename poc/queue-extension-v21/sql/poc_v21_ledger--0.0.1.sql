@@ -130,7 +130,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_hello_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/recovery.rs:166
+-- src/recovery.rs:360
 -- poc_v21_ledger::recovery::poc_v21_recovery_complete
 CREATE  FUNCTION "poc_v21_recovery_complete"() RETURNS bool /* bool */
 STRICT
@@ -404,7 +404,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_release_slot_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/recovery.rs:157
+-- src/recovery.rs:351
 -- poc_v21_ledger::recovery::poc_v21_test_reset_recovery_complete
 CREATE  FUNCTION "poc_v21_test_reset_recovery_complete"() RETURNS void
 STRICT
@@ -449,7 +449,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_run_audit_sweep_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/recovery.rs:142
+-- src/recovery.rs:331
 -- poc_v21_ledger::recovery::poc_v21_test_run_startup_recovery
 CREATE  FUNCTION "poc_v21_test_run_startup_recovery"() RETURNS json /* pgrx :: Json */
 STRICT
