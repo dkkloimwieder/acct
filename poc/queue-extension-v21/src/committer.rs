@@ -616,6 +616,24 @@ fn run_pipeline_inside_subtx(
     };
     let events: &[PocV21Event] = &kept_events;
 
+    // STEP 2.5 (M5e.2 acct-jypc): persistent_staging state transition.
+    // For envelopes whose caller user-tx committed AND that have a
+    // durable persistent_staging row: flip 'staged' → 'in_shmem'.
+    // The UPDATE WHERE state='staged' is no-op for non-durable
+    // envelopes (no row exists) and for re-processed envelopes
+    // (already 'in_shmem' or 'completed'). Single batched UPDATE per
+    // SuperBatch.
+    if !events.is_empty() {
+        let corrs: Vec<pgrx::Uuid> = events.iter().map(|e| e.correlation_id).collect();
+        Spi::run_with_args(
+            "UPDATE poc_v21_persistent_staging \
+                SET state='in_shmem' \
+              WHERE correlation_id = ANY($1::uuid[]) AND state='staged'",
+            &[corrs.into()],
+        )
+        .map_err(|e| format!("persistent_staging in_shmem UPDATE: {e}"))?;
+    }
+
     // STEP 2.4 (new at M2.1): hydrate per-SKU method assignments from
     // poc_v21_sku_method_assignments. SKUs without a row default to
     // "fifo" — this preserves M1.3 test convenience and matches the
@@ -1173,6 +1191,17 @@ fn run_pipeline_inside_subtx(
             ],
         )
         .map_err(|e| format!("status committed UPSERT: {e}"))?;
+
+        // M5e.2 (acct-jypc): persistent_staging staged|in_shmem → completed.
+        // No-op for non-durable envelopes (no row exists). Commits atomically
+        // with the cost rows + status UPSERT inside Step 5's sub-tx.
+        Spi::run_with_args(
+            "UPDATE poc_v21_persistent_staging \
+                SET state='completed' \
+              WHERE correlation_id = ANY($1::uuid[]) AND state IN ('staged','in_shmem')",
+            &[succeeded.clone().into()],
+        )
+        .map_err(|e| format!("persistent_staging completed UPDATE: {e}"))?;
     }
     for (corr, code) in &failed_correlation_ids {
         let detail = pgrx::JsonB(serde_json::json!({ "phase": "plan_apply", "detail": code }));

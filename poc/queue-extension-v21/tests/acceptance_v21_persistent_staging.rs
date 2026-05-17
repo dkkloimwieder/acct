@@ -126,7 +126,13 @@ async fn test_v21_durable_queue_true_writes_staged_row() {
 
     assert_eq!(event_type, "po_receipt");
     assert_eq!(business_date, "2025-05-13");
-    assert_eq!(state, "staged");
+    // State at write time is 'staged'; M5e.2's committer may have already
+    // transitioned to 'in_shmem' or 'completed' by the time we read back.
+    // State-machine progression is the M5e.2 acceptance binary's concern.
+    assert!(
+        ["staged", "in_shmem", "completed"].contains(&state.as_str()),
+        "unexpected state {state}"
+    );
     assert!(
         user_tx_xid.parse::<u64>().unwrap() > 0,
         "user_tx_xid must be non-zero"
@@ -196,14 +202,17 @@ async fn test_v21_durable_queue_caller_commit_persists_row() {
         .expect("enqueue inside tx");
     tx.commit().await.expect("COMMIT");
 
+    // State may have advanced past 'staged' by the time we observe;
+    // M5e.2 transitions race with this read. The invariant tested here
+    // is "the row exists post-commit" — state progression is M5e.2.
     let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::BIGINT FROM poc_v21_persistent_staging WHERE correlation_id = $1 AND state = 'staged'",
+        "SELECT COUNT(*)::BIGINT FROM poc_v21_persistent_staging WHERE correlation_id = $1",
     )
     .bind(cid)
     .fetch_one(&pool)
     .await
     .expect("count");
-    assert_eq!(count.0, 1, "caller COMMIT must persist exactly one staged row");
+    assert_eq!(count.0, 1, "caller COMMIT must persist exactly one row");
 }
 
 #[tokio::test]
