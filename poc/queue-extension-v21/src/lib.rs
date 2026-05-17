@@ -155,13 +155,19 @@ pub struct CommitterQueue {
     pub lock_tranche_id: u32,
     pub _pad: [u8; 4],
     pub next_superbatch_id: AtomicU64,
-    // ── Router stats (M3.1 acct-r29s, M3.2 acct-evyq) ─────────────
+    // ── Router stats (M3.1 acct-r29s, M3.2 acct-evyq, M3.3 acct-8xyj) ─
     // Counters live in shmem (not process-local statics) so the
     // router BGWorker's increments are visible from any backend
     // that reads via SQL accessor. Atomics — no LWLock needed.
     pub router_superbatch_count: AtomicU64,
     pub router_total_envelopes: AtomicU64,
     pub router_force_pack_count: AtomicU64,
+    pub router_ticks_total: AtomicU64,
+    pub router_entries_scanned_total: AtomicU64,
+    pub committer_drains_total: AtomicU64,
+    /// Envelope-count histogram for SuperBatches (log2-spaced 8 buckets):
+    /// 0:[1], 1:[2-3], 2:[4-7], 3:[8-15], 4:[16-31], 5:[32-63], 6:[64-127], 7:[128+].
+    pub router_envelope_histogram: [AtomicU64; 8],
     pub router_max_envelope_count: AtomicU16,
     pub _pad_stats: [u8; 6],
     pub entries: [CommitterQueueEntry; POC_V21_COMMITTER_QUEUE_SIZE],

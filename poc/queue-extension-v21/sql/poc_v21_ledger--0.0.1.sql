@@ -31,7 +31,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:529
+-- src/lib.rs:535
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT
@@ -40,7 +40,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_hello_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:533
+-- src/router.rs:564
 -- poc_v21_ledger::router::poc_v21_router_force_pack_count
 CREATE  FUNCTION "poc_v21_router_force_pack_count"() RETURNS bigint /* i64 */
 STRICT
@@ -49,7 +49,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_force_pack_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:517
+-- src/router.rs:548
 -- poc_v21_ledger::router::poc_v21_router_max_envelope_count
 CREATE  FUNCTION "poc_v21_router_max_envelope_count"() RETURNS INT /* i32 */
 STRICT
@@ -58,7 +58,19 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_max_envelope_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:497
+-- src/router.rs:590
+-- poc_v21_ledger::router::poc_v21_router_stats
+CREATE  FUNCTION "poc_v21_router_stats"() RETURNS TABLE (
+	"stat_name" TEXT,  /* String */
+	"stat_value" double precision  /* f64 */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_router_stats_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/router.rs:522
 -- poc_v21_ledger::router::poc_v21_router_stats_reset
 CREATE  FUNCTION "poc_v21_router_stats_reset"() RETURNS void
 STRICT
@@ -67,7 +79,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_stats_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:510
+-- src/router.rs:541
 -- poc_v21_ledger::router::poc_v21_router_superbatch_count
 CREATE  FUNCTION "poc_v21_router_superbatch_count"() RETURNS bigint /* i64 */
 STRICT
@@ -76,7 +88,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_superbatch_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:524
+-- src/router.rs:555
 -- poc_v21_ledger::router::poc_v21_router_total_envelopes
 CREATE  FUNCTION "poc_v21_router_total_envelopes"() RETURNS bigint /* i64 */
 STRICT
@@ -94,7 +106,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_staging_state_counts_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1110
+-- src/committer.rs:1115
 -- poc_v21_ledger::committer::poc_v21_test_committer_tick
 CREATE  FUNCTION "poc_v21_test_committer_tick"() RETURNS bool /* bool */
 STRICT
@@ -114,7 +126,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_release_slot_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:552
+-- src/router.rs:656
 -- poc_v21_ledger::router::poc_v21_test_router_drain
 CREATE  FUNCTION "poc_v21_test_router_drain"() RETURNS bigint /* i64 */
 STRICT
@@ -123,7 +135,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_router_drain_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:544
+-- src/router.rs:648
 -- poc_v21_ledger::router::poc_v21_test_router_tick
 CREATE  FUNCTION "poc_v21_test_router_tick"() RETURNS bool /* bool */
 STRICT

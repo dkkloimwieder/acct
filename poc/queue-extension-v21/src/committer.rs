@@ -40,6 +40,11 @@ pub extern "C-unwind" fn poc_v21_committer_main(_arg: pg_sys::Datum) {
                     BackgroundWorker::transaction(|| {
                         let _ = process_superbatch(cq_idx);
                     });
+                    // M3.3 (acct-8xyj): committer drain observability.
+                    // Increment regardless of process_superbatch outcome
+                    // — a failed batch still consumed a CommitterQueueEntry.
+                    let queue = COMMITTER_QUEUE.share();
+                    queue.committer_drains_total.fetch_add(1, Relaxed);
                 }
                 None => break,
             }

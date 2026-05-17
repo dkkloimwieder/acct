@@ -68,10 +68,22 @@ fn router_tick() -> u32 {
     let batch_max = batch_size_max_now().max(1) as u16;
     let starvation_threshold = router_starvation_threshold_ticks_now().max(1) as u32;
 
+    // Always increment ticks_total — observability for empty ticks too.
+    {
+        let queue = COMMITTER_QUEUE.share();
+        queue.router_ticks_total.fetch_add(1, Relaxed);
+    }
+
     // --- Phase 1: scan staging head; collect candidate metadata. ---
     let candidates_meta = collect_candidates(staging_capacity, window_limit);
     if candidates_meta.is_empty() {
         return 0;
+    }
+    {
+        let queue = COMMITTER_QUEUE.share();
+        queue
+            .router_entries_scanned_total
+            .fetch_add(candidates_meta.len() as u64, Relaxed);
     }
 
     // --- Phase 2: hydrate pool keys for each candidate from arena. ---
@@ -470,6 +482,17 @@ fn starvation_map() -> &'static Mutex<HashMap<u64, u32>> {
 // that reads via the SQL accessors. All atomics — no LWLock contention
 // on the hot path.
 
+/// Log2-spaced bucket index for an envelope count (0..=7). Bucket 0 is
+/// size-1, bucket 7 is the >=128 overflow.
+fn envelope_histogram_bucket(envelope_count: u16) -> usize {
+    if envelope_count == 0 {
+        return 0;
+    }
+    // 31 - leading_zeros(n) for n>=1 gives floor(log2(n)).
+    let lg = 31 - (envelope_count as u32).leading_zeros();
+    (lg as usize).min(7)
+}
+
 fn record_superbatch_stats(envelope_count: u16, forced: bool) {
     let queue = COMMITTER_QUEUE.share();
     queue.router_superbatch_count.fetch_add(1, Relaxed);
@@ -479,6 +502,8 @@ fn record_superbatch_stats(envelope_count: u16, forced: bool) {
     if forced {
         queue.router_force_pack_count.fetch_add(1, Relaxed);
     }
+    let bucket = envelope_histogram_bucket(envelope_count);
+    queue.router_envelope_histogram[bucket].fetch_add(1, Relaxed);
     let mut prev = queue.router_max_envelope_count.load(Relaxed);
     while envelope_count > prev {
         match queue.router_max_envelope_count.compare_exchange(
@@ -501,6 +526,12 @@ fn poc_v21_router_stats_reset() {
     queue.router_total_envelopes.store(0, Relaxed);
     queue.router_max_envelope_count.store(0, Relaxed);
     queue.router_force_pack_count.store(0, Relaxed);
+    queue.router_ticks_total.store(0, Relaxed);
+    queue.router_entries_scanned_total.store(0, Relaxed);
+    queue.committer_drains_total.store(0, Relaxed);
+    for b in queue.router_envelope_histogram.iter() {
+        b.store(0, Relaxed);
+    }
     if let Ok(mut m) = starvation_map().lock() {
         m.clear();
     }
@@ -534,6 +565,79 @@ fn poc_v21_router_total_envelopes() -> i64 {
 fn poc_v21_router_force_pack_count() -> i64 {
     let queue = COMMITTER_QUEUE.share();
     queue.router_force_pack_count.load(Relaxed) as i64
+}
+
+/// Aggregated router + committer observability stats for §4.3 R1/R2
+/// validation. Returns one row per metric so callers can `WHERE
+/// stat_name=...` to extract specific values. All values are atomic
+/// loads (Relaxed) — eventual consistency is acceptable for
+/// observability; no LWLock held.
+///
+/// Stats emitted:
+///   superbatch_count          — total SuperBatches assembled
+///   total_envelopes           — total envelopes packed across all batches
+///   force_pack_count          — fairness-backstop force-packs
+///   max_envelope_count        — largest single-batch envelope count seen
+///   ticks_total               — every router_tick invocation incl. empty
+///   entries_scanned_total     — sum of candidates collected per tick
+///   committer_drains_total    — successful committer SuperBatch drains
+///   avg_envelopes_per_sb      — total_envelopes / superbatch_count
+///   packing_efficiency        — avg_envelopes_per_sb / batch_size_max
+///                               (R1 target: > 0.7 under disjoint workload)
+///   pack_yield_per_tick       — superbatch_count / ticks_total
+///   histogram_bucket_<N>      — count of SuperBatches with envelope_count in
+///                               2^N..2^(N+1)-1 (bucket 7 is the >=128 overflow).
+#[pg_extern]
+fn poc_v21_router_stats() -> TableIterator<
+    'static,
+    (
+        name!(stat_name, String),
+        name!(stat_value, f64),
+    ),
+> {
+    let queue = COMMITTER_QUEUE.share();
+    let sb_count = queue.router_superbatch_count.load(Relaxed);
+    let total_env = queue.router_total_envelopes.load(Relaxed);
+    let force_pack = queue.router_force_pack_count.load(Relaxed);
+    let ticks = queue.router_ticks_total.load(Relaxed);
+    let scanned = queue.router_entries_scanned_total.load(Relaxed);
+    let drains = queue.committer_drains_total.load(Relaxed);
+    let max_env = queue.router_max_envelope_count.load(Relaxed);
+    let batch_max = batch_size_max_now().max(1) as u64;
+    let mut histogram: [u64; 8] = [0; 8];
+    for (i, b) in queue.router_envelope_histogram.iter().enumerate() {
+        histogram[i] = b.load(Relaxed);
+    }
+
+    let avg_envelopes_per_sb = if sb_count > 0 {
+        total_env as f64 / sb_count as f64
+    } else {
+        0.0
+    };
+    let packing_efficiency = avg_envelopes_per_sb / batch_max as f64;
+    let pack_yield_per_tick = if ticks > 0 {
+        sb_count as f64 / ticks as f64
+    } else {
+        0.0
+    };
+
+    let mut rows: Vec<(String, f64)> = vec![
+        ("superbatch_count".into(), sb_count as f64),
+        ("total_envelopes".into(), total_env as f64),
+        ("force_pack_count".into(), force_pack as f64),
+        ("max_envelope_count".into(), max_env as f64),
+        ("ticks_total".into(), ticks as f64),
+        ("entries_scanned_total".into(), scanned as f64),
+        ("committer_drains_total".into(), drains as f64),
+        ("avg_envelopes_per_sb".into(), avg_envelopes_per_sb),
+        ("packing_efficiency".into(), packing_efficiency),
+        ("pack_yield_per_tick".into(), pack_yield_per_tick),
+        ("batch_size_max_guc".into(), batch_max as f64),
+    ];
+    for (i, count) in histogram.iter().enumerate() {
+        rows.push((format!("histogram_bucket_{}", i), *count as f64));
+    }
+    TableIterator::new(rows.into_iter())
 }
 
 // ── Test SQL surface ────────────────────────────────────────────────
