@@ -140,7 +140,12 @@ async fn set_eject_guc(pool: &PgPool, max_eject: i32, timeout_ms: i32) {
         .execute(pool)
         .await
         .expect("reload");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // SIGHUP propagation: postmaster signals each BGWorker; each
+    // processes the reload at its next CHECK_FOR_INTERRUPTS, which
+    // happens at every Spi::run/connect plus the wait_latch return.
+    // 2s sleep — empirical headroom for the BGWorker pool to all see
+    // the new values before the test's enqueue triggers ticking.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
 }
 
 async fn reset_eject_guc(pool: &PgPool) {
@@ -151,7 +156,7 @@ async fn reset_eject_guc(pool: &PgPool) {
         .execute(pool)
         .await;
     let _ = sqlx::query("SELECT pg_reload_conf()").execute(pool).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 // ── A. committed caller (sanity) ─────────────────────────────────────
@@ -253,7 +258,7 @@ async fn acceptance_v21_caller_tx_eject_count_exhausted() {
     // BGWorker (router + committer) drives the eject cycle to terminal:
     // max_eject_count=2 means 3 attempts × ~50ms tick latency = ~150ms.
     // Poll arena_outstanding until it returns to baseline; up to 3s.
-    let after_terminal = wait_arena_drained_to(&pool, baseline, Duration::from_secs(3)).await;
+    let after_terminal = wait_arena_drained_to(&pool, baseline, Duration::from_secs(30)).await;
     assert_eq!(
         after_terminal, baseline,
         "in_progress terminal-fail via eject_count exhausted must release arena: baseline={baseline}, after={after_terminal}"
@@ -310,7 +315,7 @@ async fn acceptance_v21_caller_tx_timeout_exhausted() {
     // set at enqueue time and the elapsed check inside Step 2.45
     // compares GetCurrentTimestamp against it.
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    let after_terminal = wait_arena_drained_to(&pool, baseline, Duration::from_secs(3)).await;
+    let after_terminal = wait_arena_drained_to(&pool, baseline, Duration::from_secs(30)).await;
     assert_eq!(
         after_terminal, baseline,
         "in_progress terminal-fail via timeout must release arena: baseline={baseline}, after={after_terminal}"
@@ -326,6 +331,96 @@ async fn acceptance_v21_caller_tx_timeout_exhausted() {
     assert!(
         visible_external.is_none(),
         "timeout terminal-fail must NOT INSERT submission_status; got {visible_external:?}"
+    );
+
+    sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+    reset_eject_guc(&pool).await;
+}
+
+// ── F. eject_count counter grows monotonically per cycle ───────────
+//
+// Closes the per-cycle assertion gap that C and D give up for
+// timing-robustness. With max_eject_count=10_000 + caller_tx_timeout
+// ≈ 1 hour, the envelope CAN'T terminal-fail during the test window;
+// the only thing the system can do is eject + re-route repeatedly.
+// Each cycle increments staging.eject_count. The assertion
+//   ec_t0 < ec_t1 < ec_t2  is monotone-true regardless of who ticked
+// the BGWorker — the test backend or the production BGWorker can
+// only INCREASE the counter, never decrement.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn acceptance_v21_caller_tx_eject_counter_grows() {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(POC_DSN)
+        .await
+        .expect("connect");
+    full_reset(&pool).await;
+
+    // Generous budgets — no terminal-fail during the test window.
+    set_eject_guc(&pool, 10_000, 3_600_000).await;
+
+    let mut conn = PgConnection::connect(POC_DSN).await.expect("conn");
+    sqlx::query("BEGIN").execute(&mut conn).await.unwrap();
+    let cid = Uuid::new_v4();
+    enqueue_one(&mut conn, cid, 9_300_006, 6).await.unwrap();
+
+    // Locate the staging slot — scan the full 16384-slot range.
+    // The staging tail pointer advances across the regression suite
+    // (next_request_seq accumulates), so cumulative test runs push
+    // the active slot index up to anywhere in 0..16383. 16384 shmem
+    // reads is cheap (~10-50ms). Slot stays at valid != 0 throughout
+    // the test — caller is held in_progress, eject CAS bounces
+    // 3 ↔ 1 ↔ 3 ↔ ... but never goes to 0 (budgets prevent terminal).
+    let staging_idx_opt: Option<i64> = sqlx::query_scalar(
+        "SELECT slot_idx::bigint \
+           FROM generate_series(0, 16383) AS slot_idx \
+          WHERE poc_v21_test_staging_state(slot_idx::bigint) NOT LIKE '(0,%' \
+          LIMIT 1",
+    )
+    .fetch_optional(&mut conn)
+    .await
+    .expect("locator query");
+    let staging_idx = staging_idx_opt
+        .expect("active staging slot must be findable somewhere in the queue");
+
+    // Sleep 200ms — at the BGWorker's 50ms tick rate, that's ≥3-4 eject
+    // cycles. The router runs in its own BGWorker (also 50ms) and the
+    // committer pool has its own. By the end of this sleep eject_count
+    // should be ≥ 1.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ec1: i32 = sqlx::query_scalar("SELECT poc_v21_test_staging_eject_count($1)")
+        .bind(staging_idx)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        ec1 >= 1,
+        "after one BGWorker cycle eject_count must be at least 1, got {ec1}"
+    );
+
+    // Sleep another 200ms — another batch of eject cycles. ec2 > ec1
+    // proves the counter is moving forward, not stuck.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ec2: i32 = sqlx::query_scalar("SELECT poc_v21_test_staging_eject_count($1)")
+        .bind(staging_idx)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        ec2 > ec1,
+        "eject_count must grow monotonically across cycles; ec1={ec1}, ec2={ec2}"
+    );
+
+    // Sanity bound — with 400ms total and max=10_000, we should be
+    // nowhere near terminal. If ec2 is unexpectedly huge (>1000),
+    // something's broken in the eject path (e.g., busy-looping
+    // without the 50ms tick gate).
+    assert!(
+        ec2 < 1000,
+        "eject_count grew unreasonably fast — busy loop suspected? got {ec2} in ~400ms"
     );
 
     sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();

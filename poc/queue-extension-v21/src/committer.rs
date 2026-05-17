@@ -351,8 +351,16 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
     }
 
     // STEP 14: cleanup. Free staging arena blocks, reset staging slots,
-    // mark CommitterQueueEntry completed.
-    cleanup_after_superbatch(cq_idx, &staging_indices, staging_offsets_off, sku_keys_off);
+    // mark CommitterQueueEntry completed. superbatch_id passed in so
+    // the cleanup can distinguish our slots from slots a concurrent
+    // router has re-routed into a NEW SuperBatch (M5c.2 race fix).
+    cleanup_after_superbatch(
+        cq_idx,
+        superbatch_id,
+        &staging_indices,
+        staging_offsets_off,
+        sku_keys_off,
+    );
     Ok(())
 }
 
@@ -1409,11 +1417,25 @@ fn read_event_from_staging(staging_idx: u32) -> Result<PocV21Event, String> {
 
 fn cleanup_after_superbatch(
     cq_idx: u32,
+    superbatch_id: u64,
     staging_indices: &[u32],
     staging_offsets_off: u32,
     sku_keys_off: u32,
 ) {
     // Free staging-entry arena blocks; CAS staging.valid 3→0.
+    //
+    // sb_id guard (M5c.2 acct-1hyx): cleanup must verify this committer
+    // OWNS the slot before CAS 3→0. The M5c.2 eject path writes
+    // staging.valid 3→1 + sb_id=0 INSIDE the sub-tx; cleanup runs
+    // AFTER sub-tx commit. In the gap (~10ms of sub-tx release), a
+    // concurrent router can re-pack the entry: CAS 1→2, store new
+    // sb_id, CAS 2→3. If cleanup then blindly CAS 3→0, it would
+    // wrongly free the NEW SuperBatch's arena and leave the staging
+    // entry at valid=0 — router stops re-routing, committer stops
+    // cycling, the entry is silently abandoned with garbage
+    // payload_offset. Guard: only CAS 3→0 when staging.sb_id matches
+    // our sb_id (Acquire-load pairs with the router's Release store
+    // and the eject path's Release store of 0).
     //
     // R7-shaped invariant (M5b.1 acct-k7b2): the router's Phase 6
     // stamps superbatch_id (Release) then CAS valid 2→3 (Release).
@@ -1422,10 +1444,11 @@ fn cleanup_after_superbatch(
     // staging_entry_offsets and the committer can read their payload
     // from arena, BUT the CAS 3→0 in cleanup will fail because they
     // are still at valid==2. Fall back to CAS 2→0 so we still free
-    // the arena for those entries — otherwise the slot leaks.
-    // Either CAS succeeding means "this committer owns the cleanup
-    // of this staging entry"; both releases are the post-batch
-    // visible state of "slot empty".
+    // the arena for those entries — otherwise the slot leaks. The
+    // sb_id guard does NOT apply to this 2→0 fallback: by definition
+    // the router died mid-Phase-6 with sb_id potentially un-stored,
+    // so checking sb_id-match would refuse to cleanup these recovery
+    // entries.
     for &s_idx in staging_indices {
         let (payload_off, sku_off, wip_off, cas_ok) = {
             let queue = STAGING_QUEUE.share();
@@ -1433,7 +1456,9 @@ fn cleanup_after_superbatch(
             let p = slot.payload_offset;
             let s = slot.sku_pool_keys_offset;
             let w = slot.wip_pool_keys_offset;
-            let ok = slot.valid.compare_exchange(3, 0, Release, Relaxed).is_ok()
+            let observed_sb = slot.superbatch_id.load(Acquire);
+            let ok = (observed_sb == superbatch_id
+                && slot.valid.compare_exchange(3, 0, Release, Relaxed).is_ok())
                 || slot.valid.compare_exchange(2, 0, Release, Relaxed).is_ok();
             if ok {
                 // M5c.1 (acct-r0aa): wake any waiter on backpressure CV.
