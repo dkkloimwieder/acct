@@ -583,13 +583,29 @@ fn run_pipeline_inside_subtx(
         }
 
         // Roll non-terminal ejected staging entries back to pending.
-        // Reset superbatch_id BEFORE flipping valid (data-before-flag
-        // invariant, mirroring M5b.2's Release/Acquire pairing — future
-        // readers observing valid==1 must see sb_id==0).
+        //
+        // Just CAS valid 3→1 (Release). DO NOT reset superbatch_id —
+        // writing sb_id=0 (Release) BEFORE the CAS creates a brief
+        // (valid=3, sb_id=0) intermediate which the M5b.2 acct-ud4h
+        // invariant test (rightly) flags as a Release/Acquire pairing
+        // violation; writing it AFTER the CAS creates a brief
+        // (valid=2, sb_id=0) window during re-route that the cleanup
+        // 2→0 fallback would wrongly free. Leaving sb_id at its old
+        // value is harmless: no production consumer reads sb_id under
+        // valid==1 (collect_candidates only checks valid==1, ignores
+        // sb_id; boot sweep Phase 1 only reads sb_id under valid==2;
+        // committer cleanup's sb_id guard correctly skips entries with
+        // stale sb_id via the first-branch mismatch). The next router
+        // pack will overwrite sb_id in Phase 6 anyway.
+        //
+        // M5b.2 acct-kt61: gating cleanup_after_superbatch's 2→0
+        // fallback on eject_count==0 protects against the cleanup
+        // race when an ejected entry is re-routed BEFORE the old
+        // committer's Step 14 reads it (then valid=2 with old or
+        // partial sb_id, but eject_count>0 marks it as not-our-mess).
         for s_idx in requeue {
             let queue = STAGING_QUEUE.share();
             let slot = &queue.entries[s_idx as usize];
-            slot.superbatch_id.store(0, Release);
             let _ = slot.valid.compare_exchange(3, 1, Release, Relaxed);
         }
 
@@ -1469,9 +1485,19 @@ fn cleanup_after_superbatch(
             let s = slot.sku_pool_keys_offset;
             let w = slot.wip_pool_keys_offset;
             let observed_sb = slot.superbatch_id.load(Acquire);
+            // 3→0 path: this entry processed through Phase 6 normally
+            // and belongs to our SuperBatch (sb_id guard).
+            // 2→0 fallback: M5b.1 router-mid-Phase-6-death recovery —
+            // the entry stuck at valid=2 because Phase 6's CAS 2→3
+            // didn't complete. Gate on eject_count==0 so we don't
+            // race-free an entry that was ejected by THIS committer's
+            // Step 2.45 and re-routed by another router tick before
+            // we reached cleanup (M5b.2/acct-kt61 race).
+            let observed_eject = slot.eject_count.load(Acquire);
             let ok = (observed_sb == superbatch_id
                 && slot.valid.compare_exchange(3, 0, Release, Relaxed).is_ok())
-                || slot.valid.compare_exchange(2, 0, Release, Relaxed).is_ok();
+                || (observed_eject == 0
+                    && slot.valid.compare_exchange(2, 0, Release, Relaxed).is_ok());
             if ok {
                 // M5c.1 (acct-r0aa): wake any waiter on backpressure CV.
                 // Broadcast inside the share guard — the CV has its own
