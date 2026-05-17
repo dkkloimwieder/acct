@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_outstanding_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:335
+-- src/enqueue.rs:359
 -- poc_v21_ledger::enqueue::poc_v21_arena_stats
 CREATE  FUNCTION "poc_v21_arena_stats"() RETURNS json /* Json */
 STRICT
@@ -205,7 +205,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_total_envelopes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:318
+-- src/enqueue.rs:342
 -- poc_v21_ledger::enqueue::poc_v21_staging_state_counts
 CREATE  FUNCTION "poc_v21_staging_state_counts"() RETURNS json /* Json */
 STRICT
@@ -393,7 +393,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_queue_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:292
+-- src/enqueue.rs:316
 -- poc_v21_ledger::enqueue::poc_v21_test_release_slot
 CREATE  FUNCTION "poc_v21_test_release_slot"(
 	"slot_index" bigint /* i64 */
@@ -525,7 +525,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_staging_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:284
+-- src/enqueue.rs:308
 -- poc_v21_ledger::enqueue::poc_v21_test_take_pending
 CREATE  FUNCTION "poc_v21_test_take_pending"() RETURNS bigint /* Option < i64 > */
 STRICT

@@ -55,6 +55,30 @@ fn poc_v21_enqueue(
     // Parse pool_keys JSONB once on the caller side to fail fast.
     let (sku_pool_keys, wip_pool_keys) = parse_pool_keys(&pool_keys);
 
+    // 3b. durable_queue=true ⇒ WAL-backed staging row (spec §1.9, M5e.1).
+    //
+    // Rides inside caller user-tx — rolls back atomically on caller abort;
+    // commits atomically with caller's other work. No extra fsync — the
+    // INSERT's WAL is part of the caller's commit record.
+    //
+    // ON CONFLICT (correlation_id) DO NOTHING handles caller retry with
+    // the same UUID (idempotent boundary, mirrors submission_status convention).
+    //
+    // business_date extracted from payload's business_date_jdate field
+    // (integer days since Unix epoch — same convention the committer
+    // uses at _extract_payload_meta). Payloads with no business_date_jdate
+    // default to 1970-01-01 — caller error visible in the persisted row.
+    if durable_queue {
+        insert_persistent_staging_row(
+            correlation_id,
+            user_tx_xid,
+            event_type,
+            &payload,
+            &sku_pool_keys,
+            &wip_pool_keys,
+        );
+    }
+
     // 4. Status row INSERT — dispatch on poc_v21.status_insert_mode.
     // caller_intx (default): INSERT inside caller user-tx; cheapest.
     //                         On caller abort, the row is lost; the
@@ -355,6 +379,62 @@ fn insert_status_row_caller_intx(correlation_id: Uuid) {
         &[correlation_id.into()],
     )
     .expect("submission_status INSERT");
+}
+
+/// INSERT into `poc_v21_persistent_staging` for the durable_queue=true
+/// path. M5e.1 (acct-m8pg). Runs inside caller user-tx so rolls back on
+/// caller abort. ON CONFLICT (correlation_id) DO NOTHING for idempotent
+/// retry. `business_date` resolved from payload's `business_date_jdate`
+/// (integer days since Unix epoch — the same convention the committer
+/// uses at `_extract_payload_meta`).
+fn insert_persistent_staging_row(
+    correlation_id: Uuid,
+    user_tx_xid: u32,
+    event_type: &str,
+    payload: &JsonB,
+    sku_pool_keys: &[(i64, i64)],
+    wip_pool_keys: &[(i64, i64)],
+) {
+    let business_date_jdate: i32 = payload
+        .0
+        .get("business_date_jdate")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(0);
+
+    let sku_json =
+        serde_json::Value::Array(sku_pool_keys.iter().map(pool_key_to_json).collect());
+    let wip_json =
+        serde_json::Value::Array(wip_pool_keys.iter().map(pool_key_to_json).collect());
+
+    // wip_pool_keys column is nullable; empty array → SQL NULL via NULLIF.
+    // user_tx_xid binds as TEXT then casts to xid8 (no direct pgrx u64→xid8).
+    Spi::run_with_args(
+        "INSERT INTO poc_v21_persistent_staging \
+            (correlation_id, user_tx_xid, event_type, payload, \
+             sku_pool_keys, wip_pool_keys, business_date, state) \
+         VALUES ($1, $2::text::xid8, $3, $4, $5, \
+                 NULLIF($6, '[]'::jsonb), \
+                 DATE 'epoch' + ($7::int), 'staged') \
+         ON CONFLICT (correlation_id) DO NOTHING",
+        &[
+            correlation_id.into(),
+            user_tx_xid.to_string().into(),
+            event_type.into(),
+            JsonB(payload.0.clone()).into(),
+            JsonB(sku_json).into(),
+            JsonB(wip_json).into(),
+            (business_date_jdate as i64).into(),
+        ],
+    )
+    .expect("persistent_staging INSERT");
+}
+
+fn pool_key_to_json(pair: &(i64, i64)) -> serde_json::Value {
+    serde_json::Value::Array(vec![
+        serde_json::Value::Number(pair.0.into()),
+        serde_json::Value::Number(pair.1.into()),
+    ])
 }
 
 fn parse_pool_keys(pool_keys: &JsonB) -> (Vec<(i64, i64)>, Vec<(i64, i64)>) {

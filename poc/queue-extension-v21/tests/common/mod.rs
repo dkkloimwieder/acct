@@ -91,7 +91,8 @@ pub async fn reset_state(pool: &PgPool) {
         "TRUNCATE poc_v21_cost_layers, poc_v21_cost_depletions, \
                   poc_v21_cost_consumptions, poc_v21_posting_lines, \
                   poc_v21_posting_line_inventory, poc_v21_submission_status, \
-                  poc_v21_pool_locks, poc_v21_wip_pool_locks, poc_v21_avg_pool_state \
+                  poc_v21_pool_locks, poc_v21_wip_pool_locks, poc_v21_avg_pool_state, \
+                  poc_v21_persistent_staging \
                   RESTART IDENTITY CASCADE",
     )
     .execute(pool)
