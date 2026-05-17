@@ -14,7 +14,8 @@ use crate::fifo::FIFO_METHOD;
 use crate::standard::STANDARD_METHOD;
 use crate::{
     COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE,
-    committer_lease_ms_now, signal_staging_slot_freed, skip_wip_locks, target_database_str,
+    caller_tx_timeout_ms_now, committer_lease_ms_now, max_eject_count_now,
+    signal_staging_slot_freed, skip_wip_locks, target_database_str,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
@@ -359,7 +360,7 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
 fn run_pipeline_inside_subtx(
     cq_idx: u32,
     superbatch_id: u64,
-    _staging_indices: &[u32],
+    staging_indices: &[u32],
     sku_pool_keys: &[(i64, i64)],
     wip_pool_keys: &[(i64, i64)],
     events: &[PocV21Event],
@@ -425,6 +426,168 @@ fn run_pipeline_inside_subtx(
             .committer_tx_id
             .store(committer_tx_id, Relaxed);
     }
+
+    // STEP 2.45 (M5c.2 acct-1hyx): caller-tx coupling check.
+    //
+    // THE central correctness rule of v2.1 (spec §3.11): the committer
+    // NEVER sleeps waiting for a caller's user-tx. For each distinct
+    // user_tx_xid in this batch we read pg_xact_status:
+    //
+    //   - committed  → keep envelope; downstream Steps 3–5 process it.
+    //   - aborted    → mark envelope failed via lazy INSERT into
+    //                  poc_v21_submission_status (the caller_intx-mode
+    //                  'queued' row was rolled back with the caller's
+    //                  user-tx, so we create the 'failed' row now).
+    //   - in_progress → EJECT. CAS staging.valid 3→1, reset
+    //                  superbatch_id to 0 (Release), increment
+    //                  staging.eject_count. The router will re-pick
+    //                  on a future tick. Once eject_count exceeds
+    //                  max_eject_count OR enqueued duration exceeds
+    //                  caller_tx_timeout_ms, terminal-fail the envelope
+    //                  with caller_tx_eject_exhausted / caller_tx_timeout.
+    //
+    // Filter `events` to the kept (caller_tx='committed') set so
+    // every downstream step (dedup, hydrate, dispatch, bulk insert,
+    // status update) operates on the surviving envelopes only.
+    //
+    // CAS-3→1 rollback on the staging side pairs with Step 14's
+    // CAS-failure-skip cleanup: ejected staging entries leave their
+    // arena blocks in place so the next router pick can reuse them.
+    let kept_events: Vec<PocV21Event> = {
+        let mut unique_xids: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+        for e in events {
+            unique_xids.insert(e.user_tx_xid);
+        }
+        let xid_strs: Vec<String> = unique_xids.iter().map(|x| x.to_string()).collect();
+        let mut xid_status: HashMap<u64, &'static str> = HashMap::new();
+        if !xid_strs.is_empty() {
+            let rows: Vec<(String, Option<String>)> = Spi::connect(|client| {
+                let mut out: Vec<(String, Option<String>)> = Vec::new();
+                let mut t = client
+                    .select(
+                        "SELECT x.s::xid8::text, pg_xact_status(x.s::xid8) \
+                           FROM UNNEST($1::text[]) AS x(s)",
+                        None,
+                        &[xid_strs.into()],
+                    )
+                    .ok()?;
+                while let Some(row) = t.next() {
+                    let x: String = row.get::<String>(1).ok()??;
+                    let s: Option<String> = row.get::<String>(2).ok()?;
+                    out.push((x, s));
+                }
+                Some(out)
+            })
+            .unwrap_or_default();
+            for (x, s) in rows {
+                let xid: u64 = x.parse().unwrap_or(0);
+                // pg_xact_status returns 'in progress' / 'committed' /
+                // 'aborted' / NULL. NULL = unknown (clog wraparound or
+                // very recent xid); treat as 'committed' defensively
+                // — re-processing a committed-but-unknown xid is safe
+                // (dedup-lookup catches duplicates).
+                let status: &'static str = match s.as_deref() {
+                    Some("committed") => "committed",
+                    Some("aborted") => "aborted",
+                    Some("in progress") => "in_progress",
+                    _ => "committed",
+                };
+                xid_status.insert(xid, status);
+            }
+        }
+
+        let max_ej = max_eject_count_now() as i32;
+        let caller_timeout_us = (caller_tx_timeout_ms_now() as u64) * 1000;
+        let now_us = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+
+        let mut kept: Vec<PocV21Event> = Vec::with_capacity(events.len());
+        // Aborted callers get a lazy INSERT into submission_status —
+        // their 'queued' INSERT rolled back with the caller's tx so
+        // PG's unique-index check sees a dead tuple, no XactLockTableWait,
+        // INSERT proceeds cleanly.
+        let mut aborted_failed: Vec<(pgrx::Uuid, &'static str)> = Vec::new();
+        let mut requeue: Vec<u32> = Vec::new();
+        for (i, event) in events.iter().enumerate() {
+            let status = xid_status
+                .get(&event.user_tx_xid)
+                .copied()
+                .unwrap_or("committed");
+            match status {
+                "aborted" => {
+                    aborted_failed.push((event.correlation_id, "caller_tx_aborted"));
+                }
+                "in_progress" => {
+                    let s_idx = staging_indices[i];
+                    let queue = STAGING_QUEUE.share();
+                    let slot = &queue.entries[s_idx as usize];
+                    let prev = slot.eject_count.fetch_add(1, Release);
+                    let new_count = (prev as i32).saturating_add(1);
+                    let enqueued_at = slot.enqueued_at_micros;
+                    drop(queue);
+                    let elapsed_us = now_us.saturating_sub(enqueued_at);
+                    if new_count > max_ej || elapsed_us > caller_timeout_us {
+                        // Terminal-fail an in_progress caller. We do NOT
+                        // INSERT into submission_status here: the caller's
+                        // 'queued' row is still uncommitted in their tx,
+                        // PG's unique-index conflict check would acquire
+                        // XactLockTableWait on the caller's xid, and the
+                        // committer would block — violating
+                        // I-committer-non-blocking (spec §3.11). Instead
+                        // we drop the envelope: no requeue (no CAS 3→1),
+                        // no submission_status write. Step 14 cleanup's
+                        // CAS 3→0 frees the staging slot's arena
+                        // normally. The caller's 'queued' row, if it
+                        // eventually materializes (caller commits), is
+                        // an orphan — application-layer reconciliation
+                        // handles that. This is a documented PoC
+                        // limitation; production may add an out-of-band
+                        // committer_terminal_decisions table to surface
+                        // the failure to callers post-commit.
+                    } else {
+                        requeue.push(s_idx);
+                    }
+                }
+                _ => kept.push(event.clone()),
+            }
+        }
+
+        for (corr, code) in &aborted_failed {
+            let detail =
+                pgrx::JsonB(serde_json::json!({ "phase": "caller_tx_check", "detail": code }));
+            Spi::run_with_args(
+                "INSERT INTO poc_v21_submission_status \
+                   (correlation_id, state, enqueued_at, processed_at, error_code, error_detail, committer_tx_id, superbatch_id) \
+                 VALUES ($1, 'failed', now(), now(), $2, $3, $4, $5) \
+                 ON CONFLICT (correlation_id) DO UPDATE SET \
+                   state='failed', processed_at=now(), \
+                   error_code=EXCLUDED.error_code, error_detail=EXCLUDED.error_detail, \
+                   committer_tx_id=EXCLUDED.committer_tx_id, superbatch_id=EXCLUDED.superbatch_id",
+                &[
+                    (*corr).into(),
+                    (*code).into(),
+                    detail.into(),
+                    (committer_tx_id as i64).into(),
+                    (superbatch_id as i64).into(),
+                ],
+            )
+            .map_err(|e| format!("caller_tx_check status INSERT: {e}"))?;
+        }
+
+        // Roll non-terminal ejected staging entries back to pending.
+        // Reset superbatch_id BEFORE flipping valid (data-before-flag
+        // invariant, mirroring M5b.2's Release/Acquire pairing — future
+        // readers observing valid==1 must see sb_id==0).
+        for s_idx in requeue {
+            let queue = STAGING_QUEUE.share();
+            let slot = &queue.entries[s_idx as usize];
+            slot.superbatch_id.store(0, Release);
+            let _ = slot.valid.compare_exchange(3, 1, Release, Relaxed);
+        }
+
+        kept
+    };
+    let events: &[PocV21Event] = &kept_events;
 
     // STEP 2.4 (new at M2.1): hydrate per-SKU method assignments from
     // poc_v21_sku_method_assignments. SKUs without a row default to

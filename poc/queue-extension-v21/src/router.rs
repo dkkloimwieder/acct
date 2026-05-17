@@ -1105,6 +1105,21 @@ fn poc_v21_test_staging_state(staging_idx: i64) -> String {
     )
 }
 
+/// Test-only: read a staging entry's `eject_count` (M5c.2 acct-1hyx).
+/// Used by caller-tx-coupling tests to assert the eject counter grows
+/// across re-route cycles when a caller holds its user-tx open.
+#[pg_extern]
+fn poc_v21_test_staging_eject_count(staging_idx: i64) -> i32 {
+    let queue = STAGING_QUEUE.share();
+    let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
+    if staging_idx < 0 || staging_idx >= capacity {
+        return -1;
+    }
+    queue.entries[staging_idx as usize]
+        .eject_count
+        .load(Relaxed) as i32
+}
+
 /// Test-only: force-reset a staging slot to valid==0 (empty).
 #[pg_extern]
 fn poc_v21_test_force_reset_staging(staging_idx: i64) -> i32 {

@@ -25,7 +25,35 @@ pub async fn connect_pool() -> PgPool {
 /// fresh per test. `sku_method_assignments` is NOT truncated — its
 /// rows are configuration that persists across scenarios; tests that
 /// need specific assignments call `seed_method_assignments` once.
+///
+/// Before TRUNCATE, polls the shmem staging queue until pending +
+/// processing + routed == 0 — i.e., the previous test's BGWorker
+/// activity has drained. This prevents test-ordering flakes where
+/// leftover envelopes get processed mid-TRUNCATE or post-reset_state,
+/// bumping router stats / cost rows under the next test's feet.
 pub async fn reset_state(pool: &PgPool) {
+    let drain_start = Instant::now();
+    loop {
+        let in_flight: i64 = sqlx::query_scalar(
+            "SELECT (COALESCE((poc_v21_staging_state_counts()->>'pending')::bigint, 0) \
+                   + COALESCE((poc_v21_staging_state_counts()->>'processing')::bigint, 0) \
+                   + COALESCE((poc_v21_staging_state_counts()->>'routed')::bigint, 0))",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if in_flight == 0 {
+            break;
+        }
+        if drain_start.elapsed() > Duration::from_secs(5) {
+            eprintln!(
+                "reset_state: staging didn't drain within 5s (in_flight={in_flight}); \
+                 proceeding with TRUNCATE — downstream tests may flake"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     sqlx::query(
         "TRUNCATE poc_v21_cost_layers, poc_v21_cost_depletions, \
                   poc_v21_cost_consumptions, poc_v21_posting_lines, \

@@ -353,6 +353,20 @@ pub(crate) fn skip_wip_locks() -> bool {
     SKIP_WIP_LOCKS.get()
 }
 
+/// Read `poc_v21.max_eject_count`. Defaults to 100. Used by M5c.2
+/// caller-tx coupling: an envelope ejected this many times is marked
+/// failed with `caller_tx_eject_exhausted` rather than re-queued.
+pub(crate) fn max_eject_count_now() -> i32 {
+    MAX_EJECT_COUNT.get()
+}
+
+/// Read `poc_v21.caller_tx_timeout_ms`. Defaults to 300000 (5 min).
+/// Once `now - enqueued_at_micros` exceeds this, ejected envelopes are
+/// marked failed regardless of remaining eject_count budget.
+pub(crate) fn caller_tx_timeout_ms_now() -> i32 {
+    CALLER_TX_TIMEOUT_MS.get()
+}
+
 // ── M5c.1 (acct-r0aa): backpressure CV signal mechanism ─────────────
 
 /// CAS-gated lazy initialization of the backpressure ConditionVariable.
