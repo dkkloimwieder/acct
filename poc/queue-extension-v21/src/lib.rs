@@ -170,6 +170,13 @@ pub struct CommitterQueue {
     pub router_envelope_histogram: [AtomicU64; 8],
     pub router_max_envelope_count: AtomicU16,
     pub _pad_stats: [u8; 6],
+    // ── M5b.2 (acct-ud4h): release/acquire invariant test surface ──
+    // Shmem-resident (not GUCs) so a test backend's setter call is
+    // visible to the router BGWorker without pg_reload_conf gymnastics.
+    // Production binaries default both to 0/false (no-op fast path).
+    pub test_inject_router_delay_us: AtomicU32,
+    pub test_reorder_router_stores: AtomicU8,
+    pub _pad_test: [u8; 3],
     pub entries: [CommitterQueueEntry; POC_V21_COMMITTER_QUEUE_SIZE],
 }
 

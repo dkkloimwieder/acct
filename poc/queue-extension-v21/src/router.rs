@@ -269,12 +269,34 @@ fn router_tick() -> u32 {
     // (§3.3) Acquires `valid` first; if it sees 3, it then Acquires
     // `superbatch_id` and trusts that the store is visible. Reversing
     // these gives a recovery window where valid=3 with stale sb_id=0.
+    //
+    // M5b.2 (acct-ud4h): the two test-only hooks below are no-ops in
+    // production (both atomics default to 0/false).
+    //   - test_inject_router_delay_us > 0: sleep between the two
+    //     stores, enlarging the window for concurrent readers to
+    //     observe whichever interleaving is in effect.
+    //   - test_reorder_router_stores=1: reverse the order (CAS first,
+    //     then store). NEGATIVE CONTROL — breaks the invariant so the
+    //     test can confirm it would observably catch a regression.
     {
+        let delay_us = test_inject_router_delay_us();
+        let reorder = test_reorder_router_stores();
         let queue = STAGING_QUEUE.share();
         for cand in &packed {
             let slot = &queue.entries[cand.staging_idx as usize];
-            slot.superbatch_id.store(sb_id, Release);
-            let _ = slot.valid.compare_exchange(2, 3, Release, Relaxed);
+            if reorder {
+                let _ = slot.valid.compare_exchange(2, 3, Release, Relaxed);
+                if delay_us > 0 {
+                    std::thread::sleep(Duration::from_micros(delay_us as u64));
+                }
+                slot.superbatch_id.store(sb_id, Release);
+            } else {
+                slot.superbatch_id.store(sb_id, Release);
+                if delay_us > 0 {
+                    std::thread::sleep(Duration::from_micros(delay_us as u64));
+                }
+                let _ = slot.valid.compare_exchange(2, 3, Release, Relaxed);
+            }
         }
     }
 
@@ -1159,4 +1181,80 @@ fn poc_v21_test_queue_state(queue_idx: i64) -> String {
 #[pg_extern]
 fn poc_v21_test_router_recover_tick() -> i64 {
     try_recover_router_orphan() as i64
+}
+
+// ── M5b.2 (acct-ud4h): release/acquire ordering invariant test ──────
+//
+// The invariant being tested: if a reader Acquire-loads
+// staging.valid and sees 3 (routed), then a subsequent Acquire-load
+// of staging.superbatch_id MUST return the non-zero value the router
+// stored. This is the Release/Acquire pairing the M5b.1 recovery
+// sweep depends on — without it, the sweep could observe (valid=3,
+// sb_id=0) and mis-classify the entry as "router died pre-stamp",
+// CAS-reverting it to pending while a real SuperBatch is mid-flight.
+//
+// On x86 the natural store-store ordering already enforces the
+// invariant for normal-order stores, so a positive-only test would
+// pass even with Relaxed. The negative-control (reorder GUC) is what
+// makes the test load-bearing: with the stores reversed (CAS first,
+// then sb_id store), readers WILL observe (valid=3, sb_id=0) during
+// the delay window. The acceptance suite includes a negative-control
+// case that asserts the test setup actually exercises the invariant.
+
+pub(crate) fn test_inject_router_delay_us() -> u32 {
+    COMMITTER_QUEUE.share().test_inject_router_delay_us.load(Relaxed)
+}
+
+pub(crate) fn test_reorder_router_stores() -> bool {
+    COMMITTER_QUEUE.share().test_reorder_router_stores.load(Relaxed) != 0
+}
+
+/// Test-only: set the router Phase-6 inject delay in microseconds.
+/// Visible to the router BGWorker because the field is shmem-resident.
+/// Pass 0 to disable.
+#[pg_extern]
+fn poc_v21_test_set_router_delay_us(delay_us: i32) {
+    let d = if delay_us < 0 { 0 } else { delay_us as u32 };
+    COMMITTER_QUEUE
+        .share()
+        .test_inject_router_delay_us
+        .store(d, Relaxed);
+}
+
+/// Test-only: enable the router Phase-6 store reorder for negative
+/// control. When ON, the CAS valid 2→3 happens BEFORE the sb_id store
+/// — breaking the data-before-flag invariant intentionally so the
+/// test can confirm violations are actually observable.
+#[pg_extern]
+fn poc_v21_test_set_router_reorder(enabled: bool) {
+    COMMITTER_QUEUE
+        .share()
+        .test_reorder_router_stores
+        .store(if enabled { 1 } else { 0 }, Relaxed);
+}
+
+/// Test-only: scan all staging entries with Acquire ordering and
+/// return the count of (valid==3, superbatch_id==0) observations.
+/// Each observation that survives a single backend's two Acquire
+/// loads is a violation of the data-before-flag invariant.
+///
+/// Race window: a writer can transition (valid=2, sb_id=set) →
+/// (valid=3, sb_id=set) between this fn's Acquire-load of valid and
+/// the subsequent Acquire-load of sb_id. That sequence is the EXPECTED
+/// post-pack state — sb_id is non-zero so it doesn't count as a
+/// violation. The violation pattern is observing valid=3 with sb_id
+/// STILL 0, which can only happen if the router's two stores are
+/// reordered (CAS first) OR if the compiler/CPU is allowed to reorder
+/// despite the Release annotation.
+#[pg_extern]
+fn poc_v21_test_check_release_acquire_invariant() -> i64 {
+    let mut violations: i64 = 0;
+    let queue = STAGING_QUEUE.share();
+    for i in 0..POC_V21_STAGING_QUEUE_SIZE {
+        let slot = &queue.entries[i];
+        if slot.valid.load(Acquire) == 3 && slot.superbatch_id.load(Acquire) == 0 {
+            violations += 1;
+        }
+    }
+    violations
 }
