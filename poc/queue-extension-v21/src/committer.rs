@@ -14,7 +14,7 @@ use crate::fifo::FIFO_METHOD;
 use crate::standard::STANDARD_METHOD;
 use crate::{
     COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE,
-    skip_wip_locks, target_database_str,
+    committer_lease_ms_now, skip_wip_locks, target_database_str,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
@@ -49,7 +49,167 @@ pub extern "C-unwind" fn poc_v21_committer_main(_arg: pg_sys::Datum) {
                 None => break,
             }
         }
+        // M5a.1 (acct-lefr): scan for orphaned in-flight entries
+        // whose owning committer died. Recovery uses lease staleness
+        // + kill(pid, 0) liveness as the gating signal. On rescue
+        // success the queue entry is reset to valid=1 so the next
+        // committer claim can re-execute Steps 2-5 (dedup-lookup at
+        // Step 2.5 catches any rows the dead committer already
+        // committed before death).
+        while try_recover_orphan() > 0 {}
     }
+}
+
+/// Scan the committer queue for orphaned entries (valid==2 with a
+/// dead committer_pid) and reset them to valid==1 for re-processing.
+/// Returns the number of entries recovered. Spec §3.2.
+///
+/// Detection signal (both must hold):
+///   1. Lease staleness: now - committer_acquired_at_ns >
+///      committer_lease_ms × 1_000_000.
+///   2. Process liveness: kill(committer_pid, 0) returns ESRCH
+///      (errno=3). EPERM (errno=1) is treated as alive (process
+///      exists but we lack permission to signal) — safer to assume
+///      alive than risk a false-positive rescue.
+///
+/// Rescue action: CAS committer_pid old_dead → MyProcPid (single CAS;
+/// loses to other rescuers gracefully). On success, reset the entry
+/// to valid=1 and committer_pid=0. The next BGWorker tick claims it
+/// normally via claim_next_committer_entry; Step 2.5 dedup-lookup
+/// guards against duplicates if the dead committer's tx happened to
+/// commit before death (rare but possible).
+///
+/// Idempotent under concurrent rescuers (CAS election, same shape as
+/// M4.1 committer claim).
+fn try_recover_orphan() -> u32 {
+    let queue = COMMITTER_QUEUE.share();
+    let capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
+    let my_pid = unsafe { pg_sys::MyProcPid };
+    let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+    let lease_ns = committer_lease_ms_now().max(1) as u64 * 1_000_000;
+
+    let mut recovered: u32 = 0;
+    for i in 0..capacity {
+        let slot = &queue.entries[i as usize];
+        if slot.valid.load(Relaxed) != 2 {
+            continue;
+        }
+        let old_pid = slot.committer_pid.load(Relaxed);
+        if old_pid == 0 || old_pid == my_pid {
+            continue;
+        }
+        let acquired_at = slot.committer_acquired_at_ns.load(Relaxed);
+        if now_ns.saturating_sub(acquired_at) <= lease_ns {
+            continue; // not stale yet
+        }
+        // Liveness check via signal-0. ESRCH (errno 3) → process gone.
+        let kill_rc = unsafe { libc::kill(old_pid, 0) };
+        if kill_rc == 0 {
+            continue; // still alive
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno != libc::ESRCH {
+            // EPERM or other — be conservative, leave alone.
+            continue;
+        }
+        // Try to claim the orphan. CAS old_pid → my_pid.
+        if slot
+            .committer_pid
+            .compare_exchange(old_pid, my_pid, Acquire, Relaxed)
+            .is_err()
+        {
+            continue; // another rescuer won
+        }
+        // We own the rescue. Reset the entry for re-processing.
+        slot.committer_acquired_at_ns.store(0, Relaxed);
+        slot.committer_tx_id.store(0, Relaxed);
+        slot.committer_pid.store(0, Release);
+        // valid 2→1 with Release ensures the pid reset is visible
+        // before any subsequent claimer sees valid==1.
+        let _ = slot
+            .valid
+            .compare_exchange(2, 1, Release, Relaxed);
+        recovered += 1;
+    }
+    recovered
+}
+
+/// Test-only: synthetically inject an orphaned entry into an EMPTY
+/// slot by stamping valid=2 + fake committer_pid + stale acquired_at.
+/// Bypasses the valid==1 precondition so tests can exercise the
+/// orphan-recovery mechanism without racing live router/committer
+/// flow. Returns false if the target slot is not currently valid==0.
+///
+/// `fake_pid` should be a definitely-dead PID (i32::MAX is the
+/// conventional choice — exceeds typical Linux PID_MAX). The kill(0)
+/// liveness check will return ESRCH and the recovery path engages.
+///
+/// `lease_offset_ms` is subtracted from `now` to force lease
+/// staleness; pass `committer_lease_ms × 2` for safety.
+#[pg_extern]
+fn poc_v21_test_inject_orphan_into_empty(
+    slot_idx: i64,
+    fake_pid: i32,
+    lease_offset_ms: i64,
+) -> bool {
+    let queue = COMMITTER_QUEUE.share();
+    let capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
+    if slot_idx < 0 || slot_idx >= capacity {
+        return false;
+    }
+    let slot = &queue.entries[slot_idx as usize];
+    if slot.valid.compare_exchange(0, 2, Acquire, Relaxed).is_err() {
+        return false;
+    }
+    slot.committer_pid.store(fake_pid, Relaxed);
+    let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+    let stale_ns = now_ns.saturating_sub((lease_offset_ms.max(0) as u64) * 1_000_000);
+    slot.committer_acquired_at_ns.store(stale_ns, Relaxed);
+    true
+}
+
+/// Test-only: read a CommitterQueueEntry's current state as a string
+/// tuple "(valid, committer_pid)". Useful for asserting state
+/// transitions in orphan-recovery tests.
+#[pg_extern]
+fn poc_v21_test_slot_state(slot_idx: i64) -> String {
+    let queue = COMMITTER_QUEUE.share();
+    let capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
+    if slot_idx < 0 || slot_idx >= capacity {
+        return "out_of_range".to_string();
+    }
+    let slot = &queue.entries[slot_idx as usize];
+    format!(
+        "({}, {})",
+        slot.valid.load(Relaxed),
+        slot.committer_pid.load(Relaxed)
+    )
+}
+
+/// Test-only: force-reset a slot to valid==0 (empty). Used in
+/// test cleanup after synthetic orphan injection so the real
+/// committer pool doesn't try to process an artifact slot. Returns
+/// the previous valid value.
+#[pg_extern]
+fn poc_v21_test_force_reset_slot(slot_idx: i64) -> i32 {
+    let queue = COMMITTER_QUEUE.share();
+    let capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
+    if slot_idx < 0 || slot_idx >= capacity {
+        return -1;
+    }
+    let slot = &queue.entries[slot_idx as usize];
+    let prev = slot.valid.swap(0, Release);
+    slot.committer_pid.store(0, Relaxed);
+    slot.committer_acquired_at_ns.store(0, Relaxed);
+    slot.committer_tx_id.store(0, Relaxed);
+    prev as i32
+}
+
+/// Test-only: synchronously run one orphan-recovery sweep. Returns
+/// the count of entries recovered.
+#[pg_extern]
+fn poc_v21_test_orphan_recover_tick() -> i64 {
+    try_recover_orphan() as i64
 }
 
 /// CAS-claim the next valid==1 CommitterQueueEntry. Returns its

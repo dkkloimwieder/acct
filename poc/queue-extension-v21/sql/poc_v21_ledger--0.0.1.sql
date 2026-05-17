@@ -31,7 +31,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:565
+-- src/lib.rs:571
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT
@@ -106,12 +106,45 @@ AS 'MODULE_PATHNAME', 'poc_v21_staging_state_counts_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:1155
+-- src/committer.rs:1315
 -- poc_v21_ledger::committer::poc_v21_test_committer_tick
 CREATE  FUNCTION "poc_v21_test_committer_tick"() RETURNS bool /* bool */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_test_committer_tick_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/committer.rs:193
+-- poc_v21_ledger::committer::poc_v21_test_force_reset_slot
+CREATE  FUNCTION "poc_v21_test_force_reset_slot"(
+	"slot_idx" bigint /* i64 */
+) RETURNS INT /* i32 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_slot_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/committer.rs:149
+-- poc_v21_ledger::committer::poc_v21_test_inject_orphan_into_empty
+CREATE  FUNCTION "poc_v21_test_inject_orphan_into_empty"(
+	"slot_idx" bigint, /* i64 */
+	"fake_pid" INT, /* i32 */
+	"lease_offset_ms" bigint /* i64 */
+) RETURNS bool /* bool */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_inject_orphan_into_empty_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/committer.rs:210
+-- poc_v21_ledger::committer::poc_v21_test_orphan_recover_tick
+CREATE  FUNCTION "poc_v21_test_orphan_recover_tick"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_orphan_recover_tick_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -141,6 +174,17 @@ CREATE  FUNCTION "poc_v21_test_router_tick"() RETURNS bool /* bool */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_test_router_tick_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/committer.rs:174
+-- poc_v21_ledger::committer::poc_v21_test_slot_state
+CREATE  FUNCTION "poc_v21_test_slot_state"(
+	"slot_idx" bigint /* i64 */
+) RETURNS TEXT /* String */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_slot_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */

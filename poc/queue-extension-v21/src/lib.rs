@@ -292,6 +292,12 @@ pub(crate) fn queue_full_timeout_ms_now() -> i32 {
     QUEUE_FULL_TIMEOUT_MS.get()
 }
 
+/// Read `poc_v21.committer_lease_ms`. Defaults to 100. Used by M5a.1
+/// orphan-recovery to declare a committer's claim stale.
+pub(crate) fn committer_lease_ms_now() -> i32 {
+    COMMITTER_LEASE_MS.get()
+}
+
 /// Read `poc_v21.batch_size_max`. Defaults to 50.
 pub(crate) fn batch_size_max_now() -> i32 {
     BATCH_SIZE_MAX.get()
