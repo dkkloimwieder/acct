@@ -88,8 +88,28 @@ pub extern "C-unwind" fn poc_v21_router_main(_arg: pg_sys::Datum) {
     BackgroundWorker::transaction(|| {
         let _ = try_recover_router_orphan();
     });
+    // M5d.2 (acct-3rc1): seed the audit timestamp so the first periodic
+    // pass fires ~60s after the boot sweep, not immediately.
+    {
+        let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+        COMMITTER_QUEUE
+            .share()
+            .audit_last_run_at_ns
+            .store(now_ns, Release);
+    }
 
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
+        // M5d.2 (acct-3rc1): periodic slot-leak audit. Runs at most
+        // once every AUDIT_INTERVAL_NS; bounded pass (iterates fixed
+        // staging + committer queue sizes) so it doesn't perturb
+        // router tick latency on the off-cycle. Wrapped in a
+        // BackgroundWorker::transaction because Pattern B + Pattern C
+        // UPSERT submission_status.
+        if audit_due() {
+            BackgroundWorker::transaction(|| {
+                run_audit_sweep();
+            });
+        }
         // Drain SuperBatches until the queue is empty (or committer
         // queue is full / arena is exhausted; those conditions roll
         // back partial work and return 0 from this tick).
@@ -1314,4 +1334,681 @@ fn poc_v21_test_check_release_acquire_invariant() -> i64 {
         }
     }
     violations
+}
+
+// ── M5d.2 (acct-3rc1): periodic slot-leak audit ─────────────────────
+//
+// Defense-in-depth backstop catching slots that get stuck in
+// non-terminal states due to bugs the eventful recovery paths
+// (M5a.1 committer orphan recovery, M5b.1 router boot sweep,
+// M5c.2 eject cleanup, M5d.1 startup recovery) missed.
+//
+// Piggybacked on the router BGWorker: every ~60s the router's main
+// loop calls run_audit_sweep() inside a BackgroundWorker::transaction.
+// Bounded pass (iterates fixed staging + committer queue sizes).
+//
+// Four detection patterns per spec §3.12:
+//
+//   A: Staging valid=2 stuck > 60s with dead backend_pid (caller).
+//      Router should never leave a slot at valid=2 for that long
+//      in steady state — router_tick takes <1ms. CAS valid 2→1
+//      reverts to pending; re-routing on next tick.
+//
+//   B: Staging valid=3 stuck > 5min with no live CommitterQueueEntry
+//      referencing it. Defensive — should never happen in clean ops.
+//      Mark submission_status='failed' / error_code='superbatch_lost',
+//      free arena, CAS valid 3→0.
+//
+//   C: Staging valid=3 stuck > 5min linked to a CommitterQueueEntry
+//      at valid=3 (completed) with dead committer_pid. Committer
+//      finished Step 5 commit (cost rows + status rows durable) but
+//      died before Step 14 cleanup. Reap directly: per-staging arena
+//      free + CAS 3→0, queue-entry-owned arena free, CAS queue 3→0.
+//      Convergence point with M5b.1's boot sweep (Phase 2) — that runs
+//      at router startup; this is the runtime backstop.
+//
+//   D: CommitterQueueEntry valid=2 stuck with dead committer_pid.
+//      M5a.1's per-tick try_recover_orphan handles this at the
+//      committer_lease_ms threshold (~100ms). The audit's 60s call
+//      is a backstop in case all committers are dead.
+//
+// Counters exposed via SQL accessors:
+//   poc_v21_audit_reclaims_count          (patterns A + C)
+//   poc_v21_audit_orphans_recovered_count (pattern D)
+//   poc_v21_audit_lost_envelopes_count    (pattern B)
+//   poc_v21_audit_last_run_at             (timestamptz of last pass)
+
+/// Audit interval — 60 seconds (per spec §3.12 default cadence).
+const AUDIT_INTERVAL_NS: u64 = 60 * 1_000_000_000;
+
+/// Stale threshold for Pattern A (staging valid=2 stuck). Microseconds
+/// (matches StagingEntry.enqueued_at_micros).
+const AUDIT_STALE_PATTERN_A_US: u64 = 60 * 1_000_000;
+
+/// Stale threshold for Patterns B + C (5min). Microseconds.
+const AUDIT_STALE_5MIN_US: u64 = 5 * 60 * 1_000_000;
+
+/// True when the periodic audit timestamp is more than AUDIT_INTERVAL_NS
+/// stale. Caller (router_main) gates the audit pass on this; the
+/// `poc_v21_test_run_audit_sweep` SQL helper bypasses for tests.
+fn audit_due() -> bool {
+    let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+    let last = COMMITTER_QUEUE.share().audit_last_run_at_ns.load(Acquire);
+    now_ns.saturating_sub(last) >= AUDIT_INTERVAL_NS
+}
+
+/// Liveness check for a stored caller / committer pid via `kill(pid, 0)`.
+/// Returns true when the pid is definitely dead (ESRCH). Returns false
+/// for live (kill returns 0) AND for ambiguous errors (EPERM etc.) —
+/// conservative; ambiguous cases leave the slot alone.
+///
+/// A pid of 0 is treated as "no owner registered" — definitely dead.
+/// Only test helpers should ever leave a slot with backend_pid==0
+/// while the slot is at valid != empty; production paths always stamp
+/// the caller's pid.
+fn pid_is_dead(pid: i32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let kill_rc = unsafe { libc::kill(pid, 0) };
+    if kill_rc == 0 {
+        return false;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno == libc::ESRCH
+}
+
+/// Top-level audit pass. Idempotent under re-entry; safe to call from
+/// tests synchronously OR from the router BGWorker's main loop. Stamps
+/// `audit_last_run_at_ns` on completion regardless of whether any
+/// pattern fired.
+pub(crate) fn run_audit_sweep() {
+    let reclaims_a = audit_pattern_a();
+    let lost = audit_pattern_b();
+    let reclaims_c = audit_pattern_c();
+    let orphans = crate::committer::try_recover_orphan() as u64; // Pattern D
+
+    let queue = COMMITTER_QUEUE.share();
+    queue
+        .audit_reclaims_count
+        .fetch_add(reclaims_a + reclaims_c, Relaxed);
+    queue
+        .audit_orphans_recovered_count
+        .fetch_add(orphans, Relaxed);
+    queue.audit_lost_envelopes_count.fetch_add(lost, Relaxed);
+    let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+    queue.audit_last_run_at_ns.store(now_ns, Release);
+}
+
+/// Pattern A: staging valid=2 > 60s with dead backend_pid → CAS 2→1.
+/// Arena is NOT freed — the staging entry's payload + pool-keys remain
+/// valid; next router pack re-uses them. Resets sb_id to 0 under the
+/// pending-state ownership.
+fn audit_pattern_a() -> u64 {
+    let now_us = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+    let staging_capacity = POC_V21_STAGING_QUEUE_SIZE as u32;
+    let mut reclaimed: u64 = 0;
+
+    for s_idx in 0..staging_capacity {
+        let (valid, enqueued_us, backend_pid) = {
+            let queue = STAGING_QUEUE.share();
+            let slot = &queue.entries[s_idx as usize];
+            (
+                slot.valid.load(Acquire),
+                slot.enqueued_at_micros,
+                slot.backend_pid,
+            )
+        };
+        if valid != 2 {
+            continue;
+        }
+        if now_us.saturating_sub(enqueued_us) <= AUDIT_STALE_PATTERN_A_US {
+            continue;
+        }
+        if !pid_is_dead(backend_pid) {
+            continue;
+        }
+        // CAS valid 2→1 (processing → pending). On success, reset sb_id
+        // (no concurrent router pack on a valid=1 slot once we own it).
+        let cas_ok = {
+            let queue = STAGING_QUEUE.share();
+            queue.entries[s_idx as usize]
+                .valid
+                .compare_exchange(2, 1, Release, Relaxed)
+                .is_ok()
+        };
+        if cas_ok {
+            let queue = STAGING_QUEUE.share();
+            queue.entries[s_idx as usize]
+                .superbatch_id
+                .store(0, Release);
+            reclaimed += 1;
+        }
+    }
+    reclaimed
+}
+
+/// Pattern B: staging valid=3 > 5min with no live CommitterQueueEntry
+/// referencing it → mark submission_status as 'superbatch_lost', free
+/// arena, CAS valid 3→0. Defensive — should never fire in clean ops.
+fn audit_pattern_b() -> u64 {
+    let now_us = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+    let queue_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
+    let staging_capacity = POC_V21_STAGING_QUEUE_SIZE as u32;
+
+    // Snapshot the set of sb_ids belonging to live queue entries.
+    let active_sb_ids: HashSet<u64> = {
+        let queue = COMMITTER_QUEUE.share();
+        let mut s = HashSet::new();
+        for q_idx in 0..queue_capacity {
+            let slot = &queue.entries[q_idx as usize];
+            if slot.valid.load(Acquire) != 0 {
+                s.insert(slot.superbatch_id);
+            }
+        }
+        s
+    };
+
+    let mut lost: u64 = 0;
+    for s_idx in 0..staging_capacity {
+        let (valid, sb_id, enqueued_us, payload_off, sku_off, wip_off, corr) = {
+            let queue = STAGING_QUEUE.share();
+            let slot = &queue.entries[s_idx as usize];
+            (
+                slot.valid.load(Acquire),
+                slot.superbatch_id.load(Acquire),
+                slot.enqueued_at_micros,
+                slot.payload_offset,
+                slot.sku_pool_keys_offset,
+                slot.wip_pool_keys_offset,
+                pgrx::Uuid::from_bytes(slot.correlation_id),
+            )
+        };
+        if valid != 3 {
+            continue;
+        }
+        if now_us.saturating_sub(enqueued_us) <= AUDIT_STALE_5MIN_US {
+            continue;
+        }
+        // If sb_id == 0 OR sb_id is not in the active set, this entry's
+        // queue link is gone. The sb_id == 0 path catches the rare
+        // memory-ordering violation case (caught observably by M5b.2).
+        if sb_id != 0 && active_sb_ids.contains(&sb_id) {
+            continue;
+        }
+        let cas_ok = {
+            let queue = STAGING_QUEUE.share();
+            queue.entries[s_idx as usize]
+                .valid
+                .compare_exchange(3, 0, Release, Relaxed)
+                .is_ok()
+        };
+        if !cas_ok {
+            continue;
+        }
+        // Free per-entry arena blocks.
+        {
+            let mut arena = SPILLOVER_ARENA.exclusive();
+            if payload_off != 0 {
+                arena.free(payload_off);
+            }
+            if sku_off != 0 {
+                arena.free(sku_off);
+            }
+            if wip_off != 0 {
+                arena.free(wip_off);
+            }
+        }
+        // Reset sb_id; wake any backpressure waiter (slot is now empty).
+        {
+            let queue = STAGING_QUEUE.share();
+            queue.entries[s_idx as usize]
+                .superbatch_id
+                .store(0, Release);
+            signal_staging_slot_freed(&queue);
+        }
+        // Mark status 'failed' with error_code 'superbatch_lost'.
+        // ON CONFLICT covers the case where the caller already
+        // observed terminal state by some other path.
+        let _ = Spi::run_with_args(
+            "INSERT INTO poc_v21_submission_status \
+               (correlation_id, state, error_code, processed_at, enqueued_at) \
+             VALUES ($1, 'failed', 'superbatch_lost', now(), now()) \
+             ON CONFLICT (correlation_id) DO UPDATE \
+               SET state='failed', \
+                   error_code='superbatch_lost', \
+                   processed_at=now() \
+             WHERE poc_v21_submission_status.state \
+                   NOT IN ('committed', 'failed', 'replayed')",
+            &[corr.into()],
+        );
+        lost += 1;
+    }
+    lost
+}
+
+/// Pattern C: CommitterQueueEntry valid=3 (completed) > 5min with dead
+/// committer_pid → reap. The committer ran Step 5 (cost rows + status
+/// rows durable in PG) but died before Step 14 (arena free + CAS 3→0).
+/// Age-gated mirror of M5b.1's `sweep_queue_phase` Phase 2. Idempotent
+/// with that boot sweep — both use CAS 3→0 election.
+fn audit_pattern_c() -> u64 {
+    let now_us = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+    let queue_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
+    let my_pid = unsafe { pg_sys::MyProcPid };
+    let mut reaped: u64 = 0;
+
+    for q_idx in 0..queue_capacity {
+        let (
+            q_valid,
+            _q_sb_id,
+            q_envelope_count,
+            q_so_off,
+            q_sku_off,
+            q_wip_off,
+            q_committer_pid,
+            q_enqueued_us,
+        ) = {
+            let queue = COMMITTER_QUEUE.share();
+            let slot = &queue.entries[q_idx as usize];
+            (
+                slot.valid.load(Acquire),
+                slot.superbatch_id,
+                slot.envelope_count,
+                slot.staging_entry_offsets,
+                slot.sku_pool_keys_offset,
+                slot.wip_pool_keys_offset,
+                slot.committer_pid.load(Relaxed),
+                slot.enqueued_at_micros,
+            )
+        };
+        if q_valid != 3 {
+            continue;
+        }
+        if now_us.saturating_sub(q_enqueued_us) <= AUDIT_STALE_5MIN_US {
+            continue;
+        }
+        if q_committer_pid == 0 || q_committer_pid == my_pid {
+            continue;
+        }
+        if !pid_is_dead(q_committer_pid) {
+            continue;
+        }
+        // Reap. Walk linked staging entries; CAS each 3→0; free per-entry
+        // arena. Then free queue-entry-owned arena (staging_entry_offsets,
+        // sku_pool_keys, wip_pool_keys — the easy-to-miss leak source).
+        // Finally CAS queue 3→0.
+        let staging_indices = if q_so_off != 0 && q_envelope_count > 0 {
+            read_staging_indices(q_so_off, q_envelope_count)
+        } else {
+            Vec::new()
+        };
+        let mut correlation_ids: Vec<pgrx::Uuid> = Vec::with_capacity(staging_indices.len());
+        for s_idx in staging_indices {
+            let (payload_off, sku_off, wip_off, corr, did_cas) = {
+                let queue = STAGING_QUEUE.share();
+                let slot = &queue.entries[s_idx as usize];
+                let p = slot.payload_offset;
+                let s = slot.sku_pool_keys_offset;
+                let w = slot.wip_pool_keys_offset;
+                let c = pgrx::Uuid::from_bytes(slot.correlation_id);
+                let did = slot.valid.compare_exchange(3, 0, Release, Relaxed).is_ok();
+                if did {
+                    slot.superbatch_id.store(0, Release);
+                    signal_staging_slot_freed(&queue);
+                }
+                (p, s, w, c, did)
+            };
+            correlation_ids.push(corr);
+            if did_cas {
+                let mut arena = SPILLOVER_ARENA.exclusive();
+                if payload_off != 0 {
+                    arena.free(payload_off);
+                }
+                if sku_off != 0 {
+                    arena.free(sku_off);
+                }
+                if wip_off != 0 {
+                    arena.free(wip_off);
+                }
+            }
+        }
+        // Free queue-entry-owned arena (separate from per-staging blocks).
+        {
+            let mut arena = SPILLOVER_ARENA.exclusive();
+            if q_so_off != 0 {
+                arena.free(q_so_off);
+            }
+            if q_sku_off != 0 {
+                arena.free(q_sku_off);
+            }
+            if q_wip_off != 0 {
+                arena.free(q_wip_off);
+            }
+        }
+        // CAS queue 3→0; clear pid/lease.
+        {
+            let queue = COMMITTER_QUEUE.share();
+            let slot = &queue.entries[q_idx as usize];
+            let _ = slot.valid.compare_exchange(3, 0, Release, Relaxed);
+            slot.committer_pid.store(0, Relaxed);
+            slot.committer_acquired_at_ns.store(0, Relaxed);
+            slot.committer_tx_id.store(0, Relaxed);
+        }
+        // Defensive UPSERT — cost rows are already durable; status row
+        // SHOULD already be 'committed' from the pre-death tx commit.
+        // Only flip non-terminal states.
+        if !correlation_ids.is_empty() {
+            let _ = Spi::run_with_args(
+                "UPDATE poc_v21_submission_status \
+                   SET state='committed', processed_at=now() \
+                 WHERE correlation_id = ANY($1::uuid[]) \
+                   AND state NOT IN ('committed', 'failed', 'replayed')",
+                &[correlation_ids.into()],
+            );
+        }
+        reaped += 1;
+    }
+    reaped
+}
+
+// ── M5d.2 SQL surface ───────────────────────────────────────────────
+
+#[pg_extern]
+fn poc_v21_audit_reclaims_count() -> i64 {
+    COMMITTER_QUEUE.share().audit_reclaims_count.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn poc_v21_audit_orphans_recovered_count() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .audit_orphans_recovered_count
+        .load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn poc_v21_audit_lost_envelopes_count() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .audit_lost_envelopes_count
+        .load(Relaxed) as i64
+}
+
+/// Timestamp of the most recent audit pass, or NULL if no pass has run
+/// since cluster startup. Returns a PG timestamptz value derived from
+/// the audit_last_run_at_ns shmem field (PG epoch microseconds → standard
+/// PG timestamp).
+#[pg_extern]
+fn poc_v21_audit_last_run_at() -> Option<pgrx::datum::TimestampWithTimeZone> {
+    let ns = COMMITTER_QUEUE.share().audit_last_run_at_ns.load(Relaxed);
+    if ns == 0 {
+        return None;
+    }
+    let us = (ns / 1000) as pg_sys::TimestampTz;
+    // pgrx 0.18: TimestampWithTimeZone::try_from(pg_sys::TimestampTz)
+    // interprets the i64 as microseconds since the PG epoch
+    // (2000-01-01 UTC). Matches pg_sys::GetCurrentTimestamp semantics.
+    pgrx::datum::TimestampWithTimeZone::try_from(us).ok()
+}
+
+/// Test-only: run one audit pass synchronously (bypasses the 60s gate).
+/// Returns the count of slots reconciled across all patterns.
+#[pg_extern]
+fn poc_v21_test_run_audit_sweep() -> i64 {
+    let before_a = COMMITTER_QUEUE.share().audit_reclaims_count.load(Relaxed);
+    let before_b = COMMITTER_QUEUE
+        .share()
+        .audit_lost_envelopes_count
+        .load(Relaxed);
+    let before_d = COMMITTER_QUEUE
+        .share()
+        .audit_orphans_recovered_count
+        .load(Relaxed);
+    run_audit_sweep();
+    let after_a = COMMITTER_QUEUE.share().audit_reclaims_count.load(Relaxed);
+    let after_b = COMMITTER_QUEUE
+        .share()
+        .audit_lost_envelopes_count
+        .load(Relaxed);
+    let after_d = COMMITTER_QUEUE
+        .share()
+        .audit_orphans_recovered_count
+        .load(Relaxed);
+    (after_a - before_a + after_b - before_b + after_d - before_d) as i64
+}
+
+/// Test-only: reset all audit counters + last_run_at to 0. Used by
+/// tests to establish a clean baseline before manufacturing a leak.
+#[pg_extern]
+fn poc_v21_test_audit_counters_reset() {
+    let queue = COMMITTER_QUEUE.share();
+    queue.audit_reclaims_count.store(0, Relaxed);
+    queue.audit_orphans_recovered_count.store(0, Relaxed);
+    queue.audit_lost_envelopes_count.store(0, Relaxed);
+    queue.audit_last_run_at_ns.store(0, Relaxed);
+}
+
+/// Test-only: backdate a staging entry's `enqueued_at_micros` by
+/// `offset_ms` so it appears stale to audit gating. Saturates at 0
+/// (no underflow).
+#[pg_extern]
+fn poc_v21_test_backdate_staging_enqueued_at(staging_idx: i64, offset_ms: i64) -> bool {
+    let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
+    if staging_idx < 0 || staging_idx >= capacity {
+        return false;
+    }
+    let mut q = STAGING_QUEUE.exclusive();
+    let slot = &mut q.entries[staging_idx as usize];
+    let offset_us = (offset_ms.max(0) as u64) * 1000;
+    slot.enqueued_at_micros = slot.enqueued_at_micros.saturating_sub(offset_us);
+    true
+}
+
+/// Test-only: set a staging entry's `backend_pid` to a known value
+/// (used to inject Pattern A's dead-pid condition with a non-zero PID).
+#[pg_extern]
+fn poc_v21_test_set_staging_backend_pid(staging_idx: i64, pid: i32) -> bool {
+    let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
+    if staging_idx < 0 || staging_idx >= capacity {
+        return false;
+    }
+    let mut q = STAGING_QUEUE.exclusive();
+    q.entries[staging_idx as usize].backend_pid = pid;
+    true
+}
+
+/// Test-only: backdate a queue entry's `enqueued_at_micros` by
+/// `offset_ms`. Used for Pattern C age-gating.
+#[pg_extern]
+fn poc_v21_test_backdate_queue_enqueued_at(queue_idx: i64, offset_ms: i64) -> bool {
+    let capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
+    if queue_idx < 0 || queue_idx >= capacity {
+        return false;
+    }
+    let mut q = COMMITTER_QUEUE.exclusive();
+    let slot = &mut q.entries[queue_idx as usize];
+    let offset_us = (offset_ms.max(0) as u64) * 1000;
+    slot.enqueued_at_micros = slot.enqueued_at_micros.saturating_sub(offset_us);
+    true
+}
+
+/// Test-only: directly stamp a staging slot to the routed state
+/// (valid=3, sb_id=given). Mirrors the router's Phase 6 stores
+/// (sb_id Release then CAS valid 2→3 Release). Precondition: slot must
+/// be at valid=2. Used to construct Patterns B and C scenarios where
+/// staging needs to be at valid=3 with a specific sb_id linkage.
+#[pg_extern]
+fn poc_v21_test_promote_staging_to_routed(staging_idx: i64, sb_id: i64) -> bool {
+    let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
+    if staging_idx < 0 || staging_idx >= capacity {
+        return false;
+    }
+    let queue = STAGING_QUEUE.share();
+    let slot = &queue.entries[staging_idx as usize];
+    // Match router's Phase 6 ordering: store sb_id first (Release),
+    // then CAS valid 2→3 (Release).
+    slot.superbatch_id.store(sb_id as u64, Release);
+    slot.valid
+        .compare_exchange(2, 3, Release, Relaxed)
+        .is_ok()
+}
+
+/// Test-only: comprehensive shmem reset for audit tests that need strong
+/// equality assertions on arena outstanding / staging+queue state. Walks
+/// every slot in staging + committer queue, forces valid=0; nukes the
+/// arena (bump=0, freelist=0, counters=0); resets ring head/tail +
+/// next_seq + all router stats counters; resets all audit counters.
+///
+/// Safety: assumes no BGWorker is actively processing shmem. The audit
+/// pass and router_tick check slot state under atomics; forcing valid=0
+/// while a tick is mid-pack would cause it to lose track of an entry
+/// but not corrupt memory. Tests calling this should not have live
+/// enqueues in flight (which is the audit-test invariant).
+///
+/// Returns the count of (staging, queue) slots that were non-empty
+/// before reset — useful for tests that want to verify their setup
+/// state was clean.
+#[pg_extern]
+fn poc_v21_test_force_reset_all_shmem() -> String {
+    let mut s_dirty: u32 = 0;
+    let mut q_dirty: u32 = 0;
+
+    // Wipe staging entries.
+    {
+        let queue = STAGING_QUEUE.share();
+        for s_idx in 0..POC_V21_STAGING_QUEUE_SIZE {
+            let slot = &queue.entries[s_idx];
+            let prev = slot.valid.swap(0, Release);
+            if prev != 0 {
+                s_dirty += 1;
+            }
+            slot.superbatch_id.store(0, Release);
+            slot.eject_count.store(0, Relaxed);
+        }
+        queue.head.store(0, Relaxed);
+        queue.tail.store(0, Relaxed);
+        queue.next_request_seq.store(0, Relaxed);
+    }
+
+    // Wipe committer queue entries.
+    {
+        let mut queue = COMMITTER_QUEUE.exclusive();
+        for q_idx in 0..POC_V21_COMMITTER_QUEUE_SIZE {
+            let slot = &mut queue.entries[q_idx];
+            let prev = slot.valid.swap(0, Release);
+            if prev != 0 {
+                q_dirty += 1;
+            }
+            slot.superbatch_id = 0;
+            slot.envelope_count = 0;
+            slot.staging_entry_offsets = 0;
+            slot.sku_pool_keys_offset = 0;
+            slot.sku_pool_keys_count = 0;
+            slot.wip_pool_keys_offset = 0;
+            slot.wip_pool_keys_count = 0;
+            slot.committer_pid.store(0, Relaxed);
+            slot.committer_acquired_at_ns.store(0, Relaxed);
+            slot.committer_tx_id.store(0, Relaxed);
+            slot.enqueued_at_micros = 0;
+        }
+        queue.head.store(0, Relaxed);
+        queue.tail.store(0, Relaxed);
+        queue.next_superbatch_id.store(0, Relaxed);
+        // Reset router stats.
+        queue.router_superbatch_count.store(0, Relaxed);
+        queue.router_total_envelopes.store(0, Relaxed);
+        queue.router_force_pack_count.store(0, Relaxed);
+        queue.router_ticks_total.store(0, Relaxed);
+        queue.router_entries_scanned_total.store(0, Relaxed);
+        queue.committer_drains_total.store(0, Relaxed);
+        queue.router_max_envelope_count.store(0, Relaxed);
+        for b in queue.router_envelope_histogram.iter() {
+            b.store(0, Relaxed);
+        }
+        // Reset audit counters.
+        queue.audit_reclaims_count.store(0, Relaxed);
+        queue.audit_orphans_recovered_count.store(0, Relaxed);
+        queue.audit_lost_envelopes_count.store(0, Relaxed);
+        queue.audit_last_run_at_ns.store(0, Relaxed);
+    }
+
+    // Wipe spillover arena.
+    {
+        let mut arena = SPILLOVER_ARENA.exclusive();
+        arena.bump_offset.store(0, Release);
+        arena.freelist_head_offset.store(0, Release);
+        arena.total_allocs.store(0, Relaxed);
+        arena.total_frees.store(0, Relaxed);
+    }
+
+    // Clear router starvation map (process-local Mutex).
+    if let Ok(mut m) = starvation_map().lock() {
+        m.clear();
+    }
+
+    format!("({}, {})", s_dirty, q_dirty)
+}
+
+/// Test-only: directly populate an empty staging slot with an arena-backed
+/// payload + pool-keys so audit Pattern B / C tests can verify arena
+/// freeing. Stamps valid=2 with the given sb_id; tests can subsequently
+/// CAS 2→3 via `poc_v21_test_promote_staging_to_routed`.
+#[pg_extern]
+fn poc_v21_test_inject_staging_with_arena(
+    staging_idx: i64,
+    sb_id: i64,
+    correlation_id: pgrx::Uuid,
+    payload_bytes: i64,
+) -> bool {
+    let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
+    if staging_idx < 0 || staging_idx >= capacity {
+        return false;
+    }
+    if payload_bytes < 1 || payload_bytes > 65535 {
+        return false;
+    }
+    // Allocate a real arena block for payload.
+    let payload_off = {
+        let mut arena = SPILLOVER_ARENA.exclusive();
+        match arena.alloc(payload_bytes as u32) {
+            Some(o) => o,
+            None => return false,
+        }
+    };
+    // Try to claim slot.
+    {
+        let queue = STAGING_QUEUE.share();
+        let slot = &queue.entries[staging_idx as usize];
+        if slot.valid.compare_exchange(0, 2, Acquire, Relaxed).is_err() {
+            let mut arena = SPILLOVER_ARENA.exclusive();
+            arena.free(payload_off);
+            return false;
+        }
+    }
+    // Stamp non-atomic fields.
+    {
+        let mut q = STAGING_QUEUE.exclusive();
+        let slot = &mut q.entries[staging_idx as usize];
+        slot.correlation_id = *correlation_id.as_bytes();
+        slot.payload_offset = payload_off;
+        slot.payload_length = payload_bytes as u32;
+        slot.sku_pool_keys_offset = 0;
+        slot.sku_pool_count = 0;
+        slot.wip_pool_keys_offset = 0;
+        slot.wip_pool_count = 0;
+        slot.event_type_id = 0;
+        slot.backend_pid = 0;
+        slot.user_tx_xid = 0;
+        slot.request_seq = 0;
+        slot.enqueued_at_micros = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+        slot.eject_count.store(0, Relaxed);
+    }
+    // Stamp sb_id.
+    {
+        let queue = STAGING_QUEUE.share();
+        let slot = &queue.entries[staging_idx as usize];
+        slot.superbatch_id.store(sb_id as u64, Release);
+    }
+    true
 }

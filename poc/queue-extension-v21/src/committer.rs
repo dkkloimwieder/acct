@@ -85,7 +85,7 @@ pub extern "C-unwind" fn poc_v21_committer_main(_arg: pg_sys::Datum) {
 ///
 /// Idempotent under concurrent rescuers (CAS election, same shape as
 /// M4.1 committer claim).
-fn try_recover_orphan() -> u32 {
+pub(crate) fn try_recover_orphan() -> u32 {
     let queue = COMMITTER_QUEUE.share();
     let capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
     let my_pid = unsafe { pg_sys::MyProcPid };

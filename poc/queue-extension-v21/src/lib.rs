@@ -211,6 +211,14 @@ pub struct CommitterQueue {
     /// Acquire-load before opening for traffic).
     pub recovery_complete: AtomicU8,
     pub _pad_test: [u8; 2],
+    // ── M5d.2 (acct-3rc1): periodic slot-leak audit counters ──────────
+    // Incremented by the router BGWorker's periodic audit pass (every
+    // 60s). `audit_last_run_at_ns` doubles as the next-due timestamp
+    // and as an observability surface (poc_v21_audit_last_run_at).
+    pub audit_reclaims_count: AtomicU64,
+    pub audit_orphans_recovered_count: AtomicU64,
+    pub audit_lost_envelopes_count: AtomicU64,
+    pub audit_last_run_at_ns: AtomicU64,
     pub entries: [CommitterQueueEntry; POC_V21_COMMITTER_QUEUE_SIZE],
 }
 
