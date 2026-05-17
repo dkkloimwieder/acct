@@ -804,11 +804,40 @@ fn run_pipeline_inside_subtx(
         }
     }
 
-    // STEP 4: per-event dispatch. Sort by chronological key, then
-    // route each event to its SKU's method's apply_one. Methods
-    // interleave freely within one batch — AVG event then FIFO event
-    // then AVG event is supported (each method touches its own
-    // snapshot slot).
+    // STEP 4: per-event dispatch grouped by envelope for per-envelope
+    // failure isolation (M6.2 acct-p0mu; spec §1.8 Step 4 + §3.7).
+    //
+    // Events are first sorted by chronological key, then grouped by
+    // correlation_id preserving first-appearance order. Each envelope's
+    // events dispatch as a unit: pre-envelope snapshot of touched pool
+    // entries is captured; on ANY event failure within the envelope, the
+    // snapshot is restored and the envelope's accumulated result rows are
+    // truncated. Other envelopes in the SuperBatch commit normally.
+    //
+    // Within-envelope ordering: events of one wo_complete share
+    // (business_date, doc_chrono, document_id) and only differ in
+    // sub_priority — they sort consecutively. Single-event envelopes are
+    // singleton groups.
+    //
+    // Cross-envelope ordering: groups iterate by first-appearance in the
+    // chrono sort. Two envelopes targeting the same pool would process
+    // serially (FIFO bills the first against pre-batch layers, then the
+    // second against post-mutation layers). In practice the router's
+    // greedy disjoint packing ensures no two envelopes in one SuperBatch
+    // share an SKU pool, so cross-envelope shared-pool sequencing only
+    // exercises wo_complete envelopes (K+1 events on K+1 distinct pools).
+    //
+    // Snapshot rollback fixes the post-M6.1 polluted-snapshot risk: FIFO
+    // `deplete` partially mutates layer effective_qty before signalling
+    // insufficient_inventory, AVG `roll_in` mutates running state before
+    // any subsequent same-envelope component fails. Without rollback,
+    // succeeded components of a failed envelope leak mutations into
+    // unrelated envelopes (and into subsequent SuperBatches that hydrate
+    // from cost_layers/avg_pool_state — though those reads come from the
+    // committed DB state, not the snapshot, so DB persistence is already
+    // gated on succeeded_set filtering). The risk is purely in-memory:
+    // envelope N+1 within the same SuperBatch sees envelope N's partial
+    // mutation. Rollback closes that hole.
     let mut sorted_events = events_to_plan.clone();
     sorted_events.sort_by_key(|e| {
         (
@@ -818,54 +847,121 @@ fn run_pipeline_inside_subtx(
             e.sub_priority,
         )
     });
-    let mut result = PocV21ApplyResult::default();
-    // M6.1 (acct-o1yv): per-correlation_id WoComplete cost accumulator.
-    // Components push cost in; output reads and zeroes. The dispatcher
-    // injects the computed unit_cost into the output event before calling
-    // the method's apply_one — methods then use a uniform receipt path
-    // with the caller-supplied unit_cost.
-    let mut wo_cost_accum: HashMap<pgrx::Uuid, i64> = HashMap::new();
 
+    let mut envelope_groups: Vec<(pgrx::Uuid, Vec<PocV21Event>)> = Vec::new();
+    let mut corr_to_group_idx: HashMap<pgrx::Uuid, usize> = HashMap::new();
     for event in &sorted_events {
-        // Inject unit_cost into WoComplete output (qty>0) events.
-        let mut event_for_dispatch = event.clone();
-        if matches!(event.event_type, PocV21EventType::WoComplete) && event.qty > 0 {
-            let total_cost = wo_cost_accum.remove(&event.correlation_id).unwrap_or(0);
-            event_for_dispatch.unit_cost = total_cost / event.qty;
+        if let Some(&idx) = corr_to_group_idx.get(&event.correlation_id) {
+            envelope_groups[idx].1.push(event.clone());
+        } else {
+            corr_to_group_idx.insert(event.correlation_id, envelope_groups.len());
+            envelope_groups.push((event.correlation_id, vec![event.clone()]));
         }
-
-        let depl_before = result.depletion_inserts.len();
-        let cons_before = result.consumption_inserts.len();
-
-        let m = method_of(event_for_dispatch.sku_id);
-        let event_result = match m {
-            "avg" => AVG_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
-            "std" => STANDARD_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
-            _ => FIFO_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
-        };
-
-        // Accumulate cost from WoComplete component consumptions.
-        if matches!(event.event_type, PocV21EventType::WoComplete)
-            && event.qty < 0
-            && event_result.error_code.is_none()
-        {
-            let mut cost: i64 = 0;
-            for d in &result.depletion_inserts[depl_before..] {
-                cost = cost.saturating_add(d.qty.saturating_mul(d.unit_cost));
-            }
-            for c in &result.consumption_inserts[cons_before..] {
-                cost = cost.saturating_add(c.qty.saturating_mul(c.unit_cost));
-            }
-            *wo_cost_accum.entry(event.correlation_id).or_insert(0) += cost;
-        }
-
-        result.per_event.push(event_result);
     }
-    // wo_cost_accum should be drained — every component-event correlation
-    // pairs with an output event. Leftover entries indicate a malformed
-    // payload (components without output). For PoC we leave them; the
-    // output's absence already shows up as no output layer/receipt.
-    drop(wo_cost_accum);
+
+    let mut result = PocV21ApplyResult::default();
+
+    for (_corr, group) in &envelope_groups {
+        // Checkpoint: which (sku, location) pool entries does this envelope
+        // touch? Save their current state (or None if absent) so rollback
+        // can restore exactly the pre-envelope shape — including the case
+        // where this envelope was the FIRST to .entry(...).or_insert(...) a
+        // pool, in which case rollback must `remove` rather than `insert`.
+        let touched: std::collections::HashSet<(i64, i64)> =
+            group.iter().map(|e| (e.sku_id, e.location_id)).collect();
+        let pool_checkpoint: HashMap<(i64, i64), Option<SkuPoolState>> = touched
+            .iter()
+            .map(|key| (*key, snapshot.sku_pools.get(key).cloned()))
+            .collect();
+        let layer_inserts_before = result.layer_inserts.len();
+        let depletion_inserts_before = result.depletion_inserts.len();
+        let consumption_inserts_before = result.consumption_inserts.len();
+        let posting_line_inserts_before = result.posting_line_inserts.len();
+        let posting_line_inventory_inserts_before =
+            result.posting_line_inventory_inserts.len();
+
+        // M6.1 (acct-o1yv): WoComplete cost accumulator is envelope-local.
+        // Components push cost in; output reads it. Discarded automatically
+        // when the loop body ends, so a rolled-back envelope leaves no
+        // accumulator residue for subsequent envelopes.
+        let mut wo_cost_local: i64 = 0;
+        let mut envelope_failed = false;
+
+        for event in group {
+            // Inject unit_cost into WoComplete output (qty>0).
+            let mut event_for_dispatch = event.clone();
+            if matches!(event.event_type, PocV21EventType::WoComplete) && event.qty > 0 {
+                event_for_dispatch.unit_cost = if event.qty != 0 {
+                    wo_cost_local / event.qty
+                } else {
+                    0
+                };
+            }
+
+            let depl_before = result.depletion_inserts.len();
+            let cons_before = result.consumption_inserts.len();
+
+            let m = method_of(event_for_dispatch.sku_id);
+            let event_result = match m {
+                "avg" => AVG_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
+                "std" => {
+                    STANDARD_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result)
+                }
+                _ => FIFO_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
+            };
+
+            if event_result.error_code.is_some() {
+                // Mark the envelope failed; record the failing per_event
+                // entry so failed_map below can surface the error_code for
+                // status update; stop dispatching remaining events of this
+                // envelope (downstream events would see the failure-leg
+                // snapshot mid-mutation, and rollback below restores the
+                // pre-envelope state regardless).
+                envelope_failed = true;
+                result.per_event.push(event_result);
+                break;
+            }
+
+            // Accumulate component cost on a successful WoComplete consume.
+            if matches!(event.event_type, PocV21EventType::WoComplete) && event.qty < 0 {
+                let mut cost: i64 = 0;
+                for d in &result.depletion_inserts[depl_before..] {
+                    cost = cost.saturating_add(d.qty.saturating_mul(d.unit_cost));
+                }
+                for c in &result.consumption_inserts[cons_before..] {
+                    cost = cost.saturating_add(c.qty.saturating_mul(c.unit_cost));
+                }
+                wo_cost_local = wo_cost_local.saturating_add(cost);
+            }
+
+            result.per_event.push(event_result);
+        }
+
+        if envelope_failed {
+            // Snapshot rollback: restore each touched pool to its
+            // pre-envelope state (or remove it if this envelope created it).
+            for (key, saved) in &pool_checkpoint {
+                match saved {
+                    Some(state) => {
+                        snapshot.sku_pools.insert(*key, state.clone());
+                    }
+                    None => {
+                        snapshot.sku_pools.remove(key);
+                    }
+                }
+            }
+            // Result-vector rollback: drop rows accumulated by this
+            // envelope. per_event entries are kept (failed_map below reads
+            // them to emit the status='failed' update).
+            result.layer_inserts.truncate(layer_inserts_before);
+            result.depletion_inserts.truncate(depletion_inserts_before);
+            result.consumption_inserts.truncate(consumption_inserts_before);
+            result.posting_line_inserts.truncate(posting_line_inserts_before);
+            result
+                .posting_line_inventory_inserts
+                .truncate(posting_line_inventory_inserts_before);
+        }
+    }
 
     // Drop envelopes whose per_event reported an error. M6.1 (acct-o1yv):
     // wo_complete envelopes expand into K+1 per_event entries; if ANY of
