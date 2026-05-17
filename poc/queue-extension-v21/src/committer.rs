@@ -308,11 +308,38 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
         Vec::new()
     };
 
-    // Build events from each staging entry's payload.
+    // Build events from each staging entry's payload. M6.1: wo_complete
+    // expands into K+1 events per envelope. Parse errors per-envelope
+    // mark just that correlation_id failed; surviving envelopes still
+    // run through the pipeline. The submission_status INSERT happens
+    // outside the sub-tx because (a) the caller user-tx is committed
+    // (we passed the Step 2.45 check is moot — parse runs before that),
+    // and (b) keeping it in the worker-tx ensures it survives sub-tx
+    // rollback.
     let mut events: Vec<PocV21Event> = Vec::with_capacity(staging_indices.len());
+    let mut parse_errors: Vec<(pgrx::Uuid, String)> = Vec::new();
     for &s_idx in &staging_indices {
-        let event = read_event_from_staging(s_idx)?;
-        events.push(event);
+        let cid = {
+            let queue = STAGING_QUEUE.share();
+            pgrx::Uuid::from_bytes(queue.entries[s_idx as usize].correlation_id)
+        };
+        match read_event_from_staging(s_idx) {
+            Ok(v) => events.extend(v),
+            Err(e) => parse_errors.push((cid, e)),
+        }
+    }
+    for (cid, err) in &parse_errors {
+        let detail =
+            pgrx::JsonB(serde_json::json!({ "phase": "payload_parse", "detail": err }));
+        let _ = Spi::run_with_args(
+            "INSERT INTO poc_v21_submission_status \
+                (correlation_id, state, enqueued_at, processed_at, error_code, error_detail) \
+             VALUES ($1, 'failed', now(), now(), $2, $3) \
+             ON CONFLICT (correlation_id) DO UPDATE SET \
+                state='failed', processed_at=now(), \
+                error_code=EXCLUDED.error_code, error_detail=EXCLUDED.error_detail",
+            &[(*cid).into(), "payload_parse_error".into(), detail.into()],
+        );
     }
 
     // Open the sub-tx that owns committer_tx_id + the bulk INSERTs.
@@ -792,29 +819,77 @@ fn run_pipeline_inside_subtx(
         )
     });
     let mut result = PocV21ApplyResult::default();
+    // M6.1 (acct-o1yv): per-correlation_id WoComplete cost accumulator.
+    // Components push cost in; output reads and zeroes. The dispatcher
+    // injects the computed unit_cost into the output event before calling
+    // the method's apply_one — methods then use a uniform receipt path
+    // with the caller-supplied unit_cost.
+    let mut wo_cost_accum: HashMap<pgrx::Uuid, i64> = HashMap::new();
+
     for event in &sorted_events {
-        let m = method_of(event.sku_id);
+        // Inject unit_cost into WoComplete output (qty>0) events.
+        let mut event_for_dispatch = event.clone();
+        if matches!(event.event_type, PocV21EventType::WoComplete) && event.qty > 0 {
+            let total_cost = wo_cost_accum.remove(&event.correlation_id).unwrap_or(0);
+            event_for_dispatch.unit_cost = total_cost / event.qty;
+        }
+
+        let depl_before = result.depletion_inserts.len();
+        let cons_before = result.consumption_inserts.len();
+
+        let m = method_of(event_for_dispatch.sku_id);
         let event_result = match m {
-            "avg" => AVG_METHOD.apply_one(event, &mut snapshot, &mut result),
-            "std" => STANDARD_METHOD.apply_one(event, &mut snapshot, &mut result),
-            _ => FIFO_METHOD.apply_one(event, &mut snapshot, &mut result),
+            "avg" => AVG_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
+            "std" => STANDARD_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
+            _ => FIFO_METHOD.apply_one(&event_for_dispatch, &mut snapshot, &mut result),
         };
+
+        // Accumulate cost from WoComplete component consumptions.
+        if matches!(event.event_type, PocV21EventType::WoComplete)
+            && event.qty < 0
+            && event_result.error_code.is_none()
+        {
+            let mut cost: i64 = 0;
+            for d in &result.depletion_inserts[depl_before..] {
+                cost = cost.saturating_add(d.qty.saturating_mul(d.unit_cost));
+            }
+            for c in &result.consumption_inserts[cons_before..] {
+                cost = cost.saturating_add(c.qty.saturating_mul(c.unit_cost));
+            }
+            *wo_cost_accum.entry(event.correlation_id).or_insert(0) += cost;
+        }
+
         result.per_event.push(event_result);
     }
+    // wo_cost_accum should be drained — every component-event correlation
+    // pairs with an output event. Leftover entries indicate a malformed
+    // payload (components without output). For PoC we leave them; the
+    // output's absence already shows up as no output layer/receipt.
+    drop(wo_cost_accum);
 
-    // Drop envelopes whose per_event reported an error.
-    let mut failed_correlation_ids: Vec<(pgrx::Uuid, String)> = Vec::new();
+    // Drop envelopes whose per_event reported an error. M6.1 (acct-o1yv):
+    // wo_complete envelopes expand into K+1 per_event entries; if ANY of
+    // them fails, the whole envelope is failed. Dedupe correlation_ids
+    // (one row per envelope in submission_status UPSERTs to avoid
+    // "ON CONFLICT DO UPDATE command cannot affect row a second time").
+    let mut failed_map: HashMap<pgrx::Uuid, String> = HashMap::new();
     for er in &result.per_event {
         if let Some(code) = &er.error_code {
-            failed_correlation_ids.push((er.correlation_id, code.clone()));
+            failed_map.entry(er.correlation_id).or_insert_with(|| code.clone());
         }
     }
-    let succeeded: Vec<pgrx::Uuid> = result
-        .per_event
-        .iter()
-        .filter(|er| er.error_code.is_none())
-        .map(|er| er.correlation_id)
-        .collect();
+    let failed_correlation_ids: Vec<(pgrx::Uuid, String)> =
+        failed_map.iter().map(|(c, e)| (*c, e.clone())).collect();
+    // Succeeded = unique correlation_ids whose ALL per_event entries are
+    // error-free (i.e., not in failed_map).
+    let mut succeeded_dedupe: std::collections::HashSet<pgrx::Uuid> =
+        std::collections::HashSet::new();
+    for er in &result.per_event {
+        if !failed_map.contains_key(&er.correlation_id) {
+            succeeded_dedupe.insert(er.correlation_id);
+        }
+    }
+    let succeeded: Vec<pgrx::Uuid> = succeeded_dedupe.iter().copied().collect();
 
     // Filter row vectors to succeeded envelopes only.
     let succeeded_set: std::collections::HashSet<pgrx::Uuid> = succeeded.iter().copied().collect();
@@ -1403,7 +1478,7 @@ fn hydrate_fifo_layers(
     Ok(())
 }
 
-fn read_event_from_staging(staging_idx: u32) -> Result<PocV21Event, String> {
+fn read_event_from_staging(staging_idx: u32) -> Result<Vec<PocV21Event>, String> {
     let queue = STAGING_QUEUE.share();
     let slot = &queue.entries[staging_idx as usize];
     let payload_offset = slot.payload_offset;
@@ -1421,9 +1496,18 @@ fn read_event_from_staging(staging_idx: u32) -> Result<PocV21Event, String> {
     let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
         .map_err(|e| format!("payload parse: {e}"))?;
 
+    // M6.1 (acct-o1yv): wo_complete expands into K components + 1 output.
+    if event_type_id == 2 {
+        return expand_wo_complete_payload(
+            &payload,
+            correlation_id,
+            user_tx_xid,
+            enqueued_at as i64,
+        );
+    }
+
     let event_type = match event_type_id {
         1 => PocV21EventType::InvAdjust,
-        2 => return Err("wo_complete not supported at M1.3".to_string()),
         3 => return Err("wo_start not supported at M1.3".to_string()),
         5 => PocV21EventType::PoReceipt,
         6 => PocV21EventType::SoShipment,
@@ -1458,7 +1542,7 @@ fn read_event_from_staging(staging_idx: u32) -> Result<PocV21Event, String> {
         .map(|v| v as i32)
         .unwrap_or(0);
 
-    Ok(PocV21Event {
+    Ok(vec![PocV21Event {
         correlation_id,
         issue_id,
         event_type,
@@ -1472,7 +1556,133 @@ fn read_event_from_staging(staging_idx: u32) -> Result<PocV21Event, String> {
         sub_priority,
         user_tx_xid,
         at_micros: enqueued_at as i64,
-    })
+        wo_id: 0,
+        op_id: 0,
+    }])
+}
+
+/// M6.1 (acct-o1yv): expand a wo_complete payload into K+1 PocV21Events.
+///
+/// Payload shape:
+/// ```json
+/// {
+///   "wip_account": [wo_id, op_id],
+///   "components": [[sku_id, location_id, qty], ...],
+///   "output": [sku_id, location_id, qty],
+///   "business_date_jdate": ..., "doc_chrono": ..., "document_id": ...
+/// }
+/// ```
+///
+/// Each component yields a WoComplete event with qty<0 (consumption);
+/// the output yields a WoComplete event with qty>0 (receipt). sub_priority
+/// orders components first (0..K-1) then output (K) so the dispatcher's
+/// sort processes all components before the output. The output event's
+/// `unit_cost` is left at 0 — the dispatcher fills it in from accumulated
+/// component cost before calling the method's apply_one.
+fn expand_wo_complete_payload(
+    payload: &serde_json::Value,
+    correlation_id: pgrx::Uuid,
+    user_tx_xid: u64,
+    at_micros: i64,
+) -> Result<Vec<PocV21Event>, String> {
+    let wip = payload
+        .get("wip_account")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "wo_complete payload missing wip_account".to_string())?;
+    if wip.len() != 2 {
+        return Err(format!("wo_complete wip_account must be [wo_id, op_id]"));
+    }
+    let wo_id = wip[0].as_i64().unwrap_or(0);
+    let op_id = wip[1].as_i64().unwrap_or(0);
+
+    let components = payload
+        .get("components")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "wo_complete payload missing components".to_string())?;
+    if components.is_empty() {
+        return Err("wo_complete components array must be non-empty".to_string());
+    }
+
+    let output = payload
+        .get("output")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "wo_complete payload missing output".to_string())?;
+    if output.len() != 3 {
+        return Err("wo_complete output must be [sku_id, location_id, qty]".to_string());
+    }
+    let output_sku = output[0].as_i64().unwrap_or(0);
+    let output_loc = output[1].as_i64().unwrap_or(0);
+    let output_qty = output[2].as_i64().unwrap_or(0);
+    if output_qty <= 0 {
+        return Err(format!("wo_complete output qty must be positive: {output_qty}"));
+    }
+
+    let business_date_jdate = payload
+        .get("business_date_jdate")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(9999);
+    let doc_chrono = payload
+        .get("doc_chrono")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let document_id = payload
+        .get("document_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let mut events = Vec::with_capacity(components.len() + 1);
+    for (i, comp) in components.iter().enumerate() {
+        let arr = comp
+            .as_array()
+            .ok_or_else(|| "component entry must be array".to_string())?;
+        if arr.len() != 3 {
+            return Err("component entry must be [sku_id, location_id, qty]".to_string());
+        }
+        let sku = arr[0].as_i64().unwrap_or(0);
+        let loc = arr[1].as_i64().unwrap_or(0);
+        let cq = arr[2].as_i64().unwrap_or(0);
+        if cq <= 0 {
+            return Err(format!("component qty must be positive: {cq}"));
+        }
+        events.push(PocV21Event {
+            correlation_id,
+            issue_id: 0,
+            event_type: PocV21EventType::WoComplete,
+            sku_id: sku,
+            location_id: loc,
+            qty: -cq, // negative = consumption
+            unit_cost: 0,
+            business_date_jdate,
+            doc_chrono,
+            document_id,
+            sub_priority: i as i32,
+            user_tx_xid,
+            at_micros,
+            wo_id,
+            op_id,
+        });
+    }
+    // Output: sub_priority strictly greater than any component's, so the
+    // dispatch sort places it after all components for this envelope.
+    events.push(PocV21Event {
+        correlation_id,
+        issue_id: 0,
+        event_type: PocV21EventType::WoComplete,
+        sku_id: output_sku,
+        location_id: output_loc,
+        qty: output_qty,
+        unit_cost: 0, // dispatcher fills in: total_component_cost / output_qty
+        business_date_jdate,
+        doc_chrono,
+        document_id,
+        sub_priority: 1_000_000, // higher than any plausible component sub_priority
+        user_tx_xid,
+        at_micros,
+        wo_id,
+        op_id,
+    });
+    Ok(events)
 }
 
 fn cleanup_after_superbatch(

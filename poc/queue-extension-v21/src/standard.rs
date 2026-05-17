@@ -42,6 +42,19 @@ impl PocV21CostMethod for StandardMethod {
         snapshot: &mut PocV21Snapshot,
         result: &mut PocV21ApplyResult,
     ) -> PocV21EventResult {
+        // M6.1 (acct-o1yv): WoComplete output (qty>0) emits at
+        // event.unit_cost (= total_component_cost / output_qty,
+        // dispatcher-computed). Variance vs the output's own standard
+        // cost is acct's concern, not the extension's. Standard cost
+        // lookup is skipped for this path.
+        if matches!(event.event_type, PocV21EventType::WoComplete) && event.qty > 0 {
+            self.receive(event, event.unit_cost, snapshot, result);
+            return PocV21EventResult {
+                correlation_id: event.correlation_id,
+                error_code: None,
+            };
+        }
+
         // Look up the standard cost. If absent, fail the event with a
         // clear code; acct must seed standard_costs before STD events
         // are accepted for that (sku, location).
@@ -66,7 +79,10 @@ impl PocV21CostMethod for StandardMethod {
         let is_consumption = matches!(
             event.event_type,
             PocV21EventType::InvIssue | PocV21EventType::SoShipment
-        ) || (matches!(event.event_type, PocV21EventType::InvAdjust) && event.qty < 0);
+        ) || (matches!(
+            event.event_type,
+            PocV21EventType::InvAdjust | PocV21EventType::WoComplete
+        ) && event.qty < 0);
 
         if is_receipt {
             self.receive(event, std_cost, snapshot, result);
@@ -140,7 +156,7 @@ impl StandardMethod {
             event_type: event_type_name(event.event_type),
             amount,
             debit_account: Some(account_inventory(event.sku_id, event.location_id)),
-            credit_account: Some(account_offset_receipt(event.event_type)),
+            credit_account: Some(offset_receipt(event)),
             correlation_id: event.correlation_id,
             user_tx_xid: event.user_tx_xid,
         });
@@ -183,7 +199,7 @@ impl StandardMethod {
             sub_priority: event.sub_priority,
             event_type: event_type_name(event.event_type),
             amount,
-            debit_account: Some(account_offset_consumption(event.event_type)),
+            debit_account: Some(offset_consumption(event)),
             credit_account: Some(account_inventory(event.sku_id, event.location_id)),
             correlation_id: event.correlation_id,
             user_tx_xid: event.user_tx_xid,
@@ -204,6 +220,7 @@ fn event_type_name(t: PocV21EventType) -> &'static str {
         PocV21EventType::InvIssue => "inv_issue",
         PocV21EventType::PoReceipt => "po_receipt",
         PocV21EventType::SoShipment => "so_shipment",
+        PocV21EventType::WoComplete => "wo_complete",
     }
 }
 
@@ -211,6 +228,7 @@ fn source_kind_name(t: PocV21EventType) -> &'static str {
     match t {
         PocV21EventType::PoReceipt => "receipt",
         PocV21EventType::InvAdjust => "adjustment",
+        PocV21EventType::WoComplete => "wo_complete",
         _ => "other",
     }
 }
@@ -219,19 +237,25 @@ fn account_inventory(sku_id: i64, location_id: i64) -> i64 {
     1_000_000 + sku_id * 1000 + location_id
 }
 
-fn account_offset_receipt(t: PocV21EventType) -> i64 {
-    match t {
+fn account_wip(wo_id: i64, op_id: i64) -> i64 {
+    7_000_000 + wo_id * 1000 + op_id
+}
+
+fn offset_receipt(event: &PocV21Event) -> i64 {
+    match event.event_type {
         PocV21EventType::PoReceipt => 2_001,
         PocV21EventType::InvAdjust => 3_001,
+        PocV21EventType::WoComplete => account_wip(event.wo_id, event.op_id),
         _ => 9_999,
     }
 }
 
-fn account_offset_consumption(t: PocV21EventType) -> i64 {
-    match t {
+fn offset_consumption(event: &PocV21Event) -> i64 {
+    match event.event_type {
         PocV21EventType::SoShipment => 4_001,
         PocV21EventType::InvIssue => 5_001,
         PocV21EventType::InvAdjust => 3_001,
+        PocV21EventType::WoComplete => account_wip(event.wo_id, event.op_id),
         _ => 9_999,
     }
 }

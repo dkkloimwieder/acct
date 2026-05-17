@@ -29,16 +29,22 @@ impl PocV21CostMethod for FifoMethod {
         snapshot: &mut PocV21Snapshot,
         result: &mut PocV21ApplyResult,
     ) -> PocV21EventResult {
-        // Classify direction by qty sign + event_type.
-        let is_receipt = matches!(
-            event.event_type,
-            PocV21EventType::PoReceipt
-        ) || (matches!(event.event_type, PocV21EventType::InvAdjust) && event.qty > 0);
+        // Classify direction by qty sign + event_type. M6.1: WoComplete
+        // dispatches on qty sign — positive = output receipt, negative =
+        // component consumption.
+        let is_receipt = matches!(event.event_type, PocV21EventType::PoReceipt)
+            || (matches!(
+                event.event_type,
+                PocV21EventType::InvAdjust | PocV21EventType::WoComplete
+            ) && event.qty > 0);
 
         let is_consumption = matches!(
             event.event_type,
             PocV21EventType::InvIssue | PocV21EventType::SoShipment
-        ) || (matches!(event.event_type, PocV21EventType::InvAdjust) && event.qty < 0);
+        ) || (matches!(
+            event.event_type,
+            PocV21EventType::InvAdjust | PocV21EventType::WoComplete
+        ) && event.qty < 0);
 
         if is_receipt {
             self.emit_layer(event, snapshot, result);
@@ -112,7 +118,7 @@ impl FifoMethod {
             event_type: event_type_name(event.event_type),
             amount,
             debit_account: Some(account_inventory(event.sku_id, event.location_id)),
-            credit_account: Some(account_offset_receipt(event.event_type)),
+            credit_account: Some(offset_receipt(event)),
             correlation_id: event.correlation_id,
             user_tx_xid: event.user_tx_xid,
         });
@@ -211,7 +217,7 @@ impl FifoMethod {
             sub_priority: event.sub_priority,
             event_type: event_type_name(event.event_type),
             amount: total_cost,
-            debit_account: Some(account_offset_consumption(event.event_type)),
+            debit_account: Some(offset_consumption(event)),
             credit_account: Some(account_inventory(event.sku_id, event.location_id)),
             correlation_id: event.correlation_id,
             user_tx_xid: event.user_tx_xid,
@@ -234,6 +240,7 @@ fn event_type_name(t: PocV21EventType) -> &'static str {
         PocV21EventType::InvIssue => "inv_issue",
         PocV21EventType::PoReceipt => "po_receipt",
         PocV21EventType::SoShipment => "so_shipment",
+        PocV21EventType::WoComplete => "wo_complete",
     }
 }
 
@@ -241,6 +248,7 @@ fn source_kind_name(t: PocV21EventType) -> &'static str {
     match t {
         PocV21EventType::PoReceipt => "receipt",
         PocV21EventType::InvAdjust => "adjustment",
+        PocV21EventType::WoComplete => "wo_complete",
         _ => "other",
     }
 }
@@ -251,19 +259,25 @@ fn account_inventory(sku_id: i64, location_id: i64) -> i64 {
     1_000_000 + sku_id * 1000 + location_id
 }
 
-fn account_offset_receipt(t: PocV21EventType) -> i64 {
-    match t {
+fn account_wip(wo_id: i64, op_id: i64) -> i64 {
+    7_000_000 + wo_id * 1000 + op_id
+}
+
+fn offset_receipt(event: &PocV21Event) -> i64 {
+    match event.event_type {
         PocV21EventType::PoReceipt => 2_001, // ap_unsettled stub
         PocV21EventType::InvAdjust => 3_001, // inv_adjust_offset stub
+        PocV21EventType::WoComplete => account_wip(event.wo_id, event.op_id),
         _ => 9_999,
     }
 }
 
-fn account_offset_consumption(t: PocV21EventType) -> i64 {
-    match t {
+fn offset_consumption(event: &PocV21Event) -> i64 {
+    match event.event_type {
         PocV21EventType::SoShipment => 4_001, // ar_unsettled stub
         PocV21EventType::InvIssue => 5_001,   // cogs stub
         PocV21EventType::InvAdjust => 3_001,  // inv_adjust_offset stub
+        PocV21EventType::WoComplete => account_wip(event.wo_id, event.op_id),
         _ => 9_999,
     }
 }

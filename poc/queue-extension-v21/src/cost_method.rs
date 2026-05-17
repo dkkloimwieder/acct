@@ -20,7 +20,13 @@ pub enum PocV21EventType {
     InvIssue,
     PoReceipt,
     SoShipment,
-    // WoComplete deferred to M6.1.
+    /// M6.1 (acct-o1yv). Multi-pool atomic: K components + 1 WIP + 1
+    /// output, expanded into K+1 PocV21Events at staging read. Negative
+    /// qty = component consumption (per its own method); positive qty =
+    /// output emission at unit_cost = total_component_cost / output_qty.
+    /// `wo_id` / `op_id` populated on both component and output events
+    /// so each method's posting_line uses the WIP-pool stub account.
+    WoComplete,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +44,11 @@ pub struct PocV21Event {
     pub sub_priority: i32,
     pub user_tx_xid: u64,
     pub at_micros: i64,
+    /// M6.1: WO id / operation id for WoComplete events; 0 otherwise.
+    /// Used by method posting_line emission to route to a WIP-pool stub
+    /// account on the inventory-offset side.
+    pub wo_id: i64,
+    pub op_id: i64,
 }
 
 #[derive(Debug, Clone)]

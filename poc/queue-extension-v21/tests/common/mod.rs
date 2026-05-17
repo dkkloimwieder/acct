@@ -78,9 +78,9 @@ pub async fn reset_state(pool: &PgPool) {
         } else {
             last_total_envelopes = total_envelopes;
         }
-        if drain_start.elapsed() > Duration::from_secs(5) {
+        if drain_start.elapsed() > Duration::from_secs(15) {
             eprintln!(
-                "reset_state: staging didn't drain+settle within 5s (in_flight={in_flight}, \
+                "reset_state: staging didn't drain+settle within 15s (in_flight={in_flight}, \
                  total_envelopes={total_envelopes}); proceeding with TRUNCATE — downstream tests may flake"
             );
             break;
