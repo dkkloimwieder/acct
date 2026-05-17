@@ -7,12 +7,57 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/lib.rs:597
+-- poc_v21_ledger::poc_v21_arena_bump_offset
+CREATE  FUNCTION "poc_v21_arena_bump_offset"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_arena_bump_offset_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:603
+-- poc_v21_ledger::poc_v21_arena_freelist_count
+CREATE  FUNCTION "poc_v21_arena_freelist_count"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_arena_freelist_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:590
+-- poc_v21_ledger::poc_v21_arena_outstanding
+CREATE  FUNCTION "poc_v21_arena_outstanding"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_arena_outstanding_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/enqueue.rs:293
 -- poc_v21_ledger::enqueue::poc_v21_arena_stats
 CREATE  FUNCTION "poc_v21_arena_stats"() RETURNS json /* Json */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_arena_stats_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:576
+-- poc_v21_ledger::poc_v21_arena_total_allocs
+CREATE  FUNCTION "poc_v21_arena_total_allocs"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_arena_total_allocs_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:582
+-- poc_v21_ledger::poc_v21_arena_total_frees
+CREATE  FUNCTION "poc_v21_arena_total_frees"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_arena_total_frees_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -31,7 +76,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:571
+-- src/lib.rs:610
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT

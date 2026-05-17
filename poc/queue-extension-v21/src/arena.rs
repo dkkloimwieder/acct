@@ -152,6 +152,28 @@ impl SpilloverArena {
         count
     }
 
+    /// All-time total allocations.
+    pub fn allocs_total(&self) -> u64 {
+        self.total_allocs.load(Relaxed)
+    }
+
+    /// All-time total frees.
+    pub fn frees_total(&self) -> u64 {
+        self.total_frees.load(Relaxed)
+    }
+
+    /// Currently-outstanding allocations (allocs - frees). Should be 0
+    /// when the system is at rest (no in-flight SuperBatches, all
+    /// staging entries empty).
+    pub fn outstanding_allocs(&self) -> u64 {
+        self.allocs_total().saturating_sub(self.frees_total())
+    }
+
+    /// High-water mark — the maximum bytes ever bump-allocated.
+    pub fn bump_offset_now(&self) -> u32 {
+        self.bump_offset.load(Relaxed)
+    }
+
     fn read_header(&self, header_offset: u32) -> BlockHeader {
         let off = header_offset as usize;
         let size = u32::from_le_bytes(self.bytes[off..off + 4].try_into().unwrap());

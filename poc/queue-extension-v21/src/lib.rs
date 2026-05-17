@@ -566,6 +566,45 @@ pub extern "C-unwind" fn _PG_init() {
 
 // ── Smoke entry point ───────────────────────────────────────────────
 
+// ── Arena observability (M5a.2 acct-b6bw) ───────────────────────────
+//
+// Slot-lifecycle leak audit per spec §3.10 needs visibility into the
+// spillover-arena allocator state. All accessors are atomic loads;
+// no locks held.
+
+/// All-time allocation count (monotone).
+#[pg_extern]
+fn poc_v21_arena_total_allocs() -> i64 {
+    SPILLOVER_ARENA.share().allocs_total() as i64
+}
+
+/// All-time free count (monotone).
+#[pg_extern]
+fn poc_v21_arena_total_frees() -> i64 {
+    SPILLOVER_ARENA.share().frees_total() as i64
+}
+
+/// Currently outstanding allocations = total_allocs − total_frees.
+/// Should converge to 0 at rest. A persistent non-zero value across
+/// idle periods signals an arena leak.
+#[pg_extern]
+fn poc_v21_arena_outstanding() -> i64 {
+    SPILLOVER_ARENA.share().outstanding_allocs() as i64
+}
+
+/// Bump high-water mark (bytes ever allocated linearly before the
+/// freelist absorbed the demand).
+#[pg_extern]
+fn poc_v21_arena_bump_offset() -> i64 {
+    SPILLOVER_ARENA.share().bump_offset_now() as i64
+}
+
+/// Count of free blocks on the freelist (O(n) — debug only).
+#[pg_extern]
+fn poc_v21_arena_freelist_count() -> i64 {
+    SPILLOVER_ARENA.share().freelist_count() as i64
+}
+
 /// Return a one-line scaffolding banner. Used by M0.1 acceptance to
 /// confirm the extension loads cleanly and the SPI surface is wired.
 #[pg_extern]
