@@ -44,6 +44,25 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+/// Spin until M5d.1 startup-recovery has finished its sweep and set
+/// the `recovery_complete` flag. Sleep in 50ms increments and respect
+/// SIGTERM by exiting if the postmaster asks the worker to quit before
+/// recovery finishes. Called from router_main + committer_main at
+/// startup, exactly once per worker process.
+pub(crate) fn wait_for_recovery_complete() {
+    loop {
+        if COMMITTER_QUEUE.share().recovery_complete.load(Acquire) != 0 {
+            return;
+        }
+        // wait_latch returns false on SIGTERM. Honor it so we don't
+        // leave a worker spinning if the postmaster is shutting down
+        // mid-recovery.
+        if !BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
+            return;
+        }
+    }
+}
+
 /// Router BGWorker entry point.
 #[pg_guard]
 #[unsafe(no_mangle)]
@@ -51,6 +70,13 @@ pub extern "C-unwind" fn poc_v21_router_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     let dbname = target_database_str();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+
+    // M5d.1 (acct-y0bp): wait for the startup-recovery worker to finish
+    // classifying in-flight submission_status rows. Both workers start at
+    // RecoveryFinished; without this gate, the router could route new
+    // traffic for a stale correlation_id concurrent with the recovery
+    // sweep, leading to (cost rows exist, status='failed') outcomes.
+    wait_for_recovery_complete();
 
     // M5b.1 (acct-k7b2): boot-time recovery sweep. Run once before
     // entering the wait-latch loop so any router-orphaned state from
@@ -590,6 +616,17 @@ fn poc_v21_router_max_envelope_count() -> i32 {
 fn poc_v21_router_total_envelopes() -> i64 {
     let queue = COMMITTER_QUEUE.share();
     queue.router_total_envelopes.load(Relaxed) as i64
+}
+
+/// Total router_tick invocations since last reset. Used by
+/// tests/common/mod.rs `reset_state` as an idle-detection signal:
+/// two consecutive identical readings with in_flight=0 confirm
+/// the router has gone idle and won't increment stats counters
+/// during the next test's setup window.
+#[pg_extern]
+fn poc_v21_router_ticks_total() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.router_ticks_total.load(Relaxed) as i64
 }
 
 /// Total force-packs (starvation fairness backstop triggered). Each

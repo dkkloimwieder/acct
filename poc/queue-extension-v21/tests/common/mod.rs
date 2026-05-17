@@ -33,6 +33,7 @@ pub async fn connect_pool() -> PgPool {
 /// bumping router stats / cost rows under the next test's feet.
 pub async fn reset_state(pool: &PgPool) {
     let drain_start = Instant::now();
+    let mut last_total_envelopes: i64 = -1;
     loop {
         let in_flight: i64 = sqlx::query_scalar(
             "SELECT (COALESCE((poc_v21_staging_state_counts()->>'pending')::bigint, 0) \
@@ -42,13 +43,45 @@ pub async fn reset_state(pool: &PgPool) {
         .fetch_one(pool)
         .await
         .unwrap_or(0);
-        if in_flight == 0 {
-            break;
+        // Read router_total_envelopes to detect any in-flight Phase 7
+        // record_superbatch_stats. The router_metrics flake comes from
+        // a prior test's last SuperBatch finishing Phase 6 (CAS valid
+        // 2→3, in_flight visible) → committer cleans up (valid 3→0,
+        // in_flight=0) → router Phase 7 still pending. Without
+        // catching Phase 7, reset_router_stats can race with the
+        // record_superbatch_stats increment. total_envelopes only
+        // changes on actual work (not idle 50ms ticks), so two
+        // consecutive identical readings with in_flight=0 confirm
+        // the router has fully settled.
+        let total_envelopes: i64 = sqlx::query_scalar("SELECT poc_v21_router_total_envelopes()")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(-1);
+        if in_flight == 0 && total_envelopes == last_total_envelopes {
+            // Belt-and-suspenders: one more sleep + recheck to catch
+            // a Phase 7 that fires AFTER our stable observation. The
+            // router can have Phase 6 + Phase 7 separated such that
+            // committer cleanup runs between them, dropping in_flight
+            // to 0 BEFORE the stats counter is bumped. Verify across
+            // a wider window (150ms total since last_total_envelopes
+            // was first sampled at value `total_envelopes`).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let recheck: i64 =
+                sqlx::query_scalar("SELECT poc_v21_router_total_envelopes()")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(-1);
+            if recheck == total_envelopes {
+                break;
+            }
+            last_total_envelopes = recheck;
+        } else {
+            last_total_envelopes = total_envelopes;
         }
         if drain_start.elapsed() > Duration::from_secs(5) {
             eprintln!(
-                "reset_state: staging didn't drain within 5s (in_flight={in_flight}); \
-                 proceeding with TRUNCATE — downstream tests may flake"
+                "reset_state: staging didn't drain+settle within 5s (in_flight={in_flight}, \
+                 total_envelopes={total_envelopes}); proceeding with TRUNCATE — downstream tests may flake"
             );
             break;
         }

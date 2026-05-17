@@ -30,6 +30,9 @@ use std::time::Duration;
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn poc_v21_committer_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    // M5d.1 (acct-y0bp): wait for postmaster-startup recovery to finish
+    // before claiming any work. See router.rs for rationale.
+    crate::router::wait_for_recovery_complete();
     let dbname = target_database_str();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
 

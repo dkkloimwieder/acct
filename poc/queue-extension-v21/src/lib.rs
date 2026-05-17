@@ -52,6 +52,9 @@ mod avg;
 // M2.2 (acct-lgll): STD standard-cost method + 6-target bulk UNNEST.
 mod standard;
 
+// M5d.1 (acct-y0bp): postmaster-startup recovery worker (non-durable path).
+mod recovery;
+
 // ── Compile-time shmem sizing constants (spec §1.6) ─────────────────
 //
 // The matching Postmaster-scope GUCs (`poc_v21.staging_queue_size`,
@@ -201,7 +204,13 @@ pub struct CommitterQueue {
     // Production binaries default both to 0/false (no-op fast path).
     pub test_inject_router_delay_us: AtomicU32,
     pub test_reorder_router_stores: AtomicU8,
-    pub _pad_test: [u8; 3],
+    /// M5d.1 (acct-y0bp): postmaster-startup recovery flag.
+    /// 0 = recovery not yet complete; router + committer BGWorkers
+    /// spin at startup until set. 1 = recovery sweep finished
+    /// (Release stored by the recovery worker; router/committers
+    /// Acquire-load before opening for traffic).
+    pub recovery_complete: AtomicU8,
+    pub _pad_test: [u8; 2],
     pub entries: [CommitterQueueEntry; POC_V21_COMMITTER_QUEUE_SIZE],
 }
 
@@ -682,6 +691,19 @@ pub extern "C-unwind" fn _PG_init() {
     // do NOT respawn workers. Restart required to apply a new value.
     use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
     use std::time::Duration;
+    // M5d.1 (acct-y0bp): postmaster-startup recovery worker. Runs once
+    // at startup, classifies in-flight submission_status rows via
+    // cost-row existence, sets recovery_complete=1 with Release. Router
+    // + committers Acquire-load that flag and spin until set before
+    // opening for traffic. set_restart_time(None) so PG won't relaunch
+    // the worker after it exits.
+    BackgroundWorkerBuilder::new("poc_v21_recovery")
+        .set_function("poc_v21_recovery_main")
+        .set_library("poc_v21_ledger")
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(None)
+        .enable_spi_access()
+        .load();
     // M5b.1 (acct-k7b2): router now needs SPI access for the boot
     // recovery sweep's submission_status UPSERT (Phase 2 take-over of
     // a completed queue entry whose committer died mid-cleanup).
