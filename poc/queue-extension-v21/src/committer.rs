@@ -20,7 +20,7 @@ use crate::{
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::time::Duration;
@@ -827,6 +827,63 @@ fn run_pipeline_inside_subtx(
         }
     }
 
+    // STEP 2.5b (acct-0frn): within-SB cross-envelope dedup.
+    //
+    // Under the grouped router rule (`poc-v2.1-amendment-0.2`), two
+    // envelopes sharing an `(issue_id, method_used)` pair can land in
+    // the SAME SuperBatch — the DB-side check above only catches
+    // replays against persisted state. Without this pass both
+    // envelopes' depletions would mutate the in-memory pool while the
+    // table-level `INSERT ... ON CONFLICT (issue_id, method_used) DO
+    // NOTHING` silently drops the second `cost_consumptions` /
+    // `cost_depletions` row — leaving the pool drained twice with
+    // only one consumption row persisted (P6 invariant violation
+    // surfaced by `tests/property_v21_enqueue_commit.rs`).
+    //
+    // Iterate events in chrono order (matching Step 4's dispatch
+    // order so "first arrival" is well-defined); keep the first
+    // occurrence of each `(issue_id, method_used)`; mark subsequent
+    // occurrences' correlation_ids as replayed. They get UPSERTed
+    // to `state='replayed'` in Step 12 alongside the DB-replayed set.
+    //
+    // Limitation: this marks the WHOLE envelope replayed on the
+    // first duplicate event. wo_complete envelopes whose K
+    // depletions use distinct issue_ids (the standard generator
+    // shape) are unaffected; an envelope that mixed duplicate +
+    // non-duplicate issue_ids would lose the legitimate depletions
+    // — out of scope for E1, would require per-event-rather-than-
+    // per-envelope replay marking.
+    {
+        let mut chrono_indices: Vec<usize> = (0..events.len()).collect();
+        chrono_indices.sort_by_key(|&i| {
+            let e = &events[i];
+            (
+                e.business_date_jdate,
+                e.doc_chrono,
+                e.document_id,
+                e.sub_priority,
+            )
+        });
+        let mut seen_in_sb: HashSet<(i64, &'static str)> = HashSet::new();
+        for idx in chrono_indices {
+            let event = &events[idx];
+            let is_depletion = matches!(
+                event.event_type,
+                PocV21EventType::InvIssue | PocV21EventType::SoShipment
+            ) || (matches!(event.event_type, PocV21EventType::InvAdjust) && event.qty < 0);
+            if !is_depletion {
+                continue;
+            }
+            if replayed_correlation_ids.contains(&event.correlation_id) {
+                continue;
+            }
+            let key = (event.issue_id, method_of(event.sku_id));
+            if !seen_in_sb.insert(key) {
+                replayed_correlation_ids.push(event.correlation_id);
+            }
+        }
+    }
+
     let events_to_plan: Vec<PocV21Event> = events
         .iter()
         .filter(|e| !replayed_correlation_ids.contains(&e.correlation_id))
@@ -889,12 +946,14 @@ fn run_pipeline_inside_subtx(
     // singleton groups.
     //
     // Cross-envelope ordering: groups iterate by first-appearance in the
-    // chrono sort. Two envelopes targeting the same pool would process
+    // chrono sort. Two envelopes targeting the same pool process
     // serially (FIFO bills the first against pre-batch layers, then the
-    // second against post-mutation layers). In practice the router's
-    // greedy disjoint packing ensures no two envelopes in one SuperBatch
-    // share an SKU pool, so cross-envelope shared-pool sequencing only
-    // exercises wo_complete envelopes (K+1 events on K+1 distinct pools).
+    // second against post-mutation layers; AVG roll_in updates running
+    // state in chrono order). Under the grouped router rule (acct-0frn
+    // / `poc-v2.1-amendment-0.2`) shared-pool envelopes are packed INTO
+    // one SuperBatch by design, so this cross-envelope sequencing is
+    // the load-bearing path for overlapping work, not just an
+    // intra-`wo_complete` K+1 special case.
     //
     // Snapshot rollback fixes the post-M6.1 polluted-snapshot risk: FIFO
     // `deplete` partially mutates layer effective_qty before signalling

@@ -1,22 +1,23 @@
-//! M3.2 (acct-evyq) acceptance: fairness backstop fires under
-//! hot-pool burst.
+//! M3.2 (acct-evyq) acceptance: hot-pool burst drains under the grouped
+//! router rule, no envelope lost.
 //!
-//! Test shape: enqueue 30 envelopes all targeting the same (sku=999,
-//! location=1) pool. Since every envelope's pool key intersects every
-//! other's, only the head-of-queue packs per tick; the rest accumulate
-//! starvation_count by 1 each tick. After
-//! `router_starvation_threshold_ticks` (default 10) ticks, force-pack
-//! begins firing on subsequent envelopes — verified via
-//! `poc_v21_router_force_pack_count()`.
+//! The original M3.2 assertion (fairness backstop fires under hot pool)
+//! is dead under the grouped router rule (acct-0frn /
+//! `poc-v2.1-amendment-0.2`): every envelope's pool key intersects every
+//! other's, so all envelopes pack INTO one SuperBatch — there's no
+//! starvation path for hot pool anymore. The fairness backstop is
+//! preserved as a safety net for queue/arena pressure but does not
+//! fire on this workload. FU2 (`acct-shpc.8`) re-validates the
+//! backstop under grouped semantics on a workload that legitimately
+//! exercises it.
 //!
-//! The natural-progress guarantee (every envelope reaches terminal
-//! within bounded time) holds at M3.1 too — head-of-queue always
-//! packs regardless of starvation, so a hot pool drains 1-per-tick
-//! at the 50ms BGWorker cadence. M3.2's contribution is force-pack
-//! visibility: when an envelope's wait crosses the threshold, the
-//! router emits a force-packed size-1 SuperBatch and bumps the
-//! counter, giving operations + bake-off measurement (R3) a signal
-//! for tail-latency analysis.
+//! This test now asserts the load-bearing properties that still hold:
+//!
+//!   - every envelope reaches terminal state (no loss / no hang)
+//!   - the burst packs into a small number of SuperBatches (1 if the
+//!     batch fits in `batch_size_max`; 2-3 under tick jitter when the
+//!     window splits)
+//!   - max_envelope_count is multi-envelope (grouping happened)
 //!
 //! Run via:
 //!   cargo test --release --test acceptance_v21_router_fairness \
@@ -69,9 +70,11 @@ async fn acceptance_v21_router_fairness_backstop_fires() {
     reset_state(&pool).await;
     reset_router_stats(&pool).await;
 
-    // Hot pool: all envelopes touch the same (sku, location). Greedy
-    // disjoint packing trivially picks the head and rejects every
-    // other candidate in the same tick.
+    // Hot pool: all envelopes touch the same (sku, location). Under the
+    // grouped router rule they pack INTO one SuperBatch per tick (up to
+    // batch_size_max=50); under the previous disjoint rule the router
+    // would have picked the head and rejected every other candidate in
+    // the same tick.
     let mut correlation_ids: Vec<Uuid> = Vec::with_capacity(ENVELOPE_COUNT);
     let mut handles = Vec::with_capacity(ENVELOPE_COUNT);
     for i in 0..ENVELOPE_COUNT {
@@ -122,27 +125,31 @@ async fn acceptance_v21_router_fairness_backstop_fires() {
         total_envelopes, ENVELOPE_COUNT as i64,
         "no envelope lost during hot-pool drain"
     );
-    // Every SuperBatch under hot pool is size-1 (head packs alone;
-    // rest intersect). Strictly: max_envelope_count == 1.
-    assert_eq!(
-        max_env, 1,
-        "hot pool packs strictly size-1 SuperBatches; observed max envelope_count={}",
+    // Grouped rule: hot pool's envelopes pack INTO one SuperBatch up to
+    // batch_size_max=50. With ENVELOPE_COUNT=30 < batch_max, expect the
+    // whole burst to fit in 1-2 SBs (depending on tick boundary jitter
+    // — if half land just before a tick and the other half just after,
+    // they split). max_envelope_count must be multi-envelope: at least
+    // 2, typically all 30.
+    assert!(
+        max_env >= 2,
+        "grouped rule: hot-pool burst must produce at least one multi-envelope SuperBatch; observed max envelope_count={}",
         max_env
     );
-    // Fairness backstop should fire for envelopes past the threshold.
-    // With default threshold=10 and 30 envelopes:
-    //   - Envelopes 1..=10 pack as head without force (each tick's
-    //     head has starv < 10 because it just became head).
-    //   - From envelope 11 onward, starv accumulates past threshold
-    //     before its turn at the head, so the gate fires on the
-    //     tick that promotes it.
-    // We expect ~20 force-packs; assert at least 1 to keep the
-    // signal robust against scheduling jitter.
     assert!(
-        force_packs > 0,
-        "M3.2 acceptance: starvation_threshold_ticks=10 must produce \
-         at least one force-pack under a 30-envelope hot-pool burst; \
-         observed force_pack_count={}",
+        sb_count >= 1 && sb_count <= 3,
+        "grouped rule: hot-pool burst packs into 1-3 SuperBatches (1 typical, more under tick jitter); got sb_count={}",
+        sb_count
+    );
+    // Force-pack is preserved as a queue/arena-pressure safety net but
+    // does NOT fire on a hot-pool burst under the grouped rule — there
+    // are no skipped candidates for starvation to accumulate against
+    // (cf. the disjoint-rule trigger this test originally validated).
+    // FU2 (`acct-shpc.8`) re-validates the backstop on a workload that
+    // exercises queue/arena pressure.
+    assert_eq!(
+        force_packs, 0,
+        "grouped rule: hot-pool burst does not trigger starvation/force-pack; got force_pack_count={}",
         force_packs
     );
 }

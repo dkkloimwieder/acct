@@ -1,10 +1,30 @@
-//! Greedy Window Router BGWorker (M3.1, acct-r29s).
+//! Greedy Window Router BGWorker (M3.1, acct-r29s; packing rule
+//! inverted at acct-0frn per amendment `poc-v2.1-amendment-0.2`).
 //!
 //! Scans up to `router_window_size` pending staging entries per tick,
-//! packs them into SuperBatches by greedy disjoint pool-key cover, and
-//! pushes each SuperBatch onto the committer queue. WIP pool keys are
-//! carried through but NOT consulted at routing (spec §1.5 — WIP pools
-//! uncontended by construction).
+//! packs them into one SuperBatch in head-order up to `batch_size_max`
+//! (regardless of pool-key overlap), and pushes that SuperBatch onto
+//! the committer queue. WIP pool keys are carried through but NOT
+//! consulted at routing (spec §1.5 — WIP pools uncontended by
+//! construction).
+//!
+//! ## Packing rule — grouped, not disjoint (acct-0frn)
+//!
+//! The original rule was "greedy disjoint pool-key cover": envelopes
+//! that shared a SKU pool key were sent to different SuperBatches.
+//! That created cross-SB contention — two committers would each claim
+//! one of the overlapping SBs and serialize on the shared `pool_locks`
+//! row, manifesting as hangs in M8.1 shapes S3 / S4 / overlap-on-wrap
+//! S6 / S7 / S8.
+//!
+//! The current rule packs overlapping envelopes INTO ONE SuperBatch.
+//! One committer processes the batch sequentially in chrono order
+//! (Step 4 in committer.rs); running-avg / FIFO are naturally
+//! sequential operations on a shared pool. Disjoint envelopes are
+//! also packed together up to `batch_size_max` — multi-committer
+//! parallelism comes across ticks, not within a tick. The
+//! per-cluster split design (one SB per disjoint cluster within one
+//! tick) is a future optimization tracked in the meta-epic `acct-shpc`.
 //!
 //! ## Data-before-flag invariant (spec §1.6, §3.3)
 //!
@@ -147,15 +167,30 @@ fn router_tick() -> u32 {
     // --- Phase 2: hydrate pool keys for each candidate from arena. ---
     let candidates = hydrate_candidates(&candidates_meta);
 
-    // --- Phase 3: greedy disjoint pack with fairness backstop. ---
+    // --- Phase 3: grouped pack (head-order) with fairness backstop. ---
     //
-    // Per spec §1.8: when a candidate's starvation_count >= threshold
-    // AND the current SuperBatch is empty, force-pack as size-1
-    // SuperBatch and break (don't add other candidates this tick;
-    // ensure the starved entry gets through without further contention).
-    // Skipped candidates (intersecting lock_set OR losing the CAS race)
-    // get their starvation counter incremented. Packed candidates
-    // (normal or forced) have their counter cleared.
+    // Per `poc-v2.1-amendment-0.2` (acct-0frn / meta `acct-shpc`):
+    // envelopes are packed in head-order into one SuperBatch up to
+    // `batch_max`, regardless of pool-key overlap. The shared-pool
+    // case (two envelopes touching the same SKU) is intentionally
+    // pulled INTO one SB — one committer processes them sequentially
+    // in chrono order inside one transaction with one set of
+    // lex-locks. The disjoint-pack rule it replaces forced overlapping
+    // envelopes into separate SBs and triggered cross-committer hangs
+    // on shared `pool_locks` (M8.1 shapes S3 / S4 / overlap-on-wrap
+    // S6 / S7 / S8).
+    //
+    // Spec §1.8: when a candidate's starvation_count >= threshold AND
+    // the current SuperBatch is empty, force-pack as size-1 SuperBatch
+    // and break (ensure the starved entry gets through). Under the
+    // grouped rule starvation is bounded to queue/arena pressure and
+    // CAS-race losses (no more disjointness-reject path), so the
+    // counter rarely populates beyond 0/1 — but the safety net is
+    // retained.
+    //
+    // Packed candidates have their starvation counter cleared.
+    // CAS-race-lost candidates have their starvation counter
+    // incremented.
     let mut lock_set: HashSet<(i64, i64)> = HashSet::new();
     let mut wip_union: HashSet<(i64, i64)> = HashSet::new();
     let mut packed: Vec<Candidate> = Vec::new();
@@ -197,15 +232,12 @@ fn router_tick() -> u32 {
             }
         }
 
-        // Disjoint check.
-        if cand.sku_pool_keys.iter().any(|k| lock_set.contains(k)) {
-            *starv.entry(cand.request_seq).or_insert(0) += 1;
-            continue;
-        }
-
         // CAS valid 1→2 (pending → processing). Acquire on success so
         // subsequent reads from this staging entry see the caller's
         // payload writes.
+        //
+        // The disjoint-pool reject that used to live here has been
+        // deleted: overlapping envelopes are now WANTED inside one SB.
         let cas_ok = {
             let queue = STAGING_QUEUE.share();
             queue.entries[cand.staging_idx as usize]
@@ -674,7 +706,10 @@ fn poc_v21_router_force_pack_count() -> i64 {
 ///   committer_drains_total    — successful committer SuperBatch drains
 ///   avg_envelopes_per_sb      — total_envelopes / superbatch_count
 ///   packing_efficiency        — avg_envelopes_per_sb / batch_size_max
-///                               (R1 target: > 0.7 under disjoint workload)
+///                               (R1; redefinition under grouped rule
+///                               tracked as `acct-shpc.2` — singleton-SB
+///                               fraction and cluster-merge counters
+///                               replace this once they land)
 ///   pack_yield_per_tick       — superbatch_count / ticks_total
 ///   histogram_bucket_<N>      — count of SuperBatches with envelope_count in
 ///                               2^N..2^(N+1)-1 (bucket 7 is the >=128 overflow).

@@ -210,34 +210,45 @@ async fn acceptance_v21_router_metrics_hot_pool() {
     let stats = read_router_stats(&pool).await;
     println!("hot pool stats: {:?}", stats);
 
-    // Hot pool: every SuperBatch is strictly size-1.
-    assert_eq!(
-        stats["superbatch_count"] as i64, N as i64,
-        "hot pool produces N size-1 SuperBatches; got sb_count={}",
+    // Hot pool under the grouped rule (acct-0frn / `poc-v2.1-amendment-0.2`):
+    // every shared-pool envelope packs INTO one SuperBatch, not N separate
+    // ones. So sb_count is small (1-2 depending on scheduling jitter; up to
+    // batch_size_max=50 envelopes per SB) and max_envelope_count == N.
+    //
+    // Pre-fix (disjoint rule) the same test asserted N size-1 SBs;
+    // assertions flipped along with the router behavior.
+    assert!(
+        (stats["superbatch_count"] as i64) >= 1 && (stats["superbatch_count"] as i64) <= 2,
+        "hot pool packs into 1 (or 2 under jitter) SuperBatches; got sb_count={}",
         stats["superbatch_count"]
     );
     assert_eq!(
-        stats["histogram_bucket_0"] as i64, N as i64,
-        "every hot-pool SuperBatch must land in size-1 bucket 0; got bucket_0={}",
-        stats["histogram_bucket_0"]
-    );
-    assert_eq!(
-        stats["max_envelope_count"] as i64, 1,
-        "max_envelope_count under hot pool must be 1"
+        stats["total_envelopes"] as i64, N as i64,
+        "no envelope lost; got total_envelopes={}",
+        stats["total_envelopes"]
     );
     assert!(
-        stats["force_pack_count"] > 0.0,
-        "M3.2 fairness backstop should fire for hot pool of {} envelopes (threshold default 10); got {}",
-        N, stats["force_pack_count"]
+        (stats["max_envelope_count"] as i64) >= 2,
+        "max_envelope_count under hot pool must be >= 2 (grouped rule packs shared-pool envelopes together); got {}",
+        stats["max_envelope_count"]
     );
-
-    // No large-batch buckets should be populated under hot pool.
-    for i in 1..=7 {
-        let key = format!("histogram_bucket_{}", i);
-        assert_eq!(
-            stats[&key] as i64, 0,
-            "hot pool should not populate bucket {}; got {}",
-            i, stats[&key]
-        );
-    }
+    // size-1 bucket should be near-empty for a hot-pool burst that fits
+    // in one tick's window — every envelope shares the pool key with
+    // every other, so they pack together rather than dribbling out as
+    // singletons. Allow 0 or 1 singletons (boundary-of-tick effects).
+    assert!(
+        (stats["histogram_bucket_0"] as i64) <= 1,
+        "hot pool under grouped rule produces at most 1 size-1 SB (boundary jitter); got bucket_0={}",
+        stats["histogram_bucket_0"]
+    );
+    // Force-pack is dead-code-for-hot-pools under the grouped rule:
+    // no starvation arises from disjointness rejection anymore (the only
+    // remaining starvation paths are queue/arena pressure, which this
+    // 25-envelope burst doesn't hit). FU2 (`acct-shpc.8`) re-validates
+    // the fairness backstop under grouped semantics.
+    assert_eq!(
+        stats["force_pack_count"] as i64, 0,
+        "grouped rule: hot-pool burst does not trigger starvation/force-pack; got {}",
+        stats["force_pack_count"]
+    );
 }
