@@ -804,6 +804,7 @@ fn router_hist_quantile_midpoint(hist: &[u64; 8], total: u64, q: f64) -> f64 {
 /// Run one router tick. Returns true if at least one SuperBatch was
 /// assembled this call. Used by tests to drive the router
 /// deterministically.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_router_tick() -> bool {
     router_tick() > 0
@@ -812,6 +813,7 @@ fn poc_v21_test_router_tick() -> bool {
 /// Drain the router until no pending entry remains. Returns the count
 /// of SuperBatches assembled. Used by the property test fixture to
 /// flush quickly without waiting on the BGWorker's 50ms tick.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_router_drain() -> i64 {
     let mut total: u64 = 0;
@@ -1096,6 +1098,7 @@ fn read_staging_indices(offset: u32, envelope_count: u16) -> Vec<u32> {
 /// Use `sb_id=0` for the Phase A scenario (router died pre-Phase-6).
 /// Use a non-zero `sb_id` that matches NO live queue entry for the
 /// Phase B scenario (orphaned link).
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_inject_staging_orphan(
     staging_idx: i64,
@@ -1150,6 +1153,7 @@ fn poc_v21_test_inject_staging_orphan(
 ///
 /// Allocates real arena blocks (staging_entry_offsets) so the §3.10
 /// lifecycle-coupling audit can verify the sweep frees them.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_inject_orphaned_queue(
     queue_idx: i64,
@@ -1215,6 +1219,7 @@ fn poc_v21_test_inject_orphaned_queue(
 
 /// Test-only: read a staging entry's state as
 /// "(valid, superbatch_id)". Useful for asserting state transitions.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_staging_state(staging_idx: i64) -> String {
     let queue = STAGING_QUEUE.share();
@@ -1233,6 +1238,7 @@ fn poc_v21_test_staging_state(staging_idx: i64) -> String {
 /// Test-only: read a staging entry's `eject_count` (M5c.2 acct-1hyx).
 /// Used by caller-tx-coupling tests to assert the eject counter grows
 /// across re-route cycles when a caller holds its user-tx open.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_staging_eject_count(staging_idx: i64) -> i32 {
     let queue = STAGING_QUEUE.share();
@@ -1246,6 +1252,7 @@ fn poc_v21_test_staging_eject_count(staging_idx: i64) -> i32 {
 }
 
 /// Test-only: force-reset a staging slot to valid==0 (empty).
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_force_reset_staging(staging_idx: i64) -> i32 {
     let queue = STAGING_QUEUE.share();
@@ -1266,6 +1273,7 @@ fn poc_v21_test_force_reset_staging(staging_idx: i64) -> i32 {
 /// and clears committer fields. Mirrors what the recovery sweep does
 /// to the queue's own arena; idempotent if called after the sweep.
 /// Returns previous valid value.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_force_reset_injected_queue(queue_idx: i64) -> i32 {
     let capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
@@ -1305,6 +1313,7 @@ fn poc_v21_test_force_reset_injected_queue(queue_idx: i64) -> i32 {
 /// Test-only: read a queue-entry's state as "(valid, superbatch_id,
 /// committer_pid)". Distinct from `poc_v21_test_slot_state` which
 /// returns only (valid, committer_pid) per M5a.1 convention.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_queue_state(queue_idx: i64) -> String {
     let queue = COMMITTER_QUEUE.share();
@@ -1323,6 +1332,7 @@ fn poc_v21_test_queue_state(queue_idx: i64) -> String {
 
 /// Test-only: run one router-orphan recovery sweep. Returns the count
 /// of slots reconciled.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_router_recover_tick() -> i64 {
     try_recover_router_orphan() as i64
@@ -1357,6 +1367,7 @@ pub(crate) fn test_reorder_router_stores() -> bool {
 /// Test-only: set the router Phase-6 inject delay in microseconds.
 /// Visible to the router BGWorker because the field is shmem-resident.
 /// Pass 0 to disable.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_set_router_delay_us(delay_us: i32) {
     let d = if delay_us < 0 { 0 } else { delay_us as u32 };
@@ -1370,6 +1381,7 @@ fn poc_v21_test_set_router_delay_us(delay_us: i32) {
 /// control. When ON, the CAS valid 2→3 happens BEFORE the sb_id store
 /// — breaking the data-before-flag invariant intentionally so the
 /// test can confirm violations are actually observable.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_set_router_reorder(enabled: bool) {
     COMMITTER_QUEUE
@@ -1391,6 +1403,7 @@ fn poc_v21_test_set_router_reorder(enabled: bool) {
 /// STILL 0, which can only happen if the router's two stores are
 /// reordered (CAS first) OR if the compiler/CPU is allowed to reorder
 /// despite the Release annotation.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_check_release_acquire_invariant() -> i64 {
     let mut violations: i64 = 0;
@@ -1822,6 +1835,7 @@ fn poc_v21_audit_last_run_at() -> Option<pgrx::datum::TimestampWithTimeZone> {
 
 /// Test-only: run one audit pass synchronously (bypasses the 60s gate).
 /// Returns the count of slots reconciled across all patterns.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_run_audit_sweep() -> i64 {
     let before_a = COMMITTER_QUEUE.share().audit_reclaims_count.load(Relaxed);
@@ -1848,6 +1862,7 @@ fn poc_v21_test_run_audit_sweep() -> i64 {
 
 /// Test-only: reset all audit counters + last_run_at to 0. Used by
 /// tests to establish a clean baseline before manufacturing a leak.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_audit_counters_reset() {
     let queue = COMMITTER_QUEUE.share();
@@ -1860,6 +1875,7 @@ fn poc_v21_test_audit_counters_reset() {
 /// Test-only: backdate a staging entry's `enqueued_at_micros` by
 /// `offset_ms` so it appears stale to audit gating. Saturates at 0
 /// (no underflow).
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_backdate_staging_enqueued_at(staging_idx: i64, offset_ms: i64) -> bool {
     let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
@@ -1875,6 +1891,7 @@ fn poc_v21_test_backdate_staging_enqueued_at(staging_idx: i64, offset_ms: i64) -
 
 /// Test-only: set a staging entry's `backend_pid` to a known value
 /// (used to inject Pattern A's dead-pid condition with a non-zero PID).
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_set_staging_backend_pid(staging_idx: i64, pid: i32) -> bool {
     let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
@@ -1888,6 +1905,7 @@ fn poc_v21_test_set_staging_backend_pid(staging_idx: i64, pid: i32) -> bool {
 
 /// Test-only: backdate a queue entry's `enqueued_at_micros` by
 /// `offset_ms`. Used for Pattern C age-gating.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_backdate_queue_enqueued_at(queue_idx: i64, offset_ms: i64) -> bool {
     let capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
@@ -1906,6 +1924,7 @@ fn poc_v21_test_backdate_queue_enqueued_at(queue_idx: i64, offset_ms: i64) -> bo
 /// (sb_id Release then CAS valid 2→3 Release). Precondition: slot must
 /// be at valid=2. Used to construct Patterns B and C scenarios where
 /// staging needs to be at valid=3 with a specific sb_id linkage.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_promote_staging_to_routed(staging_idx: i64, sb_id: i64) -> bool {
     let capacity = POC_V21_STAGING_QUEUE_SIZE as i64;
@@ -1937,6 +1956,7 @@ fn poc_v21_test_promote_staging_to_routed(staging_idx: i64, sb_id: i64) -> bool 
 /// Returns the count of (staging, queue) slots that were non-empty
 /// before reset — useful for tests that want to verify their setup
 /// state was clean.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_force_reset_all_shmem() -> String {
     let mut s_dirty: u32 = 0;
@@ -2022,6 +2042,7 @@ fn poc_v21_test_force_reset_all_shmem() -> String {
 /// payload + pool-keys so audit Pattern B / C tests can verify arena
 /// freeing. Stamps valid=2 with the given sb_id; tests can subsequently
 /// CAS 2→3 via `poc_v21_test_promote_staging_to_routed`.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_inject_staging_with_arena(
     staging_idx: i64,

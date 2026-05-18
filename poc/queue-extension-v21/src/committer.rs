@@ -192,6 +192,7 @@ pub(crate) fn try_recover_orphan() -> u32 {
 ///
 /// `lease_offset_ms` is subtracted from `now` to force lease
 /// staleness; pass `committer_lease_ms × 2` for safety.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_inject_orphan_into_empty(
     slot_idx: i64,
@@ -217,6 +218,7 @@ fn poc_v21_test_inject_orphan_into_empty(
 /// Test-only: read a CommitterQueueEntry's current state as a string
 /// tuple "(valid, committer_pid)". Useful for asserting state
 /// transitions in orphan-recovery tests.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_slot_state(slot_idx: i64) -> String {
     let queue = COMMITTER_QUEUE.share();
@@ -236,6 +238,7 @@ fn poc_v21_test_slot_state(slot_idx: i64) -> String {
 /// test cleanup after synthetic orphan injection so the real
 /// committer pool doesn't try to process an artifact slot. Returns
 /// the previous valid value.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_force_reset_slot(slot_idx: i64) -> i32 {
     let queue = COMMITTER_QUEUE.share();
@@ -253,6 +256,7 @@ fn poc_v21_test_force_reset_slot(slot_idx: i64) -> i32 {
 
 /// Test-only: synchronously run one orphan-recovery sweep. Returns
 /// the count of entries recovered.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_orphan_recover_tick() -> i64 {
     try_recover_orphan() as i64
@@ -260,6 +264,7 @@ fn poc_v21_test_orphan_recover_tick() -> i64 {
 
 /// Test-only: read the committer queue head. Used by E1's
 /// head-advance acceptance test (acct-gx1z.1.1).
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_committer_head_get() -> i64 {
     COMMITTER_QUEUE.share().head.load(Relaxed) as i64
@@ -268,6 +273,7 @@ fn poc_v21_test_committer_head_get() -> i64 {
 /// Test-only: set the committer queue head to a specific value.
 /// Used by E1's head-advance acceptance test to fix the starting
 /// position before injecting a claimable entry off-head.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_committer_head_set(value: i64) {
     let capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
@@ -280,6 +286,7 @@ fn poc_v21_test_committer_head_set(value: i64) {
 /// (valid + committer_pid). All other CommitterQueueEntry fields
 /// stay at their resident defaults. Returns false if the slot is
 /// not currently valid==0.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_inject_claimable_entry(slot_idx: i64) -> bool {
     let queue = COMMITTER_QUEUE.share();
@@ -298,6 +305,7 @@ fn poc_v21_test_inject_claimable_entry(slot_idx: i64) -> bool {
 /// slot index claimed, or -1 if no claim was made. Used by E1's
 /// head-advance acceptance test to exercise claim without invoking
 /// the full pipeline (which expects staging-entry data).
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_claim_committer_entry() -> i64 {
     match claim_next_committer_entry() {
@@ -2119,6 +2127,7 @@ fn cleanup_after_superbatch(
 
 /// Synchronous committer-tick helper for tests: claims one entry and
 /// runs the full pipeline. Returns true if work was done.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_committer_tick() -> bool {
     let claim = claim_next_committer_entry();

@@ -34,9 +34,20 @@ if [ -z "${BINARIES:-}" ]; then
     BINARIES=$(ls tests/ | grep -E '^(acceptance_v21_|property_v21_).*\.rs$' | sed 's/\.rs$//' | sort)
 fi
 
+# Install the test_hooks-enabled .so so poc_v21_test_* pg_externs are
+# exposed (acct-gx1z.1.2). Without this, every test fails on missing
+# helper functions. The production .so build (without WITH_TEST_HOOKS)
+# stays the default for install-into-container.sh.
+echo "==> installing test_hooks-enabled .so"
+WITH_TEST_HOOKS=1 bash "$(dirname "$0")/install-into-container.sh" 2>&1 | tail -3
+
+# DROP + CREATE EXTENSION so the new SQL definitions land.
+docker exec "$CONTAINER" psql -U acct -d acct_poc_queue_v21 \
+    -c "DROP EXTENSION IF EXISTS poc_v21_ledger CASCADE; CREATE EXTENSION poc_v21_ledger;" 2>&1 | tail -3
+
 # Build once up front so per-binary runs don't re-link.
-echo "==> pre-building release artifacts"
-cargo build --release --features pg18 --no-default-features 2>&1 | tail -3
+echo "==> pre-building release artifacts (features=pg18,test_hooks)"
+cargo build --release --features pg18,test_hooks --no-default-features 2>&1 | tail -3
 
 reds=()
 greens=()
@@ -52,7 +63,7 @@ for bin in $BINARIES; do
     docker restart "$CONTAINER" >/dev/null
     sleep "$RESTART_WAIT"
 
-    if cargo test --release --features pg18 --no-default-features \
+    if cargo test --release --features pg18,test_hooks --no-default-features \
             --test "$bin" -- --ignored --test-threads=1 --nocapture; then
         greens+=("$bin")
     else

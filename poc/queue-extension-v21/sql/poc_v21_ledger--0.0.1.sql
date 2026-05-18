@@ -43,7 +43,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_outstanding_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:359
+-- src/enqueue.rs:361
 -- poc_v21_ledger::enqueue::poc_v21_arena_stats
 CREATE  FUNCTION "poc_v21_arena_stats"() RETURNS json /* Json */
 STRICT
@@ -70,7 +70,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_total_frees_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1810
+-- src/router.rs:1823
 -- poc_v21_ledger::router::poc_v21_audit_last_run_at
 CREATE  FUNCTION "poc_v21_audit_last_run_at"() RETURNS timestamp with time zone /* Option < pgrx :: datum :: TimestampWithTimeZone > */
 STRICT
@@ -79,7 +79,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_audit_last_run_at_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1798
+-- src/router.rs:1811
 -- poc_v21_ledger::router::poc_v21_audit_lost_envelopes_count
 CREATE  FUNCTION "poc_v21_audit_lost_envelopes_count"() RETURNS bigint /* i64 */
 STRICT
@@ -88,7 +88,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_audit_lost_envelopes_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1790
+-- src/router.rs:1803
 -- poc_v21_ledger::router::poc_v21_audit_orphans_recovered_count
 CREATE  FUNCTION "poc_v21_audit_orphans_recovered_count"() RETURNS bigint /* i64 */
 STRICT
@@ -97,7 +97,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_audit_orphans_recovered_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1785
+-- src/router.rs:1798
 -- poc_v21_ledger::router::poc_v21_audit_reclaims_count
 CREATE  FUNCTION "poc_v21_audit_reclaims_count"() RETURNS bigint /* i64 */
 STRICT
@@ -255,7 +255,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_queue_depth_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/recovery.rs:360
+-- src/recovery.rs:362
 -- poc_v21_ledger::recovery::poc_v21_recovery_complete
 CREATE  FUNCTION "poc_v21_recovery_complete"() RETURNS bool /* bool */
 STRICT
@@ -330,7 +330,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_total_envelopes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:342
+-- src/enqueue.rs:344
 -- poc_v21_ledger::enqueue::poc_v21_staging_state_counts
 CREATE  FUNCTION "poc_v21_staging_state_counts"() RETURNS json /* Json */
 STRICT
@@ -351,7 +351,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_staging_stats_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1851
+-- src/router.rs:1866
 -- poc_v21_ledger::router::poc_v21_test_audit_counters_reset
 CREATE  FUNCTION "poc_v21_test_audit_counters_reset"() RETURNS void
 STRICT
@@ -360,7 +360,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_audit_counters_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1891
+-- src/router.rs:1909
 -- poc_v21_ledger::router::poc_v21_test_backdate_queue_enqueued_at
 CREATE  FUNCTION "poc_v21_test_backdate_queue_enqueued_at"(
 	"queue_idx" bigint, /* i64 */
@@ -372,7 +372,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_backdate_queue_enqueued_at_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1863
+-- src/router.rs:1879
 -- poc_v21_ledger::router::poc_v21_test_backdate_staging_enqueued_at
 CREATE  FUNCTION "poc_v21_test_backdate_staging_enqueued_at"(
 	"staging_idx" bigint, /* i64 */
@@ -384,7 +384,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_backdate_staging_enqueued_at_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1394
+-- src/router.rs:1407
 -- poc_v21_ledger::router::poc_v21_test_check_release_acquire_invariant
 CREATE  FUNCTION "poc_v21_test_check_release_acquire_invariant"() RETURNS bigint /* i64 */
 STRICT
@@ -393,7 +393,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_check_release_acquire_invariant_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:301
+-- src/committer.rs:309
 -- poc_v21_ledger::committer::poc_v21_test_claim_committer_entry
 CREATE  FUNCTION "poc_v21_test_claim_committer_entry"() RETURNS bigint /* i64 */
 STRICT
@@ -402,7 +402,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_claim_committer_entry_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:263
+-- src/committer.rs:268
 -- poc_v21_ledger::committer::poc_v21_test_committer_head_get
 CREATE  FUNCTION "poc_v21_test_committer_head_get"() RETURNS bigint /* i64 */
 STRICT
@@ -411,7 +411,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_committer_head_get_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:271
+-- src/committer.rs:277
 -- poc_v21_ledger::committer::poc_v21_test_committer_head_set
 CREATE  FUNCTION "poc_v21_test_committer_head_set"(
 	"value" bigint /* i64 */
@@ -422,7 +422,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_committer_head_set_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:2122
+-- src/committer.rs:2131
 -- poc_v21_ledger::committer::poc_v21_test_committer_tick
 CREATE  FUNCTION "poc_v21_test_committer_tick"() RETURNS bool /* bool */
 STRICT
@@ -431,7 +431,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_committer_tick_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1940
+-- src/router.rs:1960
 -- poc_v21_ledger::router::poc_v21_test_force_reset_all_shmem
 CREATE  FUNCTION "poc_v21_test_force_reset_all_shmem"() RETURNS TEXT /* String */
 STRICT
@@ -440,7 +440,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_all_shmem_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1269
+-- src/router.rs:1277
 -- poc_v21_ledger::router::poc_v21_test_force_reset_injected_queue
 CREATE  FUNCTION "poc_v21_test_force_reset_injected_queue"(
 	"queue_idx" bigint /* i64 */
@@ -451,7 +451,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_injected_queue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:239
+-- src/committer.rs:242
 -- poc_v21_ledger::committer::poc_v21_test_force_reset_slot
 CREATE  FUNCTION "poc_v21_test_force_reset_slot"(
 	"slot_idx" bigint /* i64 */
@@ -462,7 +462,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_slot_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1249
+-- src/router.rs:1256
 -- poc_v21_ledger::router::poc_v21_test_force_reset_staging
 CREATE  FUNCTION "poc_v21_test_force_reset_staging"(
 	"staging_idx" bigint /* i64 */
@@ -473,7 +473,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_staging_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:283
+-- src/committer.rs:290
 -- poc_v21_ledger::committer::poc_v21_test_inject_claimable_entry
 CREATE  FUNCTION "poc_v21_test_inject_claimable_entry"(
 	"slot_idx" bigint /* i64 */
@@ -484,7 +484,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_inject_claimable_entry_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:195
+-- src/committer.rs:196
 -- poc_v21_ledger::committer::poc_v21_test_inject_orphan_into_empty
 CREATE  FUNCTION "poc_v21_test_inject_orphan_into_empty"(
 	"slot_idx" bigint, /* i64 */
@@ -497,7 +497,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_inject_orphan_into_empty_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1153
+-- src/router.rs:1157
 -- poc_v21_ledger::router::poc_v21_test_inject_orphaned_queue
 CREATE  FUNCTION "poc_v21_test_inject_orphaned_queue"(
 	"queue_idx" bigint, /* i64 */
@@ -511,7 +511,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_inject_orphaned_queue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1099
+-- src/router.rs:1102
 -- poc_v21_ledger::router::poc_v21_test_inject_staging_orphan
 CREATE  FUNCTION "poc_v21_test_inject_staging_orphan"(
 	"staging_idx" bigint, /* i64 */
@@ -524,7 +524,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_inject_staging_orphan_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:2025
+-- src/router.rs:2046
 -- poc_v21_ledger::router::poc_v21_test_inject_staging_with_arena
 CREATE  FUNCTION "poc_v21_test_inject_staging_with_arena"(
 	"staging_idx" bigint, /* i64 */
@@ -538,7 +538,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_inject_staging_with_arena_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:256
+-- src/committer.rs:260
 -- poc_v21_ledger::committer::poc_v21_test_orphan_recover_tick
 CREATE  FUNCTION "poc_v21_test_orphan_recover_tick"() RETURNS bigint /* i64 */
 STRICT
@@ -547,7 +547,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_orphan_recover_tick_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1909
+-- src/router.rs:1928
 -- poc_v21_ledger::router::poc_v21_test_promote_staging_to_routed
 CREATE  FUNCTION "poc_v21_test_promote_staging_to_routed"(
 	"staging_idx" bigint, /* i64 */
@@ -559,7 +559,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_promote_staging_to_routed_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1308
+-- src/router.rs:1317
 -- poc_v21_ledger::router::poc_v21_test_queue_state
 CREATE  FUNCTION "poc_v21_test_queue_state"(
 	"queue_idx" bigint /* i64 */
@@ -570,7 +570,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_queue_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:316
+-- src/enqueue.rs:318
 -- poc_v21_ledger::enqueue::poc_v21_test_release_slot
 CREATE  FUNCTION "poc_v21_test_release_slot"(
 	"slot_index" bigint /* i64 */
@@ -581,7 +581,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_release_slot_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/recovery.rs:351
+-- src/recovery.rs:353
 -- poc_v21_ledger::recovery::poc_v21_test_reset_recovery_complete
 CREATE  FUNCTION "poc_v21_test_reset_recovery_complete"() RETURNS void
 STRICT
@@ -590,7 +590,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_reset_recovery_complete_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:815
+-- src/router.rs:817
 -- poc_v21_ledger::router::poc_v21_test_router_drain
 CREATE  FUNCTION "poc_v21_test_router_drain"() RETURNS bigint /* i64 */
 STRICT
@@ -599,7 +599,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_router_drain_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1326
+-- src/router.rs:1336
 -- poc_v21_ledger::router::poc_v21_test_router_recover_tick
 CREATE  FUNCTION "poc_v21_test_router_recover_tick"() RETURNS bigint /* i64 */
 STRICT
@@ -608,7 +608,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_router_recover_tick_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:807
+-- src/router.rs:808
 -- poc_v21_ledger::router::poc_v21_test_router_tick
 CREATE  FUNCTION "poc_v21_test_router_tick"() RETURNS bool /* bool */
 STRICT
@@ -617,7 +617,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_router_tick_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1825
+-- src/router.rs:1839
 -- poc_v21_ledger::router::poc_v21_test_run_audit_sweep
 CREATE  FUNCTION "poc_v21_test_run_audit_sweep"() RETURNS bigint /* i64 */
 STRICT
@@ -626,7 +626,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_run_audit_sweep_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/recovery.rs:331
+-- src/recovery.rs:332
 -- poc_v21_ledger::recovery::poc_v21_test_run_startup_recovery
 CREATE  FUNCTION "poc_v21_test_run_startup_recovery"() RETURNS json /* pgrx :: Json */
 STRICT
@@ -635,7 +635,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_run_startup_recovery_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1360
+-- src/router.rs:1371
 -- poc_v21_ledger::router::poc_v21_test_set_router_delay_us
 CREATE  FUNCTION "poc_v21_test_set_router_delay_us"(
 	"delay_us" INT /* i32 */
@@ -646,7 +646,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_set_router_delay_us_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1373
+-- src/router.rs:1385
 -- poc_v21_ledger::router::poc_v21_test_set_router_reorder
 CREATE  FUNCTION "poc_v21_test_set_router_reorder"(
 	"enabled" bool /* bool */
@@ -657,7 +657,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_set_router_reorder_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1878
+-- src/router.rs:1895
 -- poc_v21_ledger::router::poc_v21_test_set_staging_backend_pid
 CREATE  FUNCTION "poc_v21_test_set_staging_backend_pid"(
 	"staging_idx" bigint, /* i64 */
@@ -669,7 +669,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_set_staging_backend_pid_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:220
+-- src/committer.rs:222
 -- poc_v21_ledger::committer::poc_v21_test_slot_state
 CREATE  FUNCTION "poc_v21_test_slot_state"(
 	"slot_idx" bigint /* i64 */
@@ -680,7 +680,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_slot_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1236
+-- src/router.rs:1242
 -- poc_v21_ledger::router::poc_v21_test_staging_eject_count
 CREATE  FUNCTION "poc_v21_test_staging_eject_count"(
 	"staging_idx" bigint /* i64 */
@@ -691,7 +691,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_staging_eject_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/router.rs:1218
+-- src/router.rs:1223
 -- poc_v21_ledger::router::poc_v21_test_staging_state
 CREATE  FUNCTION "poc_v21_test_staging_state"(
 	"staging_idx" bigint /* i64 */
@@ -702,7 +702,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_staging_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:308
+-- src/enqueue.rs:309
 -- poc_v21_ledger::enqueue::poc_v21_test_take_pending
 CREATE  FUNCTION "poc_v21_test_take_pending"() RETURNS bigint /* Option < i64 > */
 STRICT

@@ -14,6 +14,11 @@ crate-type = ["cdylib"]
 default = ["pg18"]
 pg18 = ["pgrx/pg18"]
 pg_test = []
+# Exposes the poc_v21_test_* pg_externs (see acct-gx1z.1.2). Required
+# by every test binary in tests/; gated OUT of production .so builds
+# so SQL callers cannot reach state-mutating helpers like
+# poc_v21_test_force_reset_slot.
+test_hooks = []
 
 [dependencies]
 pgrx = "=0.18.0"

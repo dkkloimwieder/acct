@@ -328,6 +328,7 @@ pub fn run_persistent_staging_recovery_sweep() -> Result<PersistentSweepCounts, 
 ///
 /// Runs persistent_staging sweep (M5e.3) FIRST, then the non-durable
 /// sweep (M5d.1). Returns JSON with both sets of counters.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_run_startup_recovery() -> pgrx::Json {
     let (ps_completed, ps_re_enqueued, ps_aborted) =
@@ -348,6 +349,7 @@ fn poc_v21_test_run_startup_recovery() -> pgrx::Json {
 
 /// Test-only: clear the recovery_complete flag so a subsequent
 /// `poc_v21_test_run_startup_recovery` call can exercise the gate.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_reset_recovery_complete() {
     COMMITTER_QUEUE

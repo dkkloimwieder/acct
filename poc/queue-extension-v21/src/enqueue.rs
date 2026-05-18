@@ -305,6 +305,7 @@ fn return_to_retry() {
 /// Pop a pending staging entry and mark valid=2. Returns the slot index
 /// (or NULL if no pending entry). Test-only helper; mirrors what the
 /// router (M3.1) would do for a size-1 SuperBatch.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_take_pending() -> Option<i64> {
     let mut queue_guard = STAGING_QUEUE.exclusive();
@@ -313,6 +314,7 @@ fn poc_v21_test_take_pending() -> Option<i64> {
 
 /// Reset a slot to empty (valid=0) and free its arena blocks. Test-only;
 /// mirrors what the committer (M1.3) would do at Step 14.
+#[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_release_slot(slot_index: i64) {
     let queue_guard = STAGING_QUEUE.share();
