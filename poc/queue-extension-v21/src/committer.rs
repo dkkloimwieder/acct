@@ -258,6 +258,54 @@ fn poc_v21_test_orphan_recover_tick() -> i64 {
     try_recover_orphan() as i64
 }
 
+/// Test-only: read the committer queue head. Used by E1's
+/// head-advance acceptance test (acct-gx1z.1.1).
+#[pg_extern]
+fn poc_v21_test_committer_head_get() -> i64 {
+    COMMITTER_QUEUE.share().head.load(Relaxed) as i64
+}
+
+/// Test-only: set the committer queue head to a specific value.
+/// Used by E1's head-advance acceptance test to fix the starting
+/// position before injecting a claimable entry off-head.
+#[pg_extern]
+fn poc_v21_test_committer_head_set(value: i64) {
+    let capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
+    let v = (value.rem_euclid(capacity as i64)) as u32;
+    COMMITTER_QUEUE.share().head.store(v, Relaxed);
+}
+
+/// Test-only: inject a claimable (valid==1) entry at the given slot
+/// with the minimum fields claim_next_committer_entry consults
+/// (valid + committer_pid). All other CommitterQueueEntry fields
+/// stay at their resident defaults. Returns false if the slot is
+/// not currently valid==0.
+#[pg_extern]
+fn poc_v21_test_inject_claimable_entry(slot_idx: i64) -> bool {
+    let queue = COMMITTER_QUEUE.share();
+    let capacity = POC_V21_COMMITTER_QUEUE_SIZE as i64;
+    if slot_idx < 0 || slot_idx >= capacity {
+        return false;
+    }
+    let slot = &queue.entries[slot_idx as usize];
+    slot.committer_pid.store(0, Relaxed);
+    slot.valid
+        .compare_exchange(0, 1, Release, Relaxed)
+        .is_ok()
+}
+
+/// Test-only: run claim_next_committer_entry once. Returns the
+/// slot index claimed, or -1 if no claim was made. Used by E1's
+/// head-advance acceptance test to exercise claim without invoking
+/// the full pipeline (which expects staging-entry data).
+#[pg_extern]
+fn poc_v21_test_claim_committer_entry() -> i64 {
+    match claim_next_committer_entry() {
+        Some(idx) => idx as i64,
+        None => -1,
+    }
+}
+
 /// CAS-claim the next valid==1 CommitterQueueEntry. Returns its
 /// slot index on success.
 fn claim_next_committer_entry() -> Option<u32> {
@@ -278,7 +326,11 @@ fn claim_next_committer_entry() -> Option<u32> {
             {
                 let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
                 slot.committer_acquired_at_ns.store(now_ns, Relaxed);
-                queue.head.store((head + 1) % capacity, Relaxed);
+                // Advance past the winning slot (head + i + 1), not just
+                // head + 1. Otherwise head drifts behind the actual claim
+                // position when i > 0 and the next tick re-scans the
+                // empty slots between [head, idx).
+                queue.head.store((head + i + 1) % capacity, Relaxed);
                 // M7.1 (acct-byue): record the CAS-win for committer-pool
                 // throughput observability.
                 queue.committer_claim_count.fetch_add(1, Relaxed);

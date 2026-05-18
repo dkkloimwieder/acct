@@ -393,7 +393,36 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_check_release_acquire_invariant_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:2070
+-- src/committer.rs:301
+-- poc_v21_ledger::committer::poc_v21_test_claim_committer_entry
+CREATE  FUNCTION "poc_v21_test_claim_committer_entry"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_claim_committer_entry_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/committer.rs:263
+-- poc_v21_ledger::committer::poc_v21_test_committer_head_get
+CREATE  FUNCTION "poc_v21_test_committer_head_get"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_committer_head_get_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/committer.rs:271
+-- poc_v21_ledger::committer::poc_v21_test_committer_head_set
+CREATE  FUNCTION "poc_v21_test_committer_head_set"(
+	"value" bigint /* i64 */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_committer_head_set_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/committer.rs:2122
 -- poc_v21_ledger::committer::poc_v21_test_committer_tick
 CREATE  FUNCTION "poc_v21_test_committer_tick"() RETURNS bool /* bool */
 STRICT
@@ -441,6 +470,17 @@ CREATE  FUNCTION "poc_v21_test_force_reset_staging"(
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_staging_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/committer.rs:283
+-- poc_v21_ledger::committer::poc_v21_test_inject_claimable_entry
+CREATE  FUNCTION "poc_v21_test_inject_claimable_entry"(
+	"slot_idx" bigint /* i64 */
+) RETURNS bool /* bool */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_test_inject_claimable_entry_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
