@@ -198,8 +198,14 @@ pub struct CommitterQueueEntry {
     pub wip_pool_keys_offset: u32,
     pub wip_pool_keys_count: u16,
     pub _pad_wip: [u8; 2],
-    pub committer_pid: AtomicI32,
-    pub _pad_pid: [u8; 4],
+    /// Owning committer's identity-slot index in `CommitterQueue.identity_slots`.
+    /// Only meaningful when `committer_bgw_generation > 0`; generation == 0 is
+    /// the "unclaimed" sentinel (matches shmem zero-init).
+    pub committer_bgw_slot: AtomicU32,
+    /// Owning committer's slot generation, captured at claim time. Compared
+    /// against `identity_slots[committer_bgw_slot].generation` to detect a
+    /// recycled slot (PID-recycling-safe per spec §1.6).
+    pub committer_bgw_generation: AtomicU32,
     pub committer_acquired_at_ns: AtomicU64,
     pub committer_tx_id: AtomicU64,
     pub enqueued_at_micros: u64,
@@ -292,8 +298,37 @@ pub struct CommitterQueue {
     /// `committer_pipeline_ns_total`. Pairs with the ns counter to give
     /// avg pipeline ns per batch.
     pub committer_pipeline_count: AtomicU64,
+    // ── Committer identity slots (acct-l7k8, spec §1.6) ──
+    // Application-level analog of PG's BackgroundWorkerData.slot[]:
+    // each running committer worker claims one entry at startup and
+    // releases at shutdown. CommitterQueueEntry.committer_bgw_slot and
+    // committer_bgw_generation point into this array. PID-recycling-safe
+    // liveness: a contender compares the entry's stored generation
+    // against this slot's current generation. If the slot was released
+    // and re-claimed by a different committer, the generation has
+    // advanced and the stored identity no longer matches → orphan.
+    pub identity_slots: [CommitterIdentitySlot; POC_V21_COMMITTER_IDENTITY_SLOTS],
     pub entries: [CommitterQueueEntry; POC_V21_COMMITTER_QUEUE_SIZE],
 }
+
+/// One per running committer worker. 64-byte-aligned so the per-slot
+/// atomics don't false-share with neighbors.
+#[repr(C, align(64))]
+pub struct CommitterIdentitySlot {
+    /// OS PID of the worker currently occupying this slot. 0 = free.
+    /// The PID is informational + a fast-path liveness gate; the
+    /// authoritative liveness signal is `generation`.
+    pub pid: AtomicI32,
+    /// Monotonic claim counter. Starts at 0 (zero-init); first claim
+    /// bumps to 1, release bumps again. Generation == 0 only at fresh
+    /// shmem init — never a valid identity. A real committer identity
+    /// always has generation >= 1.
+    pub generation: AtomicU32,
+    pub _pad: [u8; 56],
+}
+
+/// Number of identity slots — must be >= committer_count GUC max (64).
+pub const POC_V21_COMMITTER_IDENTITY_SLOTS: usize = 64;
 
 impl Default for CommitterQueue {
     fn default() -> Self {
@@ -535,6 +570,105 @@ pub fn signal_staging_slot_freed(queue: &StagingQueue) {
     unsafe {
         pg_sys::ConditionVariableBroadcast(cv);
     }
+}
+
+/// Claim a free identity slot for the calling committer (spec §1.6).
+/// Returns (slot_idx, generation). Two-pass scan: first reclaims slots
+/// marked free (pid == 0); second takes over slots whose occupant is
+/// dead per kill(pid, 0). Panics if every slot is occupied by a live
+/// PID — the GUC `committer_count` cap of 64 matches the array size.
+pub(crate) fn claim_committer_identity() -> (u32, u32) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+    let queue = COMMITTER_QUEUE.share();
+    let my_pid = unsafe { pg_sys::MyProcPid };
+    // First pass: claim slots with pid == 0.
+    for (idx, slot) in queue.identity_slots.iter().enumerate() {
+        if slot
+            .pid
+            .compare_exchange(0, my_pid, AcqRel, Relaxed)
+            .is_ok()
+        {
+            let generation = slot.generation.fetch_add(1, AcqRel) + 1;
+            return (idx as u32, generation);
+        }
+    }
+    // Second pass: take over slots with definitely-dead occupants.
+    for (idx, slot) in queue.identity_slots.iter().enumerate() {
+        let occupant = slot.pid.load(Acquire);
+        if occupant == 0 || occupant == my_pid {
+            continue;
+        }
+        let alive = unsafe { libc::kill(occupant, 0) } == 0;
+        if alive {
+            continue;
+        }
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(0);
+        if errno != libc::ESRCH {
+            continue;
+        }
+        if slot
+            .pid
+            .compare_exchange(occupant, my_pid, AcqRel, Relaxed)
+            .is_ok()
+        {
+            let generation = slot.generation.fetch_add(1, AcqRel) + 1;
+            return (idx as u32, generation);
+        }
+    }
+    panic!(
+        "no free committer identity slot (capacity {})",
+        POC_V21_COMMITTER_IDENTITY_SLOTS
+    );
+}
+
+/// Release the calling committer's identity slot on clean shutdown.
+/// Bumps generation first so any stale CommitterQueueEntry referencing
+/// the prior identity no longer matches; then clears pid to 0.
+pub(crate) fn release_committer_identity(slot_idx: u32) {
+    use std::sync::atomic::Ordering::{AcqRel, Release};
+    if (slot_idx as usize) >= POC_V21_COMMITTER_IDENTITY_SLOTS {
+        return;
+    }
+    let queue = COMMITTER_QUEUE.share();
+    let slot = &queue.identity_slots[slot_idx as usize];
+    slot.generation.fetch_add(1, AcqRel);
+    slot.pid.store(0, Release);
+}
+
+/// Liveness check (spec §1.6 step 1-4). Returns true iff the committer
+/// identified by `(slot_idx, generation)` is currently alive: slot has
+/// a non-zero pid, generation matches, and `kill(pid, 0)` succeeds.
+/// Returns false on any sentinel (generation == 0 → unclaimed) or
+/// out-of-bounds slot. Treats kill EPERM as alive (conservative).
+pub(crate) fn is_committer_alive(slot_idx: u32, expected_generation: u32) -> bool {
+    use std::sync::atomic::Ordering::Acquire;
+    if expected_generation == 0 {
+        return false;
+    }
+    if (slot_idx as usize) >= POC_V21_COMMITTER_IDENTITY_SLOTS {
+        return false;
+    }
+    let queue = COMMITTER_QUEUE.share();
+    let slot = &queue.identity_slots[slot_idx as usize];
+    let pid = slot.pid.load(Acquire);
+    if pid == 0 {
+        return false;
+    }
+    let generation = slot.generation.load(Acquire);
+    if generation != expected_generation {
+        return false;
+    }
+    let kill_rc = unsafe { libc::kill(pid, 0) };
+    if kill_rc == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(0);
+    // EPERM (process exists but we lack signal permission) → alive.
+    errno != libc::ESRCH
 }
 
 /// Observability: cumulative count of `signal_staging_slot_freed` calls

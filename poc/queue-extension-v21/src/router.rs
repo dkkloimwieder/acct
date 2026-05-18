@@ -64,7 +64,7 @@ use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -351,7 +351,8 @@ fn emit_superbatch_chunk(
             slot.sku_pool_keys_count = sku_count;
             slot.wip_pool_keys_offset = wip_keys_off;
             slot.wip_pool_keys_count = wip_count;
-            slot.committer_pid.store(0, Relaxed);
+            slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+            slot.committer_bgw_generation.store(0, Relaxed);
             slot.committer_acquired_at_ns.store(0, Relaxed);
             slot.committer_tx_id.store(0, Relaxed);
             slot.enqueued_at_micros = now_micros;
@@ -1008,11 +1009,10 @@ pub(crate) fn try_recover_router_orphan() -> u64 {
 fn sweep_queue_phase() -> u64 {
     let mut recovered: u64 = 0;
     let queue_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
-    let my_pid = unsafe { pg_sys::MyProcPid };
 
     for q_idx in 0..queue_capacity {
         // Snapshot queue fields under share lock.
-        let (q_valid, q_sb_id, q_envelope_count, q_so_off, q_sku_off, q_wip_off, q_committer_pid) = {
+        let (q_valid, q_sb_id, q_envelope_count, q_so_off, q_sku_off, q_wip_off, q_owner_slot, q_owner_gen) = {
             let queue = COMMITTER_QUEUE.share();
             let slot = &queue.entries[q_idx as usize];
             let v = slot.valid.load(Acquire);
@@ -1023,7 +1023,8 @@ fn sweep_queue_phase() -> u64 {
                 slot.staging_entry_offsets,
                 slot.sku_pool_keys_offset,
                 slot.wip_pool_keys_offset,
-                slot.committer_pid.load(Relaxed),
+                slot.committer_bgw_slot.load(Acquire),
+                slot.committer_bgw_generation.load(Acquire),
             )
         };
 
@@ -1057,17 +1058,15 @@ fn sweep_queue_phase() -> u64 {
                 // committers in this state. Leave alone.
             }
             3 => {
-                // Phase 2: completed. Check committer liveness.
-                if q_committer_pid == 0 || q_committer_pid == my_pid {
+                // Phase 2: completed. Check committer liveness via
+                // identity (slot, generation) → identity_slots lookup
+                // → kill. Unclaimed sentinel (generation == 0) means
+                // there was never an owner to track; nothing to recover.
+                if q_owner_gen == 0 {
                     continue;
                 }
-                let kill_rc = unsafe { libc::kill(q_committer_pid, 0) };
-                if kill_rc == 0 {
-                    continue; // still alive
-                }
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if errno != libc::ESRCH {
-                    continue; // EPERM etc. — be conservative
+                if crate::is_committer_alive(q_owner_slot, q_owner_gen) {
+                    continue;
                 }
                 // Sweep takes ownership.
                 let staging_indices = if q_so_off != 0 && q_envelope_count > 0 {
@@ -1122,12 +1121,13 @@ fn sweep_queue_phase() -> u64 {
                         arena.free(q_wip_off);
                     }
                 }
-                // CAS queue 3→0; clear pid/lease.
+                // CAS queue 3→0; clear identity/lease.
                 {
                     let queue = COMMITTER_QUEUE.share();
                     let slot = &queue.entries[q_idx as usize];
                     let _ = slot.valid.compare_exchange(3, 0, Release, Relaxed);
-                    slot.committer_pid.store(0, Relaxed);
+                    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+                    slot.committer_bgw_generation.store(0, Relaxed);
                     slot.committer_acquired_at_ns.store(0, Relaxed);
                     slot.committer_tx_id.store(0, Relaxed);
                 }
@@ -1265,13 +1265,18 @@ fn poc_v21_test_inject_staging_orphan(
 }
 
 /// Test-only: synthetically inject a completed-state CommitterQueueEntry
-/// with a definitely-dead committer_pid and arena-backed staging-entry
+/// with a definitely-dead committer identity and arena-backed staging-entry
 /// offsets. Each `staging_indices` entry should already be injected via
 /// `poc_v21_test_inject_staging_orphan` with sb_id matching this call's
 /// sb_id BEFORE this call — so the sweep can walk the chain.
 ///
 /// Allocates real arena blocks (staging_entry_offsets) so the §3.10
 /// lifecycle-coupling audit can verify the sweep frees them.
+///
+/// `fake_pid` becomes the pid of the test-reserved identity slot
+/// (POC_V21_TEST_IDENTITY_SLOT); the entry's stored generation
+/// is bumped fresh so is_committer_alive resolves against that slot
+/// and detects the dead pid via kill(0)→ESRCH.
 #[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_inject_orphaned_queue(
@@ -1313,6 +1318,14 @@ fn poc_v21_test_inject_orphaned_queue(
     // Stamp queue entry under exclusive lock; transition empty→completed.
     {
         let mut q = COMMITTER_QUEUE.exclusive();
+        // Touch the test-reserved identity slot first; the mut borrow
+        // of q.entries below disjoint-borrows away from identity_slots.
+        let test_id_slot_idx = (crate::POC_V21_COMMITTER_IDENTITY_SLOTS - 1) as u32;
+        let synthetic_gen = {
+            let id_slot = &q.identity_slots[test_id_slot_idx as usize];
+            id_slot.pid.store(fake_pid, Relaxed);
+            id_slot.generation.fetch_add(1, AcqRel) + 1
+        };
         let slot = &mut q.entries[queue_idx as usize];
         if slot.valid.load(Relaxed) != 0 {
             let mut arena = SPILLOVER_ARENA.exclusive();
@@ -1326,7 +1339,10 @@ fn poc_v21_test_inject_orphaned_queue(
         slot.sku_pool_keys_count = 0;
         slot.wip_pool_keys_offset = 0;
         slot.wip_pool_keys_count = 0;
-        slot.committer_pid.store(fake_pid, Relaxed);
+        // Synthetic dead-committer identity via the test-reserved slot
+        // (pid = fake_pid; generation bumped above).
+        slot.committer_bgw_slot.store(test_id_slot_idx, Relaxed);
+        slot.committer_bgw_generation.store(synthetic_gen, Release);
         let now_ns = crate::now_ns();
         slot.committer_acquired_at_ns.store(now_ns, Relaxed);
         slot.committer_tx_id.store(0, Relaxed);
@@ -1409,7 +1425,8 @@ fn poc_v21_test_force_reset_injected_queue(queue_idx: i64) -> i32 {
         slot.staging_entry_offsets = 0;
         slot.sku_pool_keys_offset = 0;
         slot.wip_pool_keys_offset = 0;
-        slot.committer_pid.store(0, Relaxed);
+        slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+        slot.committer_bgw_generation.store(0, Relaxed);
         slot.committer_acquired_at_ns.store(0, Relaxed);
         slot.committer_tx_id.store(0, Relaxed);
         (prev, so, sku, wip)
@@ -1430,8 +1447,8 @@ fn poc_v21_test_force_reset_injected_queue(queue_idx: i64) -> i32 {
 }
 
 /// Test-only: read a queue-entry's state as "(valid, superbatch_id,
-/// committer_pid)". Distinct from `poc_v21_test_slot_state` which
-/// returns only (valid, committer_pid) per M5a.1 convention.
+/// slot, generation)". Distinct from `poc_v21_test_slot_state` which
+/// returns only `(valid, slot, generation)`.
 #[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_queue_state(queue_idx: i64) -> String {
@@ -1442,10 +1459,11 @@ fn poc_v21_test_queue_state(queue_idx: i64) -> String {
     }
     let slot = &queue.entries[queue_idx as usize];
     format!(
-        "({}, {}, {})",
+        "({}, {}, {}, {})",
         slot.valid.load(Relaxed),
         slot.superbatch_id,
-        slot.committer_pid.load(Relaxed),
+        slot.committer_bgw_slot.load(Relaxed),
+        slot.committer_bgw_generation.load(Relaxed),
     )
 }
 
@@ -1626,7 +1644,10 @@ pub(crate) fn run_audit_sweep() {
     let reclaims_a = audit_pattern_a();
     let lost = audit_pattern_b();
     let reclaims_c = audit_pattern_c();
-    let orphans = crate::committer::try_recover_orphan() as u64; // Pattern D
+    // Pattern D — in-flight orphan recovery. Rescuer doesn't need a
+    // committer identity; try_recover_orphan's CAS uses a sentinel
+    // race-winner gate.
+    let orphans = crate::committer::try_recover_orphan() as u64;
 
     let queue = COMMITTER_QUEUE.share();
     queue
@@ -1787,15 +1808,14 @@ fn audit_pattern_b() -> u64 {
     lost
 }
 
-/// Pattern C: CommitterQueueEntry valid=3 (completed) > 5min with dead
-/// committer_pid → reap. The committer ran Step 5 (cost rows + status
-/// rows durable in PG) but died before Step 14 (arena free + CAS 3→0).
-/// Age-gated mirror of M5b.1's `sweep_queue_phase` Phase 2. Idempotent
-/// with that boot sweep — both use CAS 3→0 election.
+/// Pattern C: CommitterQueueEntry valid=3 (completed) > 5min with a
+/// dead committer identity → reap. The committer ran Step 5 (cost rows
+/// + status rows durable in PG) but died before Step 14 (arena free +
+/// CAS 3→0). Age-gated mirror of M5b.1's `sweep_queue_phase` Phase 2.
+/// Idempotent with that boot sweep — both use CAS 3→0 election.
 fn audit_pattern_c() -> u64 {
     let now_us = crate::now_us();
     let queue_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
-    let my_pid = unsafe { pg_sys::MyProcPid };
     let mut reaped: u64 = 0;
 
     for q_idx in 0..queue_capacity {
@@ -1806,7 +1826,8 @@ fn audit_pattern_c() -> u64 {
             q_so_off,
             q_sku_off,
             q_wip_off,
-            q_committer_pid,
+            q_owner_slot,
+            q_owner_gen,
             q_enqueued_us,
         ) = {
             let queue = COMMITTER_QUEUE.share();
@@ -1818,7 +1839,8 @@ fn audit_pattern_c() -> u64 {
                 slot.staging_entry_offsets,
                 slot.sku_pool_keys_offset,
                 slot.wip_pool_keys_offset,
-                slot.committer_pid.load(Relaxed),
+                slot.committer_bgw_slot.load(Acquire),
+                slot.committer_bgw_generation.load(Acquire),
                 slot.enqueued_at_micros,
             )
         };
@@ -1828,10 +1850,10 @@ fn audit_pattern_c() -> u64 {
         if now_us.saturating_sub(q_enqueued_us) <= AUDIT_STALE_5MIN_US {
             continue;
         }
-        if q_committer_pid == 0 || q_committer_pid == my_pid {
+        if q_owner_gen == 0 {
             continue;
         }
-        if !pid_is_dead(q_committer_pid) {
+        if crate::is_committer_alive(q_owner_slot, q_owner_gen) {
             continue;
         }
         // Reap. Walk linked staging entries; CAS each 3→0; free per-entry
@@ -1886,12 +1908,13 @@ fn audit_pattern_c() -> u64 {
                 arena.free(q_wip_off);
             }
         }
-        // CAS queue 3→0; clear pid/lease.
+        // CAS queue 3→0; clear identity/lease.
         {
             let queue = COMMITTER_QUEUE.share();
             let slot = &queue.entries[q_idx as usize];
             let _ = slot.valid.compare_exchange(3, 0, Release, Relaxed);
-            slot.committer_pid.store(0, Relaxed);
+            slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+            slot.committer_bgw_generation.store(0, Relaxed);
             slot.committer_acquired_at_ns.store(0, Relaxed);
             slot.committer_tx_id.store(0, Relaxed);
         }
@@ -2114,7 +2137,8 @@ fn poc_v21_test_force_reset_all_shmem() -> String {
             slot.sku_pool_keys_count = 0;
             slot.wip_pool_keys_offset = 0;
             slot.wip_pool_keys_count = 0;
-            slot.committer_pid.store(0, Relaxed);
+            slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+            slot.committer_bgw_generation.store(0, Relaxed);
             slot.committer_acquired_at_ns.store(0, Relaxed);
             slot.committer_tx_id.store(0, Relaxed);
             slot.enqueued_at_micros = 0;

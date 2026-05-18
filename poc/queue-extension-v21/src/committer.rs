@@ -22,18 +22,30 @@
 //!   `claim_next_committer_entry` (we re-confirm with the Acquire
 //!   CAS before any state-affecting work).
 //! - `Release` on the rare race-release in `claim_next_committer_entry`
-//!   (slot.valid is left untouched; we only release committer_pid).
+//!   (slot.valid is left untouched; we only clear the identity fields).
 //!
-//! ### CommitterQueueEntry.committer_pid (i32 ownership claim)
+//! ### CommitterQueueEntry.committer_bgw_slot + .committer_bgw_generation
+//! ### (PID-recycling-safe identity per spec §1.6, acct-l7k8)
 //!
-//! - `Acquire` on the claim CAS (0 → MyProcPid). Pairs with the
-//!   orphan-recovery rescuer's `Acquire` read of `valid==2` —
-//!   together they form the "ownership before state advance"
-//!   pattern. Collapsing to a single CAS on `valid` would lose this
-//!   invariant; see acct-gx1z.1's pushback on reviewer claim B2.
-//! - `Relaxed` on the race-release-after-failure path: no other
-//!   thread observes the timing, and the next claim's Acquire CAS
-//!   re-establishes happens-before. Documented intentional weakening.
+//! Identity is the pair `(slot, generation)`. Generation > 0 means
+//! claimed; generation == 0 is the zero-init / released sentinel.
+//! Liveness check via `is_committer_alive(slot, generation)` reads
+//! `CommitterQueue.identity_slots[slot]`, compares generation, and
+//! falls through to `kill(pid, 0)` only on a generation match.
+//!
+//! - Write order at claim: store `committer_bgw_generation` (Relaxed),
+//!   then `committer_bgw_slot` via Release CAS. The Release on the
+//!   slot store ensures the generation is visible to any reader that
+//!   observes a non-sentinel slot value via Acquire.
+//! - `Acquire` on reads of both fields by orphan-recovery + claim
+//!   contention paths. Together with the Release write, this forms
+//!   the "ownership before state advance" pattern: identity stamped
+//!   before valid 1→2 ensures any reader observing valid==2 also
+//!   sees the matching identity.
+//! - `Relaxed` on the race-release path (CAS valid 1→2 failed): we
+//!   reset the slot to the sentinel; no other thread depends on the
+//!   timing because the next claim's Acquire CAS re-establishes
+//!   happens-before.
 //!
 //! ### StagingEntry / CommitterQueueEntry.eject_count (u32)
 //!
@@ -70,7 +82,8 @@ use crate::fifo::FIFO_METHOD;
 use crate::standard::STANDARD_METHOD;
 use crate::{
     COMMITTER_QUEUE, POC_V21_COMMITTER_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE,
-    caller_tx_timeout_ms_now, committer_lease_ms_now, max_eject_count_now,
+    caller_tx_timeout_ms_now, claim_committer_identity, committer_lease_ms_now,
+    is_committer_alive, max_eject_count_now, release_committer_identity,
     signal_staging_slot_freed, skip_wip_locks, target_database_str,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
@@ -78,8 +91,40 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::time::Duration;
+
+/// Per-process identity of this committer worker (acct-l7k8). Set once
+/// at `poc_v21_committer_main` startup via `claim_committer_identity`,
+/// cleared on clean shutdown. Each BGWorker is its own OS process, so
+/// statics are effectively process-local — no thread_local needed.
+///
+/// `MY_COMMITTER_BGW_GENERATION == 0` is the "no identity claimed"
+/// sentinel; callers (e.g., test backends synthesizing a recovery
+/// sweep without being a committer) see `None` from `my_identity()`.
+static MY_COMMITTER_BGW_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
+static MY_COMMITTER_BGW_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// Currently-claimed identity of this process, or None if no slot has
+/// been claimed (test backends, router worker, recovery worker).
+pub(crate) fn my_committer_identity() -> Option<(u32, u32)> {
+    let generation = MY_COMMITTER_BGW_GENERATION.load(Relaxed);
+    if generation == 0 {
+        return None;
+    }
+    Some((MY_COMMITTER_BGW_SLOT.load(Relaxed), generation))
+}
+
+pub(crate) fn set_my_committer_identity(slot: u32, generation: u32) {
+    MY_COMMITTER_BGW_SLOT.store(slot, Relaxed);
+    MY_COMMITTER_BGW_GENERATION.store(generation, Relaxed);
+}
+
+pub(crate) fn clear_my_committer_identity() {
+    MY_COMMITTER_BGW_GENERATION.store(0, Relaxed);
+    MY_COMMITTER_BGW_SLOT.store(u32::MAX, Relaxed);
+}
 
 /// Committer-pipeline structured error (acct-gx1z.1.14).
 ///
@@ -197,6 +242,15 @@ pub extern "C-unwind" fn poc_v21_committer_main(_arg: pg_sys::Datum) {
     let dbname = target_database_str();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
 
+    // acct-l7k8: claim a committer identity slot. This identity (slot,
+    // generation) is what we stamp on CommitterQueueEntry.committer_bgw_*
+    // when claiming work, and what orphan recovery compares against to
+    // determine liveness. PID-recycling-safe: even if our OS PID is
+    // recycled after we die, the generation bump invalidates stale
+    // references.
+    let (my_slot, my_gen) = claim_committer_identity();
+    set_my_committer_identity(my_slot, my_gen);
+
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
         loop {
             let claim = claim_next_committer_entry();
@@ -216,40 +270,55 @@ pub extern "C-unwind" fn poc_v21_committer_main(_arg: pg_sys::Datum) {
         }
         // M5a.1 (acct-lefr): scan for orphaned in-flight entries
         // whose owning committer died. Recovery uses lease staleness
-        // + kill(pid, 0) liveness as the gating signal. On rescue
-        // success the queue entry is reset to valid=1 so the next
-        // committer claim can re-execute Steps 2-5 (dedup-lookup at
-        // Step 2.5 catches any rows the dead committer already
-        // committed before death).
+        // + is_committer_alive (slot+generation+kill liveness) as the
+        // gating signal. On rescue success the queue entry is reset
+        // to valid=1 so the next committer claim can re-execute Steps
+        // 2-5 (dedup-lookup at Step 2.5 catches any rows the dead
+        // committer already committed before death).
         while try_recover_orphan() > 0 {}
     }
+
+    // Clean shutdown path: release the identity slot so subsequent
+    // committer restarts can re-claim it.
+    release_committer_identity(my_slot);
+    clear_my_committer_identity();
 }
 
 /// Scan the committer queue for orphaned entries (valid==2 with a
-/// dead committer_pid) and reset them to valid==1 for re-processing.
-/// Returns the number of entries recovered. Spec §3.2.
+/// dead-or-recycled committer identity) and reset them to valid==1
+/// for re-processing. Returns the number of entries recovered. Spec §3.2.
 ///
 /// Detection signal (both must hold):
 ///   1. Lease staleness: now - committer_acquired_at_ns >
 ///      committer_lease_ms × 1_000_000.
-///   2. Process liveness: kill(committer_pid, 0) returns ESRCH
-///      (errno=3). EPERM (errno=1) is treated as alive (process
-///      exists but we lack permission to signal) — safer to assume
-///      alive than risk a false-positive rescue.
+///   2. Identity liveness: `is_committer_alive(slot, generation)` returns
+///      false. That helper compares the entry's stored generation
+///      against `identity_slots[slot].generation` (catches PID
+///      recycling — a recycled slot has a bumped generation), then
+///      falls through to kill(pid, 0). EPERM is treated as alive
+///      (conservative, safer to assume alive than risk a false-positive
+///      rescue).
 ///
-/// Rescue action: CAS committer_pid old_dead → MyProcPid (single CAS;
-/// loses to other rescuers gracefully). On success, reset the entry
-/// to valid=1 and committer_pid=0. The next BGWorker tick claims it
-/// normally via claim_next_committer_entry; Step 2.5 dedup-lookup
-/// guards against duplicates if the dead committer's tx happened to
-/// commit before death (rare but possible).
+/// Rescue action: CAS the entry's stored generation old_gen →
+/// RESCUE_SIGNATURE as the single-instruction race-winner gate, then
+/// reset the entry to valid=1 + unclaimed identity. Concurrent
+/// rescuers losing the CAS see RESCUE_SIGNATURE != old_gen and bail.
+/// Any caller can perform recovery — no identity required — because
+/// the CAS target doesn't depend on the rescuer's identity.
 ///
-/// Idempotent under concurrent rescuers (CAS election, same shape as
-/// M4.1 committer claim).
+/// Idempotent under concurrent rescuers; the next BGWorker tick
+/// claims the rescued entry normally via `claim_next_committer_entry`
+/// (Step 2.5 dedup-lookup guards against duplicates if the dead
+/// committer's tx happened to commit before death).
 pub(crate) fn try_recover_orphan() -> u32 {
+    /// Generation value written by the rescuer's CAS. Picked to be
+    /// distinct from any legitimate generation (real generations start
+    /// at 1 and increase monotonically per identity slot).
+    const RESCUE_SIGNATURE: u32 = u32::MAX;
+
     let queue = COMMITTER_QUEUE.share();
     let capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
-    let my_pid = unsafe { pg_sys::MyProcPid };
+    let my = my_committer_identity();
     let now_ns = crate::now_ns();
     let lease_ns = committer_lease_ms_now().max(1) as u64 * 1_000_000;
 
@@ -259,37 +328,42 @@ pub(crate) fn try_recover_orphan() -> u32 {
         if slot.valid.load(Relaxed) != 2 {
             continue;
         }
-        let old_pid = slot.committer_pid.load(Relaxed);
-        if old_pid == 0 || old_pid == my_pid {
-            continue;
+        let old_gen = slot.committer_bgw_generation.load(Acquire);
+        if old_gen == 0 || old_gen == RESCUE_SIGNATURE {
+            continue; // unclaimed sentinel or mid-rescue
+        }
+        let old_slot = slot.committer_bgw_slot.load(Acquire);
+        // Skip entries owned by us (only meaningful when we have an
+        // identity; rescuers without one — router audit sweep, test
+        // backends — fall through).
+        if let Some((my_slot, my_gen)) = my {
+            if old_slot == my_slot && old_gen == my_gen {
+                continue;
+            }
         }
         let acquired_at = slot.committer_acquired_at_ns.load(Relaxed);
         if now_ns.saturating_sub(acquired_at) <= lease_ns {
             continue; // not stale yet
         }
-        // Liveness check via signal-0. ESRCH (errno 3) → process gone.
-        let kill_rc = unsafe { libc::kill(old_pid, 0) };
-        if kill_rc == 0 {
-            continue; // still alive
+        if is_committer_alive(old_slot, old_gen) {
+            continue; // owner still alive
         }
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        if errno != libc::ESRCH {
-            // EPERM or other — be conservative, leave alone.
-            continue;
-        }
-        // Try to claim the orphan. CAS old_pid → my_pid.
+        // Race-winner gate: CAS old_gen → RESCUE_SIGNATURE.
         if slot
-            .committer_pid
-            .compare_exchange(old_pid, my_pid, Acquire, Relaxed)
+            .committer_bgw_generation
+            .compare_exchange(old_gen, RESCUE_SIGNATURE, AcqRel, Relaxed)
             .is_err()
         {
             continue; // another rescuer won
         }
-        // We own the rescue. Reset the entry for re-processing.
+        // We own the rescue. Reset the entry to the unclaimed sentinel
+        // (generation == 0, slot == u32::MAX) so the next claimer's
+        // CAS 0 → their_gen succeeds normally.
         slot.committer_acquired_at_ns.store(0, Relaxed);
         slot.committer_tx_id.store(0, Relaxed);
-        slot.committer_pid.store(0, Release);
-        // valid 2→1 with Release ensures the pid reset is visible
+        slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+        slot.committer_bgw_generation.store(0, Release);
+        // valid 2→1 with Release ensures the identity reset is visible
         // before any subsequent claimer sees valid==1.
         let _ = slot
             .valid
@@ -303,18 +377,29 @@ pub(crate) fn try_recover_orphan() -> u32 {
     recovered
 }
 
+/// Test-only test-reserved identity slot index. Injection helpers
+/// poke this slot's `(pid, generation)` to synthesize a dead-committer
+/// orphan without claiming a real identity. Distinct from the slot
+/// indices that real committers claim (they walk from 0 forward and
+/// in practice never reach 63 — committer_count GUC max is 64 but
+/// also typical default is 4).
+#[cfg(any(test, feature = "test_hooks"))]
+const POC_V21_TEST_IDENTITY_SLOT: u32 = (crate::POC_V21_COMMITTER_IDENTITY_SLOTS - 1) as u32;
+
 /// Test-only: synthetically inject an orphaned entry into an EMPTY
-/// slot by stamping valid=2 + fake committer_pid + stale acquired_at.
-/// Bypasses the valid==1 precondition so tests can exercise the
-/// orphan-recovery mechanism without racing live router/committer
-/// flow. Returns false if the target slot is not currently valid==0.
+/// slot. Stamps valid=2 + a fake-dead identity (slot
+/// POC_V21_TEST_IDENTITY_SLOT with fake_pid as that slot's pid +
+/// freshly-bumped generation) + stale acquired_at. The kill(0)
+/// liveness inside `is_committer_alive` returns ESRCH on the fake_pid
+/// and orphan recovery engages.
 ///
-/// `fake_pid` should be a definitely-dead PID (i32::MAX is the
-/// conventional choice — exceeds typical Linux PID_MAX). The kill(0)
-/// liveness check will return ESRCH and the recovery path engages.
+/// `fake_pid` should be a definitely-dead PID (i32::MAX conventional —
+/// exceeds typical Linux PID_MAX).
 ///
 /// `lease_offset_ms` is subtracted from `now` to force lease
 /// staleness; pass `committer_lease_ms × 2` for safety.
+///
+/// Returns false if target slot isn't currently valid==0.
 #[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_inject_orphan_into_empty(
@@ -331,7 +416,16 @@ fn poc_v21_test_inject_orphan_into_empty(
     if slot.valid.compare_exchange(0, 2, Acquire, Relaxed).is_err() {
         return false;
     }
-    slot.committer_pid.store(fake_pid, Relaxed);
+    // Poke the test-reserved identity slot with the fake-dead pid.
+    let id_slot = &queue.identity_slots[POC_V21_TEST_IDENTITY_SLOT as usize];
+    id_slot.pid.store(fake_pid, Relaxed);
+    let synthetic_gen = id_slot
+        .generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        + 1;
+    slot.committer_bgw_slot
+        .store(POC_V21_TEST_IDENTITY_SLOT, Relaxed);
+    slot.committer_bgw_generation.store(synthetic_gen, Release);
     let now_ns = crate::now_ns();
     let stale_ns = now_ns.saturating_sub((lease_offset_ms.max(0) as u64) * 1_000_000);
     slot.committer_acquired_at_ns.store(stale_ns, Relaxed);
@@ -339,8 +433,9 @@ fn poc_v21_test_inject_orphan_into_empty(
 }
 
 /// Test-only: read a CommitterQueueEntry's current state as a string
-/// tuple "(valid, committer_pid)". Useful for asserting state
-/// transitions in orphan-recovery tests.
+/// tuple "(valid, slot, generation)". Tests typically assert on the
+/// leading valid field via `.starts_with("(2,")`; the slot/generation
+/// fields surface the new identity model for finer-grained assertions.
 #[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_slot_state(slot_idx: i64) -> String {
@@ -351,9 +446,10 @@ fn poc_v21_test_slot_state(slot_idx: i64) -> String {
     }
     let slot = &queue.entries[slot_idx as usize];
     format!(
-        "({}, {})",
+        "({}, {}, {})",
         slot.valid.load(Relaxed),
-        slot.committer_pid.load(Relaxed)
+        slot.committer_bgw_slot.load(Relaxed),
+        slot.committer_bgw_generation.load(Relaxed)
     )
 }
 
@@ -371,14 +467,16 @@ fn poc_v21_test_force_reset_slot(slot_idx: i64) -> i32 {
     }
     let slot = &queue.entries[slot_idx as usize];
     let prev = slot.valid.swap(0, Release);
-    slot.committer_pid.store(0, Relaxed);
+    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+    slot.committer_bgw_generation.store(0, Relaxed);
     slot.committer_acquired_at_ns.store(0, Relaxed);
     slot.committer_tx_id.store(0, Relaxed);
     prev as i32
 }
 
-/// Test-only: synchronously run one orphan-recovery sweep. Returns
-/// the count of entries recovered.
+/// Test-only: synchronously run one orphan-recovery sweep from the
+/// test backend's context. Recovery uses a sentinel race-winner gate
+/// internally, so no identity is required.
 #[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_orphan_recover_tick() -> i64 {
@@ -406,7 +504,7 @@ fn poc_v21_test_committer_head_set(value: i64) {
 
 /// Test-only: inject a claimable (valid==1) entry at the given slot
 /// with the minimum fields claim_next_committer_entry consults
-/// (valid + committer_pid). All other CommitterQueueEntry fields
+/// (valid + identity-sentinel). All other CommitterQueueEntry fields
 /// stay at their resident defaults. Returns false if the slot is
 /// not currently valid==0.
 #[cfg(any(test, feature = "test_hooks"))]
@@ -418,7 +516,8 @@ fn poc_v21_test_inject_claimable_entry(slot_idx: i64) -> bool {
         return false;
     }
     let slot = &queue.entries[slot_idx as usize];
-    slot.committer_pid.store(0, Relaxed);
+    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+    slot.committer_bgw_generation.store(0, Relaxed);
     slot.valid
         .compare_exchange(0, 1, Release, Relaxed)
         .is_ok()
@@ -427,29 +526,51 @@ fn poc_v21_test_inject_claimable_entry(slot_idx: i64) -> bool {
 /// Test-only: run claim_next_committer_entry once. Returns the
 /// slot index claimed, or -1 if no claim was made. Used by E1's
 /// head-advance acceptance test to exercise claim without invoking
-/// the full pipeline (which expects staging-entry data).
+/// the full pipeline (which expects staging-entry data). Wraps the
+/// call with a transient identity claim so test backends (not real
+/// committer BGWorkers) can drive a claim.
 #[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_claim_committer_entry() -> i64 {
-    match claim_next_committer_entry() {
+    let (slot, generation) = claim_committer_identity();
+    set_my_committer_identity(slot, generation);
+    let result = match claim_next_committer_entry() {
         Some(idx) => idx as i64,
         None => -1,
-    }
+    };
+    release_committer_identity(slot);
+    clear_my_committer_identity();
+    result
 }
 
 /// CAS-claim the next valid==1 CommitterQueueEntry. Returns its
 /// slot index on success.
+///
+/// Ownership transfer uses the spec §1.6 identity model: CAS the
+/// `committer_bgw_generation` field from the unclaimed sentinel (0) to
+/// our identity's generation. The Acquire on the CAS pairs with the
+/// Release-stored fields the previous owner published (router's stamp
+/// at valid 0→1). On success, store our `committer_bgw_slot`; this
+/// stamps the full identity onto the entry.
 fn claim_next_committer_entry() -> Option<u32> {
     let queue = COMMITTER_QUEUE.share();
     let head = queue.head.load(Relaxed);
     let capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
-    let my_pid = unsafe { pg_sys::MyProcPid };
+    let (my_slot, my_gen) = my_committer_identity()
+        .expect("claim_next_committer_entry requires a claimed identity");
     for i in 0..capacity {
         let idx = ((head + i) % capacity) as usize;
         let slot = &queue.entries[idx];
         if slot.valid.load(Relaxed) == 1
-            && slot.committer_pid.compare_exchange(0, my_pid, Acquire, Relaxed).is_ok()
+            && slot
+                .committer_bgw_generation
+                .compare_exchange(0, my_gen, AcqRel, Relaxed)
+                .is_ok()
         {
+            // We won the generation CAS. Publish slot index (Release
+            // ordering ensures any subsequent reader that loads
+            // generation via Acquire sees the matching slot).
+            slot.committer_bgw_slot.store(my_slot, Release);
             if slot
                 .valid
                 .compare_exchange(1, 2, Acquire, Relaxed)
@@ -468,8 +589,9 @@ fn claim_next_committer_entry() -> Option<u32> {
                 return Some(idx as u32);
             } else {
                 // Rare race: another committer flipped valid first; release
-                // our pid claim.
-                slot.committer_pid.store(0, Relaxed);
+                // our identity claim back to the sentinel.
+                slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+                slot.committer_bgw_generation.store(0, Relaxed);
             }
         }
     }
@@ -2455,25 +2577,31 @@ fn cleanup_after_superbatch(
         let slot = &queue.entries[cq_idx as usize];
         let _ = slot.valid.compare_exchange(2, 3, Release, Relaxed);
         let _ = slot.valid.compare_exchange(3, 0, Release, Relaxed);
-        slot.committer_pid.store(0, Relaxed);
+        slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+        slot.committer_bgw_generation.store(0, Relaxed);
         slot.committer_acquired_at_ns.store(0, Relaxed);
         slot.committer_tx_id.store(0, Relaxed);
     }
 }
 
 /// Synchronous committer-tick helper for tests: claims one entry and
-/// runs the full pipeline. Returns true if work was done.
+/// runs the full pipeline. Returns true if work was done. Wraps the
+/// call with a transient identity claim so test backends can drive a
+/// full claim+process cycle without being a real committer BGWorker.
 #[cfg(any(test, feature = "test_hooks"))]
 #[pg_extern]
 fn poc_v21_test_committer_tick() -> bool {
+    let (slot, generation) = claim_committer_identity();
+    set_my_committer_identity(slot, generation);
     let claim = claim_next_committer_entry();
-    match claim {
+    let did_work = match claim {
         Some(cq_idx) => {
-            // Run inside an outer transaction so SPI works the same way
-            // as in the BGWorker.
             let _ = process_superbatch(cq_idx);
             true
         }
         None => false,
-    }
+    };
+    release_committer_identity(slot);
+    clear_my_committer_identity();
+    did_work
 }
