@@ -1910,12 +1910,26 @@ fn read_event_from_staging(staging_idx: u32) -> Result<Vec<PocV21Event>, String>
         _ => return Err(format!("unknown event_type_id={event_type_id}")),
     };
 
-    let sku_id = payload.get("sku_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    // E3 (acct-gx1z.1.3): fail-loud on universally-required fields
+    // (sku_id, location_id, qty, doc_chrono, document_id). The
+    // previous .unwrap_or(0) silently defaulted missing fields to 0,
+    // routing envelopes to pool (0, 0) and corrupting audit trails.
+    // Keep .unwrap_or(default) for event-type-conditional fields
+    // (issue_id only present on inv_issue; unit_cost computed by
+    // dispatcher for issue/shipment) and explicit defaults
+    // (business_date_jdate = 9999, sub_priority = 0).
+    let sku_id = payload
+        .get("sku_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "payload missing or malformed field 'sku_id'".to_string())?;
     let location_id = payload
         .get("location_id")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let qty = payload.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
+        .ok_or_else(|| "payload missing or malformed field 'location_id'".to_string())?;
+    let qty = payload
+        .get("qty")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "payload missing or malformed field 'qty'".to_string())?;
     let unit_cost = payload.get("unit_cost").and_then(|v| v.as_i64()).unwrap_or(0);
     let issue_id = payload.get("issue_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let business_date_jdate = payload
@@ -1926,11 +1940,11 @@ fn read_event_from_staging(staging_idx: u32) -> Result<Vec<PocV21Event>, String>
     let doc_chrono = payload
         .get("doc_chrono")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .ok_or_else(|| "payload missing or malformed field 'doc_chrono'".to_string())?;
     let document_id = payload
         .get("document_id")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .ok_or_else(|| "payload missing or malformed field 'document_id'".to_string())?;
     let sub_priority = payload
         .get("sub_priority")
         .and_then(|v| v.as_i64())
@@ -1987,8 +2001,12 @@ fn expand_wo_complete_payload(
     if wip.len() != 2 {
         return Err(format!("wo_complete wip_account must be [wo_id, op_id]"));
     }
-    let wo_id = wip[0].as_i64().unwrap_or(0);
-    let op_id = wip[1].as_i64().unwrap_or(0);
+    let wo_id = wip[0]
+        .as_i64()
+        .ok_or_else(|| "wo_complete wip_account[0] (wo_id) not an integer".to_string())?;
+    let op_id = wip[1]
+        .as_i64()
+        .ok_or_else(|| "wo_complete wip_account[1] (op_id) not an integer".to_string())?;
 
     let components = payload
         .get("components")
@@ -2005,9 +2023,15 @@ fn expand_wo_complete_payload(
     if output.len() != 3 {
         return Err("wo_complete output must be [sku_id, location_id, qty]".to_string());
     }
-    let output_sku = output[0].as_i64().unwrap_or(0);
-    let output_loc = output[1].as_i64().unwrap_or(0);
-    let output_qty = output[2].as_i64().unwrap_or(0);
+    let output_sku = output[0]
+        .as_i64()
+        .ok_or_else(|| "wo_complete output[0] (sku_id) not an integer".to_string())?;
+    let output_loc = output[1]
+        .as_i64()
+        .ok_or_else(|| "wo_complete output[1] (location_id) not an integer".to_string())?;
+    let output_qty = output[2]
+        .as_i64()
+        .ok_or_else(|| "wo_complete output[2] (qty) not an integer".to_string())?;
     if output_qty <= 0 {
         return Err(format!("wo_complete output qty must be positive: {output_qty}"));
     }
@@ -2020,11 +2044,11 @@ fn expand_wo_complete_payload(
     let doc_chrono = payload
         .get("doc_chrono")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .ok_or_else(|| "wo_complete payload missing or malformed 'doc_chrono'".to_string())?;
     let document_id = payload
         .get("document_id")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .ok_or_else(|| "wo_complete payload missing or malformed 'document_id'".to_string())?;
 
     let mut events = Vec::with_capacity(components.len() + 1);
     for (i, comp) in components.iter().enumerate() {
@@ -2034,9 +2058,15 @@ fn expand_wo_complete_payload(
         if arr.len() != 3 {
             return Err("component entry must be [sku_id, location_id, qty]".to_string());
         }
-        let sku = arr[0].as_i64().unwrap_or(0);
-        let loc = arr[1].as_i64().unwrap_or(0);
-        let cq = arr[2].as_i64().unwrap_or(0);
+        let sku = arr[0]
+            .as_i64()
+            .ok_or_else(|| format!("component[{i}][0] (sku_id) not an integer"))?;
+        let loc = arr[1]
+            .as_i64()
+            .ok_or_else(|| format!("component[{i}][1] (location_id) not an integer"))?;
+        let cq = arr[2]
+            .as_i64()
+            .ok_or_else(|| format!("component[{i}][2] (qty) not an integer"))?;
         if cq <= 0 {
             return Err(format!("component qty must be positive: {cq}"));
         }
