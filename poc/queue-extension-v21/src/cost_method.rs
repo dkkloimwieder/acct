@@ -53,7 +53,20 @@ pub struct PocV21Event {
 
 #[derive(Debug, Clone)]
 pub struct LayerView {
+    /// DB layer_id for layers hydrated from `poc_v21_cost_layers`. For
+    /// layers created earlier in the same SuperBatch (FIFO emit_layer)
+    /// this is 0 — the real BIGSERIAL id is only known after Step 5b's
+    /// `RETURNING`. Such layers carry their position in
+    /// `result.layer_inserts` via `layer_insert_index` so Step 5c can
+    /// translate the depletion's reference to the real id (acct-shpc.9).
     pub layer_id: i64,
+    /// `Some(idx)` for in-SB-emitted layers (idx into
+    /// `PocV21ApplyResult.layer_inserts`); `None` for hydrated layers.
+    /// Pre-acct-0frn this was unnecessary because the disjoint router
+    /// rule guaranteed Receipt + Consume of the same SKU never landed
+    /// in one SuperBatch. The grouped rule (acct-0frn) packs them
+    /// together and exposes the in-SB depletion path.
+    pub layer_insert_index: Option<usize>,
     pub unit_cost: i64,
     pub effective_qty: i64, // remaining qty after in-batch depletions
     pub born_at_micros: i64,
@@ -95,6 +108,14 @@ pub struct PocV21Snapshot {
     /// max consumed_seq per layer_id (seeded from
     /// poc_v21_cost_depletions).
     pub max_consumed_seq_per_layer: HashMap<i64, i64>,
+    /// Per-in-SB-layer consumed_seq counter. Keyed by
+    /// `layer_insert_index` (position in
+    /// `PocV21ApplyResult.layer_inserts`) because in-SB layers all
+    /// carry `layer_id == 0` until Step 5b RETURNING, so a single
+    /// `HashMap<i64, _>` would collapse them. Combined with
+    /// `max_consumed_seq_per_layer` the dispatcher routes new vs.
+    /// hydrated layers to disjoint counters (acct-shpc.9).
+    pub max_consumed_seq_per_new_layer: HashMap<usize, i64>,
     /// Latest effective standard cost per (sku, location), hydrated
     /// by the committer at Step 3 via DISTINCT ON … ORDER BY
     /// effective_from DESC. STD events fail with
@@ -149,12 +170,17 @@ pub struct PocV21ConsumptionRow {
 
 #[derive(Debug, Clone)]
 pub struct PocV21DepletionRow {
-    /// Layer to deplete. If layer_id == 0, this is a NEW layer's depletion
-    /// (the layer was created earlier in this same batch and doesn't have
-    /// a layer_id yet); Step 5 must resolve via the new-layer's eventual
-    /// BIGSERIAL id. For M1.3 with size-1 batches, all depletions are
-    /// against pre-existing layers.
+    /// Layer to deplete (DB BIGSERIAL). For depletions against
+    /// pre-existing (hydrated) layers this is the real id and
+    /// `layer_insert_index` is `None`. For depletions against layers
+    /// emitted earlier in this same SuperBatch, `layer_id == 0` and
+    /// `layer_insert_index` carries the position in
+    /// `PocV21ApplyResult.layer_inserts` — Step 5c resolves the real
+    /// BIGSERIAL after Step 5b's `RETURNING` (acct-shpc.9).
     pub layer_id: i64,
+    /// `Some(idx)` when the depleted layer is in-SB-emitted; `None`
+    /// for hydrated layers. Mirrors `LayerView.layer_insert_index`.
+    pub layer_insert_index: Option<usize>,
     pub qty: i64,
     pub unit_cost: i64,
     pub consumed_at_micros: i64,

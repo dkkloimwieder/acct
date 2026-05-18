@@ -1124,12 +1124,20 @@ fn run_pipeline_inside_subtx(
 
     // Filter row vectors to succeeded envelopes only.
     let succeeded_set: std::collections::HashSet<pgrx::Uuid> = succeeded.iter().copied().collect();
-    let layer_rows: Vec<_> = result
+    // Track each layer_row's original index in result.layer_inserts so
+    // Step 5b can map RETURNING ids back to that position. Depletions
+    // emitted earlier in this SB carry that position via
+    // `layer_insert_index`; Step 5c translates the placeholder
+    // layer_id=0 to the real BIGSERIAL (acct-shpc.9).
+    let layer_rows_indexed: Vec<(usize, crate::cost_method::PocV21LayerRow)> = result
         .layer_inserts
         .iter()
-        .filter(|r| succeeded_set.contains(&r.correlation_id))
-        .cloned()
+        .enumerate()
+        .filter(|(_, r)| succeeded_set.contains(&r.correlation_id))
+        .map(|(i, r)| (i, r.clone()))
         .collect();
+    let layer_rows: Vec<crate::cost_method::PocV21LayerRow> =
+        layer_rows_indexed.iter().map(|(_, r)| r.clone()).collect();
     let depletion_rows: Vec<_> = result
         .depletion_inserts
         .iter()
@@ -1252,6 +1260,9 @@ fn run_pipeline_inside_subtx(
     // per-correlation queues of new layer ids so posting_line_inventory
     // can pop one per receipt-side row.
     let mut new_layer_ids_by_corr: HashMap<pgrx::Uuid, Vec<i64>> = HashMap::new();
+    // Position-keyed map for Step 5c depletion translation
+    // (acct-shpc.9): depletion's layer_insert_index → real BIGSERIAL.
+    let mut layer_db_id_by_insert_index: HashMap<usize, i64> = HashMap::new();
     if !layer_rows.is_empty() {
         let sku: Vec<i64> = layer_rows.iter().map(|r| r.sku_id).collect();
         let loc: Vec<i64> = layer_rows.iter().map(|r| r.location_id).collect();
@@ -1302,14 +1313,41 @@ fn run_pipeline_inside_subtx(
             },
         )
         .ok_or_else(|| "cost_layers bulk INSERT failed".to_string())?;
-        for (id, c) in returned_pairs {
+        if returned_pairs.len() != layer_rows_indexed.len() {
+            return Err(format!(
+                "cost_layers: expected {} ids, got {}",
+                layer_rows_indexed.len(),
+                returned_pairs.len()
+            ));
+        }
+        for ((id, c), (orig_idx, _)) in returned_pairs.into_iter().zip(layer_rows_indexed.iter()) {
             new_layer_ids_by_corr.entry(c).or_default().push(id);
+            layer_db_id_by_insert_index.insert(*orig_idx, id);
         }
     }
 
     // 5c. cost_depletions — bulk UNNEST INSERT. No RETURNING needed.
+    // Translate in-SB-emitted layer placeholders (`layer_insert_index`)
+    // to real BIGSERIAL ids stamped by Step 5b's RETURNING. Hydrated
+    // layers carry their real DB id on `layer_id` directly
+    // (acct-shpc.9).
     if !depletion_rows.is_empty() {
-        let layer: Vec<i64> = depletion_rows.iter().map(|r| r.layer_id).collect();
+        let layer: Vec<i64> = depletion_rows
+            .iter()
+            .map(|r| -> Result<i64, String> {
+                if let Some(idx) = r.layer_insert_index {
+                    layer_db_id_by_insert_index.get(&idx).copied().ok_or_else(|| {
+                        format!(
+                            "cost_depletions: in-SB layer_insert_index={} \
+                             has no DB id (layer creator's correlation_id failed?)",
+                            idx
+                        )
+                    })
+                } else {
+                    Ok(r.layer_id)
+                }
+            })
+            .collect::<Result<Vec<i64>, String>>()?;
         let qty: Vec<i64> = depletion_rows.iter().map(|r| r.qty).collect();
         let unit_cost: Vec<i64> = depletion_rows.iter().map(|r| r.unit_cost).collect();
         let consumed_at: Vec<i64> = depletion_rows.iter().map(|r| r.consumed_at_micros).collect();
@@ -1666,6 +1704,7 @@ fn hydrate_fifo_layers(
             }
             pool.layers.push(LayerView {
                 layer_id,
+                layer_insert_index: None,
                 unit_cost,
                 effective_qty,
                 born_at_micros,

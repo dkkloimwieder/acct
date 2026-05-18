@@ -141,6 +141,7 @@ impl StandardMethod {
         // INSERTs).
         pool.layers.push(LayerView {
             layer_id: 0,
+            layer_insert_index: Some(result.layer_inserts.len() - 1),
             unit_cost: std_cost,
             effective_qty: qty,
             born_at_micros: event.at_micros,

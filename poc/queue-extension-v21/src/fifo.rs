@@ -85,16 +85,10 @@ impl FifoMethod {
         let qty = event.qty.abs();
         let unit_cost = event.unit_cost;
 
-        let layer_view = LayerView {
-            layer_id: 0, // Filled in at Step 5 via RETURNING (size-1 batch trick: post-INSERT scan).
-            unit_cost,
-            effective_qty: qty,
-            born_at_micros: event.at_micros,
-            born_seq: new_born_seq,
-            correlation_id: event.correlation_id,
-        };
-        pool.layers.push(layer_view);
-
+        // Stage the cost_layers insert first so we know its index in
+        // result.layer_inserts; the layer_view records that index so
+        // subsequent in-SB depletions of THIS layer can reference the
+        // real BIGSERIAL after Step 5b RETURNING (acct-shpc.9).
         result.layer_inserts.push(PocV21LayerRow {
             sku_id: event.sku_id,
             location_id: event.location_id,
@@ -107,6 +101,18 @@ impl FifoMethod {
             correlation_id: event.correlation_id,
             user_tx_xid: event.user_tx_xid,
         });
+        let layer_insert_index = result.layer_inserts.len() - 1;
+
+        let layer_view = LayerView {
+            layer_id: 0, // Placeholder; resolved post-INSERT via layer_insert_index.
+            layer_insert_index: Some(layer_insert_index),
+            unit_cost,
+            effective_qty: qty,
+            born_at_micros: event.at_micros,
+            born_seq: new_born_seq,
+            correlation_id: event.correlation_id,
+        };
+        pool.layers.push(layer_view);
 
         // Posting line: debit inventory, credit cash/ap_unsettled stub.
         let amount = qty * unit_cost;
@@ -168,18 +174,31 @@ impl FifoMethod {
             let take = remaining.min(layer.effective_qty);
             layer.effective_qty -= take;
 
-            let consumed_seq = snapshot
-                .max_consumed_seq_per_layer
-                .entry(layer.layer_id)
-                .and_modify(|s| *s += 1)
-                .or_insert(1);
+            // For in-SB-emitted layers the layer_id is still 0 (DB id
+            // assigned at Step 5b RETURNING). Route consumed_seq to a
+            // separate per-insert-index map so multiple new layers
+            // don't collapse onto key=0 (acct-shpc.9).
+            let consumed_seq = if let Some(idx) = layer.layer_insert_index {
+                *snapshot
+                    .max_consumed_seq_per_new_layer
+                    .entry(idx)
+                    .and_modify(|s| *s += 1)
+                    .or_insert(1)
+            } else {
+                *snapshot
+                    .max_consumed_seq_per_layer
+                    .entry(layer.layer_id)
+                    .and_modify(|s| *s += 1)
+                    .or_insert(1)
+            };
 
             result.depletion_inserts.push(PocV21DepletionRow {
                 layer_id: layer.layer_id,
+                layer_insert_index: layer.layer_insert_index,
                 qty: take,
                 unit_cost: layer.unit_cost,
                 consumed_at_micros: event.at_micros,
-                consumed_seq: *consumed_seq,
+                consumed_seq,
                 issue_id: event.issue_id,
                 method_used: "fifo",
                 correlation_id: event.correlation_id,

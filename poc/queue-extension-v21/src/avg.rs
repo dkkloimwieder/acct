@@ -130,6 +130,7 @@ impl AvgMethod {
         // snapshot stays consistent with what Step 5 will INSERT.
         pool.layers.push(LayerView {
             layer_id: 0,
+            layer_insert_index: Some(result.layer_inserts.len() - 1),
             unit_cost,
             effective_qty: qty,
             born_at_micros: event.at_micros,
