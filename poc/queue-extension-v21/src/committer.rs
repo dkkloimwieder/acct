@@ -489,6 +489,21 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
             Err(e) => parse_errors.push((cid, e)),
         }
     }
+    // Open the sub-tx that owns committer_tx_id + the bulk INSERTs.
+    // E6 (acct-gx1z.1.6): parse_errors INSERTs are inside this sub-tx
+    // so a PG-level error during INSERT (OOM, fatal disk, etc.) gets
+    // caught at the sub-tx boundary instead of unwinding the entire
+    // BGWorker transaction and leaking the CommitterQueueEntry slot
+    // for one orphan-recovery cycle. Trade-off: if the pipeline
+    // sub-tx rolls back, parse_errors get rolled back too; the slot
+    // stays at valid=2 and orphan-recovery re-runs read_event_from_staging
+    // on retry, which produces the same parse_errors and re-INSERTs
+    // them. Eventual visibility is preserved.
+    let savepoint_name = CString::new(format!("poc_v21_committer_sb_{superbatch_id}")).unwrap();
+    unsafe {
+        pg_sys::BeginInternalSubTransaction(savepoint_name.as_ptr());
+    }
+
     for (cid, err) in &parse_errors {
         let detail =
             pgrx::JsonB(serde_json::json!({ "phase": "payload_parse", "detail": err }));
@@ -501,12 +516,6 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
                 error_code=EXCLUDED.error_code, error_detail=EXCLUDED.error_detail",
             &[(*cid).into(), "payload_parse_error".into(), detail.into()],
         );
-    }
-
-    // Open the sub-tx that owns committer_tx_id + the bulk INSERTs.
-    let savepoint_name = CString::new(format!("poc_v21_committer_sb_{superbatch_id}")).unwrap();
-    unsafe {
-        pg_sys::BeginInternalSubTransaction(savepoint_name.as_ptr());
     }
 
     // M7.2 (acct-fln5): time the whole pipeline body (Step 2 through
