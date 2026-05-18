@@ -1,19 +1,12 @@
 //! E3 (acct-gx1z.1.3) property test: malformed payloads route to
 //! state='failed' with error_code='payload_parse_error'.
 //!
-//! Pre-fix: `read_event_from_staging` defaulted missing/malformed
-//! fields to 0 via `.and_then(|v| v.as_i64()).unwrap_or(0)`. A
-//! payload missing `sku_id` silently produced an envelope with
-//! `sku_id=0`, routed to pool (0, 0). If a sentinel SKU 0 ever
-//! existed, downstream FK joins would pass and the envelope would
-//! commit with corrupt-but-plausible data.
-//!
-//! Post-fix: universally-required fields (sku_id, location_id, qty,
-//! doc_chrono, document_id; plus wo_id/op_id and component / output
-//! triples in wo_complete) use `.ok_or_else(...)?`. Missing or
-//! non-integer fields surface as `Err(String)` that the caller
-//! routes through the parse_errors loop into `submission_status`
-//! as `state='failed'`, `error_code='payload_parse_error'`,
+//! Universally-required fields (sku_id, location_id, qty, doc_chrono,
+//! document_id; plus wo_id/op_id and component / output triples in
+//! wo_complete) use `.ok_or_else(...)?`. Missing or non-integer
+//! fields surface as `Err(String)` that the caller routes through
+//! the parse_errors loop into `submission_status` as
+//! `state='failed'`, `error_code='payload_parse_error'`,
 //! `error_detail = {"phase":"payload_parse","detail":<msg>}`.
 //!
 //! Run via:

@@ -468,9 +468,8 @@ pub fn build_components(
         Shape::S4FanInWo => {
             // K=5 components all on SKU 1..=5 (modulo g). g=1 means
             // single-pool fan-in, but K=5 still needs 5 *distinct*
-            // pool keys for the router's disjoint-set check (a
-            // wo_complete with duplicate component SKUs would be
-            // rejected at parse time). Use SKU range [1..=5]
+            // pool keys (a wo_complete with duplicate component SKUs
+            // would be rejected at parse time). Use SKU range [1..=5]
             // unconditionally for fan-in.
             for i in 0..k {
                 out.push(((i as i64) + 1, LOCATION_ID, 1));

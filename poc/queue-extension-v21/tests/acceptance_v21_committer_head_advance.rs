@@ -1,14 +1,10 @@
 //! E1 (acct-gx1z.1.1) acceptance: claim_next_committer_entry advances
 //! head PAST the winning slot, not just past the original head.
 //!
-//! Pre-fix bug (committer.rs:281): `queue.head.store((head + 1) %
-//! capacity, Relaxed)` used the loop's original `head` value, not the
-//! index that won. If head=0 and valid==1 at idx=5, head would advance
-//! to 1 — and the next tick would re-scan idx 1..4 (all valid==0)
-//! before reaching the next valid==1 entry.
-//!
-//! Post-fix: head advances to `(head + i + 1) % capacity` where `i`
-//! is the loop offset that won. Same example: head advances to 6.
+//! `queue.head.store((head + i + 1) % capacity, Relaxed)` where `i`
+//! is the loop offset that won. If head=0 and valid==1 at idx=5, head
+//! advances to 6 — the next tick starts its scan at 6, not at 1
+//! (which would re-scan empty slots 1..4).
 //!
 //! Run via:
 //!   cargo test --release --test acceptance_v21_committer_head_advance \
@@ -51,7 +47,7 @@ async fn head_advances_past_winning_slot_not_just_head() {
         .get(0);
     assert_eq!(claimed, 5, "should claim slot 5");
 
-    // Post-fix expected head: 6. Pre-fix bug: head would be 1.
+    // Expected head: 6 (winning idx 5 + 1).
     let head: i64 = sqlx::query("SELECT poc_v21_test_committer_head_get()")
         .fetch_one(&pool)
         .await

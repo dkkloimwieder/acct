@@ -62,10 +62,10 @@ pub struct LayerView {
     pub layer_id: i64,
     /// `Some(idx)` for in-SB-emitted layers (idx into
     /// `PocV21ApplyResult.layer_inserts`); `None` for hydrated layers.
-    /// Pre-acct-0frn this was unnecessary because the disjoint router
-    /// rule guaranteed Receipt + Consume of the same SKU never landed
-    /// in one SuperBatch. The grouped rule (acct-0frn) packs them
-    /// together and exposes the in-SB depletion path.
+    /// Required for the in-SB depletion path: a Receipt and a Consume
+    /// of the same SKU can land in one SuperBatch, and the depletion
+    /// needs to reference the new layer before its BIGSERIAL id is
+    /// known.
     pub layer_insert_index: Option<usize>,
     pub unit_cost: i64,
     pub effective_qty: i64, // remaining qty after in-batch depletions

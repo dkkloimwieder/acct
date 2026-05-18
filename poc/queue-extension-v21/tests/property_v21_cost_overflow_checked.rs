@@ -1,16 +1,9 @@
 //! E5 (acct-gx1z.1.5) test: cost arithmetic overflow routes the
 //! envelope to state='failed' with error_code='cost_overflow'.
 //!
-//! Pre-fix: the wo_complete component-cost accumulator used
-//! `saturating_add` + `saturating_mul`. On overflow the running
-//! `wo_cost_local` silently clamped at i64::MAX; the dispatcher
-//! then divided by output qty to produce a wildly wrong but
-//! plausible-looking per-unit cost. Cost-accounting silent failure
-//! is worse than panic.
-//!
-//! Post-fix: the accumulator uses `checked_*`; on None, the
-//! envelope is marked failed with error_code='cost_overflow' and
-//! per-envelope snapshot rollback restores pre-envelope pool state.
+//! Cost-math hot paths use `checked_*`; on None the envelope is
+//! marked failed with `error_code='cost_overflow'` and per-envelope
+//! snapshot rollback restores pre-envelope pool state.
 //!
 //! Six scenarios:
 //!   1. Single depletion overflow: 1 component, qty × unit_cost

@@ -13,10 +13,12 @@
 //!      arrays (the DB never sees them).
 //!   2. Roll back snapshot mutations made by the failed envelope's
 //!      events so OTHER envelopes downstream in the same SuperBatch see
-//!      pre-envelope pool state (the router's disjoint-pool packing makes
-//!      cross-envelope shared-pool rare, but wo_complete envelopes
-//!      naturally touch multiple pools per envelope and must not pollute
-//!      themselves across their K+1 internal events).
+//!      pre-envelope pool state. Envelopes sharing an SKU pool are
+//!      packed into one SuperBatch, so per-envelope rollback isolation
+//!      keeps a failing envelope's partial mutation from corrupting
+//!      its neighbors. wo_complete envelopes additionally touch
+//!      multiple pools per envelope and must not pollute themselves
+//!      across their K+1 internal events.
 //!
 //! Tests:
 //!   - basic: 10 single-event envelopes, envelope 3 has insufficient
@@ -419,11 +421,11 @@ async fn test_v21_per_envelope_failure_does_not_block_subsequent_replay() {
 
 /// Mixed batch: a failing envelope's snapshot pollution must not corrupt
 /// AVG running state for a SUBSEQUENT wo_complete envelope in the same
-/// SuperBatch sharing one AVG component. (Router disjoint-packs SKU pools
-/// so two same-batch envelopes cannot share an SKU pool, but a single
-/// envelope's K+1 internal events DO span K+1 pools — and partial in-flight
-/// AVG mutation on the FAILING wo_complete must not contaminate other
-/// envelopes in the same batch, even if they target ADJACENT pools.)
+/// SuperBatch sharing one AVG component. Two same-batch envelopes can
+/// share an SKU pool; cross-envelope rollback isolation is the
+/// load-bearing invariant. A single envelope's K+1 internal events
+/// span K+1 pools, and partial in-flight AVG mutation on a FAILING
+/// wo_complete must not contaminate other envelopes in the same batch.
 #[tokio::test]
 #[ignore]
 async fn test_v21_per_envelope_avg_pool_no_pollution_across_envelopes() {

@@ -954,9 +954,8 @@ fn run_pipeline_inside_subtx(
 
     // STEP 2.5b (acct-0frn): within-SB cross-envelope dedup.
     //
-    // Under the grouped router rule (`poc-v2.1-amendment-0.2`), two
-    // envelopes sharing an `(issue_id, method_used)` pair can land in
-    // the SAME SuperBatch — the DB-side check above only catches
+    // Two envelopes sharing an `(issue_id, method_used)` pair can land
+    // in the SAME SuperBatch — the DB-side check above only catches
     // replays against persisted state. Without this pass both
     // envelopes' depletions would mutate the in-memory pool while the
     // table-level `INSERT ... ON CONFLICT (issue_id, method_used) DO
@@ -1074,11 +1073,10 @@ fn run_pipeline_inside_subtx(
     // chrono sort. Two envelopes targeting the same pool process
     // serially (FIFO bills the first against pre-batch layers, then the
     // second against post-mutation layers; AVG roll_in updates running
-    // state in chrono order). Under the grouped router rule (acct-0frn
-    // / `poc-v2.1-amendment-0.2`) shared-pool envelopes are packed INTO
-    // one SuperBatch by design, so this cross-envelope sequencing is
-    // the load-bearing path for overlapping work, not just an
-    // intra-`wo_complete` K+1 special case.
+    // state in chrono order). Shared-pool envelopes are packed INTO
+    // one SuperBatch by design (acct-0frn), so this cross-envelope
+    // sequencing is the load-bearing path for overlapping work, not
+    // just an intra-`wo_complete` K+1 special case.
     //
     // Snapshot rollback fixes the post-M6.1 polluted-snapshot risk: FIFO
     // `deplete` partially mutates layer effective_qty before signalling

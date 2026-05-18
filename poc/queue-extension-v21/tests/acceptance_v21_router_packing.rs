@@ -1,15 +1,16 @@
 //! M3.1 (acct-r29s) acceptance: greedy window router produces
-//! SuperBatches with envelope_count > 1 under a disjoint-pool burst.
+//! SuperBatches with envelope_count > 1 under a multi-SKU burst.
 //!
-//! Test shape: enqueue N disjoint-SKU receipt envelopes in parallel
-//! across a small connection pool so they pile into the staging queue
-//! within roughly one router tick window. Wait for all to reach
-//! terminal state; assert that the router's max-envelope-count
-//! counter observed at least one SuperBatch with >1 envelopes, and
-//! that the total envelope count matches what we enqueued (no envelope
-//! lost). The router's data-before-flag invariant + lock_set
-//! disjointness check are structural — verified by code review +
-//! the property suite. M5b.2 ships the dedicated stress test.
+//! Test shape: enqueue N envelopes each touching a distinct (sku,
+//! location=1) pool in parallel across a small connection pool so
+//! they pile into the staging queue within roughly one router tick
+//! window. Wait for all to reach terminal state; assert that the
+//! router's max-envelope-count counter observed at least one
+//! SuperBatch with >1 envelopes, and that the total envelope count
+//! matches what we enqueued (no envelope lost). The router's
+//! data-before-flag invariant + lock_set acquisition order are
+//! structural — verified by code review + the property suite.
+//! M5b.2 ships the dedicated stress test.
 //!
 //! Run via:
 //!   cargo test --release --test acceptance_v21_router_packing \
@@ -78,14 +79,15 @@ async fn router_superbatch_count(pool: &PgPool) -> i64 {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore]
-async fn acceptance_v21_router_packs_disjoint_burst() {
+async fn acceptance_v21_router_packs_burst() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
     reset_router_stats(&pool).await;
 
-    // Build a disjoint-SKU burst. Each envelope touches a different
-    // (sku, location=1) pool, so the greedy disjoint check accepts all
-    // candidates within one router window scan.
+    // Build a multi-SKU burst. Each envelope touches a different
+    // (sku, location=1) pool — the grouped rule treats each as its
+    // own singleton cluster and packs them all into the same window
+    // scan up to batch_size_max.
     let mut correlation_ids: Vec<Uuid> = Vec::with_capacity(SKU_COUNT as usize);
     for _ in 0..SKU_COUNT {
         correlation_ids.push(Uuid::new_v4());
@@ -133,7 +135,7 @@ async fn acceptance_v21_router_packs_disjoint_burst() {
     );
     assert!(
         max_env >= 2,
-        "M3.1 acceptance: greedy router should produce at least one SuperBatch with envelope_count >= 2 under disjoint burst; observed max={}",
+        "M3.1 acceptance: greedy router should produce at least one SuperBatch with envelope_count >= 2 under multi-SKU burst; observed max={}",
         max_env
     );
     assert!(

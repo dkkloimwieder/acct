@@ -1,19 +1,16 @@
 //! E1 acceptance (acct-0frn / meta `acct-shpc`): grouped packing — envelopes
 //! sharing a SKU pool key are packed INTO one SuperBatch by the router.
 //!
-//! Pre-fix (the original "greedy disjoint" rule), two envelopes touching the
-//! same `(sku, location)` would be split across two SuperBatches that race
-//! for committers and serialize on `pool_locks`. The grouped rule (per
-//! `poc-v2.1-amendment-0.2`) intentionally pulls them INTO one SuperBatch
-//! processed by one committer in chrono order; per-event dispatch in Step 4
-//! handles the running-avg / FIFO sequencing inside one transaction.
+//! Envelopes sharing an `(sku, location)` pool key are pulled into one
+//! SuperBatch processed by one committer in chrono order; per-event
+//! dispatch in Step 4 handles the running-avg / FIFO sequencing inside
+//! one transaction.
 //!
 //! Test shape: enqueue N envelopes all touching the same `(sku=900,
 //! location=1)` pool in parallel across the connection pool so they pile
 //! into the staging queue within one router-tick window. Wait for terminal;
 //! assert the router observed at least one SuperBatch with envelope_count
-//! > 1 — under the new rule this is the expected outcome, not coincidence.
-//! Under the old rule the same burst would have produced N size-1 SBs.
+//! > 1, and that the total SuperBatch count is strictly less than N.
 //!
 //! Run via:
 //!   cargo test --release --test acceptance_v21_router_groups_shared_pool \
@@ -88,11 +85,9 @@ async fn acceptance_v21_router_groups_shared_pool_burst() {
     reset_state(&pool).await;
     reset_router_stats(&pool).await;
 
-    // Burst N envelopes all targeting the same (sku, location) pool. Each
-    // gets a fresh correlation_id but the same pool_keys array. In the
-    // disjoint regime the router would have rejected each successor as
-    // "intersects lock_set" and produced N size-1 SuperBatches; under
-    // grouped packing they land in one SuperBatch (or, if N exceeded
+    // Burst N envelopes all targeting the same (sku, location) pool.
+    // Each gets a fresh correlation_id but the same pool_keys array.
+    // Grouped packing lands them in one SuperBatch (or, if N exceeded
     // batch_size_max, a handful of multi-envelope SBs).
     let mut correlation_ids: Vec<Uuid> = Vec::with_capacity(N as usize);
     for _ in 0..N {
@@ -134,12 +129,12 @@ async fn acceptance_v21_router_groups_shared_pool_burst() {
     );
     assert!(
         max_env >= 2,
-        "grouped rule: shared-pool burst should produce at least one SuperBatch with envelope_count >= 2 (observed max={}). Pre-fix this assertion would fail because the disjoint rule put each shared-pool envelope into its own size-1 SB.",
+        "shared-pool burst should produce at least one SuperBatch with envelope_count >= 2 (observed max={})",
         max_env
     );
     assert!(
         sb_count < N,
-        "grouped rule: shared-pool burst's superbatch_count ({}) must be strictly less than envelope count ({}) — N size-1 SBs is the disjoint-rule failure mode.",
+        "shared-pool burst's superbatch_count ({}) must be strictly less than envelope count ({})",
         sb_count, N
     );
 }

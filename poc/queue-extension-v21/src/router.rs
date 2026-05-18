@@ -1,5 +1,4 @@
-//! Greedy Window Router BGWorker (M3.1, acct-r29s; packing rule
-//! inverted at acct-0frn per amendment `poc-v2.1-amendment-0.2`).
+//! Greedy Window Router BGWorker (M3.1, acct-r29s).
 //!
 //! Scans up to `router_window_size` pending staging entries per tick,
 //! packs them into one SuperBatch in head-order up to `batch_size_max`
@@ -8,23 +7,18 @@
 //! consulted at routing (spec §1.5 — WIP pools uncontended by
 //! construction).
 //!
-//! ## Packing rule — grouped, not disjoint (acct-0frn)
+//! ## Packing rule (acct-0frn)
 //!
-//! The original rule was "greedy disjoint pool-key cover": envelopes
-//! that shared a SKU pool key were sent to different SuperBatches.
-//! That created cross-SB contention — two committers would each claim
-//! one of the overlapping SBs and serialize on the shared `pool_locks`
-//! row, manifesting as hangs in M8.1 shapes S3 / S4 / overlap-on-wrap
-//! S6 / S7 / S8.
-//!
-//! The current rule packs overlapping envelopes INTO ONE SuperBatch.
-//! One committer processes the batch sequentially in chrono order
-//! (Step 4 in committer.rs); running-avg / FIFO are naturally
-//! sequential operations on a shared pool. Disjoint envelopes are
-//! also packed together up to `batch_size_max` — multi-committer
-//! parallelism comes across ticks, not within a tick. The
-//! per-cluster split design (one SB per disjoint cluster within one
-//! tick) is a future optimization tracked in the meta-epic `acct-shpc`.
+//! Envelopes are packed in head-order up to `batch_size_max`,
+//! regardless of pool-key overlap. Overlapping envelopes (same SKU
+//! pool) are intentionally packed into ONE SuperBatch — one committer
+//! processes them sequentially in chrono order (Step 4 in
+//! committer.rs) under one set of lex-locks. Running-avg / FIFO are
+//! naturally sequential on a shared pool, so co-packing eliminates
+//! cross-SB contention on shared `pool_locks` rows. Multi-committer
+//! parallelism comes across ticks, not within a tick. A per-cluster
+//! split (one SB per cluster within one tick) is a future
+//! optimization tracked in the meta-epic `acct-shpc`.
 //!
 //! ## Data-before-flag invariant (spec §1.6, §3.3)
 //!
@@ -175,16 +169,12 @@ fn router_tick() -> u32 {
     // case (two envelopes touching the same SKU) is intentionally
     // pulled INTO one SB — one committer processes them sequentially
     // in chrono order inside one transaction with one set of
-    // lex-locks. The disjoint-pack rule it replaces forced overlapping
-    // envelopes into separate SBs and triggered cross-committer hangs
-    // on shared `pool_locks` (M8.1 shapes S3 / S4 / overlap-on-wrap
-    // S6 / S7 / S8).
+    // lex-locks.
     //
     // Spec §1.8: when a candidate's starvation_count >= threshold AND
     // the current SuperBatch is empty, force-pack as size-1 SuperBatch
-    // and break (ensure the starved entry gets through). Under the
-    // grouped rule starvation is bounded to queue/arena pressure and
-    // CAS-race losses (no more disjointness-reject path), so the
+    // and break (ensure the starved entry gets through). Starvation
+    // is bounded to queue/arena pressure and CAS-race losses, so the
     // counter rarely populates beyond 0/1 — but the safety net is
     // retained.
     //
@@ -235,9 +225,6 @@ fn router_tick() -> u32 {
         // CAS valid 1→2 (pending → processing). Acquire on success so
         // subsequent reads from this staging entry see the caller's
         // payload writes.
-        //
-        // The disjoint-pool reject that used to live here has been
-        // deleted: overlapping envelopes are now WANTED inside one SB.
         let cas_ok = {
             let queue = STAGING_QUEUE.share();
             queue.entries[cand.staging_idx as usize]

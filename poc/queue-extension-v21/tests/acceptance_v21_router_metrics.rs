@@ -2,10 +2,10 @@
 //! and emits non-degenerate values for §4.3 R1/R2 validation.
 //!
 //! Two-phase coverage:
-//!  - Phase A (disjoint burst): assert avg_envelopes_per_sb > 1,
+//!  - Phase A (multi-SKU burst): assert avg_envelopes_per_sb > 1,
 //!    packing_efficiency > 0, large-batch histogram bucket populated.
-//!  - Phase B (hot pool): assert every SuperBatch is size-1
-//!    (histogram_bucket_0 == sb_count), force_pack_count > 0.
+//!  - Phase B (hot pool): assert shared-pool envelopes co-pack into
+//!    one (or two under jitter) SuperBatches; force_pack_count == 0.
 //!
 //! The empirical R1 (> 0.7 × batch_size_max) and R2 (> 3× drain rate)
 //! validations land in M8.3 against full bake-off shapes S2/S3; this
@@ -213,13 +213,10 @@ async fn acceptance_v21_router_metrics_hot_pool() {
     let stats = read_router_stats(&pool).await;
     println!("hot pool stats: {:?}", stats);
 
-    // Hot pool under the grouped rule (acct-0frn / `poc-v2.1-amendment-0.2`):
-    // every shared-pool envelope packs INTO one SuperBatch, not N separate
-    // ones. So sb_count is small (1-2 depending on scheduling jitter; up to
-    // batch_size_max=50 envelopes per SB) and max_envelope_count == N.
-    //
-    // Pre-fix (disjoint rule) the same test asserted N size-1 SBs;
-    // assertions flipped along with the router behavior.
+    // Hot pool: every shared-pool envelope packs INTO one SuperBatch,
+    // not N separate ones. sb_count is small (1-2 depending on
+    // scheduling jitter; up to batch_size_max=50 envelopes per SB) and
+    // max_envelope_count == N.
     assert!(
         (stats["superbatch_count"] as i64) >= 1 && (stats["superbatch_count"] as i64) <= 2,
         "hot pool packs into 1 (or 2 under jitter) SuperBatches; got sb_count={}",
@@ -244,14 +241,13 @@ async fn acceptance_v21_router_metrics_hot_pool() {
         "hot pool under grouped rule produces at most 1 size-1 SB (boundary jitter); got bucket_0={}",
         stats["histogram_bucket_0"]
     );
-    // Force-pack is dead-code-for-hot-pools under the grouped rule:
-    // no starvation arises from disjointness rejection anymore (the only
-    // remaining starvation paths are queue/arena pressure, which this
-    // 25-envelope burst doesn't hit). FU2 (`acct-shpc.8`) re-validates
-    // the fairness backstop under grouped semantics.
+    // Force-pack is a queue/arena-pressure safety net; this
+    // 25-envelope hot-pool burst doesn't hit those paths. FU2
+    // (`acct-shpc.8`) validates the fairness backstop on a workload
+    // that exercises queue/arena pressure.
     assert_eq!(
         stats["force_pack_count"] as i64, 0,
-        "grouped rule: hot-pool burst does not trigger starvation/force-pack; got {}",
+        "hot-pool burst does not trigger starvation/force-pack; got {}",
         stats["force_pack_count"]
     );
 }

@@ -2,11 +2,11 @@
 //! under contention.
 //!
 //! Two-domain (SKU + WIP) lex-locking is the load-bearing safety
-//! mechanism that lets multiple committers process disjoint
-//! SuperBatches in parallel. M4.1's pipeline INSERTs ON CONFLICT DO
-//! NOTHING into the lock table then SELECTs FOR UPDATE with
-//! ORDER BY (sku_id, location_id) — the lex order guarantees no two
-//! committers acquire locks in conflicting orders, so no cycle.
+//! mechanism that lets multiple committers process SuperBatches with
+//! independent lock sets in parallel. M4.1's pipeline INSERTs ON
+//! CONFLICT DO NOTHING into the lock table then SELECTs FOR UPDATE
+//! with ORDER BY (sku_id, location_id) — the lex order guarantees no
+//! two committers acquire locks in conflicting orders, so no cycle.
 //!
 //! Test phases:
 //!  - Phase A (fan_contested correctness): 8 sqlx backends parallel-

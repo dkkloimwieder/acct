@@ -1,17 +1,12 @@
-//! M3.2 (acct-evyq) acceptance: hot-pool burst drains under the grouped
-//! router rule, no envelope lost.
+//! M3.2 (acct-evyq) acceptance: hot-pool burst drains, no envelope lost.
 //!
-//! The original M3.2 assertion (fairness backstop fires under hot pool)
-//! is dead under the grouped router rule (acct-0frn /
-//! `poc-v2.1-amendment-0.2`): every envelope's pool key intersects every
-//! other's, so all envelopes pack INTO one SuperBatch — there's no
-//! starvation path for hot pool anymore. The fairness backstop is
-//! preserved as a safety net for queue/arena pressure but does not
-//! fire on this workload. FU2 (`acct-shpc.8`) re-validates the
-//! backstop under grouped semantics on a workload that legitimately
-//! exercises it.
+//! Every envelope's pool key intersects every other's, so all envelopes
+//! pack INTO one SuperBatch — the fairness backstop is a safety net
+//! for queue/arena pressure and does not fire on this workload. FU2
+//! (`acct-shpc.8`) validates the backstop on a workload that
+//! exercises queue/arena pressure.
 //!
-//! This test now asserts the load-bearing properties that still hold:
+//! Load-bearing properties asserted here:
 //!
 //!   - every envelope reaches terminal state (no loss / no hang)
 //!   - the burst packs into a small number of SuperBatches (1 if the
@@ -70,11 +65,9 @@ async fn acceptance_v21_router_fairness_backstop_fires() {
     reset_state(&pool).await;
     reset_router_stats(&pool).await;
 
-    // Hot pool: all envelopes touch the same (sku, location). Under the
-    // grouped router rule they pack INTO one SuperBatch per tick (up to
-    // batch_size_max=50); under the previous disjoint rule the router
-    // would have picked the head and rejected every other candidate in
-    // the same tick.
+    // Hot pool: all envelopes touch the same (sku, location). The
+    // router packs them INTO one SuperBatch per tick (up to
+    // batch_size_max=50).
     let mut correlation_ids: Vec<Uuid> = Vec::with_capacity(ENVELOPE_COUNT);
     let mut handles = Vec::with_capacity(ENVELOPE_COUNT);
     for i in 0..ENVELOPE_COUNT {
@@ -147,12 +140,11 @@ async fn acceptance_v21_router_fairness_backstop_fires() {
         "grouped rule: hot-pool burst packs into 1-3 SuperBatches (1 typical, more under tick jitter); got sb_count={}",
         sb_count
     );
-    // Force-pack is preserved as a queue/arena-pressure safety net but
-    // does NOT fire on a hot-pool burst under the grouped rule — there
-    // are no skipped candidates for starvation to accumulate against
-    // (cf. the disjoint-rule trigger this test originally validated).
-    // FU2 (`acct-shpc.8`) re-validates the backstop on a workload that
-    // exercises queue/arena pressure.
+    // Force-pack is a queue/arena-pressure safety net; it does NOT
+    // fire on a hot-pool burst because there are no skipped candidates
+    // for starvation to accumulate against. FU2 (`acct-shpc.8`)
+    // validates the backstop on a workload that exercises queue/arena
+    // pressure.
     assert_eq!(
         force_packs, 0,
         "grouped rule: hot-pool burst does not trigger starvation/force-pack; got force_pack_count={}",
