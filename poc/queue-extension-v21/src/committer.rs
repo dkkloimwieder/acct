@@ -597,40 +597,40 @@ fn run_pipeline_inside_subtx(
     if !sku_pool_keys.is_empty() {
         let sku_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.0).collect();
         let location_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.1).collect();
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "pool_locks INSERT",
             "INSERT INTO poc_v21_pool_locks (sku_id, location_id) \
              SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id) \
              ON CONFLICT (sku_id, location_id) DO NOTHING",
             &[sku_ids.clone().into(), location_ids.clone().into()],
-        )
-        .map_err(|e| format!("pool_locks INSERT: {e}"))?;
-        Spi::run_with_args(
+        )?;
+        crate::spi_bulk_run(
+            "pool_locks SELECT FOR UPDATE",
             "SELECT 1 FROM poc_v21_pool_locks \
              WHERE (sku_id, location_id) IN (SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id)) \
              ORDER BY sku_id, location_id \
              FOR UPDATE",
             &[sku_ids.into(), location_ids.into()],
-        )
-        .map_err(|e| format!("pool_locks SELECT FOR UPDATE: {e}"))?;
+        )?;
     }
     if !wip_pool_keys.is_empty() && !skip_wip_locks() {
         let wo_ids: Vec<i64> = wip_pool_keys.iter().map(|k| k.0).collect();
         let op_ids: Vec<i64> = wip_pool_keys.iter().map(|k| k.1).collect();
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "wip_pool_locks INSERT",
             "INSERT INTO poc_v21_wip_pool_locks (work_order_id, operation_id) \
              SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id) \
              ON CONFLICT (work_order_id, operation_id) DO NOTHING",
             &[wo_ids.clone().into(), op_ids.clone().into()],
-        )
-        .map_err(|e| format!("wip_pool_locks INSERT: {e}"))?;
-        Spi::run_with_args(
+        )?;
+        crate::spi_bulk_run(
+            "wip_pool_locks SELECT FOR UPDATE",
             "SELECT 1 FROM poc_v21_wip_pool_locks \
              WHERE (work_order_id, operation_id) IN (SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id)) \
              ORDER BY work_order_id, operation_id \
              FOR UPDATE",
             &[wo_ids.into(), op_ids.into()],
-        )
-        .map_err(|e| format!("wip_pool_locks SELECT FOR UPDATE: {e}"))?;
+        )?;
     }
 
     // Force XID allocation via a tiny no-op write (option Q-D(b) — robust
@@ -787,7 +787,8 @@ fn run_pipeline_inside_subtx(
         for (corr, code) in &aborted_failed {
             let detail =
                 pgrx::JsonB(serde_json::json!({ "phase": "caller_tx_check", "detail": code }));
-            Spi::run_with_args(
+            crate::spi_bulk_run(
+                "caller_tx_check status INSERT",
                 "INSERT INTO poc_v21_submission_status \
                    (correlation_id, state, enqueued_at, processed_at, error_code, error_detail, committer_tx_id, superbatch_id) \
                  VALUES ($1, 'failed', now(), now(), $2, $3, $4, $5) \
@@ -802,8 +803,7 @@ fn run_pipeline_inside_subtx(
                     (committer_tx_id as i64).into(),
                     (superbatch_id as i64).into(),
                 ],
-            )
-            .map_err(|e| format!("caller_tx_check status INSERT: {e}"))?;
+            )?;
         }
 
         // Roll non-terminal ejected staging entries back to pending.
@@ -846,13 +846,13 @@ fn run_pipeline_inside_subtx(
     // SuperBatch.
     if !events.is_empty() {
         let corrs: Vec<pgrx::Uuid> = events.iter().map(|e| e.correlation_id).collect();
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "persistent_staging in_shmem UPDATE",
             "UPDATE poc_v21_persistent_staging \
                 SET state='in_shmem' \
               WHERE correlation_id = ANY($1::uuid[]) AND state='staged'",
             &[corrs.into()],
-        )
-        .map_err(|e| format!("persistent_staging in_shmem UPDATE: {e}"))?;
+        )?;
     }
 
     // STEP 2.4 (new at M2.1): hydrate per-SKU method assignments from
@@ -1522,7 +1522,8 @@ fn run_pipeline_inside_subtx(
         let corr: Vec<pgrx::Uuid> = depletion_rows.iter().map(|r| r.correlation_id).collect();
         let user_xid: Vec<i64> = depletion_rows.iter().map(|r| r.user_tx_xid as i64).collect();
 
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "cost_depletions bulk INSERT",
             "INSERT INTO poc_v21_cost_depletions \
                (layer_id, qty, unit_cost, consumed_at, consumed_seq, issue_id, method_used, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
              SELECT layer, q, u, to_timestamp(ca::double precision / 1000000), cs, i, m, c, uxid::text::xid8, $10, $11 \
@@ -1542,8 +1543,7 @@ fn run_pipeline_inside_subtx(
                 (committer_tx_id as i64).into(),
                 (superbatch_id as i64).into(),
             ],
-        )
-        .map_err(|e| format!("cost_depletions bulk INSERT: {e}"))?;
+        )?;
     }
 
     // 5c'. cost_consumptions — bulk UNNEST with ON CONFLICT
@@ -1566,7 +1566,8 @@ fn run_pipeline_inside_subtx(
         let corr: Vec<pgrx::Uuid> = consumption_rows.iter().map(|r| r.correlation_id).collect();
         let user_xid: Vec<i64> = consumption_rows.iter().map(|r| r.user_tx_xid as i64).collect();
 
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "cost_consumptions bulk INSERT",
             "INSERT INTO poc_v21_cost_consumptions \
                (sku_id, location_id, qty, applied_unit_cost, consumed_at, consumed_seq, issue_id, method_used, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
              SELECT sku, loc, q, u, to_timestamp(ca::double precision / 1000000), cs, i, m, c, uxid::text::xid8, $11, $12 \
@@ -1588,8 +1589,7 @@ fn run_pipeline_inside_subtx(
                 (committer_tx_id as i64).into(),
                 (superbatch_id as i64).into(),
             ],
-        )
-        .map_err(|e| format!("cost_consumptions bulk INSERT: {e}"))?;
+        )?;
     }
 
     // 5d. posting_line_inventory — resolve posting_line_id via the
@@ -1623,7 +1623,8 @@ fn run_pipeline_inside_subtx(
         inv_layer.push(layer_id);
     }
     if !inv_pl_ids.is_empty() {
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "posting_line_inventory bulk INSERT",
             "INSERT INTO poc_v21_posting_line_inventory \
                (posting_line_id, sku_id, location_id, qty, layer_id) \
              SELECT pl, sku, loc, q, layer \
@@ -1636,8 +1637,7 @@ fn run_pipeline_inside_subtx(
                 inv_qty.into(),
                 inv_layer.into(),
             ],
-        )
-        .map_err(|e| format!("posting_line_inventory bulk INSERT: {e}"))?;
+        )?;
     }
 
     // 5e. avg_pool_state UPSERT — persist running average state for
@@ -1656,7 +1656,8 @@ fn run_pipeline_inside_subtx(
         let loc_ids: Vec<i64> = avg_dirty_pools.iter().map(|t| t.1).collect();
         let units: Vec<i64> = avg_dirty_pools.iter().map(|t| t.2).collect();
         let qtys: Vec<i64> = avg_dirty_pools.iter().map(|t| t.3).collect();
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "avg_pool_state UPSERT",
             "INSERT INTO poc_v21_avg_pool_state \
                (sku_id, location_id, avg_unit_cost, total_qty, last_updated_at, last_committer_tx_id) \
              SELECT sku_id, location_id, avg_unit_cost, total_qty, now(), $5::bigint \
@@ -1674,8 +1675,7 @@ fn run_pipeline_inside_subtx(
                 qtys.into(),
                 (committer_tx_id as i64).into(),
             ],
-        )
-        .map_err(|e| format!("avg_pool_state UPSERT: {e}"))?;
+        )?;
     }
 
     // STEP 12: status updates. INSERT ON CONFLICT DO UPDATE for
@@ -1684,7 +1684,8 @@ fn run_pipeline_inside_subtx(
     // terminal state. caller_intx / caller_subtx modes hit the
     // ON CONFLICT branch which UPDATEs the pre-existing row.
     if !succeeded.is_empty() {
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "status committed UPSERT",
             "INSERT INTO poc_v21_submission_status \
                (correlation_id, state, enqueued_at, processed_at, committed_at, committer_tx_id, superbatch_id) \
              SELECT corr, 'committed', now(), now(), now(), $1, $2 \
@@ -1698,23 +1699,23 @@ fn run_pipeline_inside_subtx(
                 (superbatch_id as i64).into(),
                 succeeded.clone().into(),
             ],
-        )
-        .map_err(|e| format!("status committed UPSERT: {e}"))?;
+        )?;
 
         // M5e.2 (acct-jypc): persistent_staging staged|in_shmem → completed.
         // No-op for non-durable envelopes (no row exists). Commits atomically
         // with the cost rows + status UPSERT inside Step 5's sub-tx.
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "persistent_staging completed UPDATE",
             "UPDATE poc_v21_persistent_staging \
                 SET state='completed' \
               WHERE correlation_id = ANY($1::uuid[]) AND state IN ('staged','in_shmem')",
             &[succeeded.clone().into()],
-        )
-        .map_err(|e| format!("persistent_staging completed UPDATE: {e}"))?;
+        )?;
     }
     for (corr, code) in &failed_correlation_ids {
         let detail = pgrx::JsonB(serde_json::json!({ "phase": "plan_apply", "detail": code }));
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "status failed UPDATE",
             "INSERT INTO poc_v21_submission_status \
                (correlation_id, state, enqueued_at, processed_at, error_code, error_detail, committer_tx_id, superbatch_id) \
              VALUES ($1, 'failed', now(), now(), $2, $3, $4, $5) \
@@ -1729,11 +1730,11 @@ fn run_pipeline_inside_subtx(
                 (committer_tx_id as i64).into(),
                 (superbatch_id as i64).into(),
             ],
-        )
-        .map_err(|e| format!("status failed UPDATE: {e}"))?;
+        )?;
     }
     if !replayed_correlation_ids.is_empty() {
-        Spi::run_with_args(
+        crate::spi_bulk_run(
+            "status replayed UPSERT",
             "INSERT INTO poc_v21_submission_status \
                (correlation_id, state, enqueued_at, processed_at, committer_tx_id, superbatch_id) \
              SELECT corr, 'replayed', now(), now(), $1, $2 \
@@ -1747,8 +1748,7 @@ fn run_pipeline_inside_subtx(
                 (superbatch_id as i64).into(),
                 replayed_correlation_ids.clone().into(),
             ],
-        )
-        .map_err(|e| format!("status replayed UPSERT: {e}"))?;
+        )?;
     }
 
     Ok(())
