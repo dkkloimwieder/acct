@@ -4,6 +4,62 @@
 //! (stub router). AVG + STD method dispatch lands at M2.1 + M2.2;
 //! committer pool + CAS election at M4.1; per-envelope failure
 //! isolation via sub-tx at M6.2.
+//!
+//! ## Atomic ordering policy (acct-gx1z.1.7 — Q9/Q8/B7)
+//!
+//! Authoritative reference: `poc/design_research/poc-v2.1.md` §5.2.
+//! This block is the per-field cheatsheet; if it disagrees with the
+//! spec, the spec wins.
+//!
+//! ### CommitterQueueEntry.valid (u8 state machine: 0→1→2→3→0)
+//!
+//! - `Release` on every CAS that advances the state (1→2, 2→3, 3→0,
+//!   and the 2→0 router-mid-Phase-6-death fallback). Pairs with the
+//!   `Acquire` reads in `claim_next_committer_entry` and
+//!   `try_recover_orphan` so the claimer/rescuer sees every field
+//!   the previous owner published.
+//! - `Relaxed` on the cheap probe read at the top of
+//!   `claim_next_committer_entry` (we re-confirm with the Acquire
+//!   CAS before any state-affecting work).
+//! - `Release` on the rare race-release in `claim_next_committer_entry`
+//!   (slot.valid is left untouched; we only release committer_pid).
+//!
+//! ### CommitterQueueEntry.committer_pid (i32 ownership claim)
+//!
+//! - `Acquire` on the claim CAS (0 → MyProcPid). Pairs with the
+//!   orphan-recovery rescuer's `Acquire` read of `valid==2` —
+//!   together they form the "ownership before state advance"
+//!   pattern. Collapsing to a single CAS on `valid` would lose this
+//!   invariant; see acct-gx1z.1's pushback on reviewer claim B2.
+//! - `Relaxed` on the race-release-after-failure path: no other
+//!   thread observes the timing, and the next claim's Acquire CAS
+//!   re-establishes happens-before. Documented intentional weakening.
+//!
+//! ### StagingEntry / CommitterQueueEntry.eject_count (u32)
+//!
+//! - `Release` on `fetch_add(1, …)` (router-side increment). Ensures
+//!   the matching `Acquire` load in Step 14's CAS-2→0 fallback sees
+//!   every concurrent eject. Invariant: a reader that observes
+//!   `eject_count == 0` AND `valid == 2` is guaranteed no eject is
+//!   in flight, because the eject path bumps the counter BEFORE
+//!   touching valid. See the inline comment around the 2→0 CAS.
+//!
+//! ### Stats counters (method_dispatch_counts, method_latency_hist,
+//!     committer_pipeline_ns_total, committer_pipeline_count, …)
+//!
+//! - `Relaxed` everywhere. Counters are monotonic; readers
+//!   (`poc_v21_*_stats` SQL fns) are eventually-consistent
+//!   observability surfaces, not synchronization points. Reading
+//!   them with stronger ordering would add cost without correctness
+//!   benefit.
+//!
+//! ### StagingEntry.superbatch_id (u64 + AtomicU64)
+//!
+//! - `Release` on router-write, `Acquire` on committer-read. The
+//!   load-bearing data-before-flag rule: router writes
+//!   `payload_offset`, `sku_pool_keys_offset`, etc. THEN releases
+//!   `superbatch_id`; committer acquires `superbatch_id` THEN reads
+//!   the data fields. Cross-module — see also `router.rs` §1.6.
 
 use crate::avg::AVG_METHOD;
 use crate::cost_method::{
@@ -127,7 +183,7 @@ pub(crate) fn try_recover_orphan() -> u32 {
     let queue = COMMITTER_QUEUE.share();
     let capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
     let my_pid = unsafe { pg_sys::MyProcPid };
-    let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+    let now_ns = crate::now_ns();
     let lease_ns = committer_lease_ms_now().max(1) as u64 * 1_000_000;
 
     let mut recovered: u32 = 0;
@@ -209,7 +265,7 @@ fn poc_v21_test_inject_orphan_into_empty(
         return false;
     }
     slot.committer_pid.store(fake_pid, Relaxed);
-    let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+    let now_ns = crate::now_ns();
     let stale_ns = now_ns.saturating_sub((lease_offset_ms.max(0) as u64) * 1_000_000);
     slot.committer_acquired_at_ns.store(stale_ns, Relaxed);
     true
@@ -332,7 +388,7 @@ fn claim_next_committer_entry() -> Option<u32> {
                 .compare_exchange(1, 2, Acquire, Relaxed)
                 .is_ok()
             {
-                let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+                let now_ns = crate::now_ns();
                 slot.committer_acquired_at_ns.store(now_ns, Relaxed);
                 // Advance past the winning slot (head + i + 1), not just
                 // head + 1. Otherwise head drifts behind the actual claim
@@ -659,7 +715,7 @@ fn run_pipeline_inside_subtx(
 
         let max_ej = max_eject_count_now() as i32;
         let caller_timeout_us = (caller_tx_timeout_ms_now() as u64) * 1000;
-        let now_us = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+        let now_us = crate::now_us();
 
         let mut kept: Vec<PocV21Event> = Vec::with_capacity(events.len());
         // Aborted callers get a lazy INSERT into submission_status —
@@ -1253,6 +1309,15 @@ fn run_pipeline_inside_subtx(
         .map(|(i, r)| (i, r))
         .unzip();
 
+    // L3 invariant (acct-gx1z.1.7): ordinal_to_pl_id maps each
+    // input position in `result.posting_line_inserts` to its
+    // RETURNING-assigned posting_line_id. The mapping is stable
+    // because (a) we issue ONE INSERT … RETURNING id that PG
+    // guarantees yields rows in input order, and (b) the
+    // `posting_line_ords_for_rows` Vec built via the same filter
+    // above carries the original indices. Sized to the full
+    // posting_line_inserts length so filtered-out (failed-envelope)
+    // ordinals stay at 0 and are never indexed downstream.
     let mut ordinal_to_pl_id: Vec<i64> = vec![0; result.posting_line_inserts.len()];
     if !posting_line_input.is_empty() {
         // Build parallel arrays from the input rows.
@@ -2065,6 +2130,19 @@ fn cleanup_after_superbatch(
             // race-free an entry that was ejected by THIS committer's
             // Step 2.45 and re-routed by another router tick before
             // we reached cleanup (M5b.2/acct-kt61 race).
+            //
+            // B7 invariant (acct-gx1z.1.7): the eject path is
+            // `eject_count.fetch_add(1, Release)` THEN
+            // `valid.compare_exchange(3, 1, Release, …)`. With our
+            // `Acquire`-load of eject_count below paired against
+            // that Release-increment, observing `eject_count == 0`
+            // AND `valid == 2` proves no eject is in flight — the
+            // bump-then-flip ordering means we'd see eject_count > 0
+            // first if one had started. The read-then-CAS gap is
+            // tolerated: a concurrent eject AFTER our load can only
+            // cause our CAS(2→0) to fail (valid is now != 2), which
+            // is the desired no-op outcome. Dead-PID rescue in
+            // try_recover_orphan (recovery.rs) covers any residual.
             let observed_eject = slot.eject_count.load(Acquire);
             let ok = (observed_sb == superbatch_id
                 && slot.valid.compare_exchange(3, 0, Release, Relaxed).is_ok())
@@ -2096,6 +2174,14 @@ fn cleanup_after_superbatch(
 
     // Free CommitterQueueEntry's own arena blocks (staging_offsets +
     // sku_pool_keys + wip_pool_keys mirror).
+    //
+    // B6 invariant (acct-gx1z.1.7): wip_pool_keys_offset is
+    // written ONCE by the router during Phase 1 SuperBatch assembly
+    // and never mutated thereafter. The committer reads it here
+    // post-sub-tx-release without a fence because there's no
+    // concurrent writer to synchronize against. If a future
+    // refactor introduces router re-mutation between Phase 1 and
+    // committer cleanup, this read becomes fragile — re-audit.
     let wip_keys_off = {
         let queue = COMMITTER_QUEUE.share();
         queue.entries[cq_idx as usize].wip_pool_keys_offset

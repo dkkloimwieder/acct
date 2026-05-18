@@ -35,6 +35,32 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64};
 
 pgrx::pg_module_magic!();
 
+/// Current PG timestamp in microseconds since 2000-01-01, clamped at
+/// zero. `pg_sys::GetCurrentTimestamp()` returns `TimestampTz` (i64);
+/// a negative pre-2000 value cast `as u64` silently wraps to ~2^63
+/// and corrupts every downstream arithmetic (lease windows, stale
+/// staging detection, etc.). Clamping with `.max(0)` keeps the
+/// invariant `now_us() >= 0` so saturating multiplication with 1000
+/// for nanoseconds remains safe.
+///
+/// Acct-gx1z.1.4 (B4): replaces the 16 inline
+/// `unsafe { pg_sys::GetCurrentTimestamp() as u64 ... }` sites that
+/// previously had this bug.
+#[inline]
+pub(crate) fn now_us() -> u64 {
+    let t = unsafe { pg_sys::GetCurrentTimestamp() };
+    t.max(0) as u64
+}
+
+/// Current PG timestamp in nanoseconds since 2000-01-01, clamped.
+/// Saturates at `u64::MAX` rather than wrapping (impossible in
+/// practice for the next ~292 years given GetCurrentTimestamp's
+/// microsecond resolution, but cheap insurance).
+#[inline]
+pub(crate) fn now_ns() -> u64 {
+    now_us().saturating_mul(1000)
+}
+
 // M1.2 (acct-q3nm): caller-side path.
 mod arena;
 mod enqueue;

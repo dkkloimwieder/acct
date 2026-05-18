@@ -111,7 +111,7 @@ pub extern "C-unwind" fn poc_v21_router_main(_arg: pg_sys::Datum) {
     // M5d.2 (acct-3rc1): seed the audit timestamp so the first periodic
     // pass fires ~60s after the boot sweep, not immediately.
     {
-        let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+        let now_ns = crate::now_ns();
         COMMITTER_QUEUE
             .share()
             .audit_last_run_at_ns
@@ -308,7 +308,7 @@ fn router_tick() -> u32 {
         }
         if let Some(cq_idx) = found {
             let sb_id = queue.next_superbatch_id.fetch_add(1, Relaxed) + 1;
-            let now_micros = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+            let now_micros = crate::now_us();
             let slot = &mut queue.entries[cq_idx as usize];
             slot.superbatch_id = sb_id;
             slot.envelope_count = envelope_count;
@@ -1208,7 +1208,7 @@ fn poc_v21_test_inject_orphaned_queue(
         slot.wip_pool_keys_offset = 0;
         slot.wip_pool_keys_count = 0;
         slot.committer_pid.store(fake_pid, Relaxed);
-        let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+        let now_ns = crate::now_ns();
         slot.committer_acquired_at_ns.store(now_ns, Relaxed);
         slot.committer_tx_id.store(0, Relaxed);
         slot.enqueued_at_micros = now_ns / 1000;
@@ -1473,7 +1473,7 @@ const AUDIT_STALE_5MIN_US: u64 = 5 * 60 * 1_000_000;
 /// stale. Caller (router_main) gates the audit pass on this; the
 /// `poc_v21_test_run_audit_sweep` SQL helper bypasses for tests.
 fn audit_due() -> bool {
-    let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+    let now_ns = crate::now_ns();
     let last = COMMITTER_QUEUE.share().audit_last_run_at_ns.load(Acquire);
     now_ns.saturating_sub(last) >= AUDIT_INTERVAL_NS
 }
@@ -1517,7 +1517,7 @@ pub(crate) fn run_audit_sweep() {
         .audit_orphans_recovered_count
         .fetch_add(orphans, Relaxed);
     queue.audit_lost_envelopes_count.fetch_add(lost, Relaxed);
-    let now_ns = unsafe { pg_sys::GetCurrentTimestamp() as u64 * 1000 };
+    let now_ns = crate::now_ns();
     queue.audit_last_run_at_ns.store(now_ns, Release);
 }
 
@@ -1526,7 +1526,7 @@ pub(crate) fn run_audit_sweep() {
 /// valid; next router pack re-uses them. Resets sb_id to 0 under the
 /// pending-state ownership.
 fn audit_pattern_a() -> u64 {
-    let now_us = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+    let now_us = crate::now_us();
     let staging_capacity = POC_V21_STAGING_QUEUE_SIZE as u32;
     let mut reclaimed: u64 = 0;
 
@@ -1573,7 +1573,7 @@ fn audit_pattern_a() -> u64 {
 /// referencing it → mark submission_status as 'superbatch_lost', free
 /// arena, CAS valid 3→0. Defensive — should never fire in clean ops.
 fn audit_pattern_b() -> u64 {
-    let now_us = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+    let now_us = crate::now_us();
     let queue_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
     let staging_capacity = POC_V21_STAGING_QUEUE_SIZE as u32;
 
@@ -1674,7 +1674,7 @@ fn audit_pattern_b() -> u64 {
 /// Age-gated mirror of M5b.1's `sweep_queue_phase` Phase 2. Idempotent
 /// with that boot sweep — both use CAS 3→0 election.
 fn audit_pattern_c() -> u64 {
-    let now_us = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+    let now_us = crate::now_us();
     let queue_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
     let my_pid = unsafe { pg_sys::MyProcPid };
     let mut reaped: u64 = 0;
@@ -2090,7 +2090,7 @@ fn poc_v21_test_inject_staging_with_arena(
         slot.backend_pid = 0;
         slot.user_tx_xid = 0;
         slot.request_seq = 0;
-        slot.enqueued_at_micros = unsafe { pg_sys::GetCurrentTimestamp() as u64 };
+        slot.enqueued_at_micros = crate::now_us();
         slot.eject_count.store(0, Relaxed);
     }
     // Stamp sb_id.

@@ -491,7 +491,7 @@ fn event_type_to_id(event_type: &str) -> u16 {
 fn now_micros() -> u64 {
     // PG's GetCurrentTimestamp returns microseconds since PG epoch
     // (2000-01-01 UTC). Used for enqueued_at_micros bookkeeping.
-    unsafe { pg_sys::GetCurrentTimestamp() as u64 }
+    crate::now_us()
 }
 
 fn past_deadline(deadline_micros: i128) -> bool {
