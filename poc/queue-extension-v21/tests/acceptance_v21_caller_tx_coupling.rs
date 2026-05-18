@@ -243,9 +243,10 @@ async fn acceptance_v21_caller_tx_eject_count_exhausted() {
         .expect("connect");
     full_reset(&pool).await;
 
-    // Pin max_eject_count=2 with a generous timeout so eject_count
-    // wins the race. ALTER SYSTEM + pg_reload_conf — Sighup GUC.
-    set_eject_guc(&pool, 2, 3_600_000).await;
+    // Pin max_eject_count=100 (spec range minimum per §1.7) with a
+    // generous timeout so eject_count wins the race against the wall-
+    // clock bound. ALTER SYSTEM + pg_reload_conf — Sighup GUC.
+    set_eject_guc(&pool, 100, 3_600_000).await;
 
     let baseline = arena_outstanding(&pool).await;
 
@@ -256,9 +257,10 @@ async fn acceptance_v21_caller_tx_eject_count_exhausted() {
     enqueue_one(&mut conn, cid, 9_300_003, 3).await.unwrap();
 
     // BGWorker (router + committer) drives the eject cycle to terminal:
-    // max_eject_count=2 means 3 attempts × ~50ms tick latency = ~150ms.
-    // Poll arena_outstanding until it returns to baseline; up to 3s.
-    let after_terminal = wait_arena_drained_to(&pool, baseline, Duration::from_secs(30)).await;
+    // max_eject_count=100 means ~101 attempts × tick latency. Poll
+    // arena_outstanding until it returns to baseline; 60s window to
+    // absorb tick-cadence variance across BGWorker runs.
+    let after_terminal = wait_arena_drained_to(&pool, baseline, Duration::from_secs(60)).await;
     assert_eq!(
         after_terminal, baseline,
         "in_progress terminal-fail via eject_count exhausted must release arena: baseline={baseline}, after={after_terminal}"

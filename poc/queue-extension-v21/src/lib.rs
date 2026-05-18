@@ -136,8 +136,8 @@ pub struct StagingEntry {
     pub backend_pid: i32,
     pub _pad_pid: [u8; 4],
     pub superbatch_id: AtomicU64,
-    pub eject_count: AtomicU16,
-    pub _pad2: [u8; 6],
+    pub eject_count: AtomicU32,
+    pub _pad2: [u8; 4],
 }
 
 #[repr(C, align(64))]
@@ -388,8 +388,8 @@ static BATCH_SIZE_MAX: GucSetting<i32> = GucSetting::<i32>::new(50);
 static BATCH_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
 static ROUTER_STARVATION_THRESHOLD_TICKS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static SNAPSHOT_LAYER_LIMIT_PER_POOL: GucSetting<i32> = GucSetting::<i32>::new(1000);
-static MAX_EJECT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(100);
-static CALLER_TX_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(300_000);
+static MAX_EJECT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(10_000);
+static CALLER_TX_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 static COMMITTER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
 static PERSISTENT_STAGING_GC_RETENTION_HOURS: GucSetting<i32> = GucSetting::<i32>::new(24);
 
@@ -478,18 +478,26 @@ pub(crate) fn skip_wip_locks() -> bool {
     SKIP_WIP_LOCKS.get()
 }
 
-/// Read `poc_v21.max_eject_count`. Defaults to 100. Used by M5c.2
-/// caller-tx coupling: an envelope ejected this many times is marked
-/// failed with `caller_tx_eject_exhausted` rather than re-queued.
+/// Read `poc_v21.max_eject_count`. Defaults to 10000 per spec §1.7. Used
+/// by M5c.2 caller-tx coupling: an envelope ejected this many times is
+/// marked failed with `caller_tx_eject_exhausted` rather than re-queued.
 pub(crate) fn max_eject_count_now() -> i32 {
     MAX_EJECT_COUNT.get()
 }
 
-/// Read `poc_v21.caller_tx_timeout_ms`. Defaults to 300000 (5 min).
-/// Once `now - enqueued_at_micros` exceeds this, ejected envelopes are
-/// marked failed regardless of remaining eject_count budget.
+/// Read `poc_v21.caller_tx_timeout_ms`. Defaults to 30000 (30 s) per
+/// spec §1.7 — realistic upper bound for user-tx duration in costing-
+/// ledger workloads. Once `now - enqueued_at_micros` exceeds this,
+/// ejected envelopes are marked failed regardless of remaining
+/// eject_count budget.
 pub(crate) fn caller_tx_timeout_ms_now() -> i32 {
     CALLER_TX_TIMEOUT_MS.get()
+}
+
+/// Read `poc_v21.batch_window_us`. Used by the startup calibration
+/// check (spec §1.7 line 563) and by router_tick's coalesce loop.
+pub(crate) fn batch_window_us_now() -> i32 {
+    BATCH_WINDOW_US.get()
 }
 
 // ── M5c.1 (acct-r0aa): backpressure CV signal mechanism ─────────────
@@ -797,18 +805,18 @@ pub extern "C-unwind" fn _PG_init() {
     );
     GucRegistry::define_int_guc(
         c"poc_v21.max_eject_count",
-        c"Caller-tx eject loop bound (spec §3.11)",
-        c"Maximum times a single envelope may be ejected (committer observes caller user-tx in_progress) before being marked failed with caller_tx_eject_exhausted. Capped at 10000 to avoid AtomicU16 overflow.",
+        c"Caller-tx eject loop bound (spec §1.7)",
+        c"Maximum times a single envelope may be ejected (committer observes caller user-tx in_progress) before being marked failed with caller_tx_eject_exhausted. Default 10000 sits comfortably above the wall-clock bound (~1500-6000 ejects at 30s/5-20ms-per-cycle).",
         &MAX_EJECT_COUNT,
-        1,
-        10_000,
+        100,
+        1_000_000,
         GucContext::Sighup,
         GucFlags::empty(),
     );
     GucRegistry::define_int_guc(
         c"poc_v21.caller_tx_timeout_ms",
-        c"Caller user-tx total timeout (spec §3.11)",
-        c"Once now - enqueued_at_micros exceeds this threshold, ejected envelopes are marked failed regardless of remaining eject_count budget.",
+        c"Caller user-tx total timeout (spec §1.7)",
+        c"Once now - enqueued_at_micros exceeds this threshold, ejected envelopes are marked failed regardless of remaining eject_count budget. Default 30000 (30 s) — realistic upper bound for user-tx duration in costing-ledger workloads.",
         &CALLER_TX_TIMEOUT_MS,
         1000,
         3_600_000,
@@ -899,6 +907,29 @@ pub extern "C-unwind" fn _PG_init() {
     // The durable_queue=true ↔ persistent_staging=on gate is enforced
     // at enqueue time (raises ERRCODE_FEATURE_NOT_SUPPORTED), not
     // here — durable_queue is a per-call argument, not a GUC.
+
+    // Eject-loop calibration warning (spec §1.7 line 563).
+    //
+    // theoretical_max_ejects bounds how many ejects a single envelope
+    // could accumulate if every router tick cycled it back through.
+    // If that bound is above max_eject_count / 2, the eject counter
+    // — not the wall-clock timeout — becomes the primary termination
+    // bound, inverting the spec's design intent. Surface a WARNING so
+    // operators can either raise max_eject_count or accept the swap.
+    let timeout_ms = CALLER_TX_TIMEOUT_MS.get() as i64;
+    let window_us = BATCH_WINDOW_US.get() as i64;
+    let max_ej = MAX_EJECT_COUNT.get() as i64;
+    if window_us > 0 {
+        let theoretical_max = timeout_ms * 1000 / window_us;
+        if theoretical_max > max_ej / 2 {
+            pgrx::warning!(
+                "poc_v21: max_eject_count={} may not be the primary bound under tight cycling; \
+                 theoretical_max_ejects={} (caller_tx_timeout_ms={} ms × 1000 / batch_window_us={} us). \
+                 Verify the wall-clock timeout is the intended bound, or raise max_eject_count to >= {}.",
+                max_ej, theoretical_max, timeout_ms, window_us, 2 * theoretical_max
+            );
+        }
+    }
 
     // M1.3 BGWorkers: router + committer pool (M4.1 acct-1c23).
     //

@@ -258,9 +258,11 @@ fn prop_v21_caller_tx_coupling() {
 
     // Sighup GUCs — set globally via ALTER SYSTEM + pg_reload_conf
     // once at runner start; revert at runner end. Scenarios share the
-    // tight eject budget (max=2, timeout=2000ms).
+    // tight eject budget (max=100 — spec §1.7 range minimum;
+    // timeout=2000ms — the wall-clock typically wins first under
+    // tick-pressure cycling, matching the spec's design intent).
     runtime.block_on(async {
-        sqlx::query("ALTER SYSTEM SET poc_v21.max_eject_count = 2")
+        sqlx::query("ALTER SYSTEM SET poc_v21.max_eject_count = 100")
             .execute(&pool)
             .await
             .unwrap();

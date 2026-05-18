@@ -239,8 +239,8 @@ fn poc_v21_enqueue(
                 backend_pid: unsafe { pg_sys::MyProcPid },
                 _pad_pid: [0; 4],
                 superbatch_id: std::sync::atomic::AtomicU64::new(0),
-                eject_count: std::sync::atomic::AtomicU16::new(0),
-                _pad2: [0; 6],
+                eject_count: std::sync::atomic::AtomicU32::new(0),
+                _pad2: [0; 4],
             };
             staging::push_entry(queue, entry)
         };
@@ -581,8 +581,8 @@ pub(crate) fn re_enqueue_from_persistent_staging(
         backend_pid: 0, // No live caller backend; recovery worker is doing this.
         _pad_pid: [0; 4],
         superbatch_id: std::sync::atomic::AtomicU64::new(0),
-        eject_count: std::sync::atomic::AtomicU16::new(0),
-        _pad2: [0; 6],
+        eject_count: std::sync::atomic::AtomicU32::new(0),
+        _pad2: [0; 4],
     };
 
     match staging::push_entry(queue, entry) {
