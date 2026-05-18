@@ -132,10 +132,13 @@ async fn acceptance_v21_router_metrics_disjoint_burst() {
     }
 
     // Sanity assertions.
-    assert_eq!(
+    // Grouped-rule re-route increments total_envelopes on each pack
+    // (acct-011x). Use >= for the "no envelope lost" property.
+    assert!(
+        stats["total_envelopes"] as i64 >= N as i64,
+        "total_envelopes ({}) must be >= enqueued count ({})",
         stats["total_envelopes"] as i64,
-        N as i64,
-        "total_envelopes must equal enqueued count"
+        N
     );
     assert!(
         stats["superbatch_count"] > 0.0,

@@ -121,9 +121,15 @@ async fn acceptance_v21_router_fairness_backstop_fires() {
         sb_count, total_envelopes, max_env, force_packs
     );
 
-    assert_eq!(
-        total_envelopes, ENVELOPE_COUNT as i64,
-        "no envelope lost during hot-pool drain"
+    // Under the grouped rule, an envelope that ejects mid-pack and gets
+    // re-routed increments total_envelopes on EACH pack (acct-011x). The
+    // load-bearing property is "no envelope lost": every enqueued envelope
+    // is packed AT LEAST once, so >= captures it. Equality is too tight.
+    assert!(
+        total_envelopes >= ENVELOPE_COUNT as i64,
+        "no envelope lost during hot-pool drain; got total_envelopes={} enqueued={}",
+        total_envelopes,
+        ENVELOPE_COUNT
     );
     // Grouped rule: hot pool's envelopes pack INTO one SuperBatch up to
     // batch_size_max=50. With ENVELOPE_COUNT=30 < batch_max, expect the
