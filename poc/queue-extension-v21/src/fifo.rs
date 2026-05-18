@@ -204,7 +204,26 @@ impl FifoMethod {
                 correlation_id: event.correlation_id,
                 user_tx_xid: event.user_tx_xid,
             });
-            total_cost += take * layer.unit_cost;
+            // E5 (acct-gx1z.1.5): checked arithmetic on the cumulative
+            // total_cost. Silent wrap would corrupt posting_line.amount
+            // below at line 'amount: total_cost' and ripple into the
+            // wo_complete component-cost accumulator in committer.rs.
+            // The committer's downstream checked_mul on the depletion
+            // row also catches the same condition, but failing here
+            // produces a more precise error message.
+            match take.checked_mul(layer.unit_cost).and_then(|p| total_cost.checked_add(p)) {
+                Some(v) => total_cost = v,
+                None => {
+                    result.depletion_inserts.truncate(depletions_before);
+                    return PocV21EventResult {
+                        correlation_id: event.correlation_id,
+                        error_code: Some(format!(
+                            "cost_overflow: sku={} location={} take={} unit_cost={}",
+                            event.sku_id, event.location_id, take, layer.unit_cost
+                        )),
+                    };
+                }
+            }
             remaining -= take;
         }
 

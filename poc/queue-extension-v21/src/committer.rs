@@ -63,8 +63,8 @@
 
 use crate::avg::AVG_METHOD;
 use crate::cost_method::{
-    PocV21ApplyResult, PocV21CostMethod, PocV21Event, PocV21EventType, PocV21Snapshot,
-    SkuPoolState,
+    PocV21ApplyResult, PocV21CostMethod, PocV21Event, PocV21EventResult, PocV21EventType,
+    PocV21Snapshot, SkuPoolState,
 };
 use crate::fifo::FIFO_METHOD;
 use crate::standard::STANDARD_METHOD;
@@ -1174,15 +1174,48 @@ fn run_pipeline_inside_subtx(
             }
 
             // Accumulate component cost on a successful WoComplete consume.
+            // E5 (acct-gx1z.1.5): use checked_* so silent overflow can't
+            // produce a clamped-at-i64::MAX wo_cost_local that then divides
+            // by output qty to give a wildly wrong unit_cost. On overflow,
+            // route the envelope through the per-envelope failure path
+            // with error_code='cost_overflow' so the snapshot rollback
+            // restores pre-envelope pool state and the caller sees the
+            // problem in submission_status.
             if matches!(event.event_type, PocV21EventType::WoComplete) && event.qty < 0 {
+                let mut overflowed = false;
                 let mut cost: i64 = 0;
-                for d in &result.depletion_inserts[depl_before..] {
-                    cost = cost.saturating_add(d.qty.saturating_mul(d.unit_cost));
+                'cost_accum: {
+                    for d in &result.depletion_inserts[depl_before..] {
+                        match d.qty.checked_mul(d.unit_cost).and_then(|p| cost.checked_add(p)) {
+                            Some(v) => cost = v,
+                            None => {
+                                overflowed = true;
+                                break 'cost_accum;
+                            }
+                        }
+                    }
+                    for c in &result.consumption_inserts[cons_before..] {
+                        match c.qty.checked_mul(c.unit_cost).and_then(|p| cost.checked_add(p)) {
+                            Some(v) => cost = v,
+                            None => {
+                                overflowed = true;
+                                break 'cost_accum;
+                            }
+                        }
+                    }
+                    match wo_cost_local.checked_add(cost) {
+                        Some(v) => wo_cost_local = v,
+                        None => overflowed = true,
+                    }
                 }
-                for c in &result.consumption_inserts[cons_before..] {
-                    cost = cost.saturating_add(c.qty.saturating_mul(c.unit_cost));
+                if overflowed {
+                    envelope_failed = true;
+                    result.per_event.push(PocV21EventResult {
+                        correlation_id: event.correlation_id,
+                        error_code: Some("cost_overflow".to_string()),
+                    });
+                    break;
                 }
-                wo_cost_local = wo_cost_local.saturating_add(cost);
             }
 
             result.per_event.push(event_result);
