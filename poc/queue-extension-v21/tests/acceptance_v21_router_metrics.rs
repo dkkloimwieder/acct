@@ -1,15 +1,15 @@
-//! M3.3 (acct-8xyj) acceptance: poc_v21_router_stats() is callable
-//! and emits non-degenerate values for §4.3 R1/R2 validation.
+//! M3.3 (acct-8xyj) / acct-zplt acceptance: poc_v21_router_stats() is
+//! callable and emits values consistent with spec §4.3 R1/R2.
 //!
 //! Two-phase coverage:
-//!  - Phase A (multi-SKU burst): assert avg_envelopes_per_sb > 1,
-//!    packing_efficiency > 0, large-batch histogram bucket populated.
-//!  - Phase B (hot pool): assert shared-pool envelopes co-pack into
-//!    one (or two under jitter) SuperBatches; force_pack_count == 0.
-//!
-//! The empirical R1 (> 0.7 × batch_size_max) and R2 (> 3× drain rate)
-//! validations land in M8.3 against full bake-off shapes S2/S3; this
-//! milestone ships the surface for those measurements.
+//!  - Phase A (pool-disjoint burst): each envelope is a singleton
+//!    connected component → one size-1 SuperBatch each. Asserts the
+//!    R1 low-overlap surface: avg_envelopes_per_sb == 1, all SBs in
+//!    histogram_bucket_0.
+//!  - Phase B (hot pool): shared-pool envelopes group into one (or
+//!    two under jitter) SuperBatches via affinity grouping; force_pack
+//!    is the defensive backstop and stays at 0 for non-saturated
+//!    workloads.
 //!
 //! Run via:
 //!   cargo test --release --test acceptance_v21_router_metrics \
@@ -132,8 +132,8 @@ async fn acceptance_v21_router_metrics_disjoint_burst() {
     }
 
     // Sanity assertions.
-    // Grouped-rule re-route increments total_envelopes on each pack
-    // (acct-011x). Use >= for the "no envelope lost" property.
+    // Re-route may increment total_envelopes on each pack (acct-011x).
+    // Use >= for the "no envelope lost" property.
     assert!(
         stats["total_envelopes"] as i64 >= N as i64,
         "total_envelopes ({}) must be >= enqueued count ({})",
@@ -158,9 +158,11 @@ async fn acceptance_v21_router_metrics_disjoint_burst() {
         stats["entries_scanned_total"],
         N
     );
+    // R1 low-overlap: each pool-disjoint envelope is its own singleton
+    // component → one size-1 SB each. Average envelopes-per-SB == 1.
     assert!(
-        stats["avg_envelopes_per_sb"] > 1.0,
-        "disjoint burst should pack > 1 envelope per SuperBatch on average; got {}",
+        (stats["avg_envelopes_per_sb"] - 1.0).abs() < 0.01,
+        "R1 low-overlap: disjoint burst yields avg_envelopes_per_sb == 1.0; got {}",
         stats["avg_envelopes_per_sb"]
     );
     assert!(
@@ -169,16 +171,21 @@ async fn acceptance_v21_router_metrics_disjoint_burst() {
         "packing_efficiency must be in (0, 1]; got {}",
         stats["packing_efficiency"]
     );
-    // At least one of the larger buckets (>= bucket_2 for size 4+) must
-    // be populated. With batch_size_max=50 and 50 disjoint envelopes,
-    // we expect bucket_5 (32-63) to hit; under scheduling jitter, the
-    // burst can split across two SuperBatches, so be permissive.
-    let large_bucket_total: f64 = (2..=7)
+    // R1 low-overlap: all SBs are size-1 → every SB lands in bucket_0;
+    // buckets 1-7 (size >= 2) must be empty.
+    let large_bucket_total: f64 = (1..=7)
         .map(|i| stats[&format!("histogram_bucket_{}", i)])
         .sum();
+    assert_eq!(
+        large_bucket_total, 0.0,
+        "R1 low-overlap: no SuperBatch of size >= 2 expected; histogram buckets 1-7 sum = {}",
+        large_bucket_total
+    );
     assert!(
-        large_bucket_total >= 1.0,
-        "expected at least one large-batch SuperBatch; histogram buckets 2-7 are all empty"
+        stats["histogram_bucket_0"] >= N as f64,
+        "R1 low-overlap: histogram_bucket_0 must hold all {} size-1 SBs; got {}",
+        N,
+        stats["histogram_bucket_0"]
     );
 }
 

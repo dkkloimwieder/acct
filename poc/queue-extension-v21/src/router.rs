@@ -1,24 +1,34 @@
-//! Greedy Window Router BGWorker (M3.1, acct-r29s).
+//! Window Router BGWorker (M3.1, acct-r29s) with affinity grouping
+//! (acct-zplt).
 //!
 //! Scans up to `router_window_size` pending staging entries per tick,
-//! packs them into one SuperBatch in head-order up to `batch_size_max`
-//! (regardless of pool-key overlap), and pushes that SuperBatch onto
-//! the committer queue. WIP pool keys are carried through but NOT
-//! consulted at routing (spec §1.5 — WIP pools uncontended by
-//! construction).
+//! groups them by pool-key overlap via union-find, and emits one
+//! SuperBatch per connected component (split into chunks of size
+//! `batch_size_max` for oversized components). Each SuperBatch is
+//! pushed onto the committer queue.
 //!
-//! ## Packing rule (acct-0frn)
+//! ## Packing rule (spec §1.5, §1.8 Phase 4)
 //!
-//! Envelopes are packed in head-order up to `batch_size_max`,
-//! regardless of pool-key overlap. Overlapping envelopes (same SKU
-//! pool) are intentionally packed into ONE SuperBatch — one committer
-//! processes them sequentially in chrono order (Step 4 in
-//! committer.rs) under one set of lex-locks. Running-avg / FIFO are
-//! naturally sequential on a shared pool, so co-packing eliminates
-//! cross-SB contention on shared `pool_locks` rows. Multi-committer
-//! parallelism comes across ticks, not within a tick. A per-cluster
-//! split (one SB per cluster within one tick) is a future
-//! optimization tracked in the meta-epic `acct-shpc`.
+//! Envelopes A and B end up in the same SuperBatch if they share at
+//! least one pool_key, OR if there is a chain C₁..Cₙ where A overlaps
+//! C₁, C₁ overlaps C₂, ..., Cₙ overlaps B. The SuperBatch is one
+//! connected component of the overlap graph over the router's window.
+//!
+//! WIP and SKU pool keys participate in grouping the same way; a
+//! shared (sku, location) pair OR a shared (work_order_id, op_id)
+//! pair pulls two envelopes into the same component. The committer
+//! acquires FOR UPDATE on the deduplicated union of both domains in
+//! Step 2 (SKU first, WIP second; lex-sorted within each).
+//!
+//! Oversized component (members > `batch_size_max`) is split into
+//! chunks of size `batch_size_max`; the chunks become separate
+//! SuperBatches that serialize via PG row locks on `pool_locks` as
+//! the spec'd cross-SuperBatch fallback (§1.5 splitting oversized
+//! components).
+//!
+//! Components are dispatched oldest-first by min(request_seq) within
+//! each component; that ordering is the fairness rule under affinity
+//! grouping (§1.8 Phase 4e).
 //!
 //! ## Data-before-flag invariant (spec §1.6, §3.3)
 //!
@@ -132,7 +142,7 @@ pub extern "C-unwind" fn poc_v21_router_main(_arg: pg_sys::Datum) {
 }
 
 /// One scan-and-pack iteration. Returns the number of SuperBatches
-/// produced (0 or 1 — looping happens in the BGWorker).
+/// produced (0+; affinity grouping may emit multiple SBs per tick).
 fn router_tick() -> u32 {
     let staging_capacity = POC_V21_STAGING_QUEUE_SIZE as u32;
     let committer_capacity = POC_V21_COMMITTER_QUEUE_SIZE as u32;
@@ -140,13 +150,12 @@ fn router_tick() -> u32 {
     let batch_max = batch_size_max_now().max(1) as u16;
     let starvation_threshold = router_starvation_threshold_ticks_now().max(1) as u32;
 
-    // Always increment ticks_total — observability for empty ticks too.
     {
         let queue = COMMITTER_QUEUE.share();
         queue.router_ticks_total.fetch_add(1, Relaxed);
     }
 
-    // --- Phase 1: scan staging head; collect candidate metadata. ---
+    // Phase 1: scan staging head; collect candidate metadata.
     let candidates_meta = collect_candidates(staging_capacity, window_limit);
     if candidates_meta.is_empty() {
         return 0;
@@ -158,103 +167,143 @@ fn router_tick() -> u32 {
             .fetch_add(candidates_meta.len() as u64, Relaxed);
     }
 
-    // --- Phase 2: hydrate pool keys for each candidate from arena. ---
-    let candidates = hydrate_candidates(&candidates_meta);
+    // Phase 2: hydrate pool keys for each candidate from arena.
+    let mut candidates = hydrate_candidates(&candidates_meta);
 
-    // --- Phase 3: grouped pack (head-order) with fairness backstop. ---
-    //
-    // Per `poc-v2.1-amendment-0.2` (acct-0frn / meta `acct-shpc`):
-    // envelopes are packed in head-order into one SuperBatch up to
-    // `batch_max`, regardless of pool-key overlap. The shared-pool
-    // case (two envelopes touching the same SKU) is intentionally
-    // pulled INTO one SB — one committer processes them sequentially
-    // in chrono order inside one transaction with one set of
-    // lex-locks.
-    //
-    // Spec §1.8: when a candidate's starvation_count >= threshold AND
-    // the current SuperBatch is empty, force-pack as size-1 SuperBatch
-    // and break (ensure the starved entry gets through). Starvation
-    // is bounded to queue/arena pressure and CAS-race losses, so the
-    // counter rarely populates beyond 0/1 — but the safety net is
-    // retained.
-    //
-    // Packed candidates have their starvation counter cleared.
-    // CAS-race-lost candidates have their starvation counter
-    // incremented.
-    let mut lock_set: HashSet<(i64, i64)> = HashSet::new();
-    let mut wip_union: HashSet<(i64, i64)> = HashSet::new();
-    let mut packed: Vec<Candidate> = Vec::new();
-    let mut forced = false;
-    let mut starv = starvation_map().lock().expect("starvation_map lock");
-
-    for cand in candidates.into_iter() {
-        if (packed.len() as u16) >= batch_max {
-            break;
+    // Phase 3: fairness backstop (spec §3.9, defensive). Single-router
+    // PoC's oldest-first dispatch in Phase 4 guarantees the head's
+    // component is dispatched first; the backstop only fires under
+    // multi-router CAS-race or backpressure edge cases that elevate
+    // one entry's starvation counter past the threshold without it
+    // being packed. When fired, force-pack the head as a size-1
+    // SuperBatch bypassing affinity grouping and return; the rest of
+    // the window is reconsidered on the next tick.
+    let force_head = {
+        let starv = starvation_map().lock().expect("starvation_map lock");
+        candidates
+            .first()
+            .map(|h| (h.request_seq, *starv.get(&h.request_seq).unwrap_or(&0)))
+    };
+    if let Some((head_seq, head_starv)) = force_head {
+        if head_starv >= starvation_threshold {
+            let head = candidates.remove(0);
+            return match emit_superbatch_chunk(vec![head], committer_capacity, true) {
+                EmitOutcome::Emitted => {
+                    let mut starv = starvation_map().lock().expect("starvation_map lock");
+                    starv.remove(&head_seq);
+                    1
+                }
+                EmitOutcome::Empty | EmitOutcome::Exhausted => 0,
+            };
         }
+    }
 
-        // Force-pack gate (runs only when SuperBatch is still empty).
-        if packed.is_empty() {
-            let current = *starv.get(&cand.request_seq).unwrap_or(&0);
-            if current >= starvation_threshold {
-                let cas_ok = {
-                    let queue = STAGING_QUEUE.share();
-                    queue.entries[cand.staging_idx as usize]
-                        .valid
-                        .compare_exchange(1, 2, Acquire, Relaxed)
-                        .is_ok()
-                };
-                if cas_ok {
-                    for k in &cand.sku_pool_keys {
-                        lock_set.insert(*k);
+    // Phase 4: affinity grouping pass — union-find on pool-key overlap.
+    let groups = affinity_group(candidates);
+
+    // Phase 5: emit each component as one or more SuperBatches sized at
+    // most batch_max. Components are already oldest-first; within each
+    // component members are sorted by request_seq.
+    let mut emitted = 0u32;
+    let mut packed_seqs: Vec<u64> = Vec::new();
+    let mut rejected_seqs: Vec<u64> = Vec::new();
+    'outer: for mut group in groups {
+        while !group.is_empty() {
+            let take = group.len().min(batch_max as usize);
+            let chunk: Vec<Candidate> = group.drain(..take).collect();
+            let chunk_seqs: Vec<u64> = chunk.iter().map(|c| c.request_seq).collect();
+            match emit_superbatch_chunk(chunk, committer_capacity, false) {
+                EmitOutcome::Emitted => {
+                    emitted += 1;
+                    packed_seqs.extend(chunk_seqs);
+                }
+                EmitOutcome::Empty => {
+                    // Every member CAS-lost (claimed by recovery sweep
+                    // or already moved on). Not in pending state any
+                    // more; don't count as starvation.
+                }
+                EmitOutcome::Exhausted => {
+                    // Arena or committer queue full. The chunk was
+                    // rolled back to pending; record starvation for it
+                    // and for the rest of this group; stop this tick.
+                    rejected_seqs.extend(chunk_seqs);
+                    for cand in group {
+                        rejected_seqs.push(cand.request_seq);
                     }
-                    for k in &cand.wip_pool_keys {
-                        wip_union.insert(*k);
-                    }
-                    starv.remove(&cand.request_seq);
-                    packed.push(cand);
-                    forced = true;
-                    break; // size-1 forced SuperBatch
-                } else {
-                    // CAS race lost (another tick took this entry).
-                    starv.remove(&cand.request_seq);
-                    continue;
+                    break 'outer;
                 }
             }
         }
+    }
 
-        // CAS valid 1→2 (pending → processing). Acquire on success so
-        // subsequent reads from this staging entry see the caller's
-        // payload writes.
-        let cas_ok = {
-            let queue = STAGING_QUEUE.share();
-            queue.entries[cand.staging_idx as usize]
+    {
+        let mut starv = starvation_map().lock().expect("starvation_map lock");
+        for seq in packed_seqs {
+            starv.remove(&seq);
+        }
+        for seq in rejected_seqs {
+            *starv.entry(seq).or_insert(0) += 1;
+        }
+    }
+
+    emitted
+}
+
+/// Outcome of emitting a single SuperBatch chunk.
+enum EmitOutcome {
+    /// Chunk emitted as a SuperBatch.
+    Emitted,
+    /// Every candidate in the chunk CAS-lost the 1→2 transition (claimed
+    /// elsewhere). No SuperBatch emitted; nothing to roll back.
+    Empty,
+    /// Arena or committer queue resource exhaustion. Any successful CAS
+    /// 1→2 was rolled back to pending.
+    Exhausted,
+}
+
+/// Emit one SuperBatch from a single chunk of candidates (already
+/// affinity-grouped and ordered by request_seq). Runs Phase 5b–7 of
+/// spec §1.8: per-candidate CAS 1→2, arena alloc, CommitterQueueEntry
+/// claim, data-before-flag stamp (sb_id then CAS 2→3), stats.
+fn emit_superbatch_chunk(
+    chunk: Vec<Candidate>,
+    committer_capacity: u32,
+    forced: bool,
+) -> EmitOutcome {
+    // Phase 5b: CAS valid 1→2 per candidate. Acquire on success so
+    // subsequent reads from the entry see the caller's payload writes.
+    let mut packed: Vec<Candidate> = Vec::with_capacity(chunk.len());
+    let mut lock_set: HashSet<(i64, i64)> = HashSet::new();
+    let mut wip_union: HashSet<(i64, i64)> = HashSet::new();
+    {
+        let queue = STAGING_QUEUE.share();
+        for cand in chunk {
+            let cas_ok = queue.entries[cand.staging_idx as usize]
                 .valid
                 .compare_exchange(1, 2, Acquire, Relaxed)
-                .is_ok()
-        };
-        if !cas_ok {
-            // Lost the race (another router tick? recovery sweep?).
-            // Don't extend lock_set since we don't own this entry.
-            *starv.entry(cand.request_seq).or_insert(0) += 1;
-            continue;
+                .is_ok();
+            if cas_ok {
+                for k in &cand.sku_pool_keys {
+                    lock_set.insert(*k);
+                }
+                for k in &cand.wip_pool_keys {
+                    wip_union.insert(*k);
+                }
+                packed.push(cand);
+            }
+            // CAS-loss: candidate was claimed by recovery sweep or
+            // another router (defensive for multi-router future); skip
+            // silently. Affinity is still preserved — the already-
+            // progressed envelope is in some other SuperBatch which
+            // will FOR UPDATE-serialize via pool_locks if it overlaps.
         }
-        for k in &cand.sku_pool_keys {
-            lock_set.insert(*k);
-        }
-        for k in &cand.wip_pool_keys {
-            wip_union.insert(*k);
-        }
-        starv.remove(&cand.request_seq);
-        packed.push(cand);
     }
-
-    drop(starv); // release before arena/queue work
 
     if packed.is_empty() {
-        return 0;
+        return EmitOutcome::Empty;
     }
 
-    // --- Phase 4: arena alloc for SuperBatch-owned blocks. ---
+    // Phase 5c–d: dedup + sort lock-set unions; arena alloc.
     let envelope_count = packed.len() as u16;
     let mut sku_union_sorted: Vec<(i64, i64)> = lock_set.into_iter().collect();
     sku_union_sorted.sort();
@@ -274,14 +323,12 @@ fn router_tick() -> u32 {
     let (staging_offsets_off, sku_keys_off, wip_keys_off) = match arena_alloc {
         Some(t) => t,
         None => {
-            // Arena exhausted; roll back the CAS 1→2's so the next
-            // tick (or the next router after free-list churn) can retry.
             rollback_packed_to_pending(&packed);
-            return 0;
+            return EmitOutcome::Exhausted;
         }
     };
 
-    // --- Phase 5: claim a free CommitterQueueEntry, write fields, CAS 0→1. ---
+    // Phase 5e–i: claim a CommitterQueueEntry, write fields, CAS 0→1.
     let cq_result = {
         let mut queue = COMMITTER_QUEUE.exclusive();
         let tail = queue.tail.load(Relaxed);
@@ -319,15 +366,13 @@ fn router_tick() -> u32 {
     let sb_id = match cq_result {
         Some(id) => id,
         None => {
-            // Committer queue full. Roll back the CAS 1→2's; free the
-            // arena blocks we just allocated. Next tick will retry.
             rollback_packed_to_pending(&packed);
             free_superbatch_arena(staging_offsets_off, sku_keys_off, wip_keys_off);
-            return 0;
+            return EmitOutcome::Exhausted;
         }
     };
 
-    // --- Phase 6: stamp staging entries with sb_id; CAS valid 2→3. ---
+    // Phase 5j: stamp staging entries with sb_id, CAS valid 2→3.
     //
     // Data-before-flag invariant: superbatch_id MUST be stored BEFORE
     // the valid CAS, both with Release ordering. The recovery sweep
@@ -365,16 +410,103 @@ fn router_tick() -> u32 {
         }
     }
 
-    // --- Phase 7: stats. ---
     record_superbatch_stats(envelope_count, forced);
 
-    // M3.1 punts on SetLatch broadcast — committer BGWorker wakes on
-    // its 50ms tick. Spec §1.8 calls for SetLatch on idle committers;
-    // proper PID registry is M4.1 / M3.2-followup work since latency
-    // here is bounded by the committer tick anyway (50ms p99 vs
-    // ~500us router tick).
+    EmitOutcome::Emitted
+}
 
-    1
+/// Partition `candidates` into connected components by pool-key
+/// overlap (union-find), with each component sorted by request_seq
+/// ascending and the components themselves sorted by their min
+/// request_seq (oldest-first dispatch per spec §1.8 Phase 4e).
+///
+/// SKU and WIP pool keys participate equally — any shared key pulls
+/// envelopes into the same component.
+fn affinity_group(candidates: Vec<Candidate>) -> Vec<Vec<Candidate>> {
+    let n = candidates.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut uf = UnionFind::new(n);
+
+    let mut pool_to_envs: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (idx, cand) in candidates.iter().enumerate() {
+        for k in &cand.sku_pool_keys {
+            pool_to_envs.entry(*k).or_default().push(idx);
+        }
+        for k in &cand.wip_pool_keys {
+            pool_to_envs.entry(*k).or_default().push(idx);
+        }
+    }
+    for envs in pool_to_envs.values() {
+        if envs.len() >= 2 {
+            let head = envs[0];
+            for &other in &envs[1..] {
+                uf.union(head, other);
+            }
+        }
+    }
+
+    // Resolve every index's root up-front to avoid borrowing uf inside
+    // the candidate-move loop below.
+    let roots: Vec<usize> = (0..n).map(|i| uf.find(i)).collect();
+
+    let mut by_root: HashMap<usize, Vec<Candidate>> = HashMap::new();
+    for (idx, cand) in candidates.into_iter().enumerate() {
+        by_root.entry(roots[idx]).or_default().push(cand);
+    }
+
+    let mut groups: Vec<Vec<Candidate>> = by_root.into_values().collect();
+    for g in &mut groups {
+        g.sort_by_key(|c| c.request_seq);
+    }
+    groups.sort_by_key(|g| g[0].request_seq);
+    groups
+}
+
+/// Disjoint-set with path compression and union-by-rank.
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<u32>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        let mut root = x;
+        while self.parent[root] != root {
+            root = self.parent[root];
+        }
+        let mut cur = x;
+        while self.parent[cur] != root {
+            let next = self.parent[cur];
+            self.parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        match self.rank[ra].cmp(&self.rank[rb]) {
+            std::cmp::Ordering::Less => self.parent[ra] = rb,
+            std::cmp::Ordering::Greater => self.parent[rb] = ra,
+            std::cmp::Ordering::Equal => {
+                self.parent[rb] = ra;
+                self.rank[ra] += 1;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

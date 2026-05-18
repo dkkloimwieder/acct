@@ -1,16 +1,13 @@
-//! M3.1 (acct-r29s) acceptance: greedy window router produces
-//! SuperBatches with envelope_count > 1 under a multi-SKU burst.
+//! M3.1 (acct-r29s) / acct-zplt acceptance: under spec §4.3 R1
+//! (low-overlap workload), each pool-disjoint envelope lands in its
+//! own SuperBatch.
 //!
 //! Test shape: enqueue N envelopes each touching a distinct (sku,
-//! location=1) pool in parallel across a small connection pool so
-//! they pile into the staging queue within roughly one router tick
-//! window. Wait for all to reach terminal state; assert that the
-//! router's max-envelope-count counter observed at least one
-//! SuperBatch with >1 envelopes, and that the total envelope count
-//! matches what we enqueued (no envelope lost). The router's
-//! data-before-flag invariant + lock_set acquisition order are
-//! structural — verified by code review + the property suite.
-//! M5b.2 ships the dedicated stress test.
+//! location=1) pool. The affinity-grouping pass produces N singleton
+//! connected components → N size-1 SuperBatches. Asserts no envelope
+//! is lost and the singleton property holds. The companion test for
+//! the high-overlap case (R2 — many envelopes sharing one pool pack
+//! into one SuperBatch) lives in acceptance_v21_router_groups_shared_pool.
 //!
 //! Run via:
 //!   cargo test --release --test acceptance_v21_router_packing \
@@ -84,10 +81,10 @@ async fn acceptance_v21_router_packs_burst() {
     reset_state(&pool).await;
     reset_router_stats(&pool).await;
 
-    // Build a multi-SKU burst. Each envelope touches a different
-    // (sku, location=1) pool — the grouped rule treats each as its
-    // own singleton cluster and packs them all into the same window
-    // scan up to batch_size_max.
+    // Build a pool-disjoint burst. Each envelope touches a different
+    // (sku, location=1) pool, so the affinity-grouping pass produces
+    // SKU_COUNT singleton connected components → SKU_COUNT size-1
+    // SuperBatches (spec §4.3 R1).
     let mut correlation_ids: Vec<Uuid> = Vec::with_capacity(SKU_COUNT as usize);
     for _ in 0..SKU_COUNT {
         correlation_ids.push(Uuid::new_v4());
@@ -133,14 +130,14 @@ async fn acceptance_v21_router_packs_burst() {
         "router_total_envelopes ({}) should equal enqueued count ({}) — no lost envelope",
         total, SKU_COUNT
     );
-    assert!(
-        max_env >= 2,
-        "M3.1 acceptance: greedy router should produce at least one SuperBatch with envelope_count >= 2 under multi-SKU burst; observed max={}",
+    assert_eq!(
+        max_env, 1,
+        "R1 low-overlap: every component is a singleton, so max_envelope_count == 1; observed {}",
         max_env
     );
-    assert!(
-        sb_count < SKU_COUNT as i64,
-        "if packing worked, superbatch_count ({}) must be strictly less than envelope count ({}) — pure size-1 routing would equal them",
+    assert_eq!(
+        sb_count, SKU_COUNT as i64,
+        "R1 low-overlap: each pool-disjoint envelope is its own connected component, so sb_count == enqueued count; observed sb_count={} enqueued={}",
         sb_count, SKU_COUNT
     );
 }
