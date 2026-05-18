@@ -61,24 +61,6 @@ pub(crate) fn now_ns() -> u64 {
     now_us().saturating_mul(1000)
 }
 
-/// Bulk SPI INSERT/UPSERT helper. Wraps `Spi::run_with_args` + the
-/// `.map_err(|e| format!("{label}: {e}"))?` boilerplate that every
-/// no-RETURNING bulk-INSERT site in committer.rs duplicates. `label`
-/// surfaces in the error message so dispatch failures stay
-/// site-attributable.
-///
-/// Use for INSERT statements that do NOT return rows. RETURNING
-/// variants (posting_lines, cost_layers) need Spi::connect with row
-/// iteration and use that pattern inline.
-#[inline]
-pub(crate) fn spi_bulk_run<'mcx>(
-    label: &'static str,
-    sql: &str,
-    args: &[pgrx::datum::DatumWithOid<'mcx>],
-) -> Result<(), String> {
-    pgrx::Spi::run_with_args(sql, args).map_err(|e| format!("{label}: {e}"))
-}
-
 // M1.2 (acct-q3nm): caller-side path.
 mod arena;
 mod enqueue;

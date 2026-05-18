@@ -81,6 +81,73 @@ use std::ffi::CString;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::time::Duration;
 
+/// Committer-pipeline structured error (acct-gx1z.1.14).
+///
+/// Variants carry parameter context; `&'static str` discriminants keep
+/// the hot path allocation-free for the SPI case (which dominates).
+/// `Display` reproduces the format!()-string shape that was previously
+/// stored verbatim in `submission_status.error_detail` JSONB, so the
+/// stringified boundary at process_superbatch's error legs stays
+/// byte-compatible with prior persisted state.
+#[derive(Debug, Clone)]
+pub(crate) enum CommitterError {
+    /// SPI call failed; `label` identifies the call site.
+    Spi { label: &'static str, source: String },
+    /// Bulk INSERT RETURNING returned a row count != input size.
+    RowCountMismatch {
+        label: &'static str,
+        expected: usize,
+        got: usize,
+    },
+    /// Event type not yet dispatched at this milestone.
+    UnsupportedEvent { kind: &'static str },
+    /// Unknown numeric event_type_id from staging.
+    UnknownEventTypeId { id: u16 },
+    /// Payload field missing, of wrong type, or violating an invariant.
+    PayloadParse { detail: String },
+    /// Internal-invariant violation surfaced by the pipeline.
+    Invariant { detail: String },
+}
+
+impl std::fmt::Display for CommitterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spi { label, source } => write!(f, "{label}: {source}"),
+            Self::RowCountMismatch { label, expected, got } => {
+                write!(f, "{label}: expected {expected} ids, got {got}")
+            }
+            Self::UnsupportedEvent { kind } => write!(f, "{kind} not supported"),
+            Self::UnknownEventTypeId { id } => write!(f, "unknown event_type_id={id}"),
+            Self::PayloadParse { detail } => f.write_str(detail),
+            Self::Invariant { detail } => f.write_str(detail),
+        }
+    }
+}
+
+/// Bridge for `?` in payload-parse paths: any String error from
+/// `.ok_or_else(|| "...")` in `expand_wo_complete_payload` /
+/// `read_event_from_staging` lands as `PayloadParse`. SPI errors do
+/// NOT go through this — `bulk()` already returns `CommitterError::Spi`
+/// directly, so the broad mapping here can't accidentally swallow SPI
+/// failures.
+impl From<String> for CommitterError {
+    fn from(detail: String) -> Self {
+        Self::PayloadParse { detail }
+    }
+}
+
+/// Committer-local bulk SPI INSERT/UPSERT wrapper. Maps SPI failures
+/// into `CommitterError::Spi` with the call-site label.
+#[inline]
+fn bulk(
+    label: &'static str,
+    sql: &str,
+    args: &[pgrx::datum::DatumWithOid<'_>],
+) -> Result<(), CommitterError> {
+    pgrx::Spi::run_with_args(sql, args)
+        .map_err(|e| CommitterError::Spi { label, source: e.to_string() })
+}
+
 /// M7.1 (acct-byue): map a method string ("fifo" / "avg" / "std") to the
 /// per-method histogram index. Returns None for unknown methods (defensive
 /// — keeps the unknown-method case out of the histogram rather than
@@ -410,7 +477,7 @@ fn claim_next_committer_entry() -> Option<u32> {
 }
 
 /// Run the 5-step pipeline for one CommitterQueueEntry.
-fn process_superbatch(cq_idx: u32) -> Result<(), String> {
+fn process_superbatch(cq_idx: u32) -> Result<(), CommitterError> {
     // Snapshot the CommitterQueueEntry's fields we need.
     let (superbatch_id, envelope_count, staging_offsets_off, sku_keys_off, sku_count, wip_off, wip_count) = {
         let queue = COMMITTER_QUEUE.share();
@@ -486,7 +553,7 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
         };
         match read_event_from_staging(s_idx) {
             Ok(v) => events.extend(v),
-            Err(e) => parse_errors.push((cid, e)),
+            Err(e) => parse_errors.push((cid, e.to_string())),
         }
     }
     // Open the sub-tx that owns committer_tx_id + the bulk INSERTs.
@@ -553,7 +620,9 @@ fn process_superbatch(cq_idx: u32) -> Result<(), String> {
             // Mark all envelopes failed.
             for event in &events {
                 let corr = event.correlation_id;
-                let detail = pgrx::JsonB(serde_json::json!({ "phase": "pipeline", "detail": err }));
+                let detail = pgrx::JsonB(
+                    serde_json::json!({ "phase": "pipeline", "detail": err.to_string() }),
+                );
                 let _ = Spi::run_with_args(
                     "INSERT INTO poc_v21_submission_status \
                        (correlation_id, state, enqueued_at, processed_at, error_code, error_detail) \
@@ -589,7 +658,7 @@ fn run_pipeline_inside_subtx(
     sku_pool_keys: &[(i64, i64)],
     wip_pool_keys: &[(i64, i64)],
     events: &[PocV21Event],
-) -> Result<(), String> {
+) -> Result<(), CommitterError> {
     // STEP 2: locks. Two-domain lex-locking — SKU pool keys always,
     // WIP pool keys gated on poc_v21.skip_wip_locks (M4.1 acct-1c23,
     // §1.5). For each domain: INSERT ON CONFLICT DO NOTHING (creates
@@ -597,14 +666,14 @@ fn run_pipeline_inside_subtx(
     if !sku_pool_keys.is_empty() {
         let sku_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.0).collect();
         let location_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.1).collect();
-        crate::spi_bulk_run(
+        bulk(
             "pool_locks INSERT",
             "INSERT INTO poc_v21_pool_locks (sku_id, location_id) \
              SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id) \
              ON CONFLICT (sku_id, location_id) DO NOTHING",
             &[sku_ids.clone().into(), location_ids.clone().into()],
         )?;
-        crate::spi_bulk_run(
+        bulk(
             "pool_locks SELECT FOR UPDATE",
             "SELECT 1 FROM poc_v21_pool_locks \
              WHERE (sku_id, location_id) IN (SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id)) \
@@ -616,14 +685,14 @@ fn run_pipeline_inside_subtx(
     if !wip_pool_keys.is_empty() && !skip_wip_locks() {
         let wo_ids: Vec<i64> = wip_pool_keys.iter().map(|k| k.0).collect();
         let op_ids: Vec<i64> = wip_pool_keys.iter().map(|k| k.1).collect();
-        crate::spi_bulk_run(
+        bulk(
             "wip_pool_locks INSERT",
             "INSERT INTO poc_v21_wip_pool_locks (work_order_id, operation_id) \
              SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id) \
              ON CONFLICT (work_order_id, operation_id) DO NOTHING",
             &[wo_ids.clone().into(), op_ids.clone().into()],
         )?;
-        crate::spi_bulk_run(
+        bulk(
             "wip_pool_locks SELECT FOR UPDATE",
             "SELECT 1 FROM poc_v21_wip_pool_locks \
              WHERE (work_order_id, operation_id) IN (SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id)) \
@@ -787,7 +856,7 @@ fn run_pipeline_inside_subtx(
         for (corr, code) in &aborted_failed {
             let detail =
                 pgrx::JsonB(serde_json::json!({ "phase": "caller_tx_check", "detail": code }));
-            crate::spi_bulk_run(
+            bulk(
                 "caller_tx_check status INSERT",
                 "INSERT INTO poc_v21_submission_status \
                    (correlation_id, state, enqueued_at, processed_at, error_code, error_detail, committer_tx_id, superbatch_id) \
@@ -846,7 +915,7 @@ fn run_pipeline_inside_subtx(
     // SuperBatch.
     if !events.is_empty() {
         let corrs: Vec<pgrx::Uuid> = events.iter().map(|e| e.correlation_id).collect();
-        crate::spi_bulk_run(
+        bulk(
             "persistent_staging in_shmem UPDATE",
             "UPDATE poc_v21_persistent_staging \
                 SET state='in_shmem' \
@@ -1300,12 +1369,6 @@ fn run_pipeline_inside_subtx(
         .filter(|r| succeeded_set.contains(&r.correlation_id))
         .cloned()
         .collect();
-    let posting_line_rows: Vec<_> = result
-        .posting_line_inserts
-        .iter()
-        .filter(|r| succeeded_set.contains(&r.correlation_id))
-        .cloned()
-        .collect();
     let posting_inventory_rows: Vec<_> = result
         .posting_line_inventory_inserts
         .iter()
@@ -1408,13 +1471,16 @@ fn run_pipeline_inside_subtx(
             }
             Some(out)
         })
-        .ok_or_else(|| "posting_lines bulk INSERT failed".to_string())?;
+        .ok_or_else(|| CommitterError::Spi {
+            label: "posting_lines bulk INSERT",
+            source: "Spi::connect returned None".to_string(),
+        })?;
         if returned.len() != posting_line_input.len() {
-            return Err(format!(
-                "posting_lines: expected {} ids, got {}",
-                posting_line_input.len(),
-                returned.len()
-            ));
+            return Err(CommitterError::RowCountMismatch {
+                label: "posting_lines",
+                expected: posting_line_input.len(),
+                got: returned.len(),
+            });
         }
         for (ordinal, id) in posting_line_ords_for_rows.iter().zip(returned.iter()) {
             ordinal_to_pl_id[*ordinal] = *id;
@@ -1477,13 +1543,16 @@ fn run_pipeline_inside_subtx(
                 Some(out)
             },
         )
-        .ok_or_else(|| "cost_layers bulk INSERT failed".to_string())?;
+        .ok_or_else(|| CommitterError::Spi {
+            label: "cost_layers bulk INSERT",
+            source: "Spi::connect returned None".to_string(),
+        })?;
         if returned_pairs.len() != layer_rows_indexed.len() {
-            return Err(format!(
-                "cost_layers: expected {} ids, got {}",
-                layer_rows_indexed.len(),
-                returned_pairs.len()
-            ));
+            return Err(CommitterError::RowCountMismatch {
+                label: "cost_layers",
+                expected: layer_rows_indexed.len(),
+                got: returned_pairs.len(),
+            });
         }
         for ((id, c), (orig_idx, _)) in returned_pairs.into_iter().zip(layer_rows_indexed.iter()) {
             new_layer_ids_by_corr.entry(c).or_default().push(id);
@@ -1499,20 +1568,22 @@ fn run_pipeline_inside_subtx(
     if !depletion_rows.is_empty() {
         let layer: Vec<i64> = depletion_rows
             .iter()
-            .map(|r| -> Result<i64, String> {
+            .map(|r| -> Result<i64, CommitterError> {
                 if let Some(idx) = r.layer_insert_index {
                     layer_db_id_by_insert_index.get(&idx).copied().ok_or_else(|| {
-                        format!(
-                            "cost_depletions: in-SB layer_insert_index={} \
-                             has no DB id (layer creator's correlation_id failed?)",
-                            idx
-                        )
+                        CommitterError::Invariant {
+                            detail: format!(
+                                "cost_depletions: in-SB layer_insert_index={} \
+                                 has no DB id (layer creator's correlation_id failed?)",
+                                idx
+                            ),
+                        }
                     })
                 } else {
                     Ok(r.layer_id)
                 }
             })
-            .collect::<Result<Vec<i64>, String>>()?;
+            .collect::<Result<Vec<i64>, CommitterError>>()?;
         let qty: Vec<i64> = depletion_rows.iter().map(|r| r.qty).collect();
         let unit_cost: Vec<i64> = depletion_rows.iter().map(|r| r.unit_cost).collect();
         let consumed_at: Vec<i64> = depletion_rows.iter().map(|r| r.consumed_at_micros).collect();
@@ -1522,7 +1593,7 @@ fn run_pipeline_inside_subtx(
         let corr: Vec<pgrx::Uuid> = depletion_rows.iter().map(|r| r.correlation_id).collect();
         let user_xid: Vec<i64> = depletion_rows.iter().map(|r| r.user_tx_xid as i64).collect();
 
-        crate::spi_bulk_run(
+        bulk(
             "cost_depletions bulk INSERT",
             "INSERT INTO poc_v21_cost_depletions \
                (layer_id, qty, unit_cost, consumed_at, consumed_seq, issue_id, method_used, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
@@ -1566,7 +1637,7 @@ fn run_pipeline_inside_subtx(
         let corr: Vec<pgrx::Uuid> = consumption_rows.iter().map(|r| r.correlation_id).collect();
         let user_xid: Vec<i64> = consumption_rows.iter().map(|r| r.user_tx_xid as i64).collect();
 
-        crate::spi_bulk_run(
+        bulk(
             "cost_consumptions bulk INSERT",
             "INSERT INTO poc_v21_cost_consumptions \
                (sku_id, location_id, qty, applied_unit_cost, consumed_at, consumed_seq, issue_id, method_used, correlation_id, user_tx_xid, committer_tx_id, superbatch_id) \
@@ -1623,7 +1694,7 @@ fn run_pipeline_inside_subtx(
         inv_layer.push(layer_id);
     }
     if !inv_pl_ids.is_empty() {
-        crate::spi_bulk_run(
+        bulk(
             "posting_line_inventory bulk INSERT",
             "INSERT INTO poc_v21_posting_line_inventory \
                (posting_line_id, sku_id, location_id, qty, layer_id) \
@@ -1656,7 +1727,7 @@ fn run_pipeline_inside_subtx(
         let loc_ids: Vec<i64> = avg_dirty_pools.iter().map(|t| t.1).collect();
         let units: Vec<i64> = avg_dirty_pools.iter().map(|t| t.2).collect();
         let qtys: Vec<i64> = avg_dirty_pools.iter().map(|t| t.3).collect();
-        crate::spi_bulk_run(
+        bulk(
             "avg_pool_state UPSERT",
             "INSERT INTO poc_v21_avg_pool_state \
                (sku_id, location_id, avg_unit_cost, total_qty, last_updated_at, last_committer_tx_id) \
@@ -1684,7 +1755,7 @@ fn run_pipeline_inside_subtx(
     // terminal state. caller_intx / caller_subtx modes hit the
     // ON CONFLICT branch which UPDATEs the pre-existing row.
     if !succeeded.is_empty() {
-        crate::spi_bulk_run(
+        bulk(
             "status committed UPSERT",
             "INSERT INTO poc_v21_submission_status \
                (correlation_id, state, enqueued_at, processed_at, committed_at, committer_tx_id, superbatch_id) \
@@ -1704,7 +1775,7 @@ fn run_pipeline_inside_subtx(
         // M5e.2 (acct-jypc): persistent_staging staged|in_shmem → completed.
         // No-op for non-durable envelopes (no row exists). Commits atomically
         // with the cost rows + status UPSERT inside Step 5's sub-tx.
-        crate::spi_bulk_run(
+        bulk(
             "persistent_staging completed UPDATE",
             "UPDATE poc_v21_persistent_staging \
                 SET state='completed' \
@@ -1714,7 +1785,7 @@ fn run_pipeline_inside_subtx(
     }
     for (corr, code) in &failed_correlation_ids {
         let detail = pgrx::JsonB(serde_json::json!({ "phase": "plan_apply", "detail": code }));
-        crate::spi_bulk_run(
+        bulk(
             "status failed UPDATE",
             "INSERT INTO poc_v21_submission_status \
                (correlation_id, state, enqueued_at, processed_at, error_code, error_detail, committer_tx_id, superbatch_id) \
@@ -1733,7 +1804,7 @@ fn run_pipeline_inside_subtx(
         )?;
     }
     if !replayed_correlation_ids.is_empty() {
-        crate::spi_bulk_run(
+        bulk(
             "status replayed UPSERT",
             "INSERT INTO poc_v21_submission_status \
                (correlation_id, state, enqueued_at, processed_at, committer_tx_id, superbatch_id) \
@@ -1758,10 +1829,10 @@ fn hydrate_standard_costs(
     snapshot: &mut PocV21Snapshot,
     sku_ids: &[i64],
     location_ids: &[i64],
-) -> Result<(), String> {
+) -> Result<(), CommitterError> {
     // DISTINCT ON returns the latest effective row per (sku, location).
     // `effective_from <= now()` filter excludes future-dated rolls.
-    Spi::connect(|client| -> Result<(), String> {
+    Spi::connect(|client| -> Result<(), CommitterError> {
         let mut t = client
             .select(
                 "SELECT DISTINCT ON (sku_id, location_id) \
@@ -1790,12 +1861,12 @@ fn hydrate_avg_pools(
     snapshot: &mut PocV21Snapshot,
     sku_ids: &[i64],
     location_ids: &[i64],
-) -> Result<(), String> {
+) -> Result<(), CommitterError> {
     // Load avg_unit_cost + total_qty for AVG-method pools. Pools with
     // no row in avg_pool_state get default (0, 0) — first receipt
     // initializes; first consumption hits the insufficient-inventory
     // path.
-    Spi::connect(|client| -> Result<(), String> {
+    Spi::connect(|client| -> Result<(), CommitterError> {
         let mut t = client
             .select(
                 "SELECT sku_id, location_id, avg_unit_cost, total_qty \
@@ -1828,10 +1899,10 @@ fn hydrate_fifo_layers(
     snapshot: &mut PocV21Snapshot,
     sku_ids: &[i64],
     location_ids: &[i64],
-) -> Result<(), String> {
+) -> Result<(), CommitterError> {
     use crate::cost_method::LayerView;
 
-    Spi::connect(|client| -> Result<(), String> {
+    Spi::connect(|client| -> Result<(), CommitterError> {
         let mut t = client
             .select(
                 "WITH layers AS (\
@@ -1884,7 +1955,7 @@ fn hydrate_fifo_layers(
     // SELECT above filtered effective_qty > 0; ensure max_born_seq still
     // reflects the highest born_seq written. For M1.3 this is conservative
     // — we'll re-fetch separately.
-    Spi::connect(|client| -> Result<(), String> {
+    Spi::connect(|client| -> Result<(), CommitterError> {
         let mut t = client
             .select(
                 "SELECT sku_id, location_id, MAX(born_seq) AS max_seq \
@@ -1913,7 +1984,7 @@ fn hydrate_fifo_layers(
     Ok(())
 }
 
-fn read_event_from_staging(staging_idx: u32) -> Result<Vec<PocV21Event>, String> {
+fn read_event_from_staging(staging_idx: u32) -> Result<Vec<PocV21Event>, CommitterError> {
     let queue = STAGING_QUEUE.share();
     let slot = &queue.entries[staging_idx as usize];
     let payload_offset = slot.payload_offset;
@@ -1943,11 +2014,11 @@ fn read_event_from_staging(staging_idx: u32) -> Result<Vec<PocV21Event>, String>
 
     let event_type = match event_type_id {
         1 => PocV21EventType::InvAdjust,
-        3 => return Err("wo_start not supported at M1.3".to_string()),
+        3 => return Err(CommitterError::UnsupportedEvent { kind: "wo_start" }),
         5 => PocV21EventType::PoReceipt,
         6 => PocV21EventType::SoShipment,
         7 => PocV21EventType::InvIssue,
-        _ => return Err(format!("unknown event_type_id={event_type_id}")),
+        _ => return Err(CommitterError::UnknownEventTypeId { id: event_type_id }),
     };
 
     // E3 (acct-gx1z.1.3): fail-loud on universally-required fields
@@ -2033,13 +2104,15 @@ fn expand_wo_complete_payload(
     correlation_id: pgrx::Uuid,
     user_tx_xid: u64,
     at_micros: i64,
-) -> Result<Vec<PocV21Event>, String> {
+) -> Result<Vec<PocV21Event>, CommitterError> {
     let wip = payload
         .get("wip_account")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "wo_complete payload missing wip_account".to_string())?;
     if wip.len() != 2 {
-        return Err(format!("wo_complete wip_account must be [wo_id, op_id]"));
+        return Err(CommitterError::PayloadParse {
+            detail: "wo_complete wip_account must be [wo_id, op_id]".to_string(),
+        });
     }
     let wo_id = wip[0]
         .as_i64()
@@ -2053,7 +2126,9 @@ fn expand_wo_complete_payload(
         .and_then(|v| v.as_array())
         .ok_or_else(|| "wo_complete payload missing components".to_string())?;
     if components.is_empty() {
-        return Err("wo_complete components array must be non-empty".to_string());
+        return Err(CommitterError::PayloadParse {
+            detail: "wo_complete components array must be non-empty".to_string(),
+        });
     }
 
     let output = payload
@@ -2061,7 +2136,9 @@ fn expand_wo_complete_payload(
         .and_then(|v| v.as_array())
         .ok_or_else(|| "wo_complete payload missing output".to_string())?;
     if output.len() != 3 {
-        return Err("wo_complete output must be [sku_id, location_id, qty]".to_string());
+        return Err(CommitterError::PayloadParse {
+            detail: "wo_complete output must be [sku_id, location_id, qty]".to_string(),
+        });
     }
     let output_sku = output[0]
         .as_i64()
@@ -2073,7 +2150,9 @@ fn expand_wo_complete_payload(
         .as_i64()
         .ok_or_else(|| "wo_complete output[2] (qty) not an integer".to_string())?;
     if output_qty <= 0 {
-        return Err(format!("wo_complete output qty must be positive: {output_qty}"));
+        return Err(CommitterError::PayloadParse {
+            detail: format!("wo_complete output qty must be positive: {output_qty}"),
+        });
     }
 
     let business_date_jdate = payload
@@ -2096,7 +2175,9 @@ fn expand_wo_complete_payload(
             .as_array()
             .ok_or_else(|| "component entry must be array".to_string())?;
         if arr.len() != 3 {
-            return Err("component entry must be [sku_id, location_id, qty]".to_string());
+            return Err(CommitterError::PayloadParse {
+                detail: "component entry must be [sku_id, location_id, qty]".to_string(),
+            });
         }
         let sku = arr[0]
             .as_i64()
@@ -2108,7 +2189,9 @@ fn expand_wo_complete_payload(
             .as_i64()
             .ok_or_else(|| format!("component[{i}][2] (qty) not an integer"))?;
         if cq <= 0 {
-            return Err(format!("component qty must be positive: {cq}"));
+            return Err(CommitterError::PayloadParse {
+                detail: format!("component qty must be positive: {cq}"),
+            });
         }
         events.push(PocV21Event {
             correlation_id,
