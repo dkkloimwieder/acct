@@ -57,8 +57,7 @@ impl PocV21CostMethod for AvgMethod {
         ) && event.qty < 0);
 
         if is_receipt {
-            self.roll_in(event, snapshot, result);
-            PocV21EventResult { correlation_id: event.correlation_id, error_code: None }
+            self.roll_in(event, snapshot, result)
         } else if is_consumption {
             self.consume(event, snapshot, result)
         } else {
@@ -86,12 +85,27 @@ impl AvgMethod {
         event: &PocV21Event,
         snapshot: &mut PocV21Snapshot,
         result: &mut PocV21ApplyResult,
-    ) {
-        let key = (event.sku_id, event.location_id);
-        let pool = snapshot.sku_pools.entry(key).or_insert_with(SkuPoolState::default);
+    ) -> PocV21EventResult {
         let qty = event.qty.abs();
         let unit_cost = event.unit_cost;
-        let amount = qty * unit_cost;
+        // E5 follow-up (acct-gx1z.1.15): receipt-amount overflow check
+        // BEFORE any snapshot mutation. The i128 weighted-average math
+        // below has its own headroom; this guard protects the posting_line
+        // amount path specifically.
+        let amount = match qty.checked_mul(unit_cost) {
+            Some(v) => v,
+            None => {
+                return PocV21EventResult {
+                    correlation_id: event.correlation_id,
+                    error_code: Some(format!(
+                        "cost_overflow: sku={} location={} qty={} unit_cost={} (avg receipt)",
+                        event.sku_id, event.location_id, qty, unit_cost
+                    )),
+                };
+            }
+        };
+        let key = (event.sku_id, event.location_id);
+        let pool = snapshot.sku_pools.entry(key).or_insert_with(SkuPoolState::default);
 
         // Weighted-average roll-in. i128 intermediate for headroom.
         let old_value: i128 = (pool.avg_unit_cost as i128) * (pool.avg_total_qty as i128);
@@ -157,6 +171,7 @@ impl AvgMethod {
             qty,
             layer_id: None,
         });
+        PocV21EventResult { correlation_id: event.correlation_id, error_code: None }
     }
 
     fn consume(
@@ -189,7 +204,22 @@ impl AvgMethod {
             };
         }
         let unit_cost = pool.avg_unit_cost;
-        let amount = qty * unit_cost;
+        // E5 follow-up (acct-gx1z.1.15): consume-amount overflow check
+        // BEFORE pool mutation. AVG consume bills against avg_unit_cost,
+        // which is bounded by inputs — qty * avg_unit_cost can still
+        // overflow with adversarial inputs.
+        let amount = match qty.checked_mul(unit_cost) {
+            Some(v) => v,
+            None => {
+                return PocV21EventResult {
+                    correlation_id: event.correlation_id,
+                    error_code: Some(format!(
+                        "cost_overflow: sku={} location={} qty={} avg_unit_cost={} (avg consume)",
+                        event.sku_id, event.location_id, qty, unit_cost
+                    )),
+                };
+            }
+        };
         pool.avg_total_qty -= qty;
         pool.avg_dirty = true;
 

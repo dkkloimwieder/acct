@@ -47,8 +47,7 @@ impl PocV21CostMethod for FifoMethod {
         ) && event.qty < 0);
 
         if is_receipt {
-            self.emit_layer(event, snapshot, result);
-            PocV21EventResult { correlation_id: event.correlation_id, error_code: None }
+            self.emit_layer(event, snapshot, result)
         } else if is_consumption {
             self.deplete(event, snapshot, result)
         } else {
@@ -77,13 +76,29 @@ impl FifoMethod {
         event: &PocV21Event,
         snapshot: &mut PocV21Snapshot,
         result: &mut PocV21ApplyResult,
-    ) {
+    ) -> PocV21EventResult {
+        let qty = event.qty.abs();
+        let unit_cost = event.unit_cost;
+        // E5 follow-up (acct-gx1z.1.15): receipt-amount overflow check
+        // BEFORE any snapshot mutation. Silent wrap on the posting_line
+        // amount corrupts the ledger downstream; fail-loud routes the
+        // envelope through the cost_overflow path with no pool side-effect.
+        let amount = match qty.checked_mul(unit_cost) {
+            Some(v) => v,
+            None => {
+                return PocV21EventResult {
+                    correlation_id: event.correlation_id,
+                    error_code: Some(format!(
+                        "cost_overflow: sku={} location={} qty={} unit_cost={} (receipt)",
+                        event.sku_id, event.location_id, qty, unit_cost
+                    )),
+                };
+            }
+        };
         let key = (event.sku_id, event.location_id);
         let pool = snapshot.sku_pools.entry(key).or_default();
         pool.max_born_seq += 1;
         let new_born_seq = pool.max_born_seq;
-        let qty = event.qty.abs();
-        let unit_cost = event.unit_cost;
 
         // Stage the cost_layers insert first so we know its index in
         // result.layer_inserts; the layer_view records that index so
@@ -115,7 +130,7 @@ impl FifoMethod {
         pool.layers.push(layer_view);
 
         // Posting line: debit inventory, credit cash/ap_unsettled stub.
-        let amount = qty * unit_cost;
+        // `amount` computed via checked_mul at fn entry above.
         result.posting_line_inserts.push(PocV21PostingLineRow {
             business_date_jdate: event.business_date_jdate,
             doc_chrono: event.doc_chrono,
@@ -136,6 +151,7 @@ impl FifoMethod {
             qty,
             layer_id: None, // Resolved post-INSERT in Step 5.
         });
+        PocV21EventResult { correlation_id: event.correlation_id, error_code: None }
     }
 
     fn deplete(
