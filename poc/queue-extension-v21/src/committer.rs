@@ -710,7 +710,10 @@ fn run_pipeline_inside_subtx(
     // Use a dummy LOCAL temp table or a session_lock; simplest is
     // pg_current_xact_id() (always returns; allocates if needed).
     let committer_tx_id: u64 = Spi::get_one("SELECT pg_current_xact_id()::text::bigint")
-        .map_err(|e| format!("get committer_tx_id: {e}"))?
+        .map_err(|e| CommitterError::Spi {
+            label: "get committer_tx_id",
+            source: e.to_string(),
+        })?
         .unwrap_or(0i64) as u64;
 
     // Store committer_tx_id on the CommitterQueueEntry.
@@ -1845,11 +1848,28 @@ fn hydrate_standard_costs(
                 None,
                 &[sku_ids.to_vec().into(), location_ids.to_vec().into()],
             )
-            .map_err(|e| format!("snapshot SELECT standard_costs: {e}"))?;
+            .map_err(|e| CommitterError::Spi {
+                label: "snapshot SELECT standard_costs",
+                source: e.to_string(),
+            })?;
         while let Some(row) = t.next() {
-            let sku_id: i64 = row.get::<i64>(1).map_err(|e| format!("sku_id: {e}"))?.unwrap_or(0);
-            let location_id: i64 = row.get::<i64>(2).map_err(|e| format!("location_id: {e}"))?.unwrap_or(0);
-            let unit_cost: i64 = row.get::<i64>(3).map_err(|e| format!("unit_cost: {e}"))?.unwrap_or(0);
+            // Columns are NOT NULL in the schema; bail loudly if PG ever
+            // produces NULL here rather than silently routing to pool (0, 0).
+            let sku_id: i64 = row.get::<i64>(1).map_err(|e| CommitterError::Spi {
+                label: "standard_costs.sku_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "standard_costs.sku_id NULL".to_string(),
+            })?;
+            let location_id: i64 = row.get::<i64>(2).map_err(|e| CommitterError::Spi {
+                label: "standard_costs.location_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "standard_costs.location_id NULL".to_string(),
+            })?;
+            let unit_cost: i64 = row.get::<i64>(3).map_err(|e| CommitterError::Spi {
+                label: "standard_costs.unit_cost", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "standard_costs.unit_cost NULL".to_string(),
+            })?;
             snapshot.standard_costs.insert((sku_id, location_id), unit_cost);
         }
         Ok(())
@@ -1876,12 +1896,33 @@ fn hydrate_avg_pools(
                 None,
                 &[sku_ids.to_vec().into(), location_ids.to_vec().into()],
             )
-            .map_err(|e| format!("snapshot SELECT avg_pool_state: {e}"))?;
+            .map_err(|e| CommitterError::Spi {
+                label: "snapshot SELECT avg_pool_state",
+                source: e.to_string(),
+            })?;
         while let Some(row) = t.next() {
-            let sku_id: i64 = row.get::<i64>(1).map_err(|e| format!("sku_id: {e}"))?.unwrap_or(0);
-            let location_id: i64 = row.get::<i64>(2).map_err(|e| format!("location_id: {e}"))?.unwrap_or(0);
-            let avg_unit_cost: i64 = row.get::<i64>(3).map_err(|e| format!("avg_unit_cost: {e}"))?.unwrap_or(0);
-            let total_qty: i64 = row.get::<i64>(4).map_err(|e| format!("total_qty: {e}"))?.unwrap_or(0);
+            // Columns are NOT NULL in the schema; bail loudly on NULL rather
+            // than silently routing to pool (0, 0) or zeroing cost/qty.
+            let sku_id: i64 = row.get::<i64>(1).map_err(|e| CommitterError::Spi {
+                label: "avg_pool_state.sku_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "avg_pool_state.sku_id NULL".to_string(),
+            })?;
+            let location_id: i64 = row.get::<i64>(2).map_err(|e| CommitterError::Spi {
+                label: "avg_pool_state.location_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "avg_pool_state.location_id NULL".to_string(),
+            })?;
+            let avg_unit_cost: i64 = row.get::<i64>(3).map_err(|e| CommitterError::Spi {
+                label: "avg_pool_state.avg_unit_cost", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "avg_pool_state.avg_unit_cost NULL".to_string(),
+            })?;
+            let total_qty: i64 = row.get::<i64>(4).map_err(|e| CommitterError::Spi {
+                label: "avg_pool_state.total_qty", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "avg_pool_state.total_qty NULL".to_string(),
+            })?;
 
             let pool = snapshot
                 .sku_pools
@@ -1920,16 +1961,54 @@ fn hydrate_fifo_layers(
                 None,
                 &[sku_ids.to_vec().into(), location_ids.to_vec().into()],
             )
-            .map_err(|e| format!("snapshot SELECT cost_layers: {e}"))?;
+            .map_err(|e| CommitterError::Spi {
+                label: "snapshot SELECT cost_layers",
+                source: e.to_string(),
+            })?;
         while let Some(row) = t.next() {
-            let layer_id: i64 = row.get::<i64>(1).map_err(|e| format!("layer_id: {e}"))?.unwrap_or(0);
-            let sku_id: i64 = row.get::<i64>(2).map_err(|e| format!("sku_id: {e}"))?.unwrap_or(0);
-            let location_id: i64 = row.get::<i64>(3).map_err(|e| format!("location_id: {e}"))?.unwrap_or(0);
-            let unit_cost: i64 = row.get::<i64>(4).map_err(|e| format!("unit_cost: {e}"))?.unwrap_or(0);
-            let born_at_micros: i64 = row.get::<i64>(5).map_err(|e| format!("born_at_micros: {e}"))?.unwrap_or(0);
-            let born_seq: i64 = row.get::<i64>(6).map_err(|e| format!("born_seq: {e}"))?.unwrap_or(0);
-            let correlation_id: pgrx::Uuid = row.get::<pgrx::Uuid>(7).map_err(|e| format!("correlation_id: {e}"))?.unwrap();
-            let effective_qty: i64 = row.get::<i64>(8).map_err(|e| format!("effective_qty: {e}"))?.unwrap_or(0);
+            // All columns NOT NULL in cost_layers schema; bail loudly rather
+            // than zero-defaulting (which would silently route layers to
+            // sku=0/loc=0 or zero-cost depletions).
+            let layer_id: i64 = row.get::<i64>(1).map_err(|e| CommitterError::Spi {
+                label: "cost_layers.layer_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers.layer_id NULL".to_string(),
+            })?;
+            let sku_id: i64 = row.get::<i64>(2).map_err(|e| CommitterError::Spi {
+                label: "cost_layers.sku_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers.sku_id NULL".to_string(),
+            })?;
+            let location_id: i64 = row.get::<i64>(3).map_err(|e| CommitterError::Spi {
+                label: "cost_layers.location_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers.location_id NULL".to_string(),
+            })?;
+            let unit_cost: i64 = row.get::<i64>(4).map_err(|e| CommitterError::Spi {
+                label: "cost_layers.unit_cost", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers.unit_cost NULL".to_string(),
+            })?;
+            let born_at_micros: i64 = row.get::<i64>(5).map_err(|e| CommitterError::Spi {
+                label: "cost_layers.born_at_micros", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers.born_at_micros NULL".to_string(),
+            })?;
+            let born_seq: i64 = row.get::<i64>(6).map_err(|e| CommitterError::Spi {
+                label: "cost_layers.born_seq", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers.born_seq NULL".to_string(),
+            })?;
+            let correlation_id: pgrx::Uuid = row.get::<pgrx::Uuid>(7).map_err(|e| CommitterError::Spi {
+                label: "cost_layers.correlation_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers.correlation_id NULL".to_string(),
+            })?;
+            let effective_qty: i64 = row.get::<i64>(8).map_err(|e| CommitterError::Spi {
+                label: "cost_layers.effective_qty", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers.effective_qty NULL".to_string(),
+            })?;
 
             let pool = snapshot
                 .sku_pools
@@ -1965,11 +2044,29 @@ fn hydrate_fifo_layers(
                 None,
                 &[sku_ids.to_vec().into(), location_ids.to_vec().into()],
             )
-            .map_err(|e| format!("snapshot SELECT max(born_seq): {e}"))?;
+            .map_err(|e| CommitterError::Spi {
+                label: "snapshot SELECT max(born_seq)",
+                source: e.to_string(),
+            })?;
         while let Some(row) = t.next() {
-            let sku_id: i64 = row.get::<i64>(1).map_err(|e| format!("sku_id: {e}"))?.unwrap_or(0);
-            let location_id: i64 = row.get::<i64>(2).map_err(|e| format!("location_id: {e}"))?.unwrap_or(0);
-            let max_seq: i64 = row.get::<i64>(3).map_err(|e| format!("max_seq: {e}"))?.unwrap_or(0);
+            let sku_id: i64 = row.get::<i64>(1).map_err(|e| CommitterError::Spi {
+                label: "cost_layers GROUP BY.sku_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers GROUP BY.sku_id NULL".to_string(),
+            })?;
+            let location_id: i64 = row.get::<i64>(2).map_err(|e| CommitterError::Spi {
+                label: "cost_layers GROUP BY.location_id", source: e.to_string(),
+            })?.ok_or_else(|| CommitterError::Invariant {
+                detail: "cost_layers GROUP BY.location_id NULL".to_string(),
+            })?;
+            // MAX(born_seq) CAN be NULL if no rows match (GROUP BY-no-rows
+            // returns no group at all, but a column expression in SELECT
+            // could yield NULL via aggregate quirks); 0 is a safe floor here
+            // since the surrounding code only updates pool.max_born_seq if
+            // max_seq > pool.max_born_seq.
+            let max_seq: i64 = row.get::<i64>(3).map_err(|e| CommitterError::Spi {
+                label: "cost_layers GROUP BY.max_seq", source: e.to_string(),
+            })?.unwrap_or(0);
             let pool = snapshot
                 .sku_pools
                 .entry((sku_id, location_id))
