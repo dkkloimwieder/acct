@@ -2395,6 +2395,21 @@ fn expand_wo_complete_payload(
         .and_then(|v| v.as_i64())
         .ok_or_else(|| "wo_complete payload missing or malformed 'document_id'".to_string())?;
 
+    // Per-component issue_id derivation (acct-jxus): components within
+    // an envelope deplete distinct cost layers, and the cost_depletions
+    // UNIQUE constraint is (issue_id, method_used, layer_id). A
+    // hardcoded issue_id=0 collides as soon as ANY two wo_complete
+    // events across the session deplete the same layer. We synthesize a
+    // stable, unique issue_id per (envelope, component) from
+    // `document_id * ISSUE_ID_COMPONENT_STRIDE + sub_priority`.
+    // ISSUE_ID_COMPONENT_STRIDE = 100_000 leaves headroom up to K=99_999
+    // components per envelope (real K ≤ 50 in S7); document_id up to
+    // ~9.2e13 stays in i64 range after multiplication.
+    const ISSUE_ID_COMPONENT_STRIDE: i64 = 100_000;
+    const OUTPUT_SUB_PRIORITY: i32 = 1_000_000;
+    const OUTPUT_ISSUE_ID_OFFSET: i64 = ISSUE_ID_COMPONENT_STRIDE - 1;
+    let envelope_issue_base = document_id.saturating_mul(ISSUE_ID_COMPONENT_STRIDE);
+
     let mut events = Vec::with_capacity(components.len() + 1);
     for (i, comp) in components.iter().enumerate() {
         let arr = comp
@@ -2421,7 +2436,7 @@ fn expand_wo_complete_payload(
         }
         events.push(PocV21Event {
             correlation_id,
-            issue_id: 0,
+            issue_id: envelope_issue_base.saturating_add(i as i64),
             event_type: PocV21EventType::WoComplete,
             sku_id: sku,
             location_id: loc,
@@ -2439,9 +2454,11 @@ fn expand_wo_complete_payload(
     }
     // Output: sub_priority strictly greater than any component's, so the
     // dispatch sort places it after all components for this envelope.
+    // issue_id uses OUTPUT_ISSUE_ID_OFFSET (= stride - 1) to stay
+    // distinct from any component slot in the same envelope.
     events.push(PocV21Event {
         correlation_id,
-        issue_id: 0,
+        issue_id: envelope_issue_base.saturating_add(OUTPUT_ISSUE_ID_OFFSET),
         event_type: PocV21EventType::WoComplete,
         sku_id: output_sku,
         location_id: output_loc,
@@ -2450,7 +2467,7 @@ fn expand_wo_complete_payload(
         business_date_jdate,
         doc_chrono,
         document_id,
-        sub_priority: 1_000_000, // higher than any plausible component sub_priority
+        sub_priority: OUTPUT_SUB_PRIORITY,
         user_tx_xid,
         at_micros,
         wo_id,

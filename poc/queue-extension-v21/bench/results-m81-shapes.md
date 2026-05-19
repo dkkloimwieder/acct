@@ -4,19 +4,23 @@ Per-shape run at N=4 backends × duration=60s. Workload-generator harness `tests
 
 Latency = enqueue → submission_status terminal-state observed. Submit-and-poll per backend (single outstanding envelope).
 
-## Summary
+## Summary (post-acct-jxus, 2026-05-19)
 
 | shape | g | K | committed | failed | throughput evps | p50 µs | p99 µs | p99.9 µs | avg eps/sb | sb count |
 |---|---|---|---|---|---|---|---|---|---|---|
 | s1_fan_out_simple | 5000 | 1 | 4108 | 0 | 68 | 54423 | 102526 | 103934 | 3.98 | 1033 |
-| s2_fan_out_wo | 5000 | 5 | 993 | 20 | 17 | 54399 | 103434 | 204298 | 3.93 | 258 |
-| s3_fan_contested_wo | 50 | 5 | 3 | 24 | 0 | 3106747 | 5264338 | 5264338 | 1.17 | 23 |
-| s4_fan_in_wo | 1 | 5 | 1 | 24 | 0 | 2365028 | 2365028 | 2365028 | 1.00 | 25 |
-| s5_hot_pool | 100 | 1 | 4 | 24 | 0 | 7605616 | 7610313 | 7610313 | 1.27 | 22 |
-| s6_large_wo | 5000 | 15 | 4 | 24 | 0 | 2756367 | 2758684 | 2758684 | 4.00 | 7 |
-| s7_very_large_wo | 5000 | 50 | 4 | 24 | 0 | 7512214 | 7514525 | 7514525 | 2.00 | 14 |
-| s8_mixed_event_mixed_method | 1000 | 5 | 4 | 24 | 0 | 7928393 | 7928404 | 7928404 | 3.50 | 8 |
+| s2_fan_out_wo | 5000 | 5 | 4084 | 0 | 68 | 60801 | 74918 | 156518 | 1.00 | 4084 |
+| s3_fan_contested_wo | 50 | 5 | 3936 | 0 | 66 | 59777 | 106690 | 112380 | 2.14 | 1843 |
+| s4_fan_in_wo | 1 | 5 | 2200 | 0 | 37 | 66088 | 495829 | 711795 | 3.74 | 588 |
+| s5_hot_pool | 100 | 1 | 4285 | 0 | 71 | (per acct-shpc.6 prior run) | | | | |
+| s6_large_wo | 5000 | 15 | 2834 | 0 | 47 | 60627 | 416495 | 467635 | 1.00 | 2834 |
+| s7_very_large_wo | 5000 | 50 | 3963 | 0 | 66 | 63203 | 81859 | 139240 | 1.00 | 3963 |
+| s8_mixed_event_mixed_method | 1000 | 5 | 4229 | 0 | 70 | 57444 | 70712 | 124786 | 1.01 | 4210 |
 | s9_causal_chain | 10 | 5 | 1352 | 0 | 23 | 162059 | 258223 | 2235778 | 3.98 | 1019 |
+
+S1/S5/S9 unchanged from prior measurement (K=1 or unaffected by
+wo_complete fix). S2/S3/S4/S6/S7/S8 reflect post-jxus
+isolated-per-shape runs (docker-restart between).
 
 ## Per-shape detail
 
@@ -113,45 +117,62 @@ Per-shape isolated runs (docker-restart between, see
 `results-m81-isolated-<shape>.md`) give the **clean** per-shape numbers.
 **Original measurements were captured under the stride workaround in
 `tests/common/m8_runner.rs::build_components`.** The acct-shpc.6
-revert of that workaround surfaced new measurements (post-acct-zplt
-router union-find affinity grouping):
+revert of that workaround surfaced a deeper committer bug (acct-jxus —
+wo_complete component depletions all stamped `issue_id=0`, colliding
+on `cost_depletions` UNIQUE `(issue_id, method_used, layer_id)` as soon
+as any two envelopes touched the same layer; the committer crashed,
+got respawned, and crash-looped).
 
-| shape | pre-shpc.6 stride / committed | post-shpc.6 consecutive / committed | tput Δ | notes |
+After the acct-jxus fix (per-component issue_id derived from
+`document_id × ISSUE_ID_COMPONENT_STRIDE + sub_priority` in
+`expand_wo_complete_payload`), spec-aligned consecutive-stride
+measurements (post-acct-zplt router union-find affinity grouping):
+
+| shape | pre-shpc.6 stride / committed | post-shpc.6 + jxus consecutive / committed | tput Δ | notes |
 |---|---|---|---|---|
-| s1_fan_out_simple | 4108 / 68 evps | (unchanged — K=1) | — | clean |
-| s2_fan_out_wo | 993 / 17 evps | 4 / 0 evps | **REGRESSED** | stride was masking the underlying wo_complete hang |
-| s3_fan_contested_wo | 3 / 0 evps | 4 / 0 evps | flat | committer hang unchanged by router fix |
-| s4_fan_in_wo | 1 / 0 evps | 0 / 0 evps | flat | single-pool fan-in still serializes-then-hangs |
+| s1_fan_out_simple | 4108 / 68 evps | (unchanged — K=1, not affected) | — | clean |
+| s2_fan_out_wo | 993 / 17 evps | 4084 / 68 evps | **4.1× improvement** | per-component issue_id fix |
+| s3_fan_contested_wo | 3 / 0 evps | 3936 / 66 evps | **1312× improvement** | union-find packs hot range, avg_eps=2.14 |
+| s4_fan_in_wo | 1 / 0 evps | 2200 / 37 evps | **2200× improvement** | g=1 fan-in packs avg_eps=3.74 |
 | s5_hot_pool | 4285 / 71 evps | (unchanged — K=1, no wo_complete) | — | clean |
-| s6_large_wo | 332 / 6 evps | 4 / 0 evps | **REGRESSED** | acct-0frn pattern surfaced earlier |
-| s7_very_large_wo | 58 / 1 evps | 4 / 0 evps | **REGRESSED** | same |
-| s8_mixed_event | 84 / 1 evps | 172 / 3 evps | partial improvement | inv_adjust half clean; wo_complete half hits bug |
+| s6_large_wo | 332 / 6 evps | 2834 / 47 evps | **8.5× improvement** | K=15 wo_complete fully unblocked |
+| s7_very_large_wo | 58 / 1 evps | 3963 / 66 evps | **68× improvement** | K=50 wo_complete fully unblocked |
+| s8_mixed_event | 84 / 1 evps | 4229 / 70 evps | **50× improvement** | both wo_complete and inv_adjust halves clean (50/50) |
 | s9_causal_chain margin=0 | 1352 / 23 evps | (unchanged) | — | clean (1352 triplets = 4056 events) |
 
-### Falsifier finding (acct-shpc.6, 2026-05-18)
+### Falsifier finding + fix (acct-shpc.6 → acct-jxus, 2026-05-19)
 
-Reverting the stride workaround surfaces a deeper committer-side issue.
-Across all wo_complete shapes (S2/S3/S4/S6/S7 and the wo_complete half
-of S8) the pattern is **exactly 4 commits + 24 failed** under N=4 ×
-60s submit-and-poll — each backend gets ONE successful commit, then
-the system hangs and subsequent submissions time out at 10s wait.
+Reverting the stride workaround exposed a committer-side bug:
+`expand_wo_complete_payload` initialized `issue_id=0` for ALL K+1
+events of every wo_complete envelope. The `cost_depletions` table's
+UNIQUE `(issue_id, method_used, layer_id)` constraint then collided as
+soon as any two wo_complete depletions across the session touched the
+same layer. The duplicate-key error aborted the sub-tx; the BGWorker
+exited with code 1; postmaster respawned it after 5s (per
+`set_restart_time`); the next claim hit the same bug. Result: per-run
+crash loop with `committer_takeover_count=48 / 60s` (~1 every 1.25s).
 
-The router union-find (acct-zplt) is grouping correctly:
-isolated_m8_s8 shows mixed event_mix=50/50 with 172 commits (the
-inv_adjust path passes through unblocked). The hang is downstream of
-the router — likely in committer Step 2 lex-lock acquisition or Step
-14 cleanup interacting with the wo_complete pool fan-out.
+`pg_stat_activity` snapshots during the hang showed **zero
+poc_v21_* locks held** — the hang wasn't lock contention at all. The
+real signal was `count_ready=16` envelopes sitting unclaimed in the
+committer queue while every claim attempt died on the constraint
+violation.
 
-The stride workaround had been masking this by making consecutive
-envelopes pool-disjoint, so the router emitted size-1 SBs and no
-batched lock-acquisition pressure built up. Spec-aligned consecutive
-form exposes the latency cliff.
+The router union-find (acct-zplt) was grouping correctly all along;
+acct-jxus was a parallel correctness bug masked by the pre-revert
+stride workaround (which kept components pool-disjoint across the SKU
+range, so each wo_complete's K=5 depletions hit different layers that
+no other envelope's depletions had reached yet).
 
-Follow-up filed for root-cause: see bd issue tracker.
+Fix: per-component issue_id = `document_id ×
+ISSUE_ID_COMPONENT_STRIDE + sub_priority` (stride = 100_000, K_MAX
+headroom ≤ 99_999, document_id ≤ ~9.2e13 stays in i64 range). Output
+event uses `stride - 1` to stay distinct from any component slot.
+Implemented in `committer.rs::expand_wo_complete_payload`.
 
-The acct-shpc.6 bench-as-validation-gate (this issue) remains OPEN
-until the root cause closes; the stride revert ships but its bench
-expectations cannot be met until then.
+acct-shpc.6's bench-validation gate passes: S2 and S6 both > 100
+committed (4084 and 2834 respectively); S3, S4, S7, S8 all also
+surged 50× – 2200×.
 
 ### Calibration
 
@@ -179,8 +200,14 @@ under the same acct-0frn investigation.
 
 ### Gates on M8.2
 
-- acct-0frn must close before M8.2's statistical runner can produce non-degenerate
-  numbers for S3, S4, and the wo_complete portion of S6/S7/S8. The v2.1 epic
-  acct-gx1z now has acct-0frn in its blocks list.
+- acct-jxus (per-component issue_id collision) closed 2026-05-19. All
+  wo_complete shapes now produce non-degenerate numbers under the
+  spec-aligned consecutive-stride form. M8.2's statistical runner can
+  proceed.
+- acct-0frn (committer hangs on sequential wo_complete with
+  overlapping components) is partially subsumed by acct-jxus. The
+  remaining concern under acct-0frn — InsufficientInventory-failure
+  slow paths surfaced by S9 margin=-1 — is independent and still
+  tracked.
 
 [acct-0frn]: ../../../.beads/  "committer hangs on sequential wo_complete envelopes with overlapping component SKUs"
