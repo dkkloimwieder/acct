@@ -106,6 +106,7 @@ async fn acceptance_v21_router_metrics_disjoint_burst() {
     println!("disjoint burst stats: {:?}", stats);
 
     // Required surface — every named stat must be present.
+    // Names align with spec §4.4 O3.
     let required = [
         "superbatch_count",
         "total_envelopes",
@@ -115,7 +116,7 @@ async fn acceptance_v21_router_metrics_disjoint_burst() {
         "entries_scanned_total",
         "committer_drains_total",
         "avg_envelopes_per_sb",
-        "packing_efficiency",
+        "cross_sb_for_update_waits",
         "pack_yield_per_tick",
         "batch_size_max_guc",
         "histogram_bucket_0",
@@ -165,11 +166,12 @@ async fn acceptance_v21_router_metrics_disjoint_burst() {
         "R1 low-overlap: disjoint burst yields avg_envelopes_per_sb == 1.0; got {}",
         stats["avg_envelopes_per_sb"]
     );
-    assert!(
-        stats["packing_efficiency"] > 0.0
-            && stats["packing_efficiency"] <= 1.0,
-        "packing_efficiency must be in (0, 1]; got {}",
-        stats["packing_efficiency"]
+    // R1 low-overlap: components are all singletons, so no chunk
+    // overflows batch_size_max. cross_sb_for_update_waits stays 0.
+    assert_eq!(
+        stats["cross_sb_for_update_waits"] as i64, 0,
+        "R1 low-overlap: singleton components don't overflow batch_size_max, so cross_sb_for_update_waits stays 0; got {}",
+        stats["cross_sb_for_update_waits"]
     );
     // R1 low-overlap: all SBs are size-1 → every SB lands in bucket_0;
     // buckets 1-7 (size >= 2) must be empty.
@@ -256,5 +258,15 @@ async fn acceptance_v21_router_metrics_hot_pool() {
         stats["force_pack_count"] as i64, 0,
         "hot-pool burst does not trigger starvation/force-pack; got {}",
         stats["force_pack_count"]
+    );
+    // 25 envelopes against default batch_size_max=50 fit in one chunk —
+    // no cluster overflow → cross_sb_for_update_waits stays 0. The
+    // overflow path needs batch_size_max < component_size, which today
+    // requires a BGWorker restart (router doesn't process SIGHUP);
+    // contended-overflow validation is deferred — see `acct-shpc-fu-cluster-overflow-validation`.
+    assert_eq!(
+        stats["cross_sb_for_update_waits"] as i64, 0,
+        "hot-pool below batch_size_max yields zero cross-SB FOR UPDATE waits; got {}",
+        stats["cross_sb_for_update_waits"]
     );
 }

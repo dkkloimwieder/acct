@@ -208,6 +208,18 @@ fn router_tick() -> u32 {
     let mut packed_seqs: Vec<u64> = Vec::new();
     let mut rejected_seqs: Vec<u64> = Vec::new();
     'outer: for mut group in groups {
+        // Spec §4.4 O3: each chunk emitted from an overflowed component
+        // beyond the first will contend on its pool_keys with sibling
+        // chunks at committer Step 2 FOR UPDATE. Count those overflow
+        // chunks here so observability reports cluster-overflow pressure
+        // even when the lock waits are absorbed by the committer pool.
+        let group_chunks = (group.len() + batch_max as usize - 1) / batch_max as usize;
+        if group_chunks > 1 {
+            COMMITTER_QUEUE
+                .share()
+                .router_cross_sb_for_update_waits
+                .fetch_add((group_chunks - 1) as u64, Relaxed);
+        }
         while !group.is_empty() {
             let take = group.len().min(batch_max as usize);
             let chunk: Vec<Candidate> = group.drain(..take).collect();
@@ -761,6 +773,7 @@ fn poc_v21_router_stats_reset() {
     queue.router_ticks_total.store(0, Relaxed);
     queue.router_entries_scanned_total.store(0, Relaxed);
     queue.committer_drains_total.store(0, Relaxed);
+    queue.router_cross_sb_for_update_waits.store(0, Relaxed);
     for b in queue.router_envelope_histogram.iter() {
         b.store(0, Relaxed);
     }
@@ -810,13 +823,17 @@ fn poc_v21_router_force_pack_count() -> i64 {
     queue.router_force_pack_count.load(Relaxed) as i64
 }
 
-/// Aggregated router + committer observability stats for §4.3 R1/R2
-/// validation. Returns one row per metric so callers can `WHERE
-/// stat_name=...` to extract specific values. All values are atomic
-/// loads (Relaxed) — eventual consistency is acceptable for
-/// observability; no LWLock held.
+/// Aggregated router + committer observability stats per spec §4.4 O3.
+/// Returns one row per metric so callers can `WHERE stat_name=...` to
+/// extract specific values. All values are atomic loads (Relaxed) —
+/// eventual consistency is acceptable for observability; no LWLock held.
 ///
-/// Stats emitted:
+/// Spec §4.4 O3 surface (verbatim wording):
+///   - component-size distribution      → histogram_bucket_<N>
+///   - average envelopes-per-SuperBatch → avg_envelopes_per_sb
+///   - cross-SuperBatch FOR UPDATE wait count → cross_sb_for_update_waits
+///
+/// Other stats emitted:
 ///   superbatch_count          — total SuperBatches assembled
 ///   total_envelopes           — total envelopes packed across all batches
 ///   force_pack_count          — fairness-backstop force-packs
@@ -824,15 +841,9 @@ fn poc_v21_router_force_pack_count() -> i64 {
 ///   ticks_total               — every router_tick invocation incl. empty
 ///   entries_scanned_total     — sum of candidates collected per tick
 ///   committer_drains_total    — successful committer SuperBatch drains
-///   avg_envelopes_per_sb      — total_envelopes / superbatch_count
-///   packing_efficiency        — avg_envelopes_per_sb / batch_size_max
-///                               (R1; redefinition under grouped rule
-///                               tracked as `acct-shpc.2` — singleton-SB
-///                               fraction and cluster-merge counters
-///                               replace this once they land)
 ///   pack_yield_per_tick       — superbatch_count / ticks_total
-///   histogram_bucket_<N>      — count of SuperBatches with envelope_count in
-///                               2^N..2^(N+1)-1 (bucket 7 is the >=128 overflow).
+///   batch_size_max_guc        — current batch_size_max GUC value
+///   envelopes_per_sb_p50/p99  — histogram-derived quantile midpoints
 #[pg_extern]
 fn poc_v21_router_stats() -> TableIterator<
     'static,
@@ -849,6 +860,7 @@ fn poc_v21_router_stats() -> TableIterator<
     let scanned = queue.router_entries_scanned_total.load(Relaxed);
     let drains = queue.committer_drains_total.load(Relaxed);
     let max_env = queue.router_max_envelope_count.load(Relaxed);
+    let cross_sb_waits = queue.router_cross_sb_for_update_waits.load(Relaxed);
     let batch_max = batch_size_max_now().max(1) as u64;
     let mut histogram: [u64; 8] = [0; 8];
     for (i, b) in queue.router_envelope_histogram.iter().enumerate() {
@@ -860,7 +872,6 @@ fn poc_v21_router_stats() -> TableIterator<
     } else {
         0.0
     };
-    let packing_efficiency = avg_envelopes_per_sb / batch_max as f64;
     let pack_yield_per_tick = if ticks > 0 {
         sb_count as f64 / ticks as f64
     } else {
@@ -884,7 +895,7 @@ fn poc_v21_router_stats() -> TableIterator<
         ("entries_scanned_total".into(), scanned as f64),
         ("committer_drains_total".into(), drains as f64),
         ("avg_envelopes_per_sb".into(), avg_envelopes_per_sb),
-        ("packing_efficiency".into(), packing_efficiency),
+        ("cross_sb_for_update_waits".into(), cross_sb_waits as f64),
         ("pack_yield_per_tick".into(), pack_yield_per_tick),
         ("batch_size_max_guc".into(), batch_max as f64),
         ("envelopes_per_sb_p50".into(), envelopes_per_sb_p50),

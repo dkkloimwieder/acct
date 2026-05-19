@@ -228,6 +228,13 @@ pub struct CommitterQueue {
     pub router_ticks_total: AtomicU64,
     pub router_entries_scanned_total: AtomicU64,
     pub committer_drains_total: AtomicU64,
+    /// Cross-SuperBatch FOR UPDATE wait count (spec §4.4 O3). Each
+    /// chunk emitted from a component that overflowed batch_size_max
+    /// shares pool_keys with its sibling chunks; sibling SuperBatches
+    /// claim the same `poc_v21_pool_locks` rows in committer Step 2
+    /// and serialize via FOR UPDATE. Incremented per overflow chunk
+    /// (chunks beyond the first within one connected component).
+    pub router_cross_sb_for_update_waits: AtomicU64,
     /// Envelope-count histogram for SuperBatches (log2-spaced 8 buckets):
     /// 0:[1], 1:[2-3], 2:[4-7], 3:[8-15], 4:[16-31], 5:[32-63], 6:[64-127], 7:[128+].
     pub router_envelope_histogram: [AtomicU64; 8],
