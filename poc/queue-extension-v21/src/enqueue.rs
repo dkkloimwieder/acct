@@ -302,6 +302,167 @@ fn return_to_retry() {
     // Inline; just here for readability of the matching arm above.
 }
 
+/// Push N envelopes onto the staging queue in one call. Amortizes the
+/// per-call LWLock + status-INSERT + arena-acquire costs across the
+/// batch. See bd issue acct-pl3b for the design rationale.
+///
+/// `envelopes` is a JSONB array of objects matching the single-envelope
+/// shape:
+///   [{"correlation_id":"uuid", "event_type":"po_receipt",
+///     "payload":{...}, "pool_keys":{"sku":[[...]], "wip":[[...]]}}, ...]
+///
+/// Returns the count of envelopes enqueued. On any envelope validation
+/// failure the whole call aborts (no partial enqueue, no staging writes,
+/// no arena writes, no status rows).
+///
+/// `durable_queue` is a per-batch flag — all envelopes ride the WAL-backed
+/// path together or none of them do.
+///
+/// Backpressure semantics: a single CV-wait on full staging or arena;
+/// retries the whole-batch reservation, not per-envelope.
+#[pg_extern]
+fn poc_v21_enqueue_batch(envelopes: JsonB, durable_queue: default!(bool, false)) -> i64 {
+    // 1. Parse + validate the whole array first. Fail-fast on any
+    // malformed envelope with the index in the error message; no
+    // side-effects yet.
+    let arr = match envelopes.0.as_array() {
+        Some(a) => a,
+        None => {
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                "poc_v21_enqueue_batch: envelopes must be a JSON array"
+            );
+        }
+    };
+    let n = arr.len();
+    if n == 0 {
+        return 0;
+    }
+    if n > crate::POC_V21_STAGING_QUEUE_SIZE {
+        ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
+            format!(
+                "poc_v21_enqueue_batch: batch size {n} exceeds staging queue capacity {}",
+                crate::POC_V21_STAGING_QUEUE_SIZE
+            )
+        );
+    }
+
+    let parsed: Vec<ParsedEnvelope> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, env)| parse_envelope(i, env))
+        .collect();
+
+    // 2. durable_queue gate (§1.7).
+    if durable_queue && !crate::persistent_staging_enabled() {
+        ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+            "poc_v21_enqueue_batch: durable_queue=true requires poc_v21.persistent_staging=on",
+            "Set poc_v21.persistent_staging=on in postgresql.conf (Postmaster scope, requires restart) before passing durable_queue=true."
+        );
+    }
+
+    // 3. Force user-tx XID allocation.
+    let user_tx_xid = unsafe { pg_sys::GetCurrentTransactionId().into_inner() };
+
+    // 3b. durable_queue=true ⇒ bulk-INSERT persistent staging rows.
+    if durable_queue {
+        bulk_insert_persistent_staging(&envelopes, user_tx_xid);
+    }
+
+    // 4. Status row INSERT — dispatch on poc_v21.status_insert_mode.
+    let mode = status_insert_mode_str();
+    match mode.as_str() {
+        "caller_intx" => {
+            bulk_insert_status_rows(&envelopes);
+        }
+        "committer_lazy" => {
+            // No-op. Committer's Step 12 INSERT ON CONFLICT path
+            // (committed/failed/replayed) creates rows lazily.
+        }
+        other => {
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                format!("poc_v21_enqueue_batch: unknown status_insert_mode '{other}'")
+            );
+        }
+    }
+
+    // 5+6. Backpressure loop: try to allocate all arena blocks +
+    // push all staging entries under one acquire of each LWLock.
+    // On QueueFull or arena-exhausted, roll back and CV-wait.
+    let timeout_ms = crate::queue_full_timeout_ms_now();
+    let deadline_micros = (now_micros() as i128) + (timeout_ms as i128) * 1000;
+    let cv = crate::backpressure_cv_ptr();
+    unsafe {
+        pg_sys::ConditionVariablePrepareToSleep(cv);
+    }
+
+    loop {
+        unsafe { pg_sys::ProcessInterrupts() };
+
+        // 5. Arena allocations for all envelopes under one LWLock.
+        let arena_offsets = match allocate_arena_batch(&parsed) {
+            Ok(offsets) => offsets,
+            Err(_) => {
+                if past_deadline(deadline_micros) {
+                    unsafe { pg_sys::ConditionVariableCancelSleep() };
+                    ereport!(
+                        ERROR,
+                        PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
+                        format!("poc_v21_enqueue_batch: spillover arena exhausted and backpressure timeout elapsed ({timeout_ms}ms)")
+                    );
+                }
+                cv_wait_for_slot(cv, deadline_micros);
+                continue;
+            }
+        };
+
+        // 6. Push all staging entries under one LWLock.
+        let push_result = {
+            let mut queue_guard = STAGING_QUEUE.exclusive();
+            let queue = &mut *queue_guard;
+            // Reserve a contiguous block of request_seqs in one
+            // fetch_add(N). Each envelope gets base+i.
+            let base = queue
+                .next_request_seq
+                .fetch_add(parsed.len() as u64, Relaxed);
+            let entries: Vec<StagingEntry> = parsed
+                .iter()
+                .zip(arena_offsets.iter())
+                .enumerate()
+                .map(|(i, (p, off))| build_staging_entry(p, off, user_tx_xid, base + i as u64))
+                .collect();
+            staging::push_entries_batch(queue, entries)
+        };
+
+        match push_result {
+            Ok(_slot_indices) => break,
+            Err(staging::StagingPushError::QueueFull) => {
+                free_arena_batch(&arena_offsets);
+                if past_deadline(deadline_micros) {
+                    unsafe { pg_sys::ConditionVariableCancelSleep() };
+                    ereport!(
+                        ERROR,
+                        PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
+                        format!("poc_v21_enqueue_batch: staging queue full and backpressure timeout elapsed ({timeout_ms}ms)")
+                    );
+                }
+                cv_wait_for_slot(cv, deadline_micros);
+                continue;
+            }
+        }
+    }
+
+    unsafe { pg_sys::ConditionVariableCancelSleep() };
+    n as i64
+}
+
 /// Pop a pending staging entry and mark valid=2. Returns the slot index
 /// (or NULL if no pending entry). Test-only helper; mirrors what the
 /// router (M3.1) would do for a size-1 SuperBatch.
@@ -372,6 +533,301 @@ fn poc_v21_arena_stats() -> Json {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
+
+/// Parsed and validated single envelope from a JSONB array. Lives only
+/// for the duration of a `poc_v21_enqueue_batch` call.
+struct ParsedEnvelope {
+    correlation_id: Uuid,
+    event_type: String,
+    payload_bytes: Vec<u8>,
+    sku_pool_keys: Vec<(i64, i64)>,
+    wip_pool_keys: Vec<(i64, i64)>,
+}
+
+fn parse_envelope(index: usize, env: &serde_json::Value) -> ParsedEnvelope {
+    let obj = match env.as_object() {
+        Some(o) => o,
+        None => {
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                format!("poc_v21_enqueue_batch: envelope[{index}] must be a JSON object")
+            );
+        }
+    };
+
+    let correlation_id = match obj.get("correlation_id").and_then(|v| v.as_str()) {
+        Some(s) => match s.parse::<uuid::Uuid>() {
+            Ok(u) => Uuid::from_bytes(*u.as_bytes()),
+            Err(_) => {
+                ereport!(
+                    ERROR,
+                    PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                    format!("poc_v21_enqueue_batch: envelope[{index}].correlation_id is not a valid UUID")
+                );
+            }
+        },
+        None => {
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                format!("poc_v21_enqueue_batch: envelope[{index}].correlation_id missing or not a string")
+            );
+        }
+    };
+
+    let event_type = match obj.get("event_type").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                format!("poc_v21_enqueue_batch: envelope[{index}].event_type missing or not a string")
+            );
+        }
+    };
+
+    let payload = match obj.get("payload") {
+        Some(p) => p,
+        None => {
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                format!("poc_v21_enqueue_batch: envelope[{index}].payload missing")
+            );
+        }
+    };
+    let payload_bytes = serde_json::to_vec(payload)
+        .unwrap_or_else(|e| {
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                format!("poc_v21_enqueue_batch: envelope[{index}].payload serialize failed: {e}")
+            );
+        });
+
+    let pool_keys_val = obj.get("pool_keys");
+    let (sku_pool_keys, wip_pool_keys) = parse_pool_keys_from_value(index, pool_keys_val);
+
+    ParsedEnvelope {
+        correlation_id,
+        event_type,
+        payload_bytes,
+        sku_pool_keys,
+        wip_pool_keys,
+    }
+}
+
+fn parse_pool_keys_from_value(
+    index: usize,
+    v: Option<&serde_json::Value>,
+) -> (Vec<(i64, i64)>, Vec<(i64, i64)>) {
+    let Some(v) = v else {
+        return (vec![], vec![]);
+    };
+    let sku = v
+        .get("sku")
+        .and_then(|x| x.as_array())
+        .map(|arr| parse_key_array_indexed(index, "sku", arr))
+        .unwrap_or_default();
+    let wip = v
+        .get("wip")
+        .and_then(|x| x.as_array())
+        .map(|arr| parse_key_array_indexed(index, "wip", arr))
+        .unwrap_or_default();
+    (sku, wip)
+}
+
+fn parse_key_array_indexed(
+    env_index: usize,
+    field: &str,
+    arr: &[serde_json::Value],
+) -> Vec<(i64, i64)> {
+    arr.iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let pair = match entry.as_array() {
+                Some(p) if p.len() == 2 => p,
+                _ => {
+                    ereport!(
+                        ERROR,
+                        PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                        format!("poc_v21_enqueue_batch: envelope[{env_index}].pool_keys.{field}[{i}] must be [id, id]")
+                    );
+                }
+            };
+            let a = pair[0].as_i64().unwrap_or_else(|| {
+                ereport!(
+                    ERROR,
+                    PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                    format!("poc_v21_enqueue_batch: envelope[{env_index}].pool_keys.{field}[{i}][0] not int")
+                );
+            });
+            let b = pair[1].as_i64().unwrap_or_else(|| {
+                ereport!(
+                    ERROR,
+                    PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                    format!("poc_v21_enqueue_batch: envelope[{env_index}].pool_keys.{field}[{i}][1] not int")
+                );
+            });
+            (a, b)
+        })
+        .collect()
+}
+
+/// Bulk-INSERT submission_status rows for every envelope in the batch
+/// in one SQL statement.
+fn bulk_insert_status_rows(envelopes: &JsonB) {
+    Spi::run_with_args(
+        "INSERT INTO poc_v21_submission_status (correlation_id, state, enqueued_at) \
+         SELECT (e->>'correlation_id')::uuid, 'queued', now() \
+         FROM jsonb_array_elements($1::jsonb) AS e \
+         ON CONFLICT (correlation_id) DO NOTHING",
+        &[JsonB(envelopes.0.clone()).into()],
+    )
+    .expect("bulk submission_status INSERT");
+}
+
+/// Bulk-INSERT persistent_staging rows for the durable_queue=true path.
+fn bulk_insert_persistent_staging(envelopes: &JsonB, user_tx_xid: u32) {
+    Spi::run_with_args(
+        "INSERT INTO poc_v21_persistent_staging \
+            (correlation_id, user_tx_xid, event_type, payload, \
+             sku_pool_keys, wip_pool_keys, business_date, state) \
+         SELECT \
+            (e->>'correlation_id')::uuid, \
+            $2::text::xid8, \
+            e->>'event_type', \
+            e->'payload', \
+            COALESCE(e->'pool_keys'->'sku', '[]'::jsonb), \
+            NULLIF(COALESCE(e->'pool_keys'->'wip', '[]'::jsonb), '[]'::jsonb), \
+            DATE 'epoch' + COALESCE((e->'payload'->>'business_date_jdate')::int, 0), \
+            'staged' \
+         FROM jsonb_array_elements($1::jsonb) AS e \
+         ON CONFLICT (correlation_id) DO NOTHING",
+        &[
+            JsonB(envelopes.0.clone()).into(),
+            user_tx_xid.to_string().into(),
+        ],
+    )
+    .expect("bulk persistent_staging INSERT");
+}
+
+/// Per-envelope arena offsets: (payload_offset, sku_keys_offset, wip_keys_offset).
+type ArenaOffsets = (u32, u32, u32);
+
+/// Allocate arena blocks for all envelopes under ONE SPILLOVER_ARENA
+/// LWLock acquire. On failure, frees any blocks already allocated and
+/// returns Err. Caller handles backpressure CV-wait.
+fn allocate_arena_batch(parsed: &[ParsedEnvelope]) -> Result<Vec<ArenaOffsets>, ()> {
+    let mut arena_guard = SPILLOVER_ARENA.exclusive();
+    let arena = &mut *arena_guard;
+    let mut offsets: Vec<ArenaOffsets> = Vec::with_capacity(parsed.len());
+
+    for p in parsed {
+        let payload_len = p.payload_bytes.len() as u32;
+        let sku_size = (p.sku_pool_keys.len() * 16) as u32;
+        let wip_size = (p.wip_pool_keys.len() * 16) as u32;
+
+        let payload_offset = match arena.alloc(payload_len.max(1)) {
+            Some(off) => off,
+            None => {
+                rollback_arena_offsets(arena, &offsets);
+                return Err(());
+            }
+        };
+        arena.write_bytes(payload_offset, &p.payload_bytes);
+
+        let sku_offset = if sku_size > 0 {
+            match arena.alloc(sku_size) {
+                Some(off) => {
+                    arena.write_bytes(off, &pool_keys_to_bytes(&p.sku_pool_keys));
+                    off
+                }
+                None => {
+                    arena.free(payload_offset);
+                    rollback_arena_offsets(arena, &offsets);
+                    return Err(());
+                }
+            }
+        } else {
+            0
+        };
+
+        let wip_offset = if wip_size > 0 {
+            match arena.alloc(wip_size) {
+                Some(off) => {
+                    arena.write_bytes(off, &pool_keys_to_bytes(&p.wip_pool_keys));
+                    off
+                }
+                None => {
+                    arena.free(payload_offset);
+                    if sku_offset != 0 {
+                        arena.free(sku_offset);
+                    }
+                    rollback_arena_offsets(arena, &offsets);
+                    return Err(());
+                }
+            }
+        } else {
+            0
+        };
+
+        offsets.push((payload_offset, sku_offset, wip_offset));
+    }
+
+    Ok(offsets)
+}
+
+fn rollback_arena_offsets(arena: &mut crate::SpilloverArena, offsets: &[ArenaOffsets]) {
+    for (p, s, w) in offsets {
+        arena.free(*p);
+        if *s != 0 {
+            arena.free(*s);
+        }
+        if *w != 0 {
+            arena.free(*w);
+        }
+    }
+}
+
+/// Free arena blocks for the whole batch under one LWLock acquire.
+/// Used on staging-queue-full rollback.
+fn free_arena_batch(offsets: &[ArenaOffsets]) {
+    let mut arena_guard = SPILLOVER_ARENA.exclusive();
+    let arena = &mut *arena_guard;
+    rollback_arena_offsets(arena, offsets);
+}
+
+fn build_staging_entry(
+    p: &ParsedEnvelope,
+    offsets: &ArenaOffsets,
+    user_tx_xid: u32,
+    request_seq: u64,
+) -> StagingEntry {
+    let payload_length: u32 = p.payload_bytes.len() as u32;
+    StagingEntry {
+        valid: std::sync::atomic::AtomicU8::new(0),
+        _pad: [0; 7],
+        request_seq,
+        correlation_id: *p.correlation_id.as_bytes(),
+        user_tx_xid: user_tx_xid as u64,
+        event_type_id: event_type_to_id(&p.event_type),
+        _pad_event: [0; 2],
+        payload_offset: offsets.0,
+        payload_length,
+        sku_pool_count: p.sku_pool_keys.len() as u16,
+        wip_pool_count: p.wip_pool_keys.len() as u16,
+        sku_pool_keys_offset: offsets.1,
+        wip_pool_keys_offset: offsets.2,
+        enqueued_at_micros: now_micros(),
+        backend_pid: unsafe { pg_sys::MyProcPid },
+        _pad_pid: [0; 4],
+        superbatch_id: std::sync::atomic::AtomicU64::new(0),
+        eject_count: std::sync::atomic::AtomicU32::new(0),
+        _pad2: [0; 4],
+    }
+}
 
 fn insert_status_row_caller_intx(correlation_id: Uuid) {
     Spi::run_with_args(

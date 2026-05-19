@@ -43,7 +43,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_outstanding_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:361
+-- src/enqueue.rs:522
 -- poc_v21_ledger::enqueue::poc_v21_arena_stats
 CREATE  FUNCTION "poc_v21_arena_stats"() RETURNS json /* Json */
 STRICT
@@ -205,6 +205,18 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/enqueue.rs:323
+-- poc_v21_ledger::enqueue::poc_v21_enqueue_batch
+CREATE  FUNCTION "poc_v21_enqueue_batch"(
+	"envelopes" jsonb, /* JsonB */
+	"durable_queue" bool DEFAULT false /* bool */
+) RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_enqueue_batch_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/lib.rs:1035
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
@@ -330,7 +342,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_router_total_envelopes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:344
+-- src/enqueue.rs:505
 -- poc_v21_ledger::enqueue::poc_v21_staging_state_counts
 CREATE  FUNCTION "poc_v21_staging_state_counts"() RETURNS json /* Json */
 STRICT
@@ -570,7 +582,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_queue_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:318
+-- src/enqueue.rs:479
 -- poc_v21_ledger::enqueue::poc_v21_test_release_slot
 CREATE  FUNCTION "poc_v21_test_release_slot"(
 	"slot_index" bigint /* i64 */
@@ -713,7 +725,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_staging_state_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/enqueue.rs:309
+-- src/enqueue.rs:470
 -- poc_v21_ledger::enqueue::poc_v21_test_take_pending
 CREATE  FUNCTION "poc_v21_test_take_pending"() RETURNS bigint /* Option < i64 > */
 STRICT

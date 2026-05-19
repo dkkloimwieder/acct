@@ -134,3 +134,69 @@ pub fn state_counts(queue: &StagingQueue) -> (u32, u32, u32, u32, u32) {
 pub enum StagingPushError {
     QueueFull,
 }
+
+/// Push N fully-prepared StagingEntries atomically under the queue
+/// LWLock. Returns the vector of slot indices on success; on partial
+/// failure (no free slot for entry k where k < N), rolls back entries
+/// [0..k) to valid=0 and returns `QueueFull`.
+///
+/// Caller holds the staging queue LWLock in EXCLUSIVE mode.
+///
+/// Rollback resets `valid` 1→0 with Release. The tail pointer is
+/// advanced once at the end of a successful push (mirroring the
+/// single-entry path's per-call tail.store). On rollback, tail is
+/// reset to its pre-call value.
+pub fn push_entries_batch(
+    queue: &mut StagingQueue,
+    entries: Vec<StagingEntry>,
+) -> Result<Vec<u32>, StagingPushError> {
+    let capacity = POC_V21_STAGING_QUEUE_SIZE as u32;
+    let n = entries.len();
+    let pre_tail = queue.tail.load(Relaxed);
+    let mut slot_indices: Vec<u32> = Vec::with_capacity(n);
+    let mut next_tail = pre_tail;
+
+    for entry in entries {
+        let mut found = false;
+        for i in 0..capacity {
+            let idx = ((next_tail + i) % capacity) as usize;
+            let slot = &mut queue.entries[idx];
+            let cur = slot.valid.load(Relaxed);
+            if cur == 0 {
+                slot.request_seq = entry.request_seq;
+                slot.correlation_id = entry.correlation_id;
+                slot.user_tx_xid = entry.user_tx_xid;
+                slot.event_type_id = entry.event_type_id;
+                slot.payload_offset = entry.payload_offset;
+                slot.payload_length = entry.payload_length;
+                slot.sku_pool_count = entry.sku_pool_count;
+                slot.wip_pool_count = entry.wip_pool_count;
+                slot.sku_pool_keys_offset = entry.sku_pool_keys_offset;
+                slot.wip_pool_keys_offset = entry.wip_pool_keys_offset;
+                slot.enqueued_at_micros = entry.enqueued_at_micros;
+                slot.backend_pid = entry.backend_pid;
+                slot.superbatch_id.store(0, Relaxed);
+                slot.eject_count.store(0, Relaxed);
+
+                if slot.valid.compare_exchange(0, 1, Release, Relaxed).is_ok() {
+                    slot_indices.push(idx as u32);
+                    next_tail = (next_tail + i + 1) % capacity;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            for prev_idx in slot_indices.iter() {
+                queue.entries[*prev_idx as usize]
+                    .valid
+                    .store(0, Release);
+            }
+            queue.tail.store(pre_tail, Relaxed);
+            return Err(StagingPushError::QueueFull);
+        }
+    }
+
+    queue.tail.store(next_tail, Relaxed);
+    Ok(slot_indices)
+}
