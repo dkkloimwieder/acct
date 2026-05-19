@@ -110,19 +110,48 @@ prevents `reset_state` from settling within its 15s timeout. Subsequent shapes
 out.
 
 Per-shape isolated runs (docker-restart between, see
-`results-m81-isolated-<shape>.md`) give the **clean** per-shape numbers:
+`results-m81-isolated-<shape>.md`) give the **clean** per-shape numbers.
+**Original measurements were captured under the stride workaround in
+`tests/common/m8_runner.rs::build_components`.** The acct-shpc.6
+revert of that workaround surfaced new measurements (post-acct-zplt
+router union-find affinity grouping):
 
-| shape | committed | failed | tput evps | p50 µs | p99 µs | notes |
-|---|---|---|---|---|---|---|
-| s1_fan_out_simple | 4108 | 0 | 68 | 54k | 102k | clean (above) |
-| s2_fan_out_wo | 993 | 20 | 17 | 54k | 103k | stride workaround |
-| s3_fan_contested_wo | 3 | 24 | 0 | 3106k | 5264k | **blocked acct-0frn** |
-| s4_fan_in_wo | 1 | 24 | 0 | 2365k | 2365k | **blocked acct-0frn** |
-| s5_hot_pool (isolated) | 4285 | 0 | 71 | 60k | 73k | clean |
-| s6_large_wo (isolated) | 332 | 24 | 6 | 56k | 105k | acct-0frn wraps at iter 333 |
-| s7_very_large_wo (isolated) | 58 | 14 | 1 | 145k | 5190k | acct-0frn wraps at iter 100 |
-| s8_mixed_event (isolated) | 84 | 12 | 1 | 121k | 5337k | wo_complete half hits bug |
-| s9_causal_chain margin=0 | 1352 | 0 | 23 | 162k | 258k | clean (1352 triplets = 4056 events) |
+| shape | pre-shpc.6 stride / committed | post-shpc.6 consecutive / committed | tput Δ | notes |
+|---|---|---|---|---|
+| s1_fan_out_simple | 4108 / 68 evps | (unchanged — K=1) | — | clean |
+| s2_fan_out_wo | 993 / 17 evps | 4 / 0 evps | **REGRESSED** | stride was masking the underlying wo_complete hang |
+| s3_fan_contested_wo | 3 / 0 evps | 4 / 0 evps | flat | committer hang unchanged by router fix |
+| s4_fan_in_wo | 1 / 0 evps | 0 / 0 evps | flat | single-pool fan-in still serializes-then-hangs |
+| s5_hot_pool | 4285 / 71 evps | (unchanged — K=1, no wo_complete) | — | clean |
+| s6_large_wo | 332 / 6 evps | 4 / 0 evps | **REGRESSED** | acct-0frn pattern surfaced earlier |
+| s7_very_large_wo | 58 / 1 evps | 4 / 0 evps | **REGRESSED** | same |
+| s8_mixed_event | 84 / 1 evps | 172 / 3 evps | partial improvement | inv_adjust half clean; wo_complete half hits bug |
+| s9_causal_chain margin=0 | 1352 / 23 evps | (unchanged) | — | clean (1352 triplets = 4056 events) |
+
+### Falsifier finding (acct-shpc.6, 2026-05-18)
+
+Reverting the stride workaround surfaces a deeper committer-side issue.
+Across all wo_complete shapes (S2/S3/S4/S6/S7 and the wo_complete half
+of S8) the pattern is **exactly 4 commits + 24 failed** under N=4 ×
+60s submit-and-poll — each backend gets ONE successful commit, then
+the system hangs and subsequent submissions time out at 10s wait.
+
+The router union-find (acct-zplt) is grouping correctly:
+isolated_m8_s8 shows mixed event_mix=50/50 with 172 commits (the
+inv_adjust path passes through unblocked). The hang is downstream of
+the router — likely in committer Step 2 lex-lock acquisition or Step
+14 cleanup interacting with the wo_complete pool fan-out.
+
+The stride workaround had been masking this by making consecutive
+envelopes pool-disjoint, so the router emitted size-1 SBs and no
+batched lock-acquisition pressure built up. Spec-aligned consecutive
+form exposes the latency cliff.
+
+Follow-up filed for root-cause: see bd issue tracker.
+
+The acct-shpc.6 bench-as-validation-gate (this issue) remains OPEN
+until the root cause closes; the stride revert ships but its bench
+expectations cannot be met until then.
 
 ### Calibration
 

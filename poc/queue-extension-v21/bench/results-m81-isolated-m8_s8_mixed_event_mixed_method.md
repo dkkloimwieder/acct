@@ -8,19 +8,19 @@ Latency = enqueue → submission_status terminal-state observed. Submit-and-poll
 
 | shape | g | K | committed | failed | throughput evps | p50 µs | p99 µs | p99.9 µs | avg eps/sb | sb count |
 |---|---|---|---|---|---|---|---|---|---|---|
-| s8_mixed_event_mixed_method | 1000 | 5 | 84 | 12 | 1 | 121473 | 5337786 | 5337788 | 3.84 | 25 |
+| s8_mixed_event_mixed_method | 1000 | 5 | 172 | 11 | 3 | 63488 | 5453789 | 9528774 | 1.00 | 183 |
 
 ## Per-shape detail
 
 ```
 shape: s8_mixed_event_mixed_method  g=1000  K=5   N=4 duration=60s
-  envelopes: total=96 committed=84 failed=12
-  throughput: 1 env/sec
-  latency: p50=121473µs p99=5337786µs p99.9=5337788µs
-  router: total_envelopes Δ=96 superbatch Δ=25 avg_eps=3.84
-  event_mix: inv_adjust=50.0%
-  event_mix: wo_complete=50.0%
+  envelopes: total=183 committed=172 failed=11
+  throughput: 3 env/sec
+  latency: p50=63488µs p99=5453789µs p99.9=9528774µs
+  router: total_envelopes Δ=183 superbatch Δ=183 avg_eps=1.00
+  event_mix: inv_adjust=50.3%
+  event_mix: wo_complete=49.7%
 ```
 
 
-Generated: 2026-05-18T01:53:39Z
+Generated: 2026-05-19T02:59:53Z

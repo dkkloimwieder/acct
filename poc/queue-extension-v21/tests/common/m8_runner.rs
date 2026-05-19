@@ -488,19 +488,20 @@ pub fn build_components(
             }
         }
         Shape::S2FanOutWo | Shape::S6LargeWo | Shape::S7VeryLargeWo => {
-            // K consecutive SKUs strided by K from primary, wrapping at
-            // g. Stride avoids component-set overlap between consecutive
-            // envelopes from the same backend (which otherwise creates
-            // pathological lock-acquisition chains across SuperBatches).
+            // K consecutive SKUs from primary, wrapping at g. Adjacent
+            // envelopes share K-1 pool keys; the router's union-find
+            // affinity grouping (acct-zplt) packs them into one SB so
+            // committer Step 2 acquires the lex-lock chain once per
+            // group, not once per envelope.
             for i in 0..k {
-                let s = (((primary_sku - 1) * k as i64 + i as i64) % g) + 1;
+                let s = ((primary_sku - 1 + i as i64) % g) + 1;
                 out.push((s, LOCATION_ID, 1));
             }
         }
         Shape::S8MixedEventMixedMethod => {
-            // K distinct SKUs strided by K from primary, wrapping at g.
+            // K consecutive SKUs from primary, wrapping at g.
             for i in 0..k {
-                let s = (((primary_sku - 1) * k as i64 + i as i64) % g) + 1;
+                let s = ((primary_sku - 1 + i as i64) % g) + 1;
                 out.push((s, LOCATION_ID, 1));
             }
         }

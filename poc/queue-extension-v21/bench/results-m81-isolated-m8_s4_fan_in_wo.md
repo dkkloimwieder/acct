@@ -8,17 +8,17 @@ Latency = enqueue → submission_status terminal-state observed. Submit-and-poll
 
 | shape | g | K | committed | failed | throughput evps | p50 µs | p99 µs | p99.9 µs | avg eps/sb | sb count |
 |---|---|---|---|---|---|---|---|---|---|---|
-| s7_very_large_wo | 5000 | 50 | 4 | 24 | 0 | 93359 | 93444 | 93444 | 1.00 | 28 |
+| s4_fan_in_wo | 1 | 5 | 0 | 24 | 0 | 0 | 0 | 0 | 4.00 | 6 |
 
 ## Per-shape detail
 
 ```
-shape: s7_very_large_wo             g=5000  K=50  N=4 duration=60s
-  envelopes: total=28 committed=4 failed=24
+shape: s4_fan_in_wo                 g=1     K=5   N=4 duration=60s
+  envelopes: total=24 committed=0 failed=24
   throughput: 0 env/sec
-  latency: p50=93359µs p99=93444µs p99.9=93444µs
-  router: total_envelopes Δ=28 superbatch Δ=28 avg_eps=1.00
+  latency: p50=0µs p99=0µs p99.9=0µs
+  router: total_envelopes Δ=24 superbatch Δ=6 avg_eps=4.00
 ```
 
 
-Generated: 2026-05-19T02:58:44Z
+Generated: 2026-05-19T02:56:31Z
