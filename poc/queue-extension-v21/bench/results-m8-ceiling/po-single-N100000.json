@@ -1,0 +1,74 @@
+{
+  "committer": {
+    "avg_pipeline_ns_per_drain": 8299921.738837405,
+    "backpressure_count": 100000,
+    "drains_total": 1187,
+    "eject_count": 98,
+    "pipeline_count": 1187,
+    "pipeline_ns_total": 9852007104,
+    "takeover_count": 0,
+    "tx_failures": 0
+  },
+  "distribution": "single",
+  "drain": {
+    "rate_evps": 181401.99748197338,
+    "wall_ms": 551
+  },
+  "end_to_end": {
+    "rate_evps": 1944.243119776005,
+    "wall_ms": 51433
+  },
+  "gucs_assumed": {
+    "batch_size_max": 50,
+    "batch_window_us_DEAD_CODE": 500,
+    "router_window_size": 1000
+  },
+  "issue": "acct-cyu6",
+  "latency_e2e_us": {
+    "count": 100000,
+    "max": 93439,
+    "min": 1,
+    "p50": 44991,
+    "p90": 72255,
+    "p99": 86015,
+    "p999": 90239
+  },
+  "n_backends": 8,
+  "n_envelopes": 100000,
+  "outcomes": {
+    "committed": 100000,
+    "failed": 0,
+    "missing": 0
+  },
+  "payload_sha256": "3941453245dc3bf1b5420275bbce064219575dc5ebc6e7eda2eb6c0ecd3e1a0b",
+  "router": {
+    "avg_envelopes_per_sb": 84.32855939342882,
+    "cross_sb_for_update_waits": 0,
+    "envelope_histogram_buckets": [
+      85,
+      57,
+      34,
+      0,
+      1,
+      6,
+      1004,
+      0
+    ],
+    "force_pack_count": 0,
+    "max_envelope_count_lifetime": 111,
+    "superbatch_count": 1187,
+    "ticks_total": 2209,
+    "total_envelopes": 100098
+  },
+  "submission": {
+    "errors": 0,
+    "rate_evps": 1965.308656679959,
+    "submitted": 100000,
+    "wall_ms": 50882
+  },
+  "top_wait_event": {
+    "sum_backends": 1439,
+    "wait_event": "WALWrite",
+    "wait_event_type": "LWLock"
+  }
+}

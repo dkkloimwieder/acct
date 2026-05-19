@@ -38,7 +38,8 @@ sqlx = { version = "0.8", default-features = false, features = [
 rand = "0.9"
 hdrhistogram = "7"
 proptest = "1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+sha2 = "0.10"
 
 [profile.dev]
 panic = "unwind"

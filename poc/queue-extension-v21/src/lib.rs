@@ -784,7 +784,7 @@ pub extern "C-unwind" fn _PG_init() {
         c"Hard cap on envelopes packed into a single SuperBatch. Larger batches amortize sub-tx + WAL costs; smaller batches keep per-batch wall-time below committer_lease_ms.",
         &BATCH_SIZE_MAX,
         1,
-        1000,
+        10_000,
         GucContext::Sighup,
         GucFlags::empty(),
     );
