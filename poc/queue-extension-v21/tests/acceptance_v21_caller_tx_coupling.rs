@@ -113,6 +113,45 @@ async fn wait_arena_drained_to(pool: &PgPool, baseline: i64, timeout: Duration) 
     }
 }
 
+/// Poll submission_status for `cid` until a terminal-state row exists
+/// (state ∈ {committed, failed, replayed}) or `timeout` elapses. Drives
+/// one_pump_cycle on each iteration so we don't rely solely on the
+/// concurrent BGWorker. Returns the (state, error_code) tuple, or
+/// panics on timeout. Matches the race-tolerance pattern of
+/// `wait_arena_drained_to` — the test's synchronous one_pump_cycle can
+/// see (0, false) when the BGWorker has the slot mid-tick, in which
+/// case the row arrives on the BGWorker's own write a few ms later.
+async fn wait_for_terminal_status(
+    conn: &mut PgConnection,
+    cid: Uuid,
+    timeout: Duration,
+) -> (String, Option<String>) {
+    let start = Instant::now();
+    loop {
+        let _ = one_pump_cycle(conn).await;
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT state, error_code FROM poc_v21_submission_status \
+              WHERE correlation_id=$1 \
+                AND state IN ('committed', 'failed', 'replayed')",
+        )
+        .bind(cid)
+        .fetch_optional(&mut *conn)
+        .await
+        .expect("submission_status query");
+        if let Some(t) = row {
+            return t;
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "submission_status for {cid} did not reach terminal state \
+                 within {:?}",
+                timeout
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn full_reset(pool: &PgPool) {
     reset_state(pool).await;
     // No staging-queue reset helper exposed; arena baseline is recorded
@@ -178,16 +217,10 @@ async fn acceptance_v21_caller_tx_committed_path() {
     enqueue_one(&mut conn, cid, 9_300_001, 1).await.unwrap();
     sqlx::query("COMMIT").execute(&mut conn).await.unwrap();
 
-    // Caller tx is committed. A fresh tick should process the envelope.
-    let (_drained, _processed) = one_pump_cycle(&mut conn).await;
-
-    let (state, _err): (String, Option<String>) = sqlx::query_as(
-        "SELECT state, error_code FROM poc_v21_submission_status WHERE correlation_id=$1",
-    )
-    .bind(cid)
-    .fetch_one(&mut conn)
-    .await
-    .expect("status row exists");
+    // Caller tx is committed. Poll for terminal state — the test's
+    // synchronous pump can race with the BGWorker's own ticks; the row
+    // arrives whoever wins.
+    let (state, _err) = wait_for_terminal_status(&mut conn, cid, Duration::from_secs(10)).await;
     assert_eq!(
         state, "committed",
         "committed-caller envelope should reach 'committed', got {state}"
@@ -216,16 +249,10 @@ async fn acceptance_v21_caller_tx_aborted_path() {
     // Caller's user-tx aborted; the 'queued' submission_status row
     // rolled back with it (the row never existed for an outside
     // observer). The shmem staging entry is still there (shmem is
-    // non-transactional). Committer's pg_xact_status sees 'aborted'.
-    let (_drained, _processed) = one_pump_cycle(&mut conn).await;
-
-    let (state, err): (String, Option<String>) = sqlx::query_as(
-        "SELECT state, error_code FROM poc_v21_submission_status WHERE correlation_id=$1",
-    )
-    .bind(cid)
-    .fetch_one(&mut conn)
-    .await
-    .expect("lazy failed-status row should exist");
+    // non-transactional). Committer's pg_xact_status sees 'aborted'
+    // and writes a lazy 'failed' row. Poll — same race tolerance as
+    // committed_path.
+    let (state, err) = wait_for_terminal_status(&mut conn, cid, Duration::from_secs(10)).await;
     assert_eq!(state, "failed", "aborted-caller envelope should be failed");
     assert_eq!(err.as_deref(), Some("caller_tx_aborted"));
 }
