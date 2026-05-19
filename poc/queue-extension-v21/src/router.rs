@@ -133,6 +133,13 @@ pub extern "C-unwind" fn poc_v21_router_main(_arg: pg_sys::Datum) {
                 pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
             }
         }
+        // acct-gx1z.2 / acct-iypm: test-only pause. Skip audit + router_tick
+        // when a test backend has flipped `test_bgworker_paused` to 1 so
+        // synchronous test-driver SQL fns can transition slot state without
+        // racing this BGWorker. Production default is 0 (no skip).
+        if COMMITTER_QUEUE.share().test_bgworker_paused.load(Acquire) == 1 {
+            continue;
+        }
         // M5d.2 (acct-3rc1): periodic slot-leak audit. Runs at most
         // once every AUDIT_INTERVAL_NS; bounded pass (iterates fixed
         // staging + committer queue sizes) so it doesn't perturb
@@ -1546,6 +1553,24 @@ fn poc_v21_test_set_router_reorder(enabled: bool) {
         .share()
         .test_reorder_router_stores
         .store(if enabled { 1 } else { 0 }, Relaxed);
+}
+
+/// Test-only: pause both BGWorkers (router + committer pool). When ON
+/// (1), both BGWorker tick loops skip their per-iteration work after
+/// the sighup check. Synchronous test-driver SQL fns
+/// (poc_v21_test_router_drain / _committer_tick / _run_audit_sweep /
+/// _orphan_recover_tick) are then the only source of progress. Default
+/// 0 (no pause). Tests in acceptance_v21_slot_leak_audit and
+/// acceptance_v21_orphan_recovery use this to eliminate BGWorker-race
+/// flakes during deterministic assertion windows; per acct-gx1z.2 /
+/// acct-iypm.
+#[cfg(any(test, feature = "test_hooks"))]
+#[pg_extern]
+fn poc_v21_test_set_bgworker_paused(paused: bool) {
+    COMMITTER_QUEUE
+        .share()
+        .test_bgworker_paused
+        .store(if paused { 1 } else { 0 }, Release);
 }
 
 /// Test-only: scan all staging entries with Acquire ordering and

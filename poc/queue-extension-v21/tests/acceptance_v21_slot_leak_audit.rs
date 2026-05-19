@@ -18,7 +18,7 @@
 
 mod common;
 
-use common::{connect_pool, reset_state};
+use common::{connect_pool, pause_bgworker, reset_state};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -52,12 +52,15 @@ async fn run_audit(pool: &PgPool) -> i64 {
         .expect("run audit sweep")
 }
 
-/// Drain prior-test traffic via reset_state, then nuke shmem to give the
-/// next assertion block a strict zero baseline. The drain step ensures
-/// no BGWorker is mid-tick when we nuke; the nuke clears any leftovers
-/// the drain couldn't catch within its 5s gate.
+/// Drain prior-test traffic via reset_state, pause the BGWorker pool so
+/// no concurrent tick races the test's synchronous slot-state assertions,
+/// then nuke shmem to give the next assertion block a strict zero baseline.
+/// The BGWorker stays paused for the rest of the test — every test in this
+/// binary needs synchronous control, and docker-restart between binaries
+/// (run-tests-v21.sh) re-zeros the pause flag. See acct-gx1z.2.
 async fn clean_slate(pool: &PgPool) {
     reset_state(pool).await;
+    pause_bgworker(pool).await;
     sqlx::query("SELECT poc_v21_test_force_reset_all_shmem()")
         .execute(pool)
         .await

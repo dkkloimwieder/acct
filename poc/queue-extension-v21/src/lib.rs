@@ -246,6 +246,14 @@ pub struct CommitterQueue {
     // Production binaries default both to 0/false (no-op fast path).
     pub test_inject_router_delay_us: AtomicU32,
     pub test_reorder_router_stores: AtomicU8,
+    /// acct-gx1z.2 / acct-iypm: test-only BGWorker pause flag. When set
+    /// to 1, both router_main and committer_main skip their per-tick
+    /// work (audit + router_tick + committer claim loop). Tests that
+    /// need deterministic synchronous control over slot transitions
+    /// (slot_leak_audit, orphan_recovery) flip this on for the test
+    /// window so concurrent BGWorker ticks don't race the test's
+    /// manually-driven `poc_v21_test_*` operations. Default 0.
+    pub test_bgworker_paused: AtomicU8,
     /// M5d.1 (acct-y0bp): postmaster-startup recovery flag.
     /// 0 = recovery not yet complete; router + committer BGWorkers
     /// spin at startup until set. 1 = recovery sweep finished

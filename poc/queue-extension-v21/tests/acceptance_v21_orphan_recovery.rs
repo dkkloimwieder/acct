@@ -27,7 +27,7 @@
 
 mod common;
 
-use common::{connect_pool, reset_state, wait_for_terminal};
+use common::{connect_pool, pause_bgworker, reset_state, resume_bgworker, wait_for_terminal};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
@@ -61,6 +61,11 @@ async fn enqueue_one(pool: &PgPool, cid: Uuid, sku: i64, chrono: i64) -> Result<
 async fn acceptance_v21_orphan_synthetic_recovery() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Pause the BGWorker pool so the BGWorker's own 50ms-tick orphan
+    // recovery can't beat the test's synchronous sweep to the injected
+    // slot. Without this, ~25-33% of runs see recovered=0 because the
+    // BGWorker rescued before the test's call ran (acct-gx1z.2).
+    pause_bgworker(&pool).await;
     // Use slot far from where the router will write so it doesn't
     // race a real SuperBatch. Slot 100 is well within the 2048 ring
     // but past where typical post-reset routing lands first.
@@ -136,6 +141,9 @@ async fn acceptance_v21_orphan_synthetic_recovery() {
         .execute(&pool)
         .await
         .expect("force_reset (post)");
+    // Resume the BGWorker pool for any subsequent test in this binary
+    // that needs the live-workload path.
+    resume_bgworker(&pool).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

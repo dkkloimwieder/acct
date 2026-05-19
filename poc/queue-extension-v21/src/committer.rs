@@ -259,6 +259,12 @@ pub extern "C-unwind" fn poc_v21_committer_main(_arg: pg_sys::Datum) {
                 pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
             }
         }
+        // acct-gx1z.2 / acct-iypm: test-only pause. Skip claim + orphan
+        // recovery when a test backend has flipped `test_bgworker_paused`
+        // to 1. Production default is 0 (no skip).
+        if COMMITTER_QUEUE.share().test_bgworker_paused.load(Acquire) == 1 {
+            continue;
+        }
         loop {
             let claim = claim_next_committer_entry();
             match claim {

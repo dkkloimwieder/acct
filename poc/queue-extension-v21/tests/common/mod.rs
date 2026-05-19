@@ -143,6 +143,28 @@ pub async fn seed_standard_costs(pool: &PgPool, costs: &[(i64, i64, i64)]) {
     .expect("seed_standard_costs INSERT");
 }
 
+/// Pause both BGWorkers (router + committer pool). Required for tests
+/// that need deterministic synchronous control over slot transitions
+/// (slot_leak_audit, orphan_recovery synthetic tests). Sleeps 100ms
+/// after flipping the flag so any in-flight BGWorker tick completes
+/// and the next iteration observes the pause. See acct-gx1z.2.
+pub async fn pause_bgworker(pool: &PgPool) {
+    sqlx::query("SELECT poc_v21_test_set_bgworker_paused(true)")
+        .execute(pool)
+        .await
+        .expect("set_bgworker_paused(true)");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+/// Resume both BGWorkers. Pairs with `pause_bgworker`. Safe to call
+/// without a prior pause (idempotent).
+pub async fn resume_bgworker(pool: &PgPool) {
+    sqlx::query("SELECT poc_v21_test_set_bgworker_paused(false)")
+        .execute(pool)
+        .await
+        .expect("set_bgworker_paused(false)");
+}
+
 /// Poll submission_status until all `correlation_ids` are in a terminal
 /// state (committed / failed / replayed) or until `timeout` elapses.
 /// Returns the count of rows reaching terminal state.

@@ -63,6 +63,20 @@ for bin in $BINARIES; do
     docker restart "$CONTAINER" >/dev/null
     sleep "$RESTART_WAIT"
 
+    # Docker restart preserves the data volume — persistent tables
+    # (sku_method_assignments, standard_costs) leak across binaries
+    # unless explicitly truncated. Inside ONE binary, reset_state
+    # intentionally keeps these populated (so seed_method_assignments at
+    # test start applies to all sub-tests). Across binaries, prior
+    # binaries' assignments would poison binaries that expect default
+    # 'fifo' for every SKU (e.g., multi_committer enqueues SKUs 1000-1399
+    # as po_receipt; if a previous binary marked any of those as 'std'
+    # without seeding standard_costs, this binary's envelope routes to
+    # STD and fails 'standard_cost_missing').
+    docker exec "$CONTAINER" psql -U acct -d acct_poc_queue_v21 \
+        -c "TRUNCATE poc_v21_sku_method_assignments, poc_v21_standard_costs" \
+        >/dev/null 2>&1
+
     if cargo test --release --features pg18,test_hooks --no-default-features \
             --test "$bin" -- --ignored --test-threads=1 --nocapture; then
         greens+=("$bin")
