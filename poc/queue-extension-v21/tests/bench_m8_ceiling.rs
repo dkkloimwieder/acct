@@ -695,9 +695,16 @@ async fn run_replay(
 fn write_result(r: &RunResult) -> std::io::Result<PathBuf> {
     let out_dir = PathBuf::from("bench/results-m8-ceiling");
     std::fs::create_dir_all(&out_dir)?;
+    // Suffix: N (backend count) + status-mode (caller_intx / committer_lazy).
+    // POC_CYU6_TAG env can override the suffix entirely (e.g. for ad-hoc
+    // GUC sweeps). Keeps prior runs' output files from being clobbered.
+    let suffix = std::env::var("POC_CYU6_TAG").unwrap_or_else(|_| {
+        let mode = std::env::var("POC_CYU6_STATUS_MODE").unwrap_or_else(|_| "caller_intx".to_string());
+        format!("_N{}backends_{}", r.n_backends, mode)
+    });
     let path = out_dir.join(format!(
-        "po-{}-N{}.json",
-        r.distribution, r.n_envelopes
+        "po-{}-N{}{}.json",
+        r.distribution, r.n_envelopes, suffix
     ));
     let submission_evps = if r.submission_wall_ns > 0 {
         (r.submitted as f64) * 1e9 / r.submission_wall_ns as f64

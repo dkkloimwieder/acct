@@ -1,0 +1,74 @@
+{
+  "committer": {
+    "avg_pipeline_ns_per_drain": 1933791.6668588007,
+    "backpressure_count": 100000,
+    "drains_total": 52047,
+    "eject_count": 0,
+    "pipeline_count": 52047,
+    "pipeline_ns_total": 100648054885,
+    "takeover_count": 0,
+    "tx_failures": 0
+  },
+  "distribution": "uniform_1000",
+  "drain": {
+    "rate_evps": 10261.747093219652,
+    "wall_ms": 9744
+  },
+  "end_to_end": {
+    "rate_evps": 1489.2594124114594,
+    "wall_ms": 67147
+  },
+  "gucs_assumed": {
+    "batch_size_max": 50,
+    "batch_window_us_DEAD_CODE": 500,
+    "router_window_size": 1000
+  },
+  "issue": "acct-cyu6",
+  "latency_e2e_us": {
+    "count": 100000,
+    "max": 65503231,
+    "min": 57856,
+    "p50": 3536895,
+    "p90": 60522495,
+    "p99": 64749567,
+    "p999": 65437695
+  },
+  "n_backends": 8,
+  "n_envelopes": 100000,
+  "outcomes": {
+    "committed": 100000,
+    "failed": 0,
+    "missing": 0
+  },
+  "payload_sha256": "547d4956845450371a20aa89ef5943e6808b08bd33df62b44a520912fe794ead",
+  "router": {
+    "avg_envelopes_per_sb": 1.9213403270121236,
+    "cross_sb_for_update_waits": 0,
+    "envelope_histogram_buckets": [
+      5330,
+      46617,
+      100,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "force_pack_count": 0,
+    "max_envelope_count_lifetime": 5,
+    "superbatch_count": 52047,
+    "ticks_total": 3197,
+    "total_envelopes": 100000
+  },
+  "submission": {
+    "errors": 0,
+    "rate_evps": 1742.0846468084014,
+    "submitted": 100000,
+    "wall_ms": 57402
+  },
+  "top_wait_event": {
+    "sum_backends": 1486,
+    "wait_event": "Extension",
+    "wait_event_type": "Extension"
+  }
+}
