@@ -9,9 +9,13 @@
 //! (no `avg_total_qty`-equivalent state). Negative pool quantities are
 //! acceptable by accounting policy.
 //!
-//! Receipt under STD: emit a layer row at standard cost (audit only —
-//! STD layers are never depleted; cost_consumptions is the live path).
-//! Posting line: debit inventory, credit ap_unsettled at qty * std_cost.
+//! Receipt under STD: no `cost_layers` row is emitted (acct-xwu3) —
+//! STD layers are never depleted (cost_consumptions is the live path),
+//! so the row is dead-weight on the bulk-insert hot path. Posting line:
+//! debit inventory, credit ap_unsettled at qty * std_cost. WoComplete
+//! output under STD is the one exception: its cost_layer is the audit
+//! trail of WO output cost (component-derived, not std), read by
+//! downstream audit/recon queries — that path passes emit_layer=true.
 //!
 //! Consumption under STD: emit a cost_consumptions row at standard
 //! cost; no pool-depth check; posting line: debit COGS, credit
@@ -48,7 +52,7 @@ impl PocV21CostMethod for StandardMethod {
         // cost is acct's concern, not the extension's. Standard cost
         // lookup is skipped for this path.
         if matches!(event.event_type, PocV21EventType::WoComplete) && event.qty > 0 {
-            self.receive(event, event.unit_cost, snapshot, result);
+            self.receive(event, event.unit_cost, snapshot, result, true);
             return PocV21EventResult {
                 correlation_id: event.correlation_id,
                 error_code: None,
@@ -85,7 +89,7 @@ impl PocV21CostMethod for StandardMethod {
         ) && event.qty < 0);
 
         if is_receipt {
-            self.receive(event, std_cost, snapshot, result);
+            self.receive(event, std_cost, snapshot, result, false);
             PocV21EventResult { correlation_id: event.correlation_id, error_code: None }
         } else if is_consumption {
             self.consume(event, std_cost, snapshot, result);
@@ -116,38 +120,38 @@ impl StandardMethod {
         std_cost: i64,
         snapshot: &mut PocV21Snapshot,
         result: &mut PocV21ApplyResult,
+        emit_layer: bool,
     ) {
         let key = (event.sku_id, event.location_id);
         let pool = snapshot.sku_pools.entry(key).or_insert_with(SkuPoolState::default);
-        pool.max_born_seq += 1;
-        let new_born_seq = pool.max_born_seq;
         let qty = event.qty.abs();
         let amount = qty * std_cost;
 
-        result.layer_inserts.push(PocV21LayerRow {
-            sku_id: event.sku_id,
-            location_id: event.location_id,
-            qty,
-            unit_cost: std_cost,
-            born_at_micros: event.at_micros,
-            born_seq: new_born_seq,
-            source_kind: source_kind_name(event.event_type),
-            source_ref: None,
-            correlation_id: event.correlation_id,
-            user_tx_xid: event.user_tx_xid,
-        });
-        // Track in snapshot for audit consistency (STD doesn't deplete
-        // layers, but the snapshot stays consistent with what Step 5
-        // INSERTs).
-        pool.layers.push(LayerView {
-            layer_id: 0,
-            layer_insert_index: Some(result.layer_inserts.len() - 1),
-            unit_cost: std_cost,
-            effective_qty: qty,
-            born_at_micros: event.at_micros,
-            born_seq: new_born_seq,
-            correlation_id: event.correlation_id,
-        });
+        if emit_layer {
+            pool.max_born_seq += 1;
+            let new_born_seq = pool.max_born_seq;
+            result.layer_inserts.push(PocV21LayerRow {
+                sku_id: event.sku_id,
+                location_id: event.location_id,
+                qty,
+                unit_cost: std_cost,
+                born_at_micros: event.at_micros,
+                born_seq: new_born_seq,
+                source_kind: source_kind_name(event.event_type),
+                source_ref: None,
+                correlation_id: event.correlation_id,
+                user_tx_xid: event.user_tx_xid,
+            });
+            pool.layers.push(LayerView {
+                layer_id: 0,
+                layer_insert_index: Some(result.layer_inserts.len() - 1),
+                unit_cost: std_cost,
+                effective_qty: qty,
+                born_at_micros: event.at_micros,
+                born_seq: new_born_seq,
+                correlation_id: event.correlation_id,
+            });
+        }
 
         result.posting_line_inserts.push(PocV21PostingLineRow {
             business_date_jdate: event.business_date_jdate,
