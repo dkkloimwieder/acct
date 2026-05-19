@@ -80,20 +80,16 @@ async fn acceptance_v21_router_groups_transitive_chain() {
     let cid_d = Uuid::new_v4();
     let correlation_ids = vec![cid_a, cid_b, cid_c, cid_d];
 
-    // Burst-enqueue in parallel so all four land in the staging window
-    // before the next router tick fires.
-    let p = pool.clone();
-    let a = tokio::spawn(async move { enqueue_multi_pool(&p, cid_a, 10, Some(20), 1).await });
-    let p = pool.clone();
-    let b = tokio::spawn(async move { enqueue_multi_pool(&p, cid_b, 20, Some(30), 2).await });
-    let p = pool.clone();
-    let c = tokio::spawn(async move { enqueue_multi_pool(&p, cid_c, 30, Some(40), 3).await });
-    let p = pool.clone();
-    let d = tokio::spawn(async move { enqueue_multi_pool(&p, cid_d, 50, None, 4).await });
-    a.await.unwrap().unwrap();
-    b.await.unwrap().unwrap();
-    c.await.unwrap().unwrap();
-    d.await.unwrap().unwrap();
+    // Serial enqueue ensures all four envelopes land in staging before
+    // the next router tick (50ms cadence; 4 SPI calls finish in <5ms).
+    // Parallel tokio::spawn lets enqueues race across the connection
+    // pool — the router can tick after envelope 1 lands and before
+    // envelopes 2-4 arrive, splitting the union-find component across
+    // multiple SBs.
+    enqueue_multi_pool(&pool, cid_a, 10, Some(20), 1).await.unwrap();
+    enqueue_multi_pool(&pool, cid_b, 20, Some(30), 2).await.unwrap();
+    enqueue_multi_pool(&pool, cid_c, 30, Some(40), 3).await.unwrap();
+    enqueue_multi_pool(&pool, cid_d, 50, None, 4).await.unwrap();
 
     let terminal = wait_for_terminal(&pool, &correlation_ids, Duration::from_secs(15)).await;
     assert_eq!(terminal, 4, "all four envelopes should reach terminal");

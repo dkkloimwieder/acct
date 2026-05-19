@@ -90,15 +90,12 @@ async fn acceptance_v21_affinity_groups_overlapping_envelopes() {
     let cid_c = Uuid::new_v4();
     let correlation_ids = vec![cid_a, cid_b, cid_c];
 
-    let p = pool.clone();
-    let a = tokio::spawn(async move { enqueue_one(&p, cid_a, 5, 1).await });
-    let p = pool.clone();
-    let b = tokio::spawn(async move { enqueue_one(&p, cid_b, 6, 2).await });
-    let p = pool.clone();
-    let c = tokio::spawn(async move { enqueue_one(&p, cid_c, 5, 3).await });
-    a.await.unwrap().unwrap();
-    b.await.unwrap().unwrap();
-    c.await.unwrap().unwrap();
+    // Serial enqueue ensures all 3 envelopes land before the router
+    // ticks; parallel spawn risks A-only landing in tick N and B,C
+    // landing in tick N+1 → A in its own SB, breaking the assertion.
+    enqueue_one(&pool, cid_a, 5, 1).await.unwrap();
+    enqueue_one(&pool, cid_b, 6, 2).await.unwrap();
+    enqueue_one(&pool, cid_c, 5, 3).await.unwrap();
 
     let terminal = wait_for_terminal(&pool, &correlation_ids, Duration::from_secs(15)).await;
     assert_eq!(terminal, 3, "all 3 envelopes should reach terminal");

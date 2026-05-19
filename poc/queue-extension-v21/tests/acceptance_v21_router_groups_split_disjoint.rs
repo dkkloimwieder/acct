@@ -74,20 +74,16 @@ async fn acceptance_v21_router_groups_three_disjoint_clusters() {
         correlation_ids.extend_from_slice(pair);
     }
 
-    // Burst across the connection pool. Chrono assigned per submission
-    // order so envelopes have distinct doc_chrono.
-    let mut handles = Vec::with_capacity(6);
+    // Serial enqueue keeps all 6 envelopes inside the next router-tick
+    // window (50ms cadence; 6 SPI calls finish in <10ms). Parallel
+    // spawn risks the router emitting before the burst completes,
+    // splitting clusters across ticks.
     let mut chrono = 0_i64;
     for (sku, pair) in clusters {
         for cid in pair {
             chrono += 1;
-            let p = pool.clone();
-            let c = chrono;
-            handles.push(tokio::spawn(async move { enqueue_one(&p, cid, sku, c).await }));
+            enqueue_one(&pool, cid, sku, chrono).await.unwrap();
         }
-    }
-    for h in handles {
-        h.await.unwrap().unwrap();
     }
 
     let terminal = wait_for_terminal(&pool, &correlation_ids, Duration::from_secs(15)).await;

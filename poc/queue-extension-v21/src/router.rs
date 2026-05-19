@@ -123,6 +123,16 @@ pub extern "C-unwind" fn poc_v21_router_main(_arg: pg_sys::Datum) {
     }
 
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
+        // acct-1gg0: pgrx's attach_signal_handlers(SIGHUP) only sets
+        // the GOT_SIGHUP flag — the user code must explicitly call
+        // ProcessConfigFile to actually reload GUCs. Without this
+        // ALTER SYSTEM SET reaches backends via pg_reload_conf but the
+        // BGWorker's GucSetting reads stay frozen at startup values.
+        if BackgroundWorker::sighup_received() {
+            unsafe {
+                pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
+            }
+        }
         // M5d.2 (acct-3rc1): periodic slot-leak audit. Runs at most
         // once every AUDIT_INTERVAL_NS; bounded pass (iterates fixed
         // staging + committer queue sizes) so it doesn't perturb

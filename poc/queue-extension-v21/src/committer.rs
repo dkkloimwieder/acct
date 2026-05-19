@@ -252,6 +252,13 @@ pub extern "C-unwind" fn poc_v21_committer_main(_arg: pg_sys::Datum) {
     set_my_committer_identity(my_slot, my_gen);
 
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
+        // acct-1gg0: pgrx's attach_signal_handlers(SIGHUP) only sets a
+        // flag — user code must drive ProcessConfigFile to reload GUCs.
+        if BackgroundWorker::sighup_received() {
+            unsafe {
+                pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
+            }
+        }
         loop {
             let claim = claim_next_committer_entry();
             match claim {
