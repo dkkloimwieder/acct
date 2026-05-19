@@ -1,0 +1,350 @@
+{
+  "cell": "s2_fan_out_wo_N=2_fifo",
+  "guc_overrides": {},
+  "method_mix": "fifo",
+  "n": 2,
+  "runs": [
+    {
+      "avg_pipeline_ns_per_drain": 1770268.687379576,
+      "committer": {
+        "backpressure_count": 2076,
+        "claim_count": 2090,
+        "drains_total": 2076,
+        "eject_count": 14,
+        "pipeline_count": 2076,
+        "pipeline_ns_total": 3675077795,
+        "takeover_count": 14,
+        "tx_failures": 0
+      },
+      "duration_s": 60,
+      "events_failed": 0,
+      "events_ok": 2076,
+      "max_us": 1068031,
+      "method_dispatch": {
+        "avg": 0,
+        "avg_errors": 0,
+        "fifo": 12456,
+        "fifo_errors": 0,
+        "std": 0,
+        "std_errors": 0
+      },
+      "p50_us": 56159,
+      "p90_us": 59423,
+      "p9999_us": 1068031,
+      "p999_us": 163199,
+      "p99_us": 103231,
+      "router": {
+        "cross_sb_for_update_waits": 0,
+        "entries_scanned_total": 2076,
+        "envelope_histogram": [
+          2076,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "envelopes_per_sb_p50_end": 1.5,
+        "envelopes_per_sb_p99_end": 1.5,
+        "force_pack_count": 0,
+        "max_envelope_count": 1,
+        "superbatch_count": 2076,
+        "ticks_total": 2301,
+        "total_envelopes": 2076
+      },
+      "sampler_on": true,
+      "throughput_evps": 34.6,
+      "top_wait_event": {
+        "sum_backends": 56,
+        "wait_event": "WalSync",
+        "wait_event_type": "IO"
+      }
+    },
+    {
+      "avg_pipeline_ns_per_drain": 1746155.527074019,
+      "committer": {
+        "backpressure_count": 2013,
+        "claim_count": 2036,
+        "drains_total": 2013,
+        "eject_count": 23,
+        "pipeline_count": 2013,
+        "pipeline_ns_total": 3515011076,
+        "takeover_count": 23,
+        "tx_failures": 0
+      },
+      "duration_s": 60,
+      "events_failed": 0,
+      "events_ok": 2013,
+      "max_us": 1368063,
+      "method_dispatch": {
+        "avg": 0,
+        "avg_errors": 0,
+        "fifo": 12078,
+        "fifo_errors": 0,
+        "std": 0,
+        "std_errors": 0
+      },
+      "p50_us": 56447,
+      "p90_us": 59743,
+      "p9999_us": 1368063,
+      "p999_us": 1264639,
+      "p99_us": 155007,
+      "router": {
+        "cross_sb_for_update_waits": 0,
+        "entries_scanned_total": 2013,
+        "envelope_histogram": [
+          2013,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "envelopes_per_sb_p50_end": 1.5,
+        "envelopes_per_sb_p99_end": 1.5,
+        "force_pack_count": 0,
+        "max_envelope_count": 1,
+        "superbatch_count": 2013,
+        "ticks_total": 2292,
+        "total_envelopes": 2013
+      },
+      "sampler_on": true,
+      "throughput_evps": 33.55,
+      "top_wait_event": {
+        "sum_backends": 35,
+        "wait_event": "WalSync",
+        "wait_event_type": "IO"
+      }
+    },
+    {
+      "avg_pipeline_ns_per_drain": 1835223.109329446,
+      "committer": {
+        "backpressure_count": 2058,
+        "claim_count": 2072,
+        "drains_total": 2058,
+        "eject_count": 14,
+        "pipeline_count": 2058,
+        "pipeline_ns_total": 3776889159,
+        "takeover_count": 14,
+        "tx_failures": 0
+      },
+      "duration_s": 60,
+      "events_failed": 0,
+      "events_ok": 2058,
+      "max_us": 1418239,
+      "method_dispatch": {
+        "avg": 0,
+        "avg_errors": 0,
+        "fifo": 12348,
+        "fifo_errors": 0,
+        "std": 0,
+        "std_errors": 0
+      },
+      "p50_us": 56575,
+      "p90_us": 59647,
+      "p9999_us": 1418239,
+      "p999_us": 163583,
+      "p99_us": 102591,
+      "router": {
+        "cross_sb_for_update_waits": 0,
+        "entries_scanned_total": 2058,
+        "envelope_histogram": [
+          2058,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "envelopes_per_sb_p50_end": 1.5,
+        "envelopes_per_sb_p99_end": 1.5,
+        "force_pack_count": 0,
+        "max_envelope_count": 1,
+        "superbatch_count": 2058,
+        "ticks_total": 2287,
+        "total_envelopes": 2058
+      },
+      "sampler_on": true,
+      "throughput_evps": 34.3,
+      "top_wait_event": {
+        "sum_backends": 38,
+        "wait_event": "WalSync",
+        "wait_event_type": "IO"
+      }
+    },
+    {
+      "avg_pipeline_ns_per_drain": 1756651.2587614018,
+      "committer": {
+        "backpressure_count": 2083,
+        "claim_count": 2104,
+        "drains_total": 2083,
+        "eject_count": 21,
+        "pipeline_count": 2083,
+        "pipeline_ns_total": 3659104572,
+        "takeover_count": 21,
+        "tx_failures": 0
+      },
+      "duration_s": 60,
+      "events_failed": 0,
+      "events_ok": 2083,
+      "max_us": 262655,
+      "method_dispatch": {
+        "avg": 0,
+        "avg_errors": 0,
+        "fifo": 12498,
+        "fifo_errors": 0,
+        "std": 0,
+        "std_errors": 0
+      },
+      "p50_us": 56735,
+      "p90_us": 59583,
+      "p9999_us": 262655,
+      "p999_us": 166271,
+      "p99_us": 152959,
+      "router": {
+        "cross_sb_for_update_waits": 0,
+        "entries_scanned_total": 2083,
+        "envelope_histogram": [
+          2083,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "envelopes_per_sb_p50_end": 1.5,
+        "envelopes_per_sb_p99_end": 1.5,
+        "force_pack_count": 0,
+        "max_envelope_count": 1,
+        "superbatch_count": 2083,
+        "ticks_total": 2308,
+        "total_envelopes": 2083
+      },
+      "sampler_on": true,
+      "throughput_evps": 34.71666666666667,
+      "top_wait_event": {
+        "sum_backends": 41,
+        "wait_event": "WalSync",
+        "wait_event_type": "IO"
+      }
+    },
+    {
+      "avg_pipeline_ns_per_drain": 1748581.8923897238,
+      "committer": {
+        "backpressure_count": 2063,
+        "claim_count": 2077,
+        "drains_total": 2063,
+        "eject_count": 14,
+        "pipeline_count": 2063,
+        "pipeline_ns_total": 3607324444,
+        "takeover_count": 14,
+        "tx_failures": 0
+      },
+      "duration_s": 60,
+      "events_failed": 0,
+      "events_ok": 2063,
+      "max_us": 1465343,
+      "method_dispatch": {
+        "avg": 0,
+        "avg_errors": 0,
+        "fifo": 12378,
+        "fifo_errors": 0,
+        "std": 0,
+        "std_errors": 0
+      },
+      "p50_us": 56287,
+      "p90_us": 59423,
+      "p9999_us": 1465343,
+      "p999_us": 162943,
+      "p99_us": 102143,
+      "router": {
+        "cross_sb_for_update_waits": 0,
+        "entries_scanned_total": 2063,
+        "envelope_histogram": [
+          2063,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "envelopes_per_sb_p50_end": 1.5,
+        "envelopes_per_sb_p99_end": 1.5,
+        "force_pack_count": 0,
+        "max_envelope_count": 1,
+        "superbatch_count": 2063,
+        "ticks_total": 2295,
+        "total_envelopes": 2063
+      },
+      "sampler_on": true,
+      "throughput_evps": 34.38333333333333,
+      "top_wait_event": {
+        "sum_backends": 47,
+        "wait_event": "WalSync",
+        "wait_event_type": "IO"
+      }
+    }
+  ],
+  "sampler_on": true,
+  "shape": "s2_fan_out_wo",
+  "stats": {
+    "avg_envelopes_per_sb": {
+      "iqr": 0.0,
+      "iqr_over_median_pct": 0.0,
+      "max": 1.0,
+      "median": 1.0,
+      "min": 1.0,
+      "noise_flag": false
+    },
+    "avg_pipeline_ns_per_drain": {
+      "iqr": 21686.794989852235,
+      "iqr_over_median_pct": 1.2345532376838069,
+      "max": 1835223.109329446,
+      "median": 1756651.2587614018,
+      "min": 1746155.527074019,
+      "noise_flag": false
+    },
+    "evps": {
+      "iqr": 0.30000000000000426,
+      "iqr_over_median_pct": 0.8725157537566774,
+      "max": 34.71666666666667,
+      "median": 34.38333333333333,
+      "min": 33.55,
+      "noise_flag": false
+    },
+    "p50_us": {
+      "iqr": 288.0,
+      "iqr_over_median_pct": 0.5102131202721137,
+      "max": 56735.0,
+      "median": 56447.0,
+      "min": 56159.0,
+      "noise_flag": false
+    },
+    "p999_us": {
+      "iqr": 3072.0,
+      "iqr_over_median_pct": 1.8779457523092253,
+      "max": 1264639.0,
+      "median": 163583.0,
+      "min": 162943.0,
+      "noise_flag": false
+    },
+    "p99_us": {
+      "iqr": 50368.0,
+      "iqr_over_median_pct": 48.79154517538337,
+      "max": 155007.0,
+      "median": 103231.0,
+      "min": 102143.0,
+      "noise_flag": true
+    }
+  }
+}

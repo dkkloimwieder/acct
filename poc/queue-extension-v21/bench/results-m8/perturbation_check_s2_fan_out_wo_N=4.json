@@ -1,0 +1,33 @@
+{
+  "check": "m82_sampler_perturbation",
+  "shape": "s2_fan_out_wo",
+  "n_backends": 4,
+  "sampler_on": {
+    "p99_us": {
+      "iqr": 2304.0,
+      "iqr_over_median_pct": 3.09017020078059,
+      "max": 75007.0,
+      "median": 74559.0,
+      "min": 72191.0,
+      "noise_flag": false
+    },
+    "evps_median": 69.31666666666666
+  },
+  "sampler_off": {
+    "p99_us": {
+      "iqr": 2624.0,
+      "iqr_over_median_pct": 3.6738865631519255,
+      "max": 73599.0,
+      "median": 71423.0,
+      "min": 70527.0,
+      "noise_flag": false
+    },
+    "evps_median": 70.03333333333333
+  },
+  "perturbation": {
+    "delta_us": 3136,
+    "delta_pct": 4.390742477913277,
+    "noise_envelope_us": 5248,
+    "within_noise": true
+  }
+}
