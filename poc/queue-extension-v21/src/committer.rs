@@ -679,6 +679,7 @@ fn process_superbatch(cq_idx: u32) -> Result<(), CommitterError> {
     // (we passed the Step 2.45 check is moot — parse runs before that),
     // and (b) keeping it in the worker-tx ensures it survives sub-tx
     // rollback.
+    let parse_t0 = std::time::Instant::now();
     let mut events: Vec<PocV21Event> = Vec::with_capacity(staging_indices.len());
     let mut parse_errors: Vec<(pgrx::Uuid, String)> = Vec::new();
     for &s_idx in &staging_indices {
@@ -691,6 +692,11 @@ fn process_superbatch(cq_idx: u32) -> Result<(), CommitterError> {
             Err(e) => parse_errors.push((cid, e.to_string())),
         }
     }
+    let parse_ns = parse_t0.elapsed().as_nanos() as u64;
+    COMMITTER_QUEUE
+        .share()
+        .committer_stage_parse_ns
+        .fetch_add(parse_ns, Relaxed);
     // Open the sub-tx that owns committer_tx_id + the bulk INSERTs.
     // E6 (acct-gx1z.1.6): parse_errors INSERTs are inside this sub-tx
     // so a PG-level error during INSERT (OOM, fatal disk, etc.) gets
@@ -794,6 +800,7 @@ fn run_pipeline_inside_subtx(
     wip_pool_keys: &[(i64, i64)],
     events: &[PocV21Event],
 ) -> Result<(), CommitterError> {
+    let pre_apply_t0 = std::time::Instant::now();
     // STEP 2: locks. Two-domain lex-locking — SKU pool keys always,
     // WIP pool keys gated on poc_v21.skip_wip_locks (M4.1 acct-1c23,
     // §1.5). For each domain: INSERT ON CONFLICT DO NOTHING (creates
@@ -1261,6 +1268,13 @@ fn run_pipeline_inside_subtx(
         }
     }
 
+    let pre_apply_ns = pre_apply_t0.elapsed().as_nanos() as u64;
+    COMMITTER_QUEUE
+        .share()
+        .committer_stage_pre_apply_ns
+        .fetch_add(pre_apply_ns, Relaxed);
+    let apply_t0 = std::time::Instant::now();
+
     // STEP 4: per-event dispatch grouped by envelope for per-envelope
     // failure isolation (M6.2 acct-p0mu; spec §1.8 Step 4 + §3.7).
     //
@@ -1519,6 +1533,13 @@ fn run_pipeline_inside_subtx(
             }
         })
         .collect();
+
+    let apply_ns = apply_t0.elapsed().as_nanos() as u64;
+    COMMITTER_QUEUE
+        .share()
+        .committer_stage_apply_ns
+        .fetch_add(apply_ns, Relaxed);
+    let bulk_t0 = std::time::Instant::now();
 
     // STEP 5: bulk UNNEST inserts. Six target tables; this is the
     // load-bearing throughput primitive measured by P5 (spec §4.2):
@@ -1887,6 +1908,13 @@ fn run_pipeline_inside_subtx(
         )?;
     }
 
+    let bulk_ns = bulk_t0.elapsed().as_nanos() as u64;
+    COMMITTER_QUEUE
+        .share()
+        .committer_stage_bulk_insert_ns
+        .fetch_add(bulk_ns, Relaxed);
+    let post_t0 = std::time::Instant::now();
+
     // STEP 12: status updates. INSERT ON CONFLICT DO UPDATE for
     // committed + replayed paths so committer_lazy mode (no
     // pre-existing 'queued' row from enqueue) creates a row at
@@ -1959,6 +1987,12 @@ fn run_pipeline_inside_subtx(
             ],
         )?;
     }
+
+    let post_ns = post_t0.elapsed().as_nanos() as u64;
+    COMMITTER_QUEUE
+        .share()
+        .committer_stage_post_ns
+        .fetch_add(post_ns, Relaxed);
 
     Ok(())
 }

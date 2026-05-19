@@ -328,3 +328,58 @@ fn poc_v21_queue_depth(queue_name: &str) -> i64 {
         _ => -1,
     }
 }
+
+/// acct-pl3b: per-stage committer timing breakdown. Returns one row per
+/// stage with total accumulated ns + count + avg ns. Stages sum to
+/// approximately committer_pipeline_ns_total (parse_ns runs OUTSIDE the
+/// sub-tx that committer_pipeline_ns_total wraps, so the sum is slightly
+/// higher than committer_pipeline_ns_total by the parse contribution).
+#[pg_extern]
+fn poc_v21_committer_stage_timings() -> TableIterator<
+    'static,
+    (
+        name!(stage, String),
+        name!(total_ns, i64),
+        name!(count, i64),
+        name!(avg_ns, f64),
+    ),
+> {
+    let q = COMMITTER_QUEUE.share();
+    let count = q.committer_pipeline_count.load(Relaxed).max(1);
+    let pairs: Vec<(&str, u64)> = vec![
+        ("parse",        q.committer_stage_parse_ns.load(Relaxed)),
+        ("pre_apply",    q.committer_stage_pre_apply_ns.load(Relaxed)),
+        ("apply",        q.committer_stage_apply_ns.load(Relaxed)),
+        ("bulk_insert",  q.committer_stage_bulk_insert_ns.load(Relaxed)),
+        ("post",         q.committer_stage_post_ns.load(Relaxed)),
+        ("pipeline_total", q.committer_pipeline_ns_total.load(Relaxed)),
+    ];
+    let count_i = count as i64;
+    let rows: Vec<(String, i64, i64, f64)> = pairs
+        .into_iter()
+        .map(|(name, total)| {
+            (
+                name.to_string(),
+                total as i64,
+                count_i,
+                total as f64 / count as f64,
+            )
+        })
+        .collect();
+    TableIterator::new(rows.into_iter())
+}
+
+/// Reset all stage timing counters + the pipeline ns/count base. Test/bench
+/// use ONLY — gated on the test_hooks feature.
+#[cfg(any(test, feature = "test_hooks"))]
+#[pg_extern]
+fn poc_v21_committer_stage_timings_reset() {
+    let q = COMMITTER_QUEUE.share();
+    q.committer_stage_parse_ns.store(0, Relaxed);
+    q.committer_stage_pre_apply_ns.store(0, Relaxed);
+    q.committer_stage_apply_ns.store(0, Relaxed);
+    q.committer_stage_bulk_insert_ns.store(0, Relaxed);
+    q.committer_stage_post_ns.store(0, Relaxed);
+    q.committer_pipeline_ns_total.store(0, Relaxed);
+    q.committer_pipeline_count.store(0, Relaxed);
+}

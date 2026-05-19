@@ -16,7 +16,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_apply_seq_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1022
+-- src/lib.rs:1038
 -- poc_v21_ledger::poc_v21_arena_bump_offset
 CREATE  FUNCTION "poc_v21_arena_bump_offset"() RETURNS bigint /* i64 */
 STRICT
@@ -25,7 +25,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_bump_offset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1028
+-- src/lib.rs:1044
 -- poc_v21_ledger::poc_v21_arena_freelist_count
 CREATE  FUNCTION "poc_v21_arena_freelist_count"() RETURNS bigint /* i64 */
 STRICT
@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_freelist_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1015
+-- src/lib.rs:1031
 -- poc_v21_ledger::poc_v21_arena_outstanding
 CREATE  FUNCTION "poc_v21_arena_outstanding"() RETURNS bigint /* i64 */
 STRICT
@@ -52,7 +52,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_stats_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1001
+-- src/lib.rs:1017
 -- poc_v21_ledger::poc_v21_arena_total_allocs
 CREATE  FUNCTION "poc_v21_arena_total_allocs"() RETURNS bigint /* i64 */
 STRICT
@@ -61,7 +61,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_total_allocs_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1007
+-- src/lib.rs:1023
 -- poc_v21_ledger::poc_v21_arena_total_frees
 CREATE  FUNCTION "poc_v21_arena_total_frees"() RETURNS bigint /* i64 */
 STRICT
@@ -124,7 +124,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_backpressure_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:700
+-- src/lib.rs:716
 -- poc_v21_ledger::poc_v21_backpressure_wake_count
 CREATE  FUNCTION "poc_v21_backpressure_wake_count"() RETURNS bigint /* i64 */
 STRICT
@@ -148,6 +148,29 @@ CREATE  FUNCTION "poc_v21_committer_pipeline_ns_total"() RETURNS bigint /* i64 *
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'poc_v21_committer_pipeline_ns_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/stats.rs:337
+-- poc_v21_ledger::stats::poc_v21_committer_stage_timings
+CREATE  FUNCTION "poc_v21_committer_stage_timings"() RETURNS TABLE (
+	"stage" TEXT,  /* String */
+	"total_ns" bigint,  /* i64 */
+	"count" bigint,  /* i64 */
+	"avg_ns" double precision  /* f64 */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_committer_stage_timings_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/stats.rs:375
+-- poc_v21_ledger::stats::poc_v21_committer_stage_timings_reset
+CREATE  FUNCTION "poc_v21_committer_stage_timings_reset"() RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poc_v21_committer_stage_timings_reset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -217,7 +240,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1035
+-- src/lib.rs:1051
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT
@@ -434,7 +457,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_committer_head_set_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:2622
+-- src/committer.rs:2656
 -- poc_v21_ledger::committer::poc_v21_test_committer_tick
 CREATE  FUNCTION "poc_v21_test_committer_tick"() RETURNS bool /* bool */
 STRICT

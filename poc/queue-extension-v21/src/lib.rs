@@ -313,6 +313,22 @@ pub struct CommitterQueue {
     /// `committer_pipeline_ns_total`. Pairs with the ns counter to give
     /// avg pipeline ns per batch.
     pub committer_pipeline_count: AtomicU64,
+    // ── acct-pl3b stage-timing breakdown ──
+    /// Per-stage cumulative ns across all committer workers since
+    /// extension load. Sum to verify ~= committer_pipeline_ns_total.
+    /// Pair with committer_pipeline_count for per-stage avg ns/SB.
+    /// Stage boundaries:
+    ///   parse_ns      — read staging arena + deserialize PocV21Event
+    ///   pre_apply_ns  — Steps 2 (locks), 2.45 (caller_tx), 2.5
+    ///                   (dedup), 3 (snapshot hydration)
+    ///   apply_ns      — Step 4 per-event dispatch via apply_one
+    ///   bulk_insert_ns— Step 5 bulk INSERTs (6 tables)
+    ///   post_ns       — Step 12 status UPSERTs + Step 14 cleanup
+    pub committer_stage_parse_ns: AtomicU64,
+    pub committer_stage_pre_apply_ns: AtomicU64,
+    pub committer_stage_apply_ns: AtomicU64,
+    pub committer_stage_bulk_insert_ns: AtomicU64,
+    pub committer_stage_post_ns: AtomicU64,
     // ── Committer identity slots (acct-l7k8, spec §1.6) ──
     // Application-level analog of PG's BackgroundWorkerData.slot[]:
     // each running committer worker claims one entry at startup and
