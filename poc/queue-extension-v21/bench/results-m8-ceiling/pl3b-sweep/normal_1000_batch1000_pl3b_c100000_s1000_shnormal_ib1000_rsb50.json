@@ -1,0 +1,23 @@
+{
+  "avg_envelopes_per_sb": 2.766175209537772,
+  "cell_index": 34,
+  "committed": 100000,
+  "count": 100000,
+  "drain_evps": 13649.404960332986,
+  "drain_wall_ms": 7326,
+  "e2e_evps": 1203.245378920071,
+  "e2e_wall_ms": 83108,
+  "failed": 0,
+  "ingress_batch": 1000,
+  "max_envelope_count": 13,
+  "missing": 0,
+  "n_backends": 8,
+  "router_sb_max": 50,
+  "sb_count": 36151,
+  "shape": "normal",
+  "spread": 1000,
+  "submission_wall_ms": 75782,
+  "submit_errors": 0,
+  "submit_evps": 1319.5708564706752,
+  "top_wait_event": "LWLock/poc_v21_staging_queue(1116)"
+}

@@ -1,0 +1,23 @@
+{
+  "avg_envelopes_per_sb": 1.8842682444272767,
+  "cell_index": 30,
+  "committed": 100000,
+  "count": 100000,
+  "drain_evps": 7265.7059217429405,
+  "drain_wall_ms": 13763,
+  "e2e_evps": 1024.6074573031824,
+  "e2e_wall_ms": 97598,
+  "failed": 0,
+  "ingress_batch": 1000,
+  "max_envelope_count": 4,
+  "missing": 0,
+  "n_backends": 8,
+  "router_sb_max": 5000,
+  "sb_count": 53071,
+  "shape": "uniform",
+  "spread": 1000,
+  "submission_wall_ms": 83835,
+  "submit_errors": 0,
+  "submit_evps": 1192.818633536909,
+  "top_wait_event": "Extension/Extension(1115)"
+}
