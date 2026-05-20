@@ -16,7 +16,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_apply_seq_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1038
+-- src/lib.rs:1062
 -- poc_v21_ledger::poc_v21_arena_bump_offset
 CREATE  FUNCTION "poc_v21_arena_bump_offset"() RETURNS bigint /* i64 */
 STRICT
@@ -25,7 +25,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_bump_offset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1044
+-- src/lib.rs:1068
 -- poc_v21_ledger::poc_v21_arena_freelist_count
 CREATE  FUNCTION "poc_v21_arena_freelist_count"() RETURNS bigint /* i64 */
 STRICT
@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_freelist_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1031
+-- src/lib.rs:1055
 -- poc_v21_ledger::poc_v21_arena_outstanding
 CREATE  FUNCTION "poc_v21_arena_outstanding"() RETURNS bigint /* i64 */
 STRICT
@@ -52,7 +52,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_stats_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1017
+-- src/lib.rs:1041
 -- poc_v21_ledger::poc_v21_arena_total_allocs
 CREATE  FUNCTION "poc_v21_arena_total_allocs"() RETURNS bigint /* i64 */
 STRICT
@@ -61,7 +61,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_arena_total_allocs_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1023
+-- src/lib.rs:1047
 -- poc_v21_ledger::poc_v21_arena_total_frees
 CREATE  FUNCTION "poc_v21_arena_total_frees"() RETURNS bigint /* i64 */
 STRICT
@@ -124,7 +124,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_backpressure_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:716
+-- src/lib.rs:730
 -- poc_v21_ledger::poc_v21_backpressure_wake_count
 CREATE  FUNCTION "poc_v21_backpressure_wake_count"() RETURNS bigint /* i64 */
 STRICT
@@ -240,7 +240,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_enqueue_batch_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:1051
+-- src/lib.rs:1075
 -- poc_v21_ledger::poc_v21_hello
 CREATE  FUNCTION "poc_v21_hello"() RETURNS TEXT /* String */
 STRICT
@@ -428,7 +428,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_check_release_acquire_invariant_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:546
+-- src/committer.rs:562
 -- poc_v21_ledger::committer::poc_v21_test_claim_committer_entry
 CREATE  FUNCTION "poc_v21_test_claim_committer_entry"() RETURNS bigint /* i64 */
 STRICT
@@ -437,7 +437,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_claim_committer_entry_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:502
+-- src/committer.rs:518
 -- poc_v21_ledger::committer::poc_v21_test_committer_head_get
 CREATE  FUNCTION "poc_v21_test_committer_head_get"() RETURNS bigint /* i64 */
 STRICT
@@ -446,7 +446,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_committer_head_get_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:511
+-- src/committer.rs:527
 -- poc_v21_ledger::committer::poc_v21_test_committer_head_set
 CREATE  FUNCTION "poc_v21_test_committer_head_set"(
 	"value" bigint /* i64 */
@@ -457,7 +457,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_committer_head_set_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:2656
+-- src/committer.rs:2672
 -- poc_v21_ledger::committer::poc_v21_test_committer_tick
 CREATE  FUNCTION "poc_v21_test_committer_tick"() RETURNS bool /* bool */
 STRICT
@@ -486,7 +486,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_injected_queue_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:474
+-- src/committer.rs:490
 -- poc_v21_ledger::committer::poc_v21_test_force_reset_slot
 CREATE  FUNCTION "poc_v21_test_force_reset_slot"(
 	"slot_idx" bigint /* i64 */
@@ -508,7 +508,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_force_reset_staging_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:524
+-- src/committer.rs:540
 -- poc_v21_ledger::committer::poc_v21_test_inject_claimable_entry
 CREATE  FUNCTION "poc_v21_test_inject_claimable_entry"(
 	"slot_idx" bigint /* i64 */
@@ -519,7 +519,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_inject_claimable_entry_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:417
+-- src/committer.rs:433
 -- poc_v21_ledger::committer::poc_v21_test_inject_orphan_into_empty
 CREATE  FUNCTION "poc_v21_test_inject_orphan_into_empty"(
 	"slot_idx" bigint, /* i64 */
@@ -573,7 +573,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_inject_staging_with_arena_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:494
+-- src/committer.rs:510
 -- poc_v21_ledger::committer::poc_v21_test_orphan_recover_tick
 CREATE  FUNCTION "poc_v21_test_orphan_recover_tick"() RETURNS bigint /* i64 */
 STRICT
@@ -715,7 +715,7 @@ AS 'MODULE_PATHNAME', 'poc_v21_test_set_staging_backend_pid_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/committer.rs:453
+-- src/committer.rs:469
 -- poc_v21_ledger::committer::poc_v21_test_slot_state
 CREATE  FUNCTION "poc_v21_test_slot_state"(
 	"slot_idx" bigint /* i64 */

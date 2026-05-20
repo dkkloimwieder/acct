@@ -265,21 +265,37 @@ pub extern "C-unwind" fn poc_v21_committer_main(_arg: pg_sys::Datum) {
         if COMMITTER_QUEUE.share().test_bgworker_paused.load(Acquire) == 1 {
             continue;
         }
+        // acct-6kcx: drain up to drain_batch_size SBs per outer BGWorker
+        // transaction. Each SB still runs inside its own internal sub-tx
+        // (process_superbatch opens a savepoint), so per-pipeline failure
+        // isolation is unchanged. The amortization win is over txn-fixed
+        // cost: snapshot, XID, WAL commit record, and fsync (when
+        // synchronous_commit=on). Trade-off documented at the GUC site.
+        let drain_batch_size = crate::drain_batch_size_now() as usize;
         loop {
-            let claim = claim_next_committer_entry();
-            match claim {
-                Some(cq_idx) => {
-                    BackgroundWorker::transaction(|| {
-                        let _ = process_superbatch(cq_idx);
-                    });
-                    // M3.3 (acct-8xyj): committer drain observability.
-                    // Increment regardless of process_superbatch outcome
-                    // — a failed batch still consumed a CommitterQueueEntry.
-                    let queue = COMMITTER_QUEUE.share();
-                    queue.committer_drains_total.fetch_add(1, Relaxed);
+            let mut claims: Vec<u32> = Vec::with_capacity(drain_batch_size);
+            for _ in 0..drain_batch_size {
+                match claim_next_committer_entry() {
+                    Some(cq_idx) => claims.push(cq_idx),
+                    None => break,
                 }
-                None => break,
             }
+            if claims.is_empty() {
+                break;
+            }
+            let claim_count = claims.len();
+            BackgroundWorker::transaction(|| {
+                for cq_idx in claims {
+                    let _ = process_superbatch(cq_idx);
+                }
+            });
+            // M3.3 (acct-8xyj): committer drain observability. Increment
+            // per-SB (claim_count) regardless of any per-SB pipeline
+            // outcome — each SB consumed a CommitterQueueEntry.
+            let queue = COMMITTER_QUEUE.share();
+            queue
+                .committer_drains_total
+                .fetch_add(claim_count as u64, Relaxed);
         }
         // M5a.1 (acct-lefr): scan for orphaned in-flight entries
         // whose owning committer died. Recovery uses lease staleness

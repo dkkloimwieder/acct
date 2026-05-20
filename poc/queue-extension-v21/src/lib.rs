@@ -422,6 +422,7 @@ static SNAPSHOT_LAYER_LIMIT_PER_POOL: GucSetting<i32> = GucSetting::<i32>::new(1
 static MAX_EJECT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(10_000);
 static CALLER_TX_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 static COMMITTER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
+static DRAIN_BATCH_SIZE: GucSetting<i32> = GucSetting::<i32>::new(2);
 static PERSISTENT_STAGING_GC_RETENTION_HOURS: GucSetting<i32> = GucSetting::<i32>::new(24);
 
 // String GUC for the 3-valued enum. pgrx 0.18 doesn't expose
@@ -489,6 +490,19 @@ pub(crate) fn committer_lease_ms_now() -> i32 {
 /// Read `poc_v21.batch_size_max`. Defaults to 50.
 pub(crate) fn batch_size_max_now() -> i32 {
     BATCH_SIZE_MAX.get()
+}
+
+/// Read `poc_v21.drain_batch_size`. Defaults to 2 (acct-6kcx, measured
+/// sweet spot at N=8 committer workers + 100-SKU normal-distribution
+/// workload: N=2 gives +38% e2e lift over N=1 with CV=2.0%; N=4 captures
+/// similar median but introduces a tail with occasional 120s timeouts
+/// from lock-extension contention on poc_v21_pool_locks).
+///
+/// 1 = legacy (one outer txn per SB). N > 1 amortizes txn-fixed cost
+/// (snapshot, XID, WAL commit record, fsync) across N SBs. Each SB still
+/// runs in its own internal sub-tx for per-pipeline failure isolation.
+pub(crate) fn drain_batch_size_now() -> i32 {
+    DRAIN_BATCH_SIZE.get().max(1)
 }
 
 /// Read `poc_v21.router_window_size`. Defaults to 1000.
@@ -859,6 +873,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"Number of committer BGWorkers",
         c"Pool of committer BGWorkers competing for SuperBatch ownership via CAS election on CommitterQueueEntry.committer_pid.",
         &COMMITTER_COUNT,
+        1,
+        64,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        c"poc_v21.drain_batch_size",
+        c"SuperBatches per committer outer transaction (acct-6kcx)",
+        c"How many SuperBatches the committer drains per outer BGWorker transaction. Default 2 (measured sweet spot: +38% e2e at N=2; N=4 has same median but introduces stalls from lock-extension contention). Set 1 for legacy one-SB-per-txn behavior. N > 1 amortizes txn-fixed cost (snapshot, XID, WAL commit record, fsync) across N SBs; each SB still runs in its own internal sub-tx for per-pipeline failure isolation. Trade-off: longer outer-txn lifetime extends row-lock hold on pool_locks rows (the locks promote from sub-tx to outer on each release), which can increase cross-committer contention when SBs touch overlapping pools.",
+        &DRAIN_BATCH_SIZE,
         1,
         64,
         GucContext::Sighup,
