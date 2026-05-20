@@ -462,6 +462,11 @@ async fn pre_seed(pool: &PgPool, dist: Distribution) {
     .execute(pool)
     .await
     .expect("seed standard_costs");
+    // acct-ed7u: invalidate committer cache so workers re-fetch fresh.
+    sqlx::query("SELECT poc_v21_invalidate_committer_caches()")
+        .execute(pool)
+        .await
+        .expect("invalidate after seed standard_costs");
 }
 
 struct RunResult {

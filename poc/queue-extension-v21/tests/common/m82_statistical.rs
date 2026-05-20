@@ -667,6 +667,10 @@ async fn seed_all_std(pool: &PgPool, shape: Shape) {
     .bind(&skus)
     .execute(pool)
     .await;
+    // acct-ed7u: invalidate committer cache after seeding std costs.
+    let _ = sqlx::query("SELECT poc_v21_invalidate_committer_caches()")
+        .execute(pool)
+        .await;
 }
 
 // ──────────────────────────────────────────────────────────────────────

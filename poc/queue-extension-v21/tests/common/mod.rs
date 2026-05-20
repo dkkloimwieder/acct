@@ -141,6 +141,13 @@ pub async fn seed_standard_costs(pool: &PgPool, costs: &[(i64, i64, i64)]) {
     .execute(pool)
     .await
     .expect("seed_standard_costs INSERT");
+    // acct-ed7u: bump the committer-side standard_costs cache version
+    // so any worker holding stale entries from a prior seed invalidates
+    // on its next SB.
+    sqlx::query("SELECT poc_v21_invalidate_committer_caches()")
+        .execute(pool)
+        .await
+        .expect("seed_standard_costs invalidate");
 }
 
 /// Pause both BGWorkers (router + committer pool). Required for tests

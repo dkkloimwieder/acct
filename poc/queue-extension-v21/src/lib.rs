@@ -329,6 +329,17 @@ pub struct CommitterQueue {
     pub committer_stage_apply_ns: AtomicU64,
     pub committer_stage_bulk_insert_ns: AtomicU64,
     pub committer_stage_post_ns: AtomicU64,
+    /// acct-ed7u: monotonic version counter for the committer's
+    /// process-local `standard_costs` hydration cache. Anyone who
+    /// INSERTs/UPDATEs `poc_v21_standard_costs` MUST call
+    /// `poc_v21_invalidate_committer_caches()` (which fetch_adds this);
+    /// each committer worker compares its last-known version against
+    /// this on every SB and clears the cache on mismatch. Relaxed
+    /// ordering is correct: the cache is a perf optimization, not
+    /// a correctness barrier — worst case is one SB observing the
+    /// pre-bump version and reading stale, which is the same window
+    /// as the without-cache code path between SELECT and FOR UPDATE.
+    pub standard_costs_cache_version: AtomicU64,
     // ── Committer identity slots (acct-l7k8, spec §1.6) ──
     // Application-level analog of PG's BackgroundWorkerData.slot[]:
     // each running committer worker claims one entry at startup and
@@ -1068,6 +1079,21 @@ fn poc_v21_arena_bump_offset() -> i64 {
 #[pg_extern]
 fn poc_v21_arena_freelist_count() -> i64 {
     SPILLOVER_ARENA.share().freelist_count() as i64
+}
+
+/// acct-ed7u: invalidate every committer worker's process-local
+/// hydration caches. Bumps `standard_costs_cache_version` so the next
+/// SB on each worker observes the change and clears its cache before
+/// hydrating Step 3. Callers: anyone that mutates
+/// `poc_v21_standard_costs` (test seeders, future
+/// `post_standard_cost_roll`). Cheap — one Relaxed fetch_add.
+#[pg_extern]
+fn poc_v21_invalidate_committer_caches() {
+    use std::sync::atomic::Ordering::Relaxed;
+    COMMITTER_QUEUE
+        .share()
+        .standard_costs_cache_version
+        .fetch_add(1, Relaxed);
 }
 
 /// Return a one-line scaffolding banner. Used by M0.1 acceptance to

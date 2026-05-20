@@ -328,6 +328,10 @@ async fn pre_seed_mixed_method(pool: &PgPool, shape: Shape) -> Result<(), sqlx::
         .bind(&std_skus)
         .execute(pool)
         .await?;
+        // acct-ed7u: invalidate committer cache after seeding std costs.
+        sqlx::query("SELECT poc_v21_invalidate_committer_caches()")
+            .execute(pool)
+            .await?;
     }
 
     Ok(())

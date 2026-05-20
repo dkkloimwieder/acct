@@ -51,6 +51,11 @@ async fn pre_seed_sku_method_assignments(pool: &PgPool, skus: &[i64]) {
         .await
         .expect("seed standard_costs");
     }
+    // acct-ed7u: invalidate committer cache after seeding std costs.
+    sqlx::query("SELECT poc_v21_invalidate_committer_caches()")
+        .execute(pool)
+        .await
+        .expect("invalidate after seed standard_costs");
 }
 
 async fn arena_outstanding(pool: &PgPool) -> i64 {

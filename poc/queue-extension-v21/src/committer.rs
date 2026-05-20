@@ -203,6 +203,52 @@ fn wip_pool_locks_cache_invalidate(keys: &[(i64, i64)]) {
     });
 }
 
+/// Process-local standard_costs hydration cache (acct-ed7u). Maps
+/// (sku_id, location_id) → unit_cost for STD-method pools so Step 3
+/// can skip the per-SB SELECT once a value has been observed.
+///
+/// Invalidation: every SB compares its last-known cache version against
+/// `CommitterQueue.standard_costs_cache_version`; mismatch clears the
+/// cache. Callers that INSERT/UPDATE `poc_v21_standard_costs` must call
+/// `poc_v21_invalidate_committer_caches()` which fetch_adds the shmem
+/// counter. Cross-worker is fine: each worker re-validates on its next
+/// SB. Stale-cache risk window equals the without-cache SELECT-snapshot
+/// window — both use READ COMMITTED.
+const STANDARD_COSTS_CACHE_CAP: usize = 16_384;
+
+thread_local! {
+    static STANDARD_COSTS_CACHE: std::cell::RefCell<HashMap<(i64, i64), i64>> =
+        std::cell::RefCell::new(HashMap::with_capacity(1024));
+    static MY_KNOWN_STD_COSTS_VERSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn standard_costs_cache_check_version() {
+    let cur = COMMITTER_QUEUE
+        .share()
+        .standard_costs_cache_version
+        .load(Relaxed);
+    MY_KNOWN_STD_COSTS_VERSION.with(|v| {
+        if v.get() != cur {
+            STANDARD_COSTS_CACHE.with(|c| c.borrow_mut().clear());
+            v.set(cur);
+        }
+    });
+}
+
+fn standard_costs_cache_get(key: (i64, i64)) -> Option<i64> {
+    STANDARD_COSTS_CACHE.with(|c| c.borrow().get(&key).copied())
+}
+
+fn standard_costs_cache_put(key: (i64, i64), value: i64) {
+    STANDARD_COSTS_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= STANDARD_COSTS_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, value);
+    });
+}
+
 /// Committer-pipeline structured error (acct-gx1z.1.14).
 ///
 /// Variants carry parameter context; `&'static str` discriminants keep
@@ -2168,6 +2214,31 @@ fn hydrate_standard_costs(
     sku_ids: &[i64],
     location_ids: &[i64],
 ) -> Result<(), CommitterError> {
+    // acct-ed7u: process-local cache. Version-checked against shmem
+    // counter; mismatch clears the cache before this SB hydrates.
+    standard_costs_cache_check_version();
+
+    // Pair sku_ids ↔ location_ids by position. Split into cached (copy
+    // straight to snapshot) and missing (fetch via SELECT).
+    let mut missing_sku: Vec<i64> = Vec::new();
+    let mut missing_loc: Vec<i64> = Vec::new();
+    for (s, l) in sku_ids.iter().zip(location_ids.iter()) {
+        let key = (*s, *l);
+        match standard_costs_cache_get(key) {
+            Some(cost) => {
+                snapshot.standard_costs.insert(key, cost);
+            }
+            None => {
+                missing_sku.push(*s);
+                missing_loc.push(*l);
+            }
+        }
+    }
+
+    if missing_sku.is_empty() {
+        return Ok(());
+    }
+
     // DISTINCT ON returns the latest effective row per (sku, location).
     // `effective_from <= now()` filter excludes future-dated rolls.
     Spi::connect(|client| -> Result<(), CommitterError> {
@@ -2181,7 +2252,7 @@ fn hydrate_standard_costs(
                     AND effective_from <= now() \
                   ORDER BY sku_id, location_id, effective_from DESC",
                 None,
-                &[sku_ids.to_vec().into(), location_ids.to_vec().into()],
+                &[missing_sku.into(), missing_loc.into()],
             )
             .map_err(|e| CommitterError::Spi {
                 label: "snapshot SELECT standard_costs",
@@ -2206,6 +2277,7 @@ fn hydrate_standard_costs(
                 detail: "standard_costs.unit_cost NULL".to_string(),
             })?;
             snapshot.standard_costs.insert((sku_id, location_id), unit_cost);
+            standard_costs_cache_put((sku_id, location_id), unit_cost);
         }
         Ok(())
     })?;
