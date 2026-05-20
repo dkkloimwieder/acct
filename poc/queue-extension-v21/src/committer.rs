@@ -126,6 +126,83 @@ pub(crate) fn clear_my_committer_identity() {
     MY_COMMITTER_BGW_SLOT.store(u32::MAX, Relaxed);
 }
 
+/// Process-local "seen" caches for the Step 2 lex-lock INSERT (acct-a2sj).
+///
+/// Pool_locks rows are write-once: created on first touch, then live
+/// forever (no document path deletes them). So a pool key known to be
+/// present can have its INSERT skipped — only the FOR UPDATE matters
+/// for ledger correctness. The cap is a clear-and-rebuild bound (not
+/// true LRU); hot sets at this PoC scale (~1k pools) fit comfortably.
+///
+/// Stale-cache fallback: the SELECT FOR UPDATE counts rows returned
+/// vs `sku_pool_keys.len()`. A shortfall (row got TRUNCATEd between
+/// SBs — admin cleanup or a test reset) triggers a re-INSERT of the
+/// full set followed by a fresh FOR UPDATE.
+const POOL_LOCKS_CACHE_CAP: usize = 16_384;
+
+thread_local! {
+    static POOL_LOCKS_SEEN: std::cell::RefCell<HashSet<(i64, i64)>> =
+        std::cell::RefCell::new(HashSet::with_capacity(1024));
+    static WIP_POOL_LOCKS_SEEN: std::cell::RefCell<HashSet<(i64, i64)>> =
+        std::cell::RefCell::new(HashSet::with_capacity(1024));
+}
+
+fn pool_locks_cache_missing(keys: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    POOL_LOCKS_SEEN.with(|c| {
+        let cache = c.borrow();
+        keys.iter().filter(|k| !cache.contains(k)).copied().collect()
+    })
+}
+
+fn pool_locks_cache_insert(keys: &[(i64, i64)]) {
+    POOL_LOCKS_SEEN.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= POOL_LOCKS_CACHE_CAP {
+            cache.clear();
+        }
+        for k in keys {
+            cache.insert(*k);
+        }
+    });
+}
+
+fn pool_locks_cache_invalidate(keys: &[(i64, i64)]) {
+    POOL_LOCKS_SEEN.with(|c| {
+        let mut cache = c.borrow_mut();
+        for k in keys {
+            cache.remove(k);
+        }
+    });
+}
+
+fn wip_pool_locks_cache_missing(keys: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    WIP_POOL_LOCKS_SEEN.with(|c| {
+        let cache = c.borrow();
+        keys.iter().filter(|k| !cache.contains(k)).copied().collect()
+    })
+}
+
+fn wip_pool_locks_cache_insert(keys: &[(i64, i64)]) {
+    WIP_POOL_LOCKS_SEEN.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= POOL_LOCKS_CACHE_CAP {
+            cache.clear();
+        }
+        for k in keys {
+            cache.insert(*k);
+        }
+    });
+}
+
+fn wip_pool_locks_cache_invalidate(keys: &[(i64, i64)]) {
+    WIP_POOL_LOCKS_SEEN.with(|c| {
+        let mut cache = c.borrow_mut();
+        for k in keys {
+            cache.remove(k);
+        }
+    });
+}
+
 /// Committer-pipeline structured error (acct-gx1z.1.14).
 ///
 /// Variants carry parameter context; `&'static str` discriminants keep
@@ -821,43 +898,116 @@ fn run_pipeline_inside_subtx(
     // WIP pool keys gated on poc_v21.skip_wip_locks (M4.1 acct-1c23,
     // §1.5). For each domain: INSERT ON CONFLICT DO NOTHING (creates
     // row if missing), then SELECT FOR UPDATE in lex order.
+    //
+    // acct-a2sj: a process-local "seen" cache skips the INSERT for
+    // pool keys known to exist. The FOR UPDATE counts rows returned
+    // — a shortfall (cache stale because a row got TRUNCATEd between
+    // SBs) re-runs INSERT on the full set and retries the FOR UPDATE.
     if !sku_pool_keys.is_empty() {
+        let missing = pool_locks_cache_missing(sku_pool_keys);
+        if !missing.is_empty() {
+            let m_sku_ids: Vec<i64> = missing.iter().map(|k| k.0).collect();
+            let m_loc_ids: Vec<i64> = missing.iter().map(|k| k.1).collect();
+            bulk(
+                "pool_locks INSERT",
+                "INSERT INTO poc_v21_pool_locks (sku_id, location_id) \
+                 SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id) \
+                 ON CONFLICT (sku_id, location_id) DO NOTHING",
+                &[m_sku_ids.into(), m_loc_ids.into()],
+            )?;
+            pool_locks_cache_insert(&missing);
+        }
+
         let sku_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.0).collect();
         let location_ids: Vec<i64> = sku_pool_keys.iter().map(|k| k.1).collect();
-        bulk(
-            "pool_locks INSERT",
-            "INSERT INTO poc_v21_pool_locks (sku_id, location_id) \
-             SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id) \
-             ON CONFLICT (sku_id, location_id) DO NOTHING",
+        let got: i64 = Spi::get_one_with_args(
+            "SELECT count(*) FROM (\
+               SELECT 1 FROM poc_v21_pool_locks \
+                WHERE (sku_id, location_id) IN (SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id)) \
+                ORDER BY sku_id, location_id \
+                FOR UPDATE\
+             ) s",
             &[sku_ids.clone().into(), location_ids.clone().into()],
-        )?;
-        bulk(
-            "pool_locks SELECT FOR UPDATE",
-            "SELECT 1 FROM poc_v21_pool_locks \
-             WHERE (sku_id, location_id) IN (SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id)) \
-             ORDER BY sku_id, location_id \
-             FOR UPDATE",
-            &[sku_ids.into(), location_ids.into()],
-        )?;
+        )
+        .map_err(|e| CommitterError::Spi {
+            label: "pool_locks SELECT FOR UPDATE",
+            source: e.to_string(),
+        })?
+        .unwrap_or(0);
+
+        if (got as usize) != sku_pool_keys.len() {
+            // Stale-cache fallback: TRUNCATE happened. Drop suspect
+            // entries from the cache and re-run the full INSERT.
+            pool_locks_cache_invalidate(sku_pool_keys);
+            bulk(
+                "pool_locks INSERT (fallback)",
+                "INSERT INTO poc_v21_pool_locks (sku_id, location_id) \
+                 SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id) \
+                 ON CONFLICT (sku_id, location_id) DO NOTHING",
+                &[sku_ids.clone().into(), location_ids.clone().into()],
+            )?;
+            bulk(
+                "pool_locks SELECT FOR UPDATE (fallback)",
+                "SELECT 1 FROM poc_v21_pool_locks \
+                 WHERE (sku_id, location_id) IN (SELECT sku_id, location_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(sku_id, location_id)) \
+                 ORDER BY sku_id, location_id \
+                 FOR UPDATE",
+                &[sku_ids.into(), location_ids.into()],
+            )?;
+            pool_locks_cache_insert(sku_pool_keys);
+        }
     }
     if !wip_pool_keys.is_empty() && !skip_wip_locks() {
+        let missing = wip_pool_locks_cache_missing(wip_pool_keys);
+        if !missing.is_empty() {
+            let m_wo_ids: Vec<i64> = missing.iter().map(|k| k.0).collect();
+            let m_op_ids: Vec<i64> = missing.iter().map(|k| k.1).collect();
+            bulk(
+                "wip_pool_locks INSERT",
+                "INSERT INTO poc_v21_wip_pool_locks (work_order_id, operation_id) \
+                 SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id) \
+                 ON CONFLICT (work_order_id, operation_id) DO NOTHING",
+                &[m_wo_ids.into(), m_op_ids.into()],
+            )?;
+            wip_pool_locks_cache_insert(&missing);
+        }
+
         let wo_ids: Vec<i64> = wip_pool_keys.iter().map(|k| k.0).collect();
         let op_ids: Vec<i64> = wip_pool_keys.iter().map(|k| k.1).collect();
-        bulk(
-            "wip_pool_locks INSERT",
-            "INSERT INTO poc_v21_wip_pool_locks (work_order_id, operation_id) \
-             SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id) \
-             ON CONFLICT (work_order_id, operation_id) DO NOTHING",
+        let got: i64 = Spi::get_one_with_args(
+            "SELECT count(*) FROM (\
+               SELECT 1 FROM poc_v21_wip_pool_locks \
+                WHERE (work_order_id, operation_id) IN (SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id)) \
+                ORDER BY work_order_id, operation_id \
+                FOR UPDATE\
+             ) s",
             &[wo_ids.clone().into(), op_ids.clone().into()],
-        )?;
-        bulk(
-            "wip_pool_locks SELECT FOR UPDATE",
-            "SELECT 1 FROM poc_v21_wip_pool_locks \
-             WHERE (work_order_id, operation_id) IN (SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id)) \
-             ORDER BY work_order_id, operation_id \
-             FOR UPDATE",
-            &[wo_ids.into(), op_ids.into()],
-        )?;
+        )
+        .map_err(|e| CommitterError::Spi {
+            label: "wip_pool_locks SELECT FOR UPDATE",
+            source: e.to_string(),
+        })?
+        .unwrap_or(0);
+
+        if (got as usize) != wip_pool_keys.len() {
+            wip_pool_locks_cache_invalidate(wip_pool_keys);
+            bulk(
+                "wip_pool_locks INSERT (fallback)",
+                "INSERT INTO poc_v21_wip_pool_locks (work_order_id, operation_id) \
+                 SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id) \
+                 ON CONFLICT (work_order_id, operation_id) DO NOTHING",
+                &[wo_ids.clone().into(), op_ids.clone().into()],
+            )?;
+            bulk(
+                "wip_pool_locks SELECT FOR UPDATE (fallback)",
+                "SELECT 1 FROM poc_v21_wip_pool_locks \
+                 WHERE (work_order_id, operation_id) IN (SELECT work_order_id, operation_id FROM UNNEST($1::bigint[], $2::bigint[]) AS t(work_order_id, operation_id)) \
+                 ORDER BY work_order_id, operation_id \
+                 FOR UPDATE",
+                &[wo_ids.into(), op_ids.into()],
+            )?;
+            wip_pool_locks_cache_insert(wip_pool_keys);
+        }
     }
 
     // Force XID allocation via a tiny no-op write (option Q-D(b) — robust
