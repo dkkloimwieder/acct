@@ -184,6 +184,37 @@ fn router_tick() -> u32 {
             .fetch_add(candidates_meta.len() as u64, Relaxed);
     }
 
+    // Phase 1.5 (acct-0sc4): time-coalesce emission gate. If the oldest
+    // candidate has been pending for less than batch_window_us, defer
+    // emission to let more envelopes accumulate in the same SuperBatch.
+    //
+    // The BGWorker latch wait is 50ms (router_main loop), so for windows
+    // much smaller than 50000us the gate is dominated by tick cadence —
+    // the oldest envelope is already past the window by the time we run.
+    // For windows in [50000us..50000000us] (50ms..50s) the gate
+    // meaningfully holds emission. Window=0 disables the gate entirely.
+    //
+    // Starvation backstop (Phase 3) is unaffected: window-deferral
+    // returns before Phase 5's rejected_seqs increment, so a deferred
+    // envelope's starv counter stays at 0. Once now-enqueued_at crosses
+    // the window, the gate releases and Phases 2-5 proceed normally.
+    let window_us = crate::batch_window_us_now() as u64;
+    if window_us > 0 {
+        let now = crate::now_us();
+        let oldest_age_us = candidates_meta
+            .iter()
+            .map(|m| now.saturating_sub(m.enqueued_at_micros))
+            .max()
+            .unwrap_or(u64::MAX);
+        if oldest_age_us < window_us {
+            COMMITTER_QUEUE
+                .share()
+                .router_window_defers_total
+                .fetch_add(1, Relaxed);
+            return 0;
+        }
+    }
+
     // Phase 2: hydrate pool keys for each candidate from arena.
     let mut candidates = hydrate_candidates(&candidates_meta);
 
@@ -547,6 +578,7 @@ struct CandidateMeta {
     sku_pool_count: u16,
     wip_pool_keys_offset: u32,
     wip_pool_count: u16,
+    enqueued_at_micros: u64,
 }
 
 #[derive(Debug)]
@@ -576,6 +608,7 @@ fn collect_candidates(staging_capacity: u32, window_limit: u32) -> Vec<Candidate
                 sku_pool_count: slot.sku_pool_count,
                 wip_pool_keys_offset: slot.wip_pool_keys_offset,
                 wip_pool_count: slot.wip_pool_count,
+                enqueued_at_micros: slot.enqueued_at_micros,
             });
         }
         scanned += 1;
@@ -791,6 +824,7 @@ fn poc_v21_router_stats_reset() {
     queue.router_entries_scanned_total.store(0, Relaxed);
     queue.committer_drains_total.store(0, Relaxed);
     queue.router_cross_sb_for_update_waits.store(0, Relaxed);
+    queue.router_window_defers_total.store(0, Relaxed);
     for b in queue.router_envelope_histogram.iter() {
         b.store(0, Relaxed);
     }
@@ -840,6 +874,15 @@ fn poc_v21_router_force_pack_count() -> i64 {
     queue.router_force_pack_count.load(Relaxed) as i64
 }
 
+/// acct-0sc4: ticks deferred by the batch_window_us time-coalesce gate.
+/// Each increment is one router_tick that saw pending candidates but
+/// returned 0 because the oldest was younger than the configured window.
+#[pg_extern]
+fn poc_v21_router_window_defers_total() -> i64 {
+    let queue = COMMITTER_QUEUE.share();
+    queue.router_window_defers_total.load(Relaxed) as i64
+}
+
 /// Aggregated router + committer observability stats per spec §4.4 O3.
 /// Returns one row per metric so callers can `WHERE stat_name=...` to
 /// extract specific values. All values are atomic loads (Relaxed) —
@@ -878,6 +921,7 @@ fn poc_v21_router_stats() -> TableIterator<
     let drains = queue.committer_drains_total.load(Relaxed);
     let max_env = queue.router_max_envelope_count.load(Relaxed);
     let cross_sb_waits = queue.router_cross_sb_for_update_waits.load(Relaxed);
+    let window_defers = queue.router_window_defers_total.load(Relaxed);
     let batch_max = batch_size_max_now().max(1) as u64;
     let mut histogram: [u64; 8] = [0; 8];
     for (i, b) in queue.router_envelope_histogram.iter().enumerate() {
@@ -913,6 +957,7 @@ fn poc_v21_router_stats() -> TableIterator<
         ("committer_drains_total".into(), drains as f64),
         ("avg_envelopes_per_sb".into(), avg_envelopes_per_sb),
         ("cross_sb_for_update_waits".into(), cross_sb_waits as f64),
+        ("window_defers_total".into(), window_defers as f64),
         ("pack_yield_per_tick".into(), pack_yield_per_tick),
         ("batch_size_max_guc".into(), batch_max as f64),
         ("envelopes_per_sb_p50".into(), envelopes_per_sb_p50),

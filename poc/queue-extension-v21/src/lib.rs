@@ -235,6 +235,13 @@ pub struct CommitterQueue {
     /// and serialize via FOR UPDATE. Incremented per overflow chunk
     /// (chunks beyond the first within one connected component).
     pub router_cross_sb_for_update_waits: AtomicU64,
+    /// acct-0sc4: ticks where router_tick deferred emission because the
+    /// oldest candidate was younger than `batch_window_us`. Useful for
+    /// dialing the window GUC: a high ratio (defers / ticks_total) at a
+    /// given window value confirms the gate is firing; a near-zero ratio
+    /// with non-zero window means the BGWorker tick interval (50ms) is
+    /// dominating.
+    pub router_window_defers_total: AtomicU64,
     /// Envelope-count histogram for SuperBatches (log2-spaced 8 buckets):
     /// 0:[1], 1:[2-3], 2:[4-7], 3:[8-15], 4:[16-31], 5:[32-63], 6:[64-127], 7:[128+].
     pub router_envelope_histogram: [AtomicU64; 8],
@@ -832,10 +839,10 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_int_guc(
         c"poc_v21.batch_window_us",
         c"Router batch window in microseconds",
-        c"How long the router waits to coalesce envelopes before emitting a SuperBatch. Trades latency for batch size.",
+        c"How long the router waits to coalesce envelopes before emitting a SuperBatch. Trades latency for batch size. 0 disables the gate (current default behaviour). acct-0sc4 widened the range so 0 disables and large values (>50000) are reachable; values above the BGWorker tick interval (50ms) are dominated by tick cadence in practice.",
         &BATCH_WINDOW_US,
-        50,
-        50_000,
+        0,
+        5_000_000,
         GucContext::Sighup,
         GucFlags::empty(),
     );
