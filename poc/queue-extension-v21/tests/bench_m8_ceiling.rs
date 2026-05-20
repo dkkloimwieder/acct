@@ -632,6 +632,14 @@ async fn run_replay(
     let sampler_report = sampler.shutdown().await;
     let top_wait_event = sampler_report.top_wait_event();
 
+    // Surface the full lock / wait-event distribution under
+    // `POC_PL3B_PRINT_SAMPLER=1`. Always-on output would clutter every
+    // bench run; opt-in via env keeps the default lean while making the
+    // detailed signal accessible.
+    if std::env::var("POC_PL3B_PRINT_SAMPLER").ok().as_deref() == Some("1") {
+        eprintln!("\n{}", sampler_report.format());
+    }
+
     let counters_after = snap(&pool).await;
     let counters = delta(&counters_after, &counters_before);
 
@@ -1060,6 +1068,11 @@ async fn run_replay_batch(
 
     let sampler_report = sampler.shutdown().await;
     let top_wait_event = sampler_report.top_wait_event();
+
+    // Opt-in full lock / wait-event distribution via env (see other site).
+    if std::env::var("POC_PL3B_PRINT_SAMPLER").ok().as_deref() == Some("1") {
+        eprintln!("\n{}", sampler_report.format());
+    }
 
     let counters_after = snap(&pool).await;
     let counters = delta(&counters_after, &counters_before);
