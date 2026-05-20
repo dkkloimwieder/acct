@@ -1187,6 +1187,80 @@ async fn set_router_sb_max(pool: &PgPool, v: i32) {
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
+/// acct-rq4w: reset per-stage timing counters (test_hooks build).
+async fn stage_timings_reset(pool: &PgPool) {
+    let _ = sqlx::query("SELECT poc_v21_committer_stage_timings_reset()")
+        .execute(pool).await;
+}
+
+/// acct-rq4w: read stage timings as a HashMap<stage_name, avg_ns_f64>.
+/// Returns empty map if test_hooks not compiled or table absent.
+async fn read_stage_timings(pool: &PgPool) -> std::collections::HashMap<String, f64> {
+    let rows: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT stage, avg_ns FROM poc_v21_committer_stage_timings()",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter().collect()
+}
+
+/// acct-rq4w: summary stats over a sample. p50 = median; p95 by linear
+/// interpolation between adjacent sorted samples; cv_pct = stddev / mean × 100.
+#[derive(Debug, Clone)]
+struct SampleStats {
+    n: usize,
+    min: f64,
+    median: f64,
+    mean: f64,
+    p95: f64,
+    max: f64,
+    stddev: f64,
+    cv_pct: f64,
+}
+
+fn summary_stats(samples: &[f64]) -> SampleStats {
+    if samples.is_empty() {
+        return SampleStats { n: 0, min: 0.0, median: 0.0, mean: 0.0,
+                             p95: 0.0, max: 0.0, stddev: 0.0, cv_pct: 0.0 };
+    }
+    let mut s = samples.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = s.len();
+    let min = s[0];
+    let max = s[n - 1];
+    let median = if n % 2 == 1 { s[n / 2] } else { (s[n / 2 - 1] + s[n / 2]) / 2.0 };
+    let mean = s.iter().sum::<f64>() / n as f64;
+    // Linear-interpolated p95.
+    let p95 = if n == 1 {
+        s[0]
+    } else {
+        let rank = 0.95 * (n - 1) as f64;
+        let lo = rank.floor() as usize;
+        let hi = rank.ceil() as usize;
+        s[lo] + (s[hi] - s[lo]) * (rank - lo as f64)
+    };
+    let variance = if n > 1 {
+        s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64
+    } else { 0.0 };
+    let stddev = variance.sqrt();
+    let cv_pct = if mean.abs() > f64::EPSILON { stddev / mean * 100.0 } else { 0.0 };
+    SampleStats { n, min, median, mean, p95, max, stddev, cv_pct }
+}
+
+fn stats_to_json(s: &SampleStats) -> serde_json::Value {
+    serde_json::json!({
+        "n": s.n,
+        "min": s.min,
+        "median": s.median,
+        "mean": s.mean,
+        "p95": s.p95,
+        "max": s.max,
+        "stddev": s.stddev,
+        "cv_pct": s.cv_pct,
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 #[ignore]
 async fn pl3b_sweep() {
@@ -1208,10 +1282,15 @@ async fn pl3b_sweep() {
         .unwrap_or_else(|_| "50,500,5000".to_string())
         .split(',').filter_map(|s| s.parse().ok()).collect();
     let n_backends = env_n();
+    // acct-rq4w: multi-iteration measurement.
+    let iters: usize = std::env::var("POC_PL3B_ITERS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(3).max(1);
+    let warm: bool = std::env::var("POC_PL3B_WARM")
+        .ok().map(|s| s == "1" || s.eq_ignore_ascii_case("true")).unwrap_or(false);
 
     eprintln!("==> pl3b_sweep config:");
-    eprintln!("    counts={:?} spreads={:?} shapes={:?} ingress={:?} router_sb={:?} N={}",
-              counts, spreads, shapes, ibatches, rsbmaxes, n_backends);
+    eprintln!("    counts={:?} spreads={:?} shapes={:?} ingress={:?} router_sb={:?} N={} iters={} warm={}",
+              counts, spreads, shapes, ibatches, rsbmaxes, n_backends, iters, warm);
     let total_cells = counts.len() * spreads.len() * shapes.len() * ibatches.len() * rsbmaxes.len();
     eprintln!("    {} total cells", total_cells);
 
@@ -1245,22 +1324,87 @@ async fn pl3b_sweep() {
                                   idx, total_cells, count, spread, shape_s, ibatch, rsbmax);
                         set_router_sb_max(&admin, rsbmax).await;
 
-                        let r = run_replay_batch(pool.clone(), dist, count, ibatch, n_backends).await;
+                        // acct-rq4w: multi-iteration loop. Optional warm-up
+                        // iter (POC_PL3B_WARM=1) runs first and is discarded
+                        // so PG shared_buffers / plan-cache / JIT settle.
+                        if warm {
+                            eprintln!("  [warmup] discarding 1 iter for PG warmup");
+                            stage_timings_reset(&pool).await;
+                            let _ = run_replay_batch(pool.clone(), dist, count, ibatch, n_backends).await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+
+                        let mut iter_records: Vec<serde_json::Value> = Vec::with_capacity(iters);
+                        let mut e2e_samples: Vec<f64> = Vec::with_capacity(iters);
+                        let mut submit_samples: Vec<f64> = Vec::with_capacity(iters);
+                        let mut drain_samples: Vec<f64> = Vec::with_capacity(iters);
+                        let mut stage_samples: std::collections::HashMap<String, Vec<f64>> =
+                            std::collections::HashMap::new();
+                        let mut distribution_name = String::new();
+
+                        for it in 0..iters {
+                            stage_timings_reset(&pool).await;
+                            let r = run_replay_batch(pool.clone(), dist, count, ibatch, n_backends).await;
+                            let stage_avg_ns = read_stage_timings(&pool).await;
+
+                            let submit_evps = if r.submission_wall_ns > 0 {
+                                r.submitted as f64 * 1e9 / r.submission_wall_ns as f64
+                            } else { 0.0 };
+                            let drain_evps = if r.drain_wall_ns > 0 {
+                                r.committed as f64 * 1e9 / r.drain_wall_ns as f64
+                            } else { 0.0 };
+                            let e2e_evps = if r.end_to_end_wall_ns > 0 {
+                                r.committed as f64 * 1e9 / r.end_to_end_wall_ns as f64
+                            } else { 0.0 };
+                            distribution_name = r.distribution.clone();
+
+                            e2e_samples.push(e2e_evps);
+                            submit_samples.push(submit_evps);
+                            drain_samples.push(drain_evps);
+                            for (stage, avg_ns) in &stage_avg_ns {
+                                stage_samples.entry(stage.clone()).or_default().push(*avg_ns);
+                            }
+
+                            iter_records.push(serde_json::json!({
+                                "iter": it,
+                                "submit_evps": submit_evps,
+                                "drain_evps": drain_evps,
+                                "e2e_evps": e2e_evps,
+                                "submission_wall_ms": r.submission_wall_ns / 1_000_000,
+                                "drain_wall_ms": r.drain_wall_ns / 1_000_000,
+                                "e2e_wall_ms": r.end_to_end_wall_ns / 1_000_000,
+                                "committed": r.committed,
+                                "failed": r.failed,
+                                "missing": r.missing,
+                                "submit_errors": r.submit_errors,
+                                "avg_envelopes_per_sb": if r.counters.superbatch_count > 0 {
+                                    r.counters.total_envelopes as f64 / r.counters.superbatch_count as f64
+                                } else { 0.0 },
+                                "sb_count": r.counters.superbatch_count,
+                                "max_envelope_count": r.counters.max_envelope_count,
+                                "top_wait_event": r.top_wait_event.as_ref().map(|(wet,we,c)|
+                                    format!("{}/{}({})", wet, we, c)),
+                                "stage_avg_ns": stage_avg_ns,
+                            }));
+                            eprintln!("  [iter {}/{}] e2e={:.0} submit={:.0} drain={:.0} avgSB={:.1}",
+                                it + 1, iters, e2e_evps, submit_evps, drain_evps,
+                                iter_records.last().unwrap()["avg_envelopes_per_sb"]
+                                    .as_f64().unwrap_or(0.0));
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+
+                        let e2e_stats = summary_stats(&e2e_samples);
+                        let submit_stats = summary_stats(&submit_samples);
+                        let drain_stats = summary_stats(&drain_samples);
+                        let stage_stats: std::collections::HashMap<String, serde_json::Value> =
+                            stage_samples.iter().map(|(k, v)| (k.clone(), stats_to_json(&summary_stats(v)))).collect();
+
                         let tag = format!("_pl3b_c{}_s{}_sh{}_ib{}_rsb{}",
                                           count, spread, shape_s, ibatch, rsbmax);
-                        // Persist with custom tag.
                         let outdir = PathBuf::from("bench/results-m8-ceiling/pl3b-sweep");
                         std::fs::create_dir_all(&outdir).ok();
-                        let path = outdir.join(format!("{}{}.json", r.distribution, tag));
-                        let submit_evps = if r.submission_wall_ns > 0 {
-                            r.submitted as f64 * 1e9 / r.submission_wall_ns as f64
-                        } else { 0.0 };
-                        let drain_evps = if r.drain_wall_ns > 0 {
-                            r.committed as f64 * 1e9 / r.drain_wall_ns as f64
-                        } else { 0.0 };
-                        let e2e_evps = if r.end_to_end_wall_ns > 0 {
-                            r.committed as f64 * 1e9 / r.end_to_end_wall_ns as f64
-                        } else { 0.0 };
+                        let path = outdir.join(format!("{}{}.json", distribution_name, tag));
+
                         let cell_summary = serde_json::json!({
                             "cell_index": idx,
                             "count": count,
@@ -1269,29 +1413,24 @@ async fn pl3b_sweep() {
                             "ingress_batch": ibatch,
                             "router_sb_max": rsbmax,
                             "n_backends": n_backends,
-                            "submit_evps": submit_evps,
-                            "drain_evps": drain_evps,
-                            "e2e_evps": e2e_evps,
-                            "submission_wall_ms": r.submission_wall_ns / 1_000_000,
-                            "drain_wall_ms": r.drain_wall_ns / 1_000_000,
-                            "e2e_wall_ms": r.end_to_end_wall_ns / 1_000_000,
-                            "committed": r.committed,
-                            "failed": r.failed,
-                            "missing": r.missing,
-                            "submit_errors": r.submit_errors,
-                            "avg_envelopes_per_sb": if r.counters.superbatch_count > 0 {
-                                r.counters.total_envelopes as f64 / r.counters.superbatch_count as f64
-                            } else { 0.0 },
-                            "sb_count": r.counters.superbatch_count,
-                            "max_envelope_count": r.counters.max_envelope_count,
-                            "top_wait_event": r.top_wait_event.as_ref().map(|(wet,we,c)|
-                                format!("{}/{}({})", wet, we, c)),
+                            "iters": iter_records,
+                            "warmup_iter": warm,
+                            "summary": {
+                                "e2e_evps": stats_to_json(&e2e_stats),
+                                "submit_evps": stats_to_json(&submit_stats),
+                                "drain_evps": stats_to_json(&drain_stats),
+                                "stage_avg_ns": stage_stats,
+                            },
                         });
                         std::fs::write(&path, serde_json::to_string_pretty(&cell_summary).unwrap()).ok();
-                        eprintln!("  → submit={:.0} drain={:.0} e2e={:.0} avgSB={:.1} ({})",
-                            submit_evps, drain_evps, e2e_evps,
-                            cell_summary["avg_envelopes_per_sb"].as_f64().unwrap_or(0.0),
-                            path.display());
+                        eprintln!(
+                            "  → e2e median={:.0} mean={:.0} CV={:.1}% (min={:.0} max={:.0})  submit median={:.0} CV={:.1}%  drain median={:.0} CV={:.1}%  ({})",
+                            e2e_stats.median, e2e_stats.mean, e2e_stats.cv_pct,
+                            e2e_stats.min, e2e_stats.max,
+                            submit_stats.median, submit_stats.cv_pct,
+                            drain_stats.median, drain_stats.cv_pct,
+                            path.display(),
+                        );
                         summary.push(cell_summary);
 
                         // Brief rest between cells.
