@@ -92,6 +92,14 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let driver_started = Instant::now();
     let deadline = driver_started + opts.duration;
 
+    // Run-unique source_id prefix: (epoch_secs % 1_000_000) * 10^12 keeps
+    // the trx UNIQUE (trx_type, source_id) constraint from colliding
+    // across measurement runs against the same persisted DB. Each
+    // caller's slot is caller_id * 10^6 + tick (room for ~10^6 ticks per
+    // caller per run, ~10^3 callers per run). Wraparound is ~11.5 days;
+    // fine for measurement cadence.
+    let run_prefix: i64 = (started_at.timestamp() as i64 % 1_000_000) * 1_000_000_000_000;
+
     // ── Per-caller tasks ──
     let workload = Arc::new(spec.workload.clone());
     let barrier = Arc::new(Barrier::new(spec.callers));
@@ -101,7 +109,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         let workload = workload.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            caller_loop(pool, workload, barrier, caller_id, deadline).await
+            caller_loop(pool, workload, barrier, caller_id, run_prefix, deadline).await
         }));
     }
 
@@ -151,6 +159,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         spec.callers,
         elapsed.as_secs_f64(),
         &ack,
+        errors_total,
         &measure,
         &sampler_report,
         sampler_dump_path,
@@ -160,12 +169,13 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     report::write_to_path(&report, &output_path).map_err(|e| format!("write report: {e}"))?;
     println!(
         "{{\"scenario\":\"{}\",\"path\":\"direct\",\"throughput_trx_per_sec\":{:.1},\
-        \"p99_us\":{},\"commits\":{},\"errors\":{},\"output\":\"{}\"}}",
+        \"p99_us\":{},\"commits\":{},\"attempts\":{},\"errors\":{},\"output\":\"{}\"}}",
         spec.id,
         report.throughput_trx_per_sec,
         report.ack_latency_us.p99,
         report.commits_observed,
-        errors_total,
+        report.attempts_total,
+        report.errors_total,
         output_path.display()
     );
     Ok(())
@@ -180,15 +190,14 @@ async fn caller_loop(
     workload: Arc<crate::workload::Workload>,
     barrier: Arc<Barrier>,
     caller_id: usize,
+    run_prefix: i64,
     deadline: Instant,
 ) -> (LatencyHistogram, u64) {
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
     let mut hist = LatencyHistogram::new();
     let mut errors: u64 = 0;
-    // Per-caller source_id space: (caller_id+1) * 1e9 + tick. Keeps the
-    // trx UNIQUE (trx_type, source_id) constraint from colliding across
-    // callers up to 10^9 submissions per caller.
-    let caller_base: i64 = (caller_id as i64 + 1) * 1_000_000_000;
+    // Per-run, per-caller source_id space: run_prefix + caller_id*10^6 + tick.
+    let caller_base: i64 = run_prefix + (caller_id as i64) * 1_000_000;
     let mut tick: i64 = 0;
 
     barrier.wait().await;

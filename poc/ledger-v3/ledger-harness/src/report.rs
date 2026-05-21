@@ -84,6 +84,13 @@ pub struct RunReport {
     pub duration_secs: f64,
     pub callers: usize,
     pub throughput_trx_per_sec: f64,
+    /// Total submission attempts across all callers (successes + errors).
+    /// Disambiguates throughput=0 (all errored) from throughput=0 (no
+    /// attempts) — cs5k first-pass showed s3/s4 with 0 successful trx
+    /// but tens of thousands of attempts.
+    pub attempts_total: u64,
+    /// Submissions that returned an error from the SPI call.
+    pub errors_total: u64,
     pub ack_latency_us: LatencyPercentiles,
     pub committed_latency_us: LatencyPercentiles,
     pub commits_observed: i64,
@@ -104,12 +111,14 @@ impl RunReport {
         callers: usize,
         duration_secs: f64,
         ack: &Histogram<u64>,
+        errors_total: u64,
         measure: &MeasureReport,
         sampler: &SamplerReport,
         sampler_report_path: Option<String>,
         started_at: DateTime<Utc>,
     ) -> Self {
         let percentiles = LatencyPercentiles::from_ns_hist(ack);
+        let attempts_total = ack.len() + errors_total;
         Self {
             scenario: scenario.into(),
             path: "direct".into(),
@@ -120,6 +129,8 @@ impl RunReport {
             } else {
                 0.0
             },
+            attempts_total,
+            errors_total,
             ack_latency_us: LatencyPercentiles::from_ns_hist(ack),
             committed_latency_us: percentiles,
             commits_observed: measure.xact_commit_delta,
@@ -236,6 +247,7 @@ mod tests {
             10,
             1.0,
             &ack,
+            7,
             &measure,
             &sampler,
             None,
@@ -250,6 +262,8 @@ mod tests {
         assert_eq!(parsed["path"], "direct");
         assert_eq!(parsed["callers"], 10);
         assert_eq!(parsed["commits_observed"], 3);
+        assert_eq!(parsed["attempts_total"], 10); // 3 ack + 7 errors
+        assert_eq!(parsed["errors_total"], 7);
         assert!(parsed["routed"].is_null());
         assert!(parsed["ack_latency_us"]["p50"].is_number());
     }

@@ -41,11 +41,23 @@ pub async fn seed(
         )));
     }
 
-    // Idempotency: if any pool exists, treat as already-seeded.
+    // Idempotency: reuse only when the existing count matches the
+    // request. Mismatch is a configuration error — the harness scenario
+    // sizing depends on the universe size (S6 stripe_size = universe /
+    // callers, S5 Zipf head, etc.), so silently using a smaller fixture
+    // produces meaningless measurements.
     let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM pool")
         .fetch_one(pool)
         .await?;
     if existing > 0 {
+        if (existing as usize) != count {
+            return Err(sqlx::Error::Protocol(format!(
+                "seed-pools: existing pool count ({existing}) != requested ({count}). \
+                 Drop the existing fixture (TRUNCATE pool, pool_state, pool_lock, trx, \
+                 trx_line, posting_line, posting_line_dimension RESTART IDENTITY CASCADE) \
+                 or re-run with --count {existing} to reuse."
+            )));
+        }
         let pool_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM pool ORDER BY id")
             .fetch_all(pool)
             .await?;
@@ -59,7 +71,7 @@ pub async fn seed(
         )
         .fetch_one(pool)
         .await?;
-        eprintln!("seed-pools: existing {} pools; reusing", pool_ids.len());
+        eprintln!("seed-pools: existing {} pools match request; reusing", pool_ids.len());
         return Ok(PoolUniverse {
             pool_ids,
             inv_account: inv,

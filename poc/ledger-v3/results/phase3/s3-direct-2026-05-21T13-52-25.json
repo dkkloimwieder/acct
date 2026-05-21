@@ -1,0 +1,60 @@
+{
+  "scenario": "s3",
+  "path": "direct",
+  "duration_secs": 60.043661475,
+  "callers": 10,
+  "throughput_trx_per_sec": 436.33248466881577,
+  "attempts_total": 27005,
+  "errors_total": 806,
+  "ack_latency_us": {
+    "p50": 18923,
+    "p95": 46727,
+    "p99": 65470,
+    "min": 5582,
+    "max": 180355,
+    "mean": 22207,
+    "count": 26199
+  },
+  "committed_latency_us": {
+    "p50": 18923,
+    "p95": 46727,
+    "p99": 65470,
+    "min": 5582,
+    "max": 180355,
+    "mean": 22207,
+    "count": 26199
+  },
+  "commits_observed": 27588,
+  "rollbacks_observed": 806,
+  "wal_bytes_per_trx": 33045.32608380455,
+  "top_wait_events": [
+    {
+      "wait_event_type": "Lock",
+      "wait_event": "transactionid",
+      "samples": 1685
+    },
+    {
+      "wait_event_type": "IO",
+      "wait_event": "WalSync",
+      "samples": 400
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "WALWrite",
+      "samples": 377
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "BufferContent",
+      "samples": 66
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "WALInsert",
+      "samples": 39
+    }
+  ],
+  "routed": null,
+  "sampler_report_path": null,
+  "started_at": "2026-05-21T17:55:03.822289504Z"
+}
