@@ -15,7 +15,9 @@ mod measure;
 mod pool_universe;
 #[allow(dead_code)] // wired by run-subcommand drivers (acct-ykyl, acct-qiaz)
 mod sampler;
-#[allow(dead_code)] // wired by scenarios (acct-7ywx) + drivers (acct-ykyl)
+#[allow(dead_code)] // wired by run-subcommand drivers (acct-ykyl, acct-qiaz)
+mod scenarios;
+#[allow(dead_code)] // wired by scenarios + drivers (acct-ykyl)
 mod workload;
 
 use std::time::Duration;
