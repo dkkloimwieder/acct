@@ -43,6 +43,7 @@ use std::ffi::CString;
 
 pgrx::pg_module_magic!();
 
+pub(crate) mod arena;
 pub(crate) mod identity;
 pub(crate) mod shmem;
 
@@ -255,6 +256,42 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Postmaster,
         GucFlags::empty(),
     );
+}
+
+// ── Arena observability ─────────────────────────────────────────────
+//
+// Slot-lifecycle leak audit needs visibility into the spillover-arena
+// allocator state. All accessors are atomic loads; no locks held
+// (PgLwLock.share() takes the read side; the atomic reads inside are
+// Relaxed, sequenced by the LWLock).
+
+#[pg_extern]
+fn ledger_routed_arena_total_allocs() -> i64 {
+    SPILLOVER_ARENA.share().allocs_total() as i64
+}
+
+#[pg_extern]
+fn ledger_routed_arena_total_frees() -> i64 {
+    SPILLOVER_ARENA.share().frees_total() as i64
+}
+
+/// Currently outstanding allocations = total_allocs − total_frees.
+/// Converges to 0 at rest; a persistent non-zero value across idle
+/// periods signals an arena leak.
+#[pg_extern]
+fn ledger_routed_arena_outstanding() -> i64 {
+    SPILLOVER_ARENA.share().outstanding_allocs() as i64
+}
+
+#[pg_extern]
+fn ledger_routed_arena_bump_offset() -> i64 {
+    SPILLOVER_ARENA.share().bump_offset_now() as i64
+}
+
+/// O(n) walk of the freelist — debug / observability only.
+#[pg_extern]
+fn ledger_routed_arena_freelist_count() -> i64 {
+    SPILLOVER_ARENA.share().freelist_count() as i64
 }
 
 // ── Smoke entry point ───────────────────────────────────────────────
