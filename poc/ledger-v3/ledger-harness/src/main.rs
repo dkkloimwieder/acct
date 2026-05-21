@@ -10,6 +10,8 @@
 //!   equivalence  acct-t9lo
 
 mod cli;
+#[allow(dead_code)] // wired by run-subcommand drivers (acct-ykyl, acct-qiaz)
+mod measure;
 mod pool_universe;
 #[allow(dead_code)] // wired by run-subcommand drivers (acct-ykyl, acct-qiaz)
 mod sampler;
