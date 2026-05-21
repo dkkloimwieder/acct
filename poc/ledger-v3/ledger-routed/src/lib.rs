@@ -47,6 +47,7 @@ pub(crate) mod arena;
 pub(crate) mod enqueue;
 pub(crate) mod identity;
 pub(crate) mod payload;
+pub(crate) mod router;
 pub(crate) mod shmem;
 
 use shmem::{
@@ -258,6 +259,21 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Postmaster,
         GucFlags::empty(),
     );
+
+    // ── BGWorker registration ────────────────────────────────────────
+    //
+    // Router only at this point (acct-zedi). Committer pool registers
+    // with acct-usn2; recovery worker with acct-r2ud. set_restart_time
+    // = 5s so PG relaunches the worker after a crash (matches v21).
+    use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
+    use std::time::Duration;
+    BackgroundWorkerBuilder::new("ledger_routed_router")
+        .set_function("ledger_routed_router_main")
+        .set_library("ledger_routed")
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(Duration::from_secs(5)))
+        .enable_spi_access()
+        .load();
 }
 
 // ── Arena observability ─────────────────────────────────────────────

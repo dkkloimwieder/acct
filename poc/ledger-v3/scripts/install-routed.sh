@@ -76,14 +76,19 @@ docker cp "$SQL_SRC" "$CONTAINER:$EXTDIR/"
 CURRENT_PRELOADS=$(docker exec "$CONTAINER" psql -U acct -d postgres -tA -c "SHOW shared_preload_libraries")
 echo "==> current shared_preload_libraries: $CURRENT_PRELOADS"
 
+# Normalize: strip whitespace so the idempotency grep matches whether
+# the live value is "a,b,c" or "a, b, c" (ALTER SYSTEM happens to write
+# the latter; postgresql.conf usually has the former).
+CURRENT_NORMALIZED=$(echo "$CURRENT_PRELOADS" | tr -d ' ')
+
 NEED_RESTART=0
-if echo ",$CURRENT_PRELOADS," | grep -q ',ledger_routed,'; then
+if echo ",$CURRENT_NORMALIZED," | grep -q ',ledger_routed,'; then
     echo "==> ledger_routed already preloaded; skipping ALTER SYSTEM"
 else
-    if [ -z "$CURRENT_PRELOADS" ]; then
+    if [ -z "$CURRENT_NORMALIZED" ]; then
         NEW_PRELOADS_LIST="ledger_routed"
     else
-        NEW_PRELOADS_LIST="$(echo "$CURRENT_PRELOADS" | sed 's/,/, /g'), ledger_routed"
+        NEW_PRELOADS_LIST="$(echo "$CURRENT_NORMALIZED" | sed 's/,/, /g'), ledger_routed"
     fi
     echo "==> ALTER SYSTEM SET shared_preload_libraries = $NEW_PRELOADS_LIST"
     docker exec "$CONTAINER" psql -U acct -d postgres -c \
