@@ -17,6 +17,7 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 clap         = { workspace = true }
 rand         = { workspace = true }
+rand_distr   = "0.5"
 hdrhistogram = { workspace = true }
 uuid         = { workspace = true, features = ["v4"] }
 chrono       = { workspace = true }
