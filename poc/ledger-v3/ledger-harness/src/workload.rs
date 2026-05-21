@@ -35,6 +35,7 @@ pub enum Complexity {
     /// 1 line per submission.
     Simple,
     /// Uniform 2-5 lines.
+    #[allow(dead_code)]
     Medium,
     /// Uniform 10-50 lines.
     Complex,
@@ -60,6 +61,10 @@ pub struct Workload {
     pub universe: PoolUniverse,
     pub overlap: OverlapMode,
     pub complexity: Complexity,
+    /// Informational — the scenario's advertised caller count. Pickers
+    /// don't consult it (Disjoint already takes stripe_size); kept so
+    /// the workload struct is self-describing for diagnostics.
+    #[allow(dead_code)]
     pub caller_count: usize,
 }
 

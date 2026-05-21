@@ -46,14 +46,17 @@ pub struct LatencyPercentiles {
 }
 
 impl LatencyPercentiles {
-    pub fn from_us(hist: &Histogram<u64>) -> Self {
+    /// Build microsecond-valued percentiles from a nanosecond-valued
+    /// histogram. Drivers record `elapsed.as_nanos()` for sub-microsecond
+    /// precision; the JSON schema reports µs to match plan §F.
+    pub fn from_ns_hist(hist: &Histogram<u64>) -> Self {
         Self {
-            p50: hist.value_at_quantile(0.50),
-            p95: hist.value_at_quantile(0.95),
-            p99: hist.value_at_quantile(0.99),
-            min: hist.min(),
-            max: hist.max(),
-            mean: hist.mean() as u64,
+            p50: hist.value_at_quantile(0.50) / 1_000,
+            p95: hist.value_at_quantile(0.95) / 1_000,
+            p99: hist.value_at_quantile(0.99) / 1_000,
+            min: hist.min() / 1_000,
+            max: hist.max() / 1_000,
+            mean: (hist.mean() / 1_000.0) as u64,
             count: hist.len(),
         }
     }
@@ -106,7 +109,7 @@ impl RunReport {
         sampler_report_path: Option<String>,
         started_at: DateTime<Utc>,
     ) -> Self {
-        let percentiles = LatencyPercentiles::from_us(ack);
+        let percentiles = LatencyPercentiles::from_ns_hist(ack);
         Self {
             scenario: scenario.into(),
             path: "direct".into(),
@@ -117,7 +120,7 @@ impl RunReport {
             } else {
                 0.0
             },
-            ack_latency_us: LatencyPercentiles::from_us(ack),
+            ack_latency_us: LatencyPercentiles::from_ns_hist(ack),
             committed_latency_us: percentiles,
             commits_observed: measure.xact_commit_delta,
             rollbacks_observed: measure.xact_rollback_delta,
@@ -181,8 +184,9 @@ mod tests {
 
     #[test]
     fn percentiles_match_simple_distribution() {
-        let h = hist_with_values(&[100, 200, 300, 400, 500]);
-        let p = LatencyPercentiles::from_us(&h);
+        // Values in ns; assertions on the ÷1000 µs output.
+        let h = hist_with_values(&[100_000, 200_000, 300_000, 400_000, 500_000]);
+        let p = LatencyPercentiles::from_ns_hist(&h);
         assert_eq!(p.count, 5);
         assert!(p.min <= 100 && p.max >= 500);
         assert!(p.p50 >= 200 && p.p50 <= 400);

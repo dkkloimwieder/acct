@@ -84,6 +84,7 @@ impl SamplerReport {
     }
 
     /// Compact one-line wait_event summary for the JSON record.
+    #[allow(dead_code)]
     pub fn top_wait_event(&self) -> Option<(String, String, i64)> {
         self.wait_observations
             .iter()

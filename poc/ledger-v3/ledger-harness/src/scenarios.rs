@@ -35,6 +35,7 @@ pub struct ScenarioSpec {
     /// methods come from the seed-pools run; this is a label that the
     /// scenario builder *expects* the universe to have been seeded
     /// with. Drivers don't enforce it (the workload is method-agnostic).
+    #[allow(dead_code)]
     pub expected_method_mix: MethodMix,
 }
 

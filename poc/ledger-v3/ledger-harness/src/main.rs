@@ -10,16 +10,12 @@
 //!   equivalence  acct-t9lo
 
 mod cli;
-#[allow(dead_code)] // wired by run-subcommand drivers (acct-ykyl, acct-qiaz)
+mod driver_direct;
 mod measure;
 mod pool_universe;
-#[allow(dead_code)] // wired by run-subcommand drivers (acct-ykyl, acct-qiaz)
 mod report;
-#[allow(dead_code)] // wired by run-subcommand drivers (acct-ykyl, acct-qiaz)
 mod sampler;
-#[allow(dead_code)] // wired by run-subcommand drivers (acct-ykyl, acct-qiaz)
 mod scenarios;
-#[allow(dead_code)] // wired by scenarios + drivers (acct-ykyl)
 mod workload;
 
 use std::time::Duration;
@@ -27,7 +23,7 @@ use std::time::Duration;
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
 
-use cli::{Cli, Cmd};
+use cli::{Cli, Cmd, Path};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -74,13 +70,28 @@ async fn main() -> std::process::ExitCode {
             duration,
             output,
             no_sampler,
-        } => {
-            eprintln!(
-                "run: scenario={scenario} path={path:?} duration={duration} output={output:?} no_sampler={no_sampler}"
-            );
-            eprintln!("[stub] direct driver lands in acct-ykyl, routed in acct-qiaz");
-            std::process::ExitCode::from(2)
-        }
+        } => match path {
+            Path::Direct => {
+                let opts = driver_direct::RunOptions {
+                    dsn: args.dsn,
+                    scenario,
+                    duration: duration.into(),
+                    output,
+                    no_sampler,
+                };
+                match driver_direct::run(opts).await {
+                    Ok(()) => std::process::ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("run direct failed: {e}");
+                        std::process::ExitCode::from(1)
+                    }
+                }
+            }
+            Path::Routed => {
+                eprintln!("run --path routed: stub — lands in acct-qiaz");
+                std::process::ExitCode::from(2)
+            }
+        },
         Cmd::Equivalence { scenario, duration } => {
             eprintln!("equivalence: scenario={scenario} duration={duration}");
             eprintln!("[stub] body lands in acct-t9lo");
