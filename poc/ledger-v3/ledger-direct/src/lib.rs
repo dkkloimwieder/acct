@@ -27,6 +27,7 @@ pub(crate) mod bulk_write;
 pub(crate) mod hydration;
 pub(crate) mod ledger_error_map;
 pub(crate) mod pool_lock;
+pub(crate) mod submit;
 
 // ── _PG_init ────────────────────────────────────────────────────────
 //
