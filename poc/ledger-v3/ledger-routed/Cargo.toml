@@ -22,6 +22,7 @@ pgrx        = { workspace = true }
 ledger-core = { path = "../ledger-core" }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+chrono      = { workspace = true }
 libc        = { workspace = true }
 uuid        = { workspace = true, features = ["v4"] }
 sha2        = { workspace = true }

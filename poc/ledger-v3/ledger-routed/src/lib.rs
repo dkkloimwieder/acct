@@ -44,6 +44,7 @@ use std::ffi::CString;
 pgrx::pg_module_magic!();
 
 pub(crate) mod arena;
+pub(crate) mod enqueue;
 pub(crate) mod identity;
 pub(crate) mod payload;
 pub(crate) mod shmem;
