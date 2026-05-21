@@ -10,6 +10,9 @@ description = "ledger-v3 measurement binary: multi-session driver, synthetic wor
 name = "ledger-harness"
 path = "src/main.rs"
 
+[dev-dependencies]
+tempfile     = "3"
+
 [dependencies]
 tokio        = { workspace = true }
 sqlx         = { workspace = true }
