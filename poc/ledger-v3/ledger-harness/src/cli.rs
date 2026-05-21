@@ -56,6 +56,11 @@ pub enum Cmd {
         /// Disable the pg_locks sampler.
         #[arg(long)]
         no_sampler: bool,
+        /// Cap caller count at most this many — useful when PG
+        /// max_connections cannot accommodate the scenario's natural
+        /// caller count (e.g. dev container at 320 vs S5/S6 wanting 1000).
+        #[arg(long)]
+        max_callers: Option<usize>,
     },
     /// Run Path A and Path B against an identical workload and diff
     /// the resulting trx + pool_state tables (design-v3 §8.4).

@@ -1,0 +1,58 @@
+{
+  "scenario": "s5",
+  "path": "direct",
+  "duration_secs": 30.491370775,
+  "callers": 200,
+  "throughput_trx_per_sec": 0.4591462975970453,
+  "ack_latency_us": {
+    "p50": 485228,
+    "p95": 492830,
+    "p99": 492830,
+    "min": 438304,
+    "max": 492830,
+    "mean": 480903,
+    "count": 14
+  },
+  "committed_latency_us": {
+    "p50": 485228,
+    "p95": 492830,
+    "p99": 492830,
+    "min": 438304,
+    "max": 492830,
+    "mean": 480903,
+    "count": 14
+  },
+  "commits_observed": 1422,
+  "rollbacks_observed": 13246,
+  "wal_bytes_per_trx": 3135.2798874824193,
+  "top_wait_events": [
+    {
+      "wait_event_type": "Lock",
+      "wait_event": "tuple",
+      "samples": 59071
+    },
+    {
+      "wait_event_type": "Lock",
+      "wait_event": "transactionid",
+      "samples": 293
+    },
+    {
+      "wait_event_type": "Client",
+      "wait_event": "ClientRead",
+      "samples": 12
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "LockManager",
+      "samples": 4
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "XidGen",
+      "samples": 1
+    }
+  ],
+  "routed": null,
+  "sampler_report_path": null,
+  "started_at": "2026-05-21T17:29:25.714763788Z"
+}

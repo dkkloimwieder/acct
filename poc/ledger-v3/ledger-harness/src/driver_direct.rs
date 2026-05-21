@@ -36,6 +36,7 @@ pub struct RunOptions {
     pub duration: Duration,
     pub output: Option<PathBuf>,
     pub no_sampler: bool,
+    pub max_callers: Option<usize>,
 }
 
 pub async fn run(opts: RunOptions) -> Result<(), String> {
@@ -50,9 +51,20 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         .map_err(|e| format!("connect: {e}"))?;
 
     let universe = load_universe(&pool).await?;
-    let spec = scenarios::by_id(&opts.scenario, universe).ok_or_else(|| {
+    let mut spec = scenarios::by_id(&opts.scenario, universe).ok_or_else(|| {
         format!("unknown scenario '{}' (try s1..s6)", opts.scenario)
     })?;
+    if let Some(cap) = opts.max_callers {
+        let capped = spec.callers.min(cap);
+        if capped != spec.callers {
+            eprintln!(
+                "scenario {}: capping callers {} -> {} via --max-callers",
+                spec.id, spec.callers, capped
+            );
+            spec.callers = capped;
+            spec.workload.caller_count = capped;
+        }
+    }
     eprintln!(
         "scenario {}: {} (callers={}, duration={:?})",
         spec.id, spec.description, spec.callers, opts.duration

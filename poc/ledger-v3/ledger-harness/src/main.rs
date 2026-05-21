@@ -70,6 +70,7 @@ async fn main() -> std::process::ExitCode {
             duration,
             output,
             no_sampler,
+            max_callers,
         } => match path {
             Path::Direct => {
                 let opts = driver_direct::RunOptions {
@@ -78,6 +79,7 @@ async fn main() -> std::process::ExitCode {
                     duration: duration.into(),
                     output,
                     no_sampler,
+                    max_callers,
                 };
                 match driver_direct::run(opts).await {
                     Ok(()) => std::process::ExitCode::SUCCESS,
