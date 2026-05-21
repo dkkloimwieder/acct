@@ -20,4 +20,5 @@ rand         = { workspace = true }
 hdrhistogram = { workspace = true }
 uuid         = { workspace = true, features = ["v4"] }
 chrono       = { workspace = true }
+humantime    = "2"
 ledger-core  = { path = "../ledger-core" }
