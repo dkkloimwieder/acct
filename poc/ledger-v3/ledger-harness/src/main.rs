@@ -10,10 +10,14 @@
 //!   equivalence  acct-t9lo
 
 mod cli;
+mod pool_universe;
 #[allow(dead_code)] // wired by run-subcommand drivers (acct-ykyl, acct-qiaz)
 mod sampler;
 
+use std::time::Duration;
+
 use clap::Parser;
+use sqlx::postgres::PgPoolOptions;
 
 use cli::{Cli, Cmd};
 
@@ -28,11 +32,33 @@ async fn main() -> std::process::ExitCode {
             locations,
             method_mix,
         } => {
-            eprintln!(
-                "seed-pools: count={count} skus={skus} locations={locations} method_mix={method_mix:?}"
-            );
-            eprintln!("[stub] body lands in acct-llt2");
-            std::process::ExitCode::from(2)
+            let pool = match PgPoolOptions::new()
+                .max_connections(4)
+                .acquire_timeout(Duration::from_secs(10))
+                .connect(&args.dsn)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("connect failed: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
+            match pool_universe::seed(&pool, count, skus, locations, method_mix).await {
+                Ok(u) => {
+                    println!(
+                        "{{\"pools\":{},\"inv_account\":{},\"ap_account\":{}}}",
+                        u.pool_ids.len(),
+                        u.inv_account,
+                        u.ap_account
+                    );
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("seed-pools failed: {e}");
+                    std::process::ExitCode::from(1)
+                }
+            }
         }
         Cmd::Run {
             scenario,
