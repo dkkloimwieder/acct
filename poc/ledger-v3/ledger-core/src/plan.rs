@@ -24,6 +24,23 @@ pub enum LineType {
     RevaluationLine,
 }
 
+impl LineType {
+    /// SQL `line_type` enum text. Stable contract — must match migration 0001.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            LineType::PoReceiptLine => "po_receipt_line",
+            LineType::WoOutput => "wo_output",
+            LineType::WoBackflush => "wo_backflush",
+            LineType::WoScrap => "wo_scrap",
+            LineType::InvAdjustmentLine => "inv_adjustment_line",
+            LineType::TransferShipmentLine => "transfer_shipment_line",
+            LineType::TransferReceiptLine => "transfer_receipt_line",
+            LineType::ManualAdjustmentLine => "manual_adjustment_line",
+            LineType::RevaluationLine => "revaluation_line",
+        }
+    }
+}
+
 /// Mirror of the SQL `posting_event_type` enum from design-v3 §2.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PostingEventType {
@@ -34,6 +51,22 @@ pub enum PostingEventType {
     Scrap,
     Adjustment,
     Revaluation,
+}
+
+impl PostingEventType {
+    /// SQL `posting_event_type` enum text. Stable contract — must match
+    /// migration 0001.
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            PostingEventType::InventoryReceipt => "inventory_receipt",
+            PostingEventType::InventoryDepletion => "inventory_depletion",
+            PostingEventType::WipMovement => "wip_movement",
+            PostingEventType::Variance => "variance",
+            PostingEventType::Scrap => "scrap",
+            PostingEventType::Adjustment => "adjustment",
+            PostingEventType::Revaluation => "revaluation",
+        }
+    }
 }
 
 /// One line from a caller's submission. Input to plan_apply.

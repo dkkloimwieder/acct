@@ -23,6 +23,7 @@ test_hooks = []
 pgrx        = { workspace = true }
 ledger-core = { path = "../ledger-core" }
 serde_json  = { workspace = true }
+chrono      = { workspace = true }
 
 [dev-dependencies]
 pgrx-tests  = { workspace = true }
