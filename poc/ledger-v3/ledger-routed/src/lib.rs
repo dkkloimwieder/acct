@@ -45,6 +45,7 @@ pgrx::pg_module_magic!();
 
 pub(crate) mod arena;
 pub(crate) mod identity;
+pub(crate) mod payload;
 pub(crate) mod shmem;
 
 use shmem::{
