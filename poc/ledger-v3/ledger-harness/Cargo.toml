@@ -1,0 +1,23 @@
+[package]
+name = "ledger-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "ledger-v3 measurement binary: multi-session driver, synthetic workload generator, scenarios S1-S6, throughput/latency/lock-wait/WAL/eject measurement collection, JSON report output (design-v3 §8.5 / §9)."
+
+[[bin]]
+name = "ledger-harness"
+path = "src/main.rs"
+
+[dependencies]
+tokio        = { workspace = true }
+sqlx         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+clap         = { workspace = true }
+rand         = { workspace = true }
+hdrhistogram = { workspace = true }
+uuid         = { workspace = true, features = ["v4"] }
+chrono       = { workspace = true }
+ledger-core  = { path = "../ledger-core" }

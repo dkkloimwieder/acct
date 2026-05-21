@@ -1,0 +1,33 @@
+[package]
+name = "ledger-direct"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "ledger-v3 Path A: pgrx 0.18 extension exposing ledger_submit_trx — synchronous SPI executing the full ledger work inside the caller's user-tx (design-v3 §4)."
+
+[lib]
+name = "ledger_direct"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18"]
+pg_test = []
+# Exposes the ledger_direct_test_* pg_externs. Required by every test binary
+# in tests/; gated OUT of production .so builds so SQL callers cannot reach
+# state-mutating helpers. Mirrors v21's acct-gx1z.1.2 pattern.
+test_hooks = []
+
+[dependencies]
+pgrx        = { workspace = true }
+ledger-core = { path = "../ledger-core" }
+serde_json  = { workspace = true }
+
+[dev-dependencies]
+pgrx-tests  = { workspace = true }
+tokio       = { workspace = true }
+sqlx        = { workspace = true }
+rand        = { workspace = true }
+proptest    = { workspace = true }
+uuid        = { workspace = true, features = ["v4"] }

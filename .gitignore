@@ -13,6 +13,8 @@ poc/queue-extension/target/
 poc/queue-extension/Cargo.lock
 poc/queue-extension-v21/target/
 poc/queue-extension-v21/Cargo.lock
+poc/ledger-v3/target/
+poc/ledger-v3/Cargo.lock
 
 # Local env (use .env.example as template)
 .env
