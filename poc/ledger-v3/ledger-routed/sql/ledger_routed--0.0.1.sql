@@ -7,11 +7,91 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:262
+-- ledger-routed/src/enqueue.rs:50
+-- ledger_routed::enqueue::ledger_enqueue_trx
+CREATE  FUNCTION "ledger_enqueue_trx"(
+	"trx_type" TEXT, /* & str */
+	"source_id" bigint, /* i64 */
+	"posted_at" TEXT, /* & str */
+	"lines" jsonb /* pgrx :: JsonB */
+) RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_enqueue_trx_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/lib.rs:288
+-- ledger_routed::ledger_routed_arena_bump_offset
+CREATE  FUNCTION "ledger_routed_arena_bump_offset"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_arena_bump_offset_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/lib.rs:294
+-- ledger_routed::ledger_routed_arena_freelist_count
+CREATE  FUNCTION "ledger_routed_arena_freelist_count"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_arena_freelist_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/lib.rs:283
+-- ledger_routed::ledger_routed_arena_outstanding
+CREATE  FUNCTION "ledger_routed_arena_outstanding"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_arena_outstanding_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/lib.rs:270
+-- ledger_routed::ledger_routed_arena_total_allocs
+CREATE  FUNCTION "ledger_routed_arena_total_allocs"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_arena_total_allocs_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/lib.rs:275
+-- ledger_routed::ledger_routed_arena_total_frees
+CREATE  FUNCTION "ledger_routed_arena_total_frees"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_arena_total_frees_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/lib.rs:301
 -- ledger_routed::ledger_routed_hello
 CREATE  FUNCTION "ledger_routed_hello"() RETURNS TEXT /* String */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_routed_hello_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/enqueue.rs:218
+-- ledger_routed::enqueue::ledger_routed_staging_request_seq_max
+CREATE  FUNCTION "ledger_routed_staging_request_seq_max"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_staging_request_seq_max_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/enqueue.rs:194
+-- ledger_routed::enqueue::ledger_routed_staging_state_counts
+CREATE  FUNCTION "ledger_routed_staging_state_counts"() RETURNS TABLE (
+	"state" TEXT,  /* String */
+	"count" bigint  /* i64 */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_staging_state_counts_wrapper';
 /* </end connected objects> */
 
