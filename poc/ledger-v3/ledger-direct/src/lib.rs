@@ -15,7 +15,6 @@
 //! - `pool_lock`        — acct-bvps (singleton-loop FOR UPDATE per §4.2 step 3)
 //! - `hydration`        — acct-1ucl (snapshot read per §4.2 step 4)
 //! - `bulk_write`       — acct-iir7 (UNNEST INSERT/UPSERT/UPDATE/DELETE helpers)
-//! - `ledger_error_map` — acct-d74b (LedgerError → ereport!)
 //! - `submit`           — acct-v4xz (8-step orchestration)
 
 #![allow(unexpected_cfgs)]
@@ -23,6 +22,8 @@
 use pgrx::prelude::*;
 
 pgrx::pg_module_magic!();
+
+pub(crate) mod ledger_error_map;
 
 // ── _PG_init ────────────────────────────────────────────────────────
 //
