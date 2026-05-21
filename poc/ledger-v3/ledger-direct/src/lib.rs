@@ -7,13 +7,76 @@
 //! snapshot read, ledger-core plan_apply, ordered bulk writes) inside the caller's
 //! user-tx. One PG transaction per submission, one fsync, caller-visible failures.
 //!
-//! Modules added by follow-up beads issues:
-//! - `submit.rs`           — acct-v4xz (8-step orchestration)
-//! - `pool_lock.rs`        — acct-bvps (singleton-loop FOR UPDATE)
-//! - `hydration.rs`        — acct-1ucl (snapshot read)
-//! - `bulk_write.rs`       — acct-iir7 (UNNEST INSERT/UPSERT/UPDATE/DELETE helpers)
-//! - `ledger_error_map.rs` — acct-d74b (LedgerError → ereport!)
+//! Path A allocates no shared memory: every submission's work happens entirely in
+//! the caller's backend, so `_PG_init` is a no-op beyond pgrx wiring. Path B
+//! (ledger-routed) is the one that needs shmem regions.
 //!
-//! Per the plan, `pgrx::pg_module_magic!()` and the `_PG_init` hook are added in
-//! acct-bnhr (c14: pgrx scaffolding + hello smoke pg_extern); this file is the
-//! workspace stub.
+//! Modules added by follow-up beads issues:
+//! - `pool_lock`        — acct-bvps (singleton-loop FOR UPDATE per §4.2 step 3)
+//! - `hydration`        — acct-1ucl (snapshot read per §4.2 step 4)
+//! - `bulk_write`       — acct-iir7 (UNNEST INSERT/UPSERT/UPDATE/DELETE helpers)
+//! - `ledger_error_map` — acct-d74b (LedgerError → ereport!)
+//! - `submit`           — acct-v4xz (8-step orchestration)
+
+#![allow(unexpected_cfgs)]
+
+use pgrx::prelude::*;
+
+pgrx::pg_module_magic!();
+
+// ── _PG_init ────────────────────────────────────────────────────────
+//
+// Path A is shmem-free, so this hook only exists to give PG something
+// to invoke when the .so is loaded via LOAD or via the implicit load
+// from a pg_extern call. No GUC registration today either — the
+// 8-step orchestration (acct-v4xz) can register `ledger_direct.*`
+// GUCs at that point if any prove necessary.
+
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {}
+
+/// One-line scaffolding banner. Used by Phase 2 acceptance to confirm
+/// the extension loads cleanly and the SPI surface is wired.
+#[pg_extern]
+fn ledger_direct_hello() -> String {
+    format!(
+        "ledger_direct {} (acct-bnhr scaffolding) — Path A: synchronous in-tx ledger_submit_trx",
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+
+    /// Smoke test: the hello fn returns a stable prefix. Guards against
+    /// CARGO_PKG_VERSION drift breaking the literal as a contract while
+    /// still asserting the SPI surface is reachable.
+    #[pg_test]
+    fn hello_pg_extern_reachable() {
+        let banner =
+            Spi::get_one::<String>("SELECT ledger_direct_hello()").expect("SPI call failed");
+        let banner = banner.expect("hello fn returned NULL");
+        assert!(
+            banner.starts_with("ledger_direct "),
+            "unexpected banner: {banner:?}"
+        );
+        assert!(
+            banner.contains("Path A"),
+            "banner missing path identifier: {banner:?}"
+        );
+    }
+}
+
+/// Required by `cargo pgrx test`. Returns the postgresql.conf lines to
+/// add for tests. Empty for Path A — no GUCs to set, no
+/// shared_preload_libraries because there is no shmem to allocate.
+#[cfg(test)]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {}
+
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        vec![]
+    }
+}
