@@ -1,0 +1,60 @@
+{
+  "scenario": "s1",
+  "path": "direct",
+  "duration_secs": 60.003494691,
+  "callers": 10,
+  "throughput_trx_per_sec": 2440.3745274183734,
+  "attempts_total": 146431,
+  "errors_total": 0,
+  "ack_latency_us": {
+    "p50": 3905,
+    "p95": 5816,
+    "p99": 6438,
+    "min": 3074,
+    "max": 24674,
+    "mean": 4094,
+    "count": 146431
+  },
+  "committed_latency_us": {
+    "p50": 3905,
+    "p95": 5816,
+    "p99": 6438,
+    "min": 3074,
+    "max": 24674,
+    "mean": 4094,
+    "count": 146431
+  },
+  "commits_observed": 147832,
+  "rollbacks_observed": 0,
+  "wal_bytes_per_trx": 1688.4388224471022,
+  "top_wait_events": [
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "WALWrite",
+      "samples": 3072
+    },
+    {
+      "wait_event_type": "IO",
+      "wait_event": "WalSync",
+      "samples": 548
+    },
+    {
+      "wait_event_type": "Client",
+      "wait_event": "ClientRead",
+      "samples": 64
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "BufferContent",
+      "samples": 52
+    },
+    {
+      "wait_event_type": "IO",
+      "wait_event": "WalWrite",
+      "samples": 10
+    }
+  ],
+  "routed": null,
+  "sampler_report_path": null,
+  "started_at": "2026-05-21T18:22:06.756979061Z"
+}

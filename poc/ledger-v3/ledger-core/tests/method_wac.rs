@@ -192,9 +192,15 @@ fn guard_receipt_into_oversold_then_back_positive_resumes_weighted_average() {
     let mut snap = wac_snapshot(1, Some((-5, 100)), 0);
     let r = plan_apply(&mut snap, &[line(1, 3, 50), line(1, 5, 80)], Utc::now()).unwrap();
 
-    assert_eq!(r.pool_state_mutations.len(), 2);
-    let second = &r.pool_state_mutations[1];
-    match second {
+    // Two lines into the same WAC pool emit two Upserts at layer_seq=0;
+    // plan_apply's dedupe collapses them to one Upsert carrying the
+    // cumulative state (snapshot is updated in-place between lines, so
+    // the second Upsert already has the final qty / unit_cost). Folding
+    // is required because the bulk-write UPSERT batch can't accept two
+    // input rows targeting the same conflict-target row (SQLSTATE 21000).
+    assert_eq!(r.pool_state_mutations.len(), 1);
+    let only = &r.pool_state_mutations[0];
+    match only {
         PoolStateMutation::Upsert {
             qty: 3,
             unit_cost: 66,

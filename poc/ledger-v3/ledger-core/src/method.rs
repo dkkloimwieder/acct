@@ -65,5 +65,6 @@ pub fn plan_apply(
             }
         }
     }
+    result.dedupe_pool_state_mutations();
     Ok(result)
 }

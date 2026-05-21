@@ -171,6 +171,59 @@ impl PlanResult {
     /// and `trx_line_idx` (in PostingLineRequest) by the current
     /// `self.trx_lines.len()` offset so the merged indices remain valid
     /// against the combined `trx_lines` vec.
+    /// Collapse multiple same-`(pool_id, layer_seq)` mutations of the same
+    /// kind into one. Each per-method `apply_*` appends a mutation per line;
+    /// submissions with two lines into the same WAC pool emit two Upserts at
+    /// layer_seq=0, which the bulk-write UPSERT batch rejects with
+    /// `ON CONFLICT DO UPDATE command cannot affect row a second time`
+    /// (SQLSTATE 21000).
+    ///
+    /// Bulk-write executes four separate statements in order (Insert →
+    /// Upsert → Update → Delete), so cross-kind same-key sequences are
+    /// already correct in PG: e.g. Insert(qty=10) followed by Update(qty=7)
+    /// runs Insert first (row created at 10), then Update (row set to 7),
+    /// ending at qty=7. Only within-kind same-key duplicates collide
+    /// (Upsert batch's ON CONFLICT; Update batch's non-deterministic
+    /// per-row pick; Delete batch's redundant no-ops). This fold keeps the
+    /// LAST same-kind same-key entry — the latest one carries the
+    /// cumulative state because the snapshot is updated in-place as
+    /// plan_apply walks lines.
+    pub fn dedupe_pool_state_mutations(&mut self) {
+        use std::collections::HashMap;
+
+        if self.pool_state_mutations.len() < 2 {
+            return;
+        }
+
+        // Pass 1: for each (kind_tag, pool_id, layer_seq), find the index
+        // of the LAST occurrence. Earlier ones become redundant.
+        let mut last_seen: HashMap<(u8, i64, i64), usize> = HashMap::new();
+        for (i, m) in self.pool_state_mutations.iter().enumerate() {
+            let key = match m {
+                PoolStateMutation::Insert { pool_id, layer_seq, .. } => (0, *pool_id, *layer_seq),
+                PoolStateMutation::Upsert { pool_id, layer_seq, .. } => (1, *pool_id, *layer_seq),
+                PoolStateMutation::Update { pool_id, layer_seq, .. } => (2, *pool_id, *layer_seq),
+                PoolStateMutation::Delete { pool_id, layer_seq } => (3, *pool_id, *layer_seq),
+            };
+            last_seen.insert(key, i);
+        }
+
+        // Pass 2: keep an entry only when it is the LAST same-kind same-key
+        // entry. Order is preserved.
+        let mut keep_idx = 0usize;
+        self.pool_state_mutations.retain(|m| {
+            let key = match m {
+                PoolStateMutation::Insert { pool_id, layer_seq, .. } => (0, *pool_id, *layer_seq),
+                PoolStateMutation::Upsert { pool_id, layer_seq, .. } => (1, *pool_id, *layer_seq),
+                PoolStateMutation::Update { pool_id, layer_seq, .. } => (2, *pool_id, *layer_seq),
+                PoolStateMutation::Delete { pool_id, layer_seq } => (3, *pool_id, *layer_seq),
+            };
+            let is_last = last_seen.get(&key) == Some(&keep_idx);
+            keep_idx += 1;
+            is_last
+        });
+    }
+
     pub fn merge(&mut self, other: PlanResult) {
         let offset = self.trx_lines.len();
         self.trx_lines.extend(other.trx_lines);
@@ -209,5 +262,138 @@ impl PlanResult {
             posting.trx_line_idx += offset;
             self.posting_lines.push(posting);
         }
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::*;
+
+    fn ins(pool: i64, seq: i64, qty: i64, cost: i64, idx: usize) -> PoolStateMutation {
+        PoolStateMutation::Insert {
+            pool_id: pool,
+            layer_seq: seq,
+            qty,
+            unit_cost: cost,
+            last_trx_line_idx: idx,
+        }
+    }
+    fn ups(pool: i64, seq: i64, qty: i64, cost: i64, idx: usize) -> PoolStateMutation {
+        PoolStateMutation::Upsert {
+            pool_id: pool,
+            layer_seq: seq,
+            qty,
+            unit_cost: cost,
+            last_trx_line_idx: idx,
+        }
+    }
+    fn upd(pool: i64, seq: i64, qty: i64) -> PoolStateMutation {
+        PoolStateMutation::Update {
+            pool_id: pool,
+            layer_seq: seq,
+            qty,
+        }
+    }
+    fn del(pool: i64, seq: i64) -> PoolStateMutation {
+        PoolStateMutation::Delete {
+            pool_id: pool,
+            layer_seq: seq,
+        }
+    }
+    fn run(ms: Vec<PoolStateMutation>) -> Vec<PoolStateMutation> {
+        let mut p = PlanResult {
+            pool_state_mutations: ms,
+            ..Default::default()
+        };
+        p.dedupe_pool_state_mutations();
+        p.pool_state_mutations
+    }
+
+    #[test]
+    fn three_same_key_upserts_collapse_to_last_one() {
+        let out = run(vec![
+            ups(7, 0, 100, 10, 0),
+            ups(7, 0, 200, 11, 1),
+            ups(7, 0, 250, 12, 2),
+        ]);
+        assert_eq!(out, vec![ups(7, 0, 250, 12, 2)]);
+    }
+
+    #[test]
+    fn two_same_key_updates_collapse_to_last_one() {
+        let out = run(vec![upd(7, 0, 50), upd(7, 0, 30)]);
+        assert_eq!(out, vec![upd(7, 0, 30)]);
+    }
+
+    #[test]
+    fn cross_kind_same_key_insert_then_update_preserved() {
+        // Insert batch runs before Update batch in bulk_write; this sequence
+        // is correct as-is and must NOT be folded.
+        let out = run(vec![ins(7, 0, 100, 10, 0), upd(7, 0, 80)]);
+        assert_eq!(out, vec![ins(7, 0, 100, 10, 0), upd(7, 0, 80)]);
+    }
+
+    #[test]
+    fn cross_kind_same_key_insert_then_delete_preserved() {
+        // Inefficient but correct: Insert batch creates row, Delete removes it.
+        let out = run(vec![ins(7, 5, 100, 10, 0), del(7, 5)]);
+        assert_eq!(out, vec![ins(7, 5, 100, 10, 0), del(7, 5)]);
+    }
+
+    #[test]
+    fn pre_existing_layer_update_then_delete_preserved() {
+        // Update batch runs before Delete batch; both run, Delete wins as end state.
+        let out = run(vec![upd(7, 5, 50), del(7, 5)]);
+        assert_eq!(out, vec![upd(7, 5, 50), del(7, 5)]);
+    }
+
+    #[test]
+    fn multi_pool_keys_dont_cross_fold() {
+        let out = run(vec![
+            ups(7, 0, 100, 10, 0),
+            ups(8, 0, 200, 20, 1),
+            ups(7, 0, 150, 11, 2),
+        ]);
+        // (7,0)'s latest Upsert at index 2 replaces the one at index 0;
+        // (8,0) is left untouched at its original position.
+        assert_eq!(out, vec![ups(8, 0, 200, 20, 1), ups(7, 0, 150, 11, 2)]);
+    }
+
+    #[test]
+    fn no_duplicates_pass_through_unchanged() {
+        let input = vec![
+            ins(7, 0, 100, 10, 0),
+            ins(8, 1, 50, 20, 1),
+            upd(9, 2, 30),
+            ups(10, 0, 100, 10, 3),
+            del(11, 4),
+        ];
+        assert_eq!(run(input.clone()), input);
+    }
+
+    #[test]
+    fn order_preserved_for_last_occurrences_across_kinds() {
+        let out = run(vec![
+            ups(7, 0, 100, 10, 0),
+            ins(8, 0, 50, 5, 1),
+            ups(7, 0, 150, 11, 2),
+            upd(9, 0, 20),
+        ]);
+        // (7,0) Upsert collapses to index-2 entry; ins(8,0,1) and upd(9,0,3)
+        // stay; final order matches the surviving entries' original positions.
+        assert_eq!(
+            out,
+            vec![
+                ins(8, 0, 50, 5, 1),
+                ups(7, 0, 150, 11, 2),
+                upd(9, 0, 20),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_deletes_collapse_to_one() {
+        let out = run(vec![del(7, 1), del(7, 1)]);
+        assert_eq!(out, vec![del(7, 1)]);
     }
 }
