@@ -1,0 +1,5 @@
+comment = 'ledger-v3 Path B: routed asynchronous ledger_enqueue_trx + router BGWorker + committer BGWorker pool (design-v3 §5)'
+default_version = '0.0.1'
+module_pathname = '$libdir/ledger_routed'
+relocatable = false
+superuser = true
