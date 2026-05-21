@@ -24,6 +24,7 @@ use pgrx::prelude::*;
 pgrx::pg_module_magic!();
 
 pub(crate) mod ledger_error_map;
+pub(crate) mod pool_lock;
 
 // ── _PG_init ────────────────────────────────────────────────────────
 //
