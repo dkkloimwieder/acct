@@ -133,13 +133,16 @@ pub extern "C-unwind" fn ledger_routed_committer_main(_arg: pg_sys::Datum) {
             // for slots that reached the routed state.
             let (drained_staging_indices, drained_status) = match outcome {
                 ProcessOutcome::Committed {
-                    committed_count,
+                    committed_count: _,
                     staging_indices,
                 } => {
-                    let cq = COMMITTER_QUEUE.share();
-                    cq.committer_drains_total.fetch_add(1, Relaxed);
-                    cq.router_total_envelopes
-                        .fetch_add(committed_count as u64, Relaxed);
+                    // router_total_envelopes is router-side (counted in
+                    // record_superbatch_stats); committer just increments
+                    // its drain counter.
+                    COMMITTER_QUEUE
+                        .share()
+                        .committer_drains_total
+                        .fetch_add(1, Relaxed);
                     (staging_indices, "ok")
                 }
                 ProcessOutcome::AllEjected { staging_indices } => {
@@ -243,6 +246,17 @@ enum CallerTxStatus {
 }
 
 fn process_commit_group(cq_idx: u32, _sb_id: u64) -> ProcessOutcome {
+    let pipeline_t0 = now_ns();
+    let outcome = process_commit_group_inner(cq_idx);
+    let pipeline_ns = now_ns().saturating_sub(pipeline_t0);
+    let cq = COMMITTER_QUEUE.share();
+    cq.committer_pipeline_ns_total
+        .fetch_add(pipeline_ns, Relaxed);
+    cq.committer_pipeline_count.fetch_add(1, Relaxed);
+    outcome
+}
+
+fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
     // Step 3: decode all submissions from arena
     let parse_t0 = now_ns();
     let staging_indices = read_staging_indices(cq_idx);

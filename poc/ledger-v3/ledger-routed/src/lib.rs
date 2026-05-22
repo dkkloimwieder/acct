@@ -55,6 +55,7 @@ pub(crate) mod pool_lock;
 pub(crate) mod recovery;
 pub(crate) mod router;
 pub(crate) mod shmem;
+pub(crate) mod stats;
 
 use shmem::{
     COMMITTER_QUEUE, LEDGER_V3_COMMITTER_QUEUE_SIZE, LEDGER_V3_SPILLOVER_ARENA_MB,
