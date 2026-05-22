@@ -142,6 +142,50 @@ impl RunReport {
             started_at,
         }
     }
+
+    /// Path B constructor: ack and committed latencies come from
+    /// separate histograms. Throughput is derived from `committed.len()`
+    /// (actual trx materialization count) rather than `ack.len()` —
+    /// callers whose enqueue succeeded but whose trx didn't materialize
+    /// within `poll_deadline` are real losses, not throughput.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_routed(
+        scenario: impl Into<String>,
+        callers: usize,
+        duration_secs: f64,
+        ack: &Histogram<u64>,
+        committed: &Histogram<u64>,
+        errors_total: u64,
+        measure: &MeasureReport,
+        sampler: &SamplerReport,
+        sampler_report_path: Option<String>,
+        started_at: DateTime<Utc>,
+        routed: RoutedReport,
+    ) -> Self {
+        let attempts_total = ack.len() + errors_total;
+        Self {
+            scenario: scenario.into(),
+            path: "routed".into(),
+            duration_secs,
+            callers,
+            throughput_trx_per_sec: if duration_secs > 0.0 {
+                committed.len() as f64 / duration_secs
+            } else {
+                0.0
+            },
+            attempts_total,
+            errors_total,
+            ack_latency_us: LatencyPercentiles::from_ns_hist(ack),
+            committed_latency_us: LatencyPercentiles::from_ns_hist(committed),
+            commits_observed: measure.xact_commit_delta,
+            rollbacks_observed: measure.xact_rollback_delta,
+            wal_bytes_per_trx: measure.wal_bytes_per_commit(),
+            top_wait_events: top_wait_events(sampler, 5),
+            routed: Some(routed),
+            sampler_report_path,
+            started_at,
+        }
+    }
 }
 
 fn top_wait_events(s: &SamplerReport, n: usize) -> Vec<TopWaitEvent> {

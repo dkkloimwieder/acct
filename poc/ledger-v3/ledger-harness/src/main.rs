@@ -11,6 +11,7 @@
 
 mod cli;
 mod driver_direct;
+mod driver_routed;
 mod measure;
 mod pool_universe;
 mod report;
@@ -90,8 +91,22 @@ async fn main() -> std::process::ExitCode {
                 }
             }
             Path::Routed => {
-                eprintln!("run --path routed: stub — lands in acct-qiaz");
-                std::process::ExitCode::from(2)
+                let opts = driver_routed::RunOptions {
+                    dsn: args.dsn,
+                    scenario,
+                    duration: duration.into(),
+                    output,
+                    no_sampler,
+                    max_callers,
+                    poll_deadline: Duration::from_secs(30),
+                };
+                match driver_routed::run(opts).await {
+                    Ok(()) => std::process::ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("run routed failed: {e}");
+                        std::process::ExitCode::from(1)
+                    }
+                }
             }
         },
         Cmd::Equivalence { scenario, duration } => {
