@@ -45,6 +45,7 @@ pgrx::pg_module_magic!();
 
 pub(crate) mod arena;
 pub(crate) mod bulk_write;
+pub(crate) mod cleanup;
 pub(crate) mod enqueue;
 pub(crate) mod identity;
 pub(crate) mod payload;
