@@ -1,0 +1,22 @@
+Phase 5 measurement run starting at 2026-05-22T15-52-30Z
+==> s1 at 15:52:30
+scenario s1: baseline — 10 callers, uniform, simple, all-wac (callers=10, duration=30s)
+{"scenario":"s1","path":"routed","throughput_trx_per_sec":170.1,"ack_p99_us":3198,"committed_p99_us":82837,"commits":122943,"attempts":5109,"errors":0,"eject_total":0,"commit_group_avg":1.00,"commit_group_p99":1,"pipeline_ns_avg":1510891,"drains":5108,"window_defers":13,"output":"results/phase5/s1-routed-2026-05-22T15-52-30Z.json"}
+==> s2 at 15:53:09
+scenario s2: routing lock-amortization — 200 callers, zipf(1.5), simple, all-wac (callers=200, duration=30s)
+{"scenario":"s2","path":"routed","throughput_trx_per_sec":419.9,"ack_p99_us":152043,"committed_p99_us":699924,"commits":456361,"attempts":12756,"errors":0,"eject_total":0,"commit_group_avg":2.14,"commit_group_p99":15,"pipeline_ns_avg":11671399,"drains":5972,"window_defers":21,"output":"results/phase5/s2-routed-2026-05-22T15-52-30Z.json"}
+==> s3 at 15:53:48
+scenario s3: per-trx work intensity — 10 callers, uniform, complex, mixed (callers=10, duration=30s)
+{"scenario":"s3","path":"routed","throughput_trx_per_sec":134.9,"ack_p99_us":4694,"committed_p99_us":125501,"commits":117521,"attempts":4054,"errors":0,"eject_total":0,"commit_group_avg":1.47,"commit_group_p99":7,"pipeline_ns_avg":11080959,"drains":2761,"window_defers":9,"output":"results/phase5/s3-routed-2026-05-22T15-52-30Z.json"}
+==> s4 at 15:54:27
+scenario s4: production-like stress — 200 callers, zipf(1.2), complex, mixed (callers=200, duration=30s)
+{"scenario":"s4","path":"routed","throughput_trx_per_sec":59.1,"ack_p99_us":392691,"committed_p99_us":4546625,"commits":553163,"attempts":2021,"errors":0,"eject_total":0,"commit_group_avg":6.16,"commit_group_p99":63,"pipeline_ns_avg":407800701,"drains":328,"window_defers":7,"output":"results/phase5/s4-routed-2026-05-22T15-52-30Z.json"}
+==> s5 at 15:55:10
+scenario s5: capping callers 1000 -> 200 via --max-callers
+scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=200, duration=30s)
+{"scenario":"s5","path":"routed","throughput_trx_per_sec":379.0,"ack_p99_us":171311,"committed_p99_us":817889,"commits":622098,"attempts":11599,"errors":0,"eject_total":0,"commit_group_avg":21.20,"commit_group_p99":63,"pipeline_ns_avg":217811748,"drains":547,"window_defers":17,"output":"results/phase5/s5-routed-2026-05-22T15-52-30Z.json"}
+==> s6 at 15:55:50
+scenario s6: capping callers 1000 -> 200 via --max-callers
+scenario s6: pathological for routed — 1000 callers, disjoint stripes, simple, all-wac (callers=200, duration=30s)
+{"scenario":"s6","path":"routed","throughput_trx_per_sec":293.7,"ack_p99_us":162267,"committed_p99_us":936902,"commits":590651,"attempts":8950,"errors":0,"eject_total":0,"commit_group_avg":1.00,"commit_group_p99":1,"pipeline_ns_avg":5783526,"drains":8950,"window_defers":13,"output":"results/phase5/s6-routed-2026-05-22T15-52-30Z.json"}
+==> done at 15:56:30

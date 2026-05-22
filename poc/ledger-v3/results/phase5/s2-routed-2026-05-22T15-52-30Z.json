@@ -1,0 +1,67 @@
+{
+  "scenario": "s2",
+  "path": "routed",
+  "duration_secs": 30.381793631,
+  "callers": 200,
+  "throughput_trx_per_sec": 419.85671270521834,
+  "attempts_total": 12756,
+  "errors_total": 0,
+  "ack_latency_us": {
+    "p50": 9789,
+    "p95": 27918,
+    "p99": 152043,
+    "min": 1180,
+    "max": 384303,
+    "mean": 14270,
+    "count": 12756
+  },
+  "committed_latency_us": {
+    "p50": 471859,
+    "p95": 627572,
+    "p99": 699924,
+    "min": 158072,
+    "max": 850919,
+    "mean": 473131,
+    "count": 12756
+  },
+  "commits_observed": 456361,
+  "rollbacks_observed": 0,
+  "wal_bytes_per_trx": 44.44537548125278,
+  "top_wait_events": [
+    {
+      "wait_event_type": "Client",
+      "wait_event": "ClientRead",
+      "samples": 280
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "ledger_v3_spillover_arena",
+      "samples": 25
+    },
+    {
+      "wait_event_type": "Timeout",
+      "wait_event": "SpinDelay",
+      "samples": 18
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "WALInsert",
+      "samples": 10
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "BufferContent",
+      "samples": 10
+    }
+  ],
+  "routed": {
+    "eject_count_total": 0,
+    "commit_group_size_avg": 2.1359678499665105,
+    "commit_group_size_p99": 15,
+    "committer_pipeline_ns_avg": 11671398.86135298,
+    "committer_drains_total": 5972,
+    "router_window_defers_total": 21
+  },
+  "sampler_report_path": null,
+  "started_at": "2026-05-22T15:53:15.265658311Z"
+}
