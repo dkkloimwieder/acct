@@ -76,6 +76,7 @@ static SNAPSHOT_LAYER_LIMIT_PER_POOL: GucSetting<i32> = GucSetting::<i32>::new(1
 static MAX_EJECT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(10_000);
 static CALLER_TX_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 static COMMITTER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
+static EJECT_COOLDOWN_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static TARGET_DATABASE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"poc_v3"));
 
@@ -123,6 +124,10 @@ pub(crate) fn caller_tx_timeout_ms_now() -> i32 {
 #[allow(dead_code)]
 pub(crate) fn committer_count_now() -> i32 {
     COMMITTER_COUNT.get().max(1)
+}
+#[allow(dead_code)]
+pub(crate) fn eject_cooldown_ms_now() -> i32 {
+    EJECT_COOLDOWN_MS.get().max(0)
 }
 
 // ── _PG_init ────────────────────────────────────────────────────────
@@ -250,6 +255,16 @@ pub extern "C-unwind" fn _PG_init() {
         &COMMITTER_COUNT,
         1,
         64,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        c"ledger_routed.eject_cooldown_ms",
+        c"Router skip window for recently-ejected staging entries",
+        c"After the committer ejects a staging entry (caller user-tx still in_progress), the router skips re-packing it until this many ms have elapsed since the eject (design-v3 §5.3 step 2). 0 disables the filter.",
+        &EJECT_COOLDOWN_MS,
+        0,
+        60_000,
         GucContext::Sighup,
         GucFlags::empty(),
     );

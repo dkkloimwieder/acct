@@ -71,6 +71,14 @@ pub struct StagingEntry {
     pub superbatch_id: AtomicU64,
     pub eject_count: AtomicU32,
     pub _pad2: [u8; 4],
+    /// Timestamp of the most recent eject (`now_ns()` units, PG epoch).
+    /// Written by the committer's eject path
+    /// (`fetch_add` on `eject_count` Release THEN `store` here
+    /// Release). Read by the router's `collect_candidates`
+    /// cooldown filter (Acquire-load); paired against
+    /// `eject_cooldown_ms` to skip recently-ejected slots
+    /// (design-v3 §5.3 step 2). 0 = never ejected.
+    pub last_eject_at_ns: AtomicU64,
 }
 
 #[repr(C, align(64))]

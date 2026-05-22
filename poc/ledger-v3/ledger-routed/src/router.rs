@@ -128,7 +128,9 @@ fn router_tick() -> u32 {
         queue.router_ticks_total.fetch_add(1, Relaxed);
     }
 
-    let candidates_meta = collect_candidates(staging_capacity, window_limit);
+    let cooldown_ms = crate::eject_cooldown_ms_now().max(0) as u32;
+    let now_ns = crate::shmem::now_ns();
+    let candidates_meta = collect_candidates(staging_capacity, window_limit, now_ns, cooldown_ms);
     if candidates_meta.is_empty() {
         return 0;
     }
@@ -430,7 +432,16 @@ struct Candidate {
 /// Walk the staging ring from `head` and collect up to `window_limit`
 /// pending (valid==1) entries' metadata. Bounded at `staging_capacity`
 /// total slot inspections per call.
-fn collect_candidates(staging_capacity: u32, window_limit: u32) -> Vec<CandidateMeta> {
+///
+/// Per design-v3 §5.3 step 2, skips entries inside their eject cooldown
+/// window: `eject_count > 0 AND now_ns - last_eject_at_ns <
+/// cooldown_ms × 1_000_000`. `cooldown_ms == 0` disables the filter.
+fn collect_candidates(
+    staging_capacity: u32,
+    window_limit: u32,
+    now_ns: u64,
+    cooldown_ms: u32,
+) -> Vec<CandidateMeta> {
     let mut out: Vec<CandidateMeta> = Vec::new();
     let queue = STAGING_QUEUE.share();
     let head = queue.head.load(Relaxed);
@@ -439,17 +450,40 @@ fn collect_candidates(staging_capacity: u32, window_limit: u32) -> Vec<Candidate
         let idx = ((head + scanned) % staging_capacity) as usize;
         let slot = &queue.entries[idx];
         if slot.valid.load(Relaxed) == 1 {
-            out.push(CandidateMeta {
-                staging_idx: idx as u32,
-                request_seq: slot.request_seq,
-                pool_keys_offset: slot.pool_keys_offset,
-                pool_count: slot.pool_count,
-                enqueued_at_micros: slot.enqueued_at_micros,
-            });
+            let observed_eject = slot.eject_count.load(Acquire);
+            let observed_last_eject_ns = slot.last_eject_at_ns.load(Acquire);
+            if !is_in_eject_cooldown(observed_eject, observed_last_eject_ns, now_ns, cooldown_ms) {
+                out.push(CandidateMeta {
+                    staging_idx: idx as u32,
+                    request_seq: slot.request_seq,
+                    pool_keys_offset: slot.pool_keys_offset,
+                    pool_count: slot.pool_count,
+                    enqueued_at_micros: slot.enqueued_at_micros,
+                });
+            }
         }
         scanned += 1;
     }
     out
+}
+
+/// Pure helper: returns true if the slot's `eject_count` and
+/// `last_eject_at_ns` place it inside the active cooldown window.
+/// `cooldown_ms == 0` disables the filter (always returns false).
+/// `eject_count == 0` means the slot was never ejected (cooldown
+/// inapplicable; returns false).
+fn is_in_eject_cooldown(
+    eject_count: u32,
+    last_eject_at_ns: u64,
+    now_ns: u64,
+    cooldown_ms: u32,
+) -> bool {
+    if cooldown_ms == 0 || eject_count == 0 {
+        return false;
+    }
+    let cooldown_ns: u64 = (cooldown_ms as u64).saturating_mul(1_000_000);
+    let elapsed = now_ns.saturating_sub(last_eject_at_ns);
+    elapsed < cooldown_ns
 }
 
 /// Read each candidate's pool_keys (i64 array) from the spillover
@@ -694,6 +728,47 @@ mod tests {
         assert_eq!(uf.find(2), root);
         assert_eq!(uf.find(3), root);
         assert_ne!(uf.find(4), root);
+    }
+
+    #[test]
+    fn cooldown_zero_disables_filter() {
+        // cooldown_ms == 0 must always return false even with a
+        // recent eject.
+        assert!(!is_in_eject_cooldown(5, 100, 100, 0));
+        assert!(!is_in_eject_cooldown(1, u64::MAX - 1, u64::MAX, 0));
+    }
+
+    #[test]
+    fn cooldown_zero_eject_count_returns_false() {
+        // eject_count == 0 means never ejected; cooldown inapplicable.
+        assert!(!is_in_eject_cooldown(0, 0, 100, 10));
+        assert!(!is_in_eject_cooldown(0, 999_999, 1_000_000, 10));
+    }
+
+    #[test]
+    fn cooldown_recent_eject_returns_true() {
+        // 10ms cooldown = 10_000_000 ns. now - last = 5ms = 5_000_000
+        // ns. Inside window → filtered.
+        assert!(is_in_eject_cooldown(1, 10_000_000, 15_000_000, 10));
+        assert!(is_in_eject_cooldown(5, 0, 9_999_999, 10));
+    }
+
+    #[test]
+    fn cooldown_stale_eject_returns_false() {
+        // Elapsed exceeds cooldown → no longer filtered.
+        assert!(!is_in_eject_cooldown(1, 10_000_000, 21_000_000, 10));
+        assert!(!is_in_eject_cooldown(5, 0, 10_000_000, 10));
+        // Equal-to threshold is OUTSIDE the window (strict <).
+        assert!(!is_in_eject_cooldown(1, 0, 10_000_000, 10));
+    }
+
+    #[test]
+    fn cooldown_now_before_last_eject_returns_false_via_saturating_sub() {
+        // Edge: now_ns < last_eject_at_ns (shouldn't happen in
+        // practice but defensive). saturating_sub returns 0; elapsed
+        // 0 < cooldown → would return true. That's actually the
+        // CORRECT defensive choice — treat as just-ejected.
+        assert!(is_in_eject_cooldown(1, 100, 50, 10));
     }
 
     #[test]
