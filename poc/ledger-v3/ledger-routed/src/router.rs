@@ -52,9 +52,11 @@
 //! startup, sweep, set 1). Until then, the router seeds it to 1 at
 //! BGWorker entry as an INTERIM no-op so the gate is benign.
 
+use crate::identity::is_committer_alive;
 use crate::shmem::{
-    COMMITTER_QUEUE, LEDGER_V3_COMMITTER_QUEUE_SIZE, LEDGER_V3_STAGING_QUEUE_SIZE,
-    SPILLOVER_ARENA, STAGING_QUEUE,
+    COMMITTER_QUEUE, CommitterQueue, LEDGER_V3_COMMITTER_QUEUE_SIZE,
+    LEDGER_V3_STAGING_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE, SpilloverArena, StagingQueue,
+    signal_staging_slot_freed,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_guard;
@@ -88,12 +90,15 @@ pub extern "C-unwind" fn ledger_routed_router_main(_arg: pg_sys::Datum) {
     let dbname = crate::target_database_str();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
 
-    // INTERIM: acct-r2ud will own the recovery_complete flag (set 0
-    // at startup, run the orphan sweep, set 1 with Release). Until
-    // that ships, seed 1 here so wait_for_recovery_complete is a
-    // no-op and the tick loop runs.
-    COMMITTER_QUEUE.share().recovery_complete.store(1, Release);
+    // Postmaster-recovery flag is owned by `recovery::ledger_routed_recovery_main`
+    // (acct-r2ud) which runs once at postmaster start and Release-stores 1.
     wait_for_recovery_complete();
+
+    // Router boot recovery sweep — runs at EVERY router restart
+    // (postmaster start AND after any router-only crash). Reconciles
+    // staging entries + CQ entries left orphaned by a prior crash.
+    // Idempotent under repeated firings.
+    let _ = try_recover_router_orphan();
 
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
         if BackgroundWorker::sighup_received() {
@@ -613,6 +618,231 @@ fn record_superbatch_stats(envelope_count: u16) {
     }
 }
 
+// ── Router boot recovery sweep (acct-r2ud) ──────────────────────────
+//
+// Recover from a router BGWorker SIGKILL or panic per design-v3 §5.5.
+// Postmaster restarts the router (set_restart_time(5s) — see lib.rs);
+// the new router runs this sweep before entering the tick loop.
+//
+// Three-phase shape (ported from v21 `router::try_recover_router_orphan`
+// with v3 simplifications — single pool_id domain, no submission_status
+// UPSERT in Phase 2):
+//
+//   Phase 1 (queue-driven re-stamp): for each CommitterQueueEntry at
+//     valid==1 (ready, no committer claim yet), iterate linked staging
+//     entries. Any linked staging at (valid==2, sb_id==0 OR sb_id ==
+//     CQ.sb_id) means the old router pushed the queue entry but died
+//     before completing the per-entry stamp+CAS (the Phase 6
+//     data-before-flag block in emit_superbatch_chunk). Roll FORWARD:
+//     store sb_id (Release) + CAS staging 2→3 (Release). The
+//     committer's normal claim+drain will pick up the now-ready slot.
+//
+//   Phase 2 (queue-driven take-over dead committer): for each
+//     CommitterQueueEntry at valid==2 with a dead committer identity
+//     (is_committer_alive(slot, generation) returns false), revert
+//     the CQ to valid==1 + clear identity. The next committer's
+//     claim_next_committer_entry sees valid==1 and re-claims;
+//     pristine-replay's UNIQUE handling catches any prior writes the
+//     dead committer's tx managed to land. Distinct from v21 Phase 2
+//     which freed arena + UPSERT'd submission_status — v3's
+//     "trx exists iff committed" semantics let the new committer
+//     drain through the existing CQ payload.
+//
+//   Phase 3 (staging-driven orphan-no-queue): for each StagingEntry
+//     at valid==2 whose sb_id isn't backed by an active CQ entry
+//     (sb_id==0 OR sb_id != any live CQ entry's sb_id), revert
+//     valid 2→1 + reset sb_id to 0. The router crashed before
+//     pushing the CQ entry (Phase 5 of emit_superbatch_chunk).
+//
+// Memory ordering: Acquire loads on staging.{valid, superbatch_id,
+// eject_count} pair with Release stores in emit_superbatch_chunk's
+// data-before-flag block. CAS attempts use Release to publish the
+// reverted state to a concurrent emit_superbatch_chunk on the next
+// router tick.
+//
+// Idempotent under repeated firings — CAS election semantics mean a
+// second call finds the slots already at their post-recovery state
+// and skips.
+
+/// Run one full router-orphan recovery sweep. Returns the number of
+/// shmem slots reconciled (re-stamped, reverted, or CQ-cleared).
+/// Idempotent.
+pub(crate) fn try_recover_router_orphan() -> u64 {
+    let mut recovered: u64 = 0;
+    recovered += sweep_queue_phase();
+    recovered += sweep_staging_phase();
+    recovered
+}
+
+fn sweep_queue_phase() -> u64 {
+    let mut recovered: u64 = 0;
+    let queue_capacity = LEDGER_V3_COMMITTER_QUEUE_SIZE as u32;
+
+    for q_idx in 0..queue_capacity {
+        let (q_valid, q_sb_id, q_envelope_count, q_so_off, q_owner_slot, q_owner_gen) = {
+            let queue = COMMITTER_QUEUE.share();
+            let slot = &queue.entries[q_idx as usize];
+            let v = slot.valid.load(Acquire);
+            (
+                v,
+                slot.superbatch_id,
+                slot.envelope_count,
+                slot.staging_entry_offsets,
+                slot.committer_bgw_slot.load(Acquire),
+                slot.committer_bgw_generation.load(Acquire),
+            )
+        };
+
+        match q_valid {
+            1 => {
+                // Phase 1: re-stamp linked staging entries the old
+                // router never reached in the data-before-flag block.
+                if q_envelope_count == 0 || q_so_off == 0 {
+                    continue;
+                }
+                let staging_indices = read_staging_indices(q_so_off, q_envelope_count);
+                let queue = STAGING_QUEUE.share();
+                for s_idx in staging_indices {
+                    if try_restamp_staging_to_routed(&queue, s_idx, q_sb_id) {
+                        recovered += 1;
+                    }
+                }
+            }
+            2 => {
+                // Phase 2: in-flight with a possibly-dead committer.
+                // Unclaimed sentinel (generation == 0) means there
+                // was never an owner — nothing to recover.
+                if q_owner_gen == 0 {
+                    continue;
+                }
+                if is_committer_alive(q_owner_slot, q_owner_gen) {
+                    continue;
+                }
+                // Revert CQ valid 2→1 + clear identity so the next
+                // committer's claim_next_committer_entry can take over.
+                // Staging entries stay at valid==3; the new committer
+                // re-decodes via the CQ payload and re-runs the
+                // pipeline (pristine-replay's UNIQUE handling catches
+                // anything the dead committer's tx committed before
+                // dying).
+                let queue = COMMITTER_QUEUE.share();
+                let slot = &queue.entries[q_idx as usize];
+                if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
+                    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+                    slot.committer_bgw_generation.store(0, Relaxed);
+                    slot.committer_acquired_at_ns.store(0, Relaxed);
+                    slot.committer_tx_id.store(0, Relaxed);
+                    queue.committer_takeover_count.fetch_add(1, Relaxed);
+                    recovered += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    recovered
+}
+
+fn sweep_staging_phase() -> u64 {
+    let mut recovered: u64 = 0;
+    let staging_capacity = LEDGER_V3_STAGING_QUEUE_SIZE as u32;
+    let queue_capacity = LEDGER_V3_COMMITTER_QUEUE_SIZE as u32;
+
+    // Build a set of sb_ids backed by an active CQ entry. Staging at
+    // valid==2 whose sb_id is in this set was either handled by
+    // sweep_queue_phase or is intentionally in-flight; staging at
+    // valid==2 whose sb_id isn't in this set is genuinely orphaned.
+    let active_sb_ids: HashSet<u64> = {
+        let queue = COMMITTER_QUEUE.share();
+        let mut s = HashSet::new();
+        for q_idx in 0..queue_capacity {
+            let slot = &queue.entries[q_idx as usize];
+            if slot.valid.load(Acquire) != 0 {
+                s.insert(slot.superbatch_id);
+            }
+        }
+        s
+    };
+
+    let staging = STAGING_QUEUE.share();
+    for s_idx in 0..staging_capacity {
+        if try_revert_orphan_staging(&staging, s_idx, &active_sb_ids) {
+            signal_staging_slot_freed(&staging);
+            recovered += 1;
+        }
+    }
+
+    recovered
+}
+
+/// Phase 1 pure helper: if `s_idx` is at valid==2 with sb_id==0 or
+/// matching the queue's sb_id, complete the router's interrupted
+/// data-before-flag stamp (store sb_id Release + CAS valid 2→3
+/// Release). Returns true on successful re-stamp.
+pub(crate) fn try_restamp_staging_to_routed(
+    queue: &StagingQueue,
+    s_idx: u32,
+    q_sb_id: u64,
+) -> bool {
+    let slot = &queue.entries[s_idx as usize];
+    if slot.valid.load(Acquire) != 2 {
+        return false;
+    }
+    let s_sb = slot.superbatch_id.load(Acquire);
+    if s_sb != 0 && s_sb != q_sb_id {
+        return false; // belongs to a different (later) SuperBatch
+    }
+    slot.superbatch_id.store(q_sb_id, Release);
+    slot.valid.compare_exchange(2, 3, Release, Relaxed).is_ok()
+}
+
+/// Phase 3 pure helper: if `s_idx` is at valid==2 with an sb_id not
+/// in `active_sb_ids`, CAS revert valid 2→1 + reset sb_id Release.
+/// Returns true on successful revert. Caller broadcasts the
+/// backpressure CV after each successful revert.
+pub(crate) fn try_revert_orphan_staging(
+    queue: &StagingQueue,
+    s_idx: u32,
+    active_sb_ids: &HashSet<u64>,
+) -> bool {
+    let slot = &queue.entries[s_idx as usize];
+    if slot.valid.load(Acquire) != 2 {
+        return false;
+    }
+    let s_sb = slot.superbatch_id.load(Acquire);
+    if s_sb != 0 && active_sb_ids.contains(&s_sb) {
+        return false;
+    }
+    if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
+        slot.superbatch_id.store(0, Release);
+        return true;
+    }
+    false
+}
+
+/// Read an envelope_count-length array of u32 staging indices from
+/// the spillover arena at `offset`. Mirror of the same helper in
+/// committer.rs / cleanup.rs (small enough to copy-paste; resist
+/// premature abstraction).
+fn read_staging_indices(offset: u32, envelope_count: u16) -> Vec<u32> {
+    if envelope_count == 0 || offset == 0 {
+        return Vec::new();
+    }
+    let arena = SPILLOVER_ARENA.share();
+    let bytes = arena.read_bytes(offset, envelope_count as u32 * 4);
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+// Silence unused-import warnings for items only consumed by tests.
+#[allow(dead_code)]
+fn _silence_unused() {
+    let _: Option<&CommitterQueue> = None;
+    let _: Option<&SpilloverArena> = None;
+}
+
 // ── Tests for the pure helpers ──────────────────────────────────────
 
 #[cfg(test)]
@@ -769,6 +999,99 @@ mod tests {
         // 0 < cooldown → would return true. That's actually the
         // CORRECT defensive choice — treat as just-ejected.
         assert!(is_in_eject_cooldown(1, 100, 50, 10));
+    }
+
+    // ── Router-orphan sweep helpers (acct-r2ud) ────────────────────
+
+    fn fresh_staging_queue() -> Box<StagingQueue> {
+        unsafe { Box::<StagingQueue>::new_zeroed().assume_init() }
+    }
+
+    fn set_staging(slot_state: u8, sb_id: u64) -> Box<StagingQueue> {
+        let mut q = fresh_staging_queue();
+        let slot = &mut q.entries[3];
+        slot.valid = std::sync::atomic::AtomicU8::new(slot_state);
+        slot.superbatch_id = std::sync::atomic::AtomicU64::new(sb_id);
+        q
+    }
+
+    #[test]
+    fn restamp_promotes_valid_2_sb_zero_to_routed_with_sb_id() {
+        let q = set_staging(2, 0);
+        let promoted = try_restamp_staging_to_routed(&q, 3, 42);
+        assert!(promoted);
+        assert_eq!(q.entries[3].valid.load(Relaxed), 3);
+        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 42);
+    }
+
+    #[test]
+    fn restamp_skips_when_valid_is_not_2() {
+        let q = set_staging(1, 0);
+        assert!(!try_restamp_staging_to_routed(&q, 3, 42));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn restamp_skips_when_sb_id_mismatches() {
+        // Staging at valid=2 with sb_id=99 belongs to a later SB; the
+        // current Phase 1 sweep iterating CQ sb_id=42 must NOT
+        // re-stamp it (would corrupt the later SB).
+        let q = set_staging(2, 99);
+        assert!(!try_restamp_staging_to_routed(&q, 3, 42));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 2);
+        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 99);
+    }
+
+    #[test]
+    fn restamp_idempotent_second_call_is_noop() {
+        let q = set_staging(2, 0);
+        assert!(try_restamp_staging_to_routed(&q, 3, 42));
+        // valid now == 3
+        assert!(!try_restamp_staging_to_routed(&q, 3, 42));
+    }
+
+    #[test]
+    fn revert_orphan_promotes_valid_2_to_pending_when_sb_not_active() {
+        let q = set_staging(2, 0);
+        let active: HashSet<u64> = HashSet::new();
+        assert!(try_revert_orphan_staging(&q, 3, &active));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 1);
+        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn revert_orphan_promotes_when_sb_id_set_but_not_active() {
+        let q = set_staging(2, 77);
+        let active: HashSet<u64> = HashSet::new(); // 77 not present
+        assert!(try_revert_orphan_staging(&q, 3, &active));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 1);
+        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn revert_orphan_skips_when_sb_id_active() {
+        let q = set_staging(2, 77);
+        let active: HashSet<u64> = [77u64].into_iter().collect();
+        assert!(!try_revert_orphan_staging(&q, 3, &active));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 2);
+        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 77);
+    }
+
+    #[test]
+    fn revert_orphan_skips_when_valid_is_not_2() {
+        let q = set_staging(3, 0);
+        let active: HashSet<u64> = HashSet::new();
+        assert!(!try_revert_orphan_staging(&q, 3, &active));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 3);
+    }
+
+    #[test]
+    fn revert_orphan_idempotent_second_call_is_noop() {
+        let q = set_staging(2, 0);
+        let active: HashSet<u64> = HashSet::new();
+        assert!(try_revert_orphan_staging(&q, 3, &active));
+        // valid now == 1 — second call sees the wrong source state
+        assert!(!try_revert_orphan_staging(&q, 3, &active));
     }
 
     #[test]

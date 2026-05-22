@@ -52,6 +52,7 @@ pub(crate) mod hydration;
 pub(crate) mod identity;
 pub(crate) mod payload;
 pub(crate) mod pool_lock;
+pub(crate) mod recovery;
 pub(crate) mod router;
 pub(crate) mod shmem;
 
@@ -287,6 +288,18 @@ pub extern "C-unwind" fn _PG_init() {
     // = 5s so PG relaunches the worker after a crash (matches v21).
     use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
     use std::time::Duration;
+    // Recovery worker runs ONCE at postmaster start (set_restart_time
+    // None); flips COMMITTER_QUEUE.recovery_complete 0→1 with Release
+    // so router + committers can open for traffic. Per design-v3 §5.5,
+    // in-flight subs evaporate at postmaster restart so the worker is
+    // effectively just the gate-flipper.
+    BackgroundWorkerBuilder::new("ledger_routed_recovery")
+        .set_function("ledger_routed_recovery_main")
+        .set_library("ledger_routed")
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(None)
+        .enable_spi_access()
+        .load();
     BackgroundWorkerBuilder::new("ledger_routed_router")
         .set_function("ledger_routed_router_main")
         .set_library("ledger_routed")
