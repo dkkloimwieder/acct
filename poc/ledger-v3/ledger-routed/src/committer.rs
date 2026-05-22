@@ -319,6 +319,27 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
     let pre_apply_ns = now_ns().saturating_sub(pre_apply_t0);
     record_stage_pre_apply(pre_apply_ns);
 
+    // Test-only stall: hold pool_lock + open tx for this many us so
+    // acct-p0d8 orphan_recovery has time to pg_terminate_backend the
+    // committer mid-flight (before bulk_write / COMMIT lands). The
+    // shmem atomic is unconditional but only test_hooks builds + the
+    // test SPI ever set it nonzero. Production callers Acquire-load 0
+    // and skip the sleep.
+    let stall_us = COMMITTER_QUEUE
+        .share()
+        .test_inject_committer_stall_us
+        .load(Acquire);
+    if stall_us > 0 {
+        // Increment a hits counter so the orphan_recovery test can
+        // confirm the stall code path is reachable before asserting
+        // on the recovery outcome.
+        COMMITTER_QUEUE
+            .share()
+            .test_committer_stall_hits
+            .fetch_add(1, Release);
+        std::thread::sleep(std::time::Duration::from_micros(stall_us as u64));
+    }
+
     // Steps 8 + 9: pristine-replay loop with bulk-write
     let result = run_pristine_replay_loop(&pristine, &kept);
     let committed_count = match result {

@@ -57,6 +57,9 @@ pub(crate) mod router;
 pub(crate) mod shmem;
 pub(crate) mod stats;
 
+#[cfg(feature = "test_hooks")]
+pub(crate) mod test_hooks;
+
 use shmem::{
     COMMITTER_QUEUE, LEDGER_V3_COMMITTER_QUEUE_SIZE, LEDGER_V3_SPILLOVER_ARENA_MB,
     LEDGER_V3_STAGING_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE,

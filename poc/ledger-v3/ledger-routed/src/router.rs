@@ -90,6 +90,16 @@ pub extern "C-unwind" fn ledger_routed_router_main(_arg: pg_sys::Datum) {
     let dbname = crate::target_database_str();
     BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
 
+    // Publish router's PID so the test_hooks `ledger_routed_test_router_pid`
+    // SPI (acct-p0d8 orphan_recovery) can target it via
+    // pg_terminate_backend to force a router restart + boot sweep. Released
+    // on clean exit via SIGTERM handler is implicit (postmaster restart
+    // re-runs router_main and overwrites).
+    COMMITTER_QUEUE
+        .share()
+        .router_pid
+        .store(unsafe { pg_sys::MyProcPid } as i32, Release);
+
     // Postmaster-recovery flag is owned by `recovery::ledger_routed_recovery_main`
     // (acct-r2ud) which runs once at postmaster start and Release-stores 1.
     wait_for_recovery_complete();

@@ -171,6 +171,24 @@ pub struct CommitterQueue {
 
     // ── Test injection ─────────────────────────────────────────────
     pub test_inject_router_delay_us: AtomicU32,
+    /// Microseconds the committer pipeline sleeps under
+    /// `cfg(feature = "test_hooks")` after pool_lock acquisition and
+    /// before bulk_write. Production builds never reach the read site;
+    /// the field exists unconditionally so shmem layout doesn't drift
+    /// across feature variants. Tests set this via
+    /// `ledger_routed_test_set_committer_stall_us` to force the
+    /// committer to remain in flight long enough for pg_terminate_backend
+    /// to land mid-pipeline (acct-p0d8 orphan_recovery).
+    pub test_inject_committer_stall_us: AtomicU32,
+    /// Number of times the committer pipeline entered the stall sleep
+    /// path under nonzero `test_inject_committer_stall_us`. Read by
+    /// the test_hooks `ledger_routed_test_committer_stall_hits` SPI.
+    pub test_committer_stall_hits: AtomicU64,
+    /// Router worker's OS PID, stored once at router_main startup.
+    /// 0 = router not yet started (or restarting). Read by the
+    /// test_hooks `ledger_routed_test_router_pid` SPI so tests can
+    /// pg_terminate_backend the router to trigger boot sweep on restart.
+    pub router_pid: AtomicI32,
     pub test_reorder_router_stores: AtomicU8,
     pub test_bgworker_paused: AtomicU8,
     /// Postmaster-startup recovery flag. 0 = recovery not yet
