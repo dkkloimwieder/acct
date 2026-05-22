@@ -178,7 +178,8 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         "{{\"scenario\":\"{}\",\"path\":\"routed\",\"throughput_trx_per_sec\":{:.1},\
         \"ack_p99_us\":{},\"committed_p99_us\":{},\"commits\":{},\"attempts\":{},\
         \"errors\":{},\"eject_total\":{},\"commit_group_avg\":{:.2},\
-        \"commit_group_p99\":{},\"output\":\"{}\"}}",
+        \"commit_group_p99\":{},\"pipeline_ns_avg\":{:.0},\"drains\":{},\
+        \"window_defers\":{},\"output\":\"{}\"}}",
         spec.id,
         report.throughput_trx_per_sec,
         report.ack_latency_us.p99,
@@ -189,6 +190,9 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         routed.eject_count_total,
         routed.commit_group_size_avg,
         routed.commit_group_size_p99,
+        routed.committer_pipeline_ns_avg,
+        routed.committer_drains_total,
+        routed.router_window_defers_total,
         output_path.display()
     );
     Ok(())
@@ -308,6 +312,10 @@ struct RoutedCounterSnapshot {
     eject_total: i64,
     superbatch_count: i64,
     total_submissions: i64,
+    pipeline_ns_total: i64,
+    pipeline_count: i64,
+    committer_drains_total: i64,
+    router_window_defers_total: i64,
     /// (bucket, lower, upper, count) — 8 entries, log2-spaced per
     /// ledger_routed_router_envelope_histogram().
     envelope_histogram: Vec<(i32, i32, i32, i64)>,
@@ -327,6 +335,25 @@ async fn read_routed_counters(pool: &PgPool) -> Result<RoutedCounterSnapshot, St
             .fetch_one(pool)
             .await
             .map_err(|e| format!("read total_submissions: {e}"))?;
+    let pipeline_ns_total: i64 =
+        sqlx::query_scalar("SELECT ledger_routed_committer_pipeline_ns_total()")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("read pipeline_ns_total: {e}"))?;
+    let pipeline_count: i64 = sqlx::query_scalar("SELECT ledger_routed_committer_pipeline_count()")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("read pipeline_count: {e}"))?;
+    let committer_drains_total: i64 =
+        sqlx::query_scalar("SELECT ledger_routed_committer_drains_total()")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("read committer_drains_total: {e}"))?;
+    let router_window_defers_total: i64 =
+        sqlx::query_scalar("SELECT ledger_routed_router_window_defers_total()")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("read router_window_defers_total: {e}"))?;
     let envelope_histogram: Vec<(i32, i32, i32, i64)> = sqlx::query_as(
         "SELECT bucket, lower, upper, count FROM ledger_routed_router_envelope_histogram() \
           ORDER BY bucket",
@@ -338,6 +365,10 @@ async fn read_routed_counters(pool: &PgPool) -> Result<RoutedCounterSnapshot, St
         eject_total,
         superbatch_count,
         total_submissions,
+        pipeline_ns_total,
+        pipeline_count,
+        committer_drains_total,
+        router_window_defers_total,
         envelope_histogram,
     })
 }
@@ -354,10 +385,24 @@ fn derive_routed_report(pre: &RoutedCounterSnapshot, post: &RoutedCounterSnapsho
 
     let p99 = commit_group_p99_from_buckets(&pre.envelope_histogram, &post.envelope_histogram);
 
+    let pipeline_ns_delta = post.pipeline_ns_total - pre.pipeline_ns_total;
+    let pipeline_count_delta = post.pipeline_count - pre.pipeline_count;
+    let pipeline_ns_avg = if pipeline_count_delta > 0 {
+        pipeline_ns_delta as f64 / pipeline_count_delta as f64
+    } else {
+        0.0
+    };
+    let drains_delta = (post.committer_drains_total - pre.committer_drains_total).max(0) as u64;
+    let defers_delta =
+        (post.router_window_defers_total - pre.router_window_defers_total).max(0) as u64;
+
     RoutedReport {
         eject_count_total: eject_delta,
         commit_group_size_avg: avg,
         commit_group_size_p99: p99,
+        committer_pipeline_ns_avg: pipeline_ns_avg,
+        committer_drains_total: drains_delta,
+        router_window_defers_total: defers_delta,
     }
 }
 
@@ -508,5 +553,34 @@ mod tests {
         let r = derive_routed_report(&pre, &post);
         assert_eq!(r.eject_count_total, 7);
         assert_eq!(r.commit_group_size_avg, 5.0);
+    }
+
+    #[test]
+    fn derive_report_computes_pipeline_avg_and_diagnostic_deltas() {
+        let mut pre = RoutedCounterSnapshot::default();
+        let mut post = RoutedCounterSnapshot::default();
+        pre.envelope_histogram = (0..8).map(|i| (i, 1, 1, 0)).collect();
+        post.envelope_histogram = pre.envelope_histogram.clone();
+        pre.pipeline_ns_total = 1_000_000;
+        post.pipeline_ns_total = 6_000_000; // 5,000,000 ns / 50 = 100,000 ns/drain
+        pre.pipeline_count = 100;
+        post.pipeline_count = 150;
+        pre.committer_drains_total = 80;
+        post.committer_drains_total = 130; // 50 drains
+        pre.router_window_defers_total = 5;
+        post.router_window_defers_total = 12; // 7 defers
+        let r = derive_routed_report(&pre, &post);
+        assert_eq!(r.committer_pipeline_ns_avg, 100_000.0);
+        assert_eq!(r.committer_drains_total, 50);
+        assert_eq!(r.router_window_defers_total, 7);
+    }
+
+    #[test]
+    fn derive_report_pipeline_avg_zero_when_no_drains() {
+        let s = RoutedCounterSnapshot::default();
+        let r = derive_routed_report(&s, &s);
+        assert_eq!(r.committer_pipeline_ns_avg, 0.0);
+        assert_eq!(r.committer_drains_total, 0);
+        assert_eq!(r.router_window_defers_total, 0);
     }
 }

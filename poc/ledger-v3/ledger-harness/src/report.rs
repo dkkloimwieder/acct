@@ -75,6 +75,20 @@ pub struct RoutedReport {
     pub eject_count_total: u64,
     pub commit_group_size_avg: f64,
     pub commit_group_size_p99: u64,
+    /// Mean ns spent in the §5.4 5-stage pipeline per drain. Derived
+    /// from `committer_pipeline_ns_total / committer_pipeline_count`.
+    /// Coarse "CPU burn per commit_group" indicator per §8.5.
+    pub committer_pipeline_ns_avg: f64,
+    /// Number of commit_groups the committer pool drained during the
+    /// run window. Sanity siblings: `committer_drains_total ==
+    /// router_superbatch_count` in steady state (each routed envelope
+    /// flips to drained once); divergence flags in-flight stragglers.
+    pub committer_drains_total: u64,
+    /// Router window-defer count delta. Routed candidates that the
+    /// router skipped because their caller_tx was already mid-eject
+    /// cooldown. Cross-check against `eject_count_total` to spot
+    /// runaway eject loops.
+    pub router_window_defers_total: u64,
 }
 
 #[derive(Debug, Serialize)]
