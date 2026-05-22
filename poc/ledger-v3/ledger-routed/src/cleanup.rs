@@ -44,34 +44,39 @@
 //! which Broadcasts on the queue's backpressure ConditionVariable so
 //! a `ledger_enqueue_trx` caller blocked in `cv_wait_for_slot`
 //! wakes immediately and retries.
+//!
+//! ## Lock ordering
+//!
+//! Per the convention v21 established (cleanup_after_superbatch
+//! literal port), STAGING_QUEUE / COMMITTER_QUEUE and SPILLOVER_ARENA
+//! are held SEQUENTIALLY, never nested. Each helper takes a single
+//! ref so callers can scope guards independently:
+//!
+//!   - staging.share() guard → CAS + capture offsets → drop guard
+//!   - arena.exclusive() guard → free captured offsets → drop guard
+//!
+//! Same shape for the CQ-cleanup branch (arena free first, then
+//! committer.share() for the slot-finalization CAS sequence).
 
 #![allow(dead_code)]
 
 use crate::shmem::{
-    COMMITTER_QUEUE, SPILLOVER_ARENA, STAGING_QUEUE, SpilloverArena, StagingQueue,
+    COMMITTER_QUEUE, CommitterQueue, SPILLOVER_ARENA, STAGING_QUEUE, SpilloverArena, StagingQueue,
     signal_staging_slot_freed,
 };
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-/// Attempt to release one staging entry's slot + arena ownership.
-///
-/// Returns `true` if the slot was released (CAS 3→0 success on
-/// sb-match, or CAS 2→0 fallback when `eject_count == 0`); `false`
+/// CAS-release one staging entry's slot. Returns `Some((payload_off,
+/// pool_keys_off))` if the slot was released (CAS 3→0 success on
+/// sb-match, or CAS 2→0 fallback when `eject_count == 0`); `None`
 /// otherwise (ejected, or already abandoned, or re-routed under a
-/// different sb_id).
-///
-/// Frees the slot's `payload_offset` + `pool_keys_offset` arena
-/// blocks on success. Does NOT broadcast on the backpressure CV —
-/// that's the caller's responsibility (the live wrapper performs the
-/// broadcast via `signal_staging_slot_freed` under the share-lock;
-/// unit tests can call this helper directly without invoking PG-side
-/// CV machinery).
-pub(crate) fn try_release_staging_entry(
+/// different sb_id). Caller frees the returned arena offsets in a
+/// separate `SPILLOVER_ARENA.exclusive()` scope.
+pub(crate) fn try_release_staging_slot(
     staging_queue: &StagingQueue,
-    arena: &mut SpilloverArena,
     s_idx: u32,
     superbatch_id: u64,
-) -> bool {
+) -> Option<(u32, u32)> {
     let slot = &staging_queue.entries[s_idx as usize];
     let payload_off = slot.payload_offset;
     let pool_keys_off = slot.pool_keys_offset;
@@ -88,25 +93,32 @@ pub(crate) fn try_release_staging_entry(
                 .compare_exchange(2, 0, Release, Relaxed)
                 .is_ok());
     if cas_ok {
-        if payload_off != 0 {
-            arena.free(payload_off);
-        }
-        if pool_keys_off != 0 {
-            arena.free(pool_keys_off);
-        }
+        Some((payload_off, pool_keys_off))
+    } else {
+        None
     }
-    cas_ok
 }
 
-/// Release one CommitterQueueEntry: free its arena-owned blocks
-/// (`staging_offsets_off` + `pool_keys_off`), CAS valid 2→3 (completed)
-/// then 3→0 (empty), and clear the identity / lease atomics. The
-/// completed→empty CAS sequence mirrors v21 and gives a brief window
-/// where observability can see `completed` before reuse.
-pub(crate) fn release_committer_queue_entry(
-    committer_queue: &crate::shmem::CommitterQueue,
+/// Free the two arena blocks owned by a staging entry's payload.
+/// Either offset may be 0 (sentinel for "no block allocated"); free
+/// is skipped for those.
+pub(crate) fn free_staging_arena_blocks(
     arena: &mut SpilloverArena,
-    cq_idx: u32,
+    payload_off: u32,
+    pool_keys_off: u32,
+) {
+    if payload_off != 0 {
+        arena.free(payload_off);
+    }
+    if pool_keys_off != 0 {
+        arena.free(pool_keys_off);
+    }
+}
+
+/// Free the two arena blocks owned by a CommitterQueueEntry
+/// (staging_indices + deduplicated pool_keys union).
+pub(crate) fn free_committer_queue_arena(
+    arena: &mut SpilloverArena,
     staging_offsets_off: u32,
     pool_keys_off: u32,
 ) {
@@ -116,6 +128,13 @@ pub(crate) fn release_committer_queue_entry(
     if pool_keys_off != 0 {
         arena.free(pool_keys_off);
     }
+}
+
+/// Finalize a CommitterQueueEntry: CAS valid 2→3 (completed) then
+/// 3→0 (empty), and clear the identity / lease atomics. The
+/// completed→empty CAS sequence mirrors v21 and gives a brief window
+/// where observability can see `completed` before reuse.
+pub(crate) fn finalize_committer_queue_slot(committer_queue: &CommitterQueue, cq_idx: u32) {
     let slot = &committer_queue.entries[cq_idx as usize];
     let _ = slot.valid.compare_exchange(2, 3, Release, Relaxed);
     let _ = slot.valid.compare_exchange(3, 0, Release, Relaxed);
@@ -126,11 +145,19 @@ pub(crate) fn release_committer_queue_entry(
 }
 
 /// Live wrapper: called by the committer after `COMMIT` on a
-/// commit_group. Iterates `staging_indices`, attempts to release each
-/// slot (under the shared staging-queue LWLock), broadcasts on the
-/// backpressure CV for each successful release, then frees the
-/// CommitterQueueEntry's own arena blocks and CAS-cycles its valid
-/// 2→3→0 with the identity / lease atomics cleared.
+/// commit_group. For each staging entry: under STAGING_QUEUE.share(),
+/// do the CAS + (on success) broadcast the backpressure CV + capture
+/// the arena offsets; then drop the staging guard; then acquire
+/// SPILLOVER_ARENA.exclusive() to free the captured offsets. After
+/// all staging entries: free the CQ's own arena blocks, then under
+/// COMMITTER_QUEUE.share() finalize the slot's valid CAS + identity
+/// atomics.
+///
+/// Lock acquisition is strictly sequential — staging or committer
+/// guards never wrap the arena guard. This matches v21's literal
+/// pattern and avoids cross-lock deadlocks against any future caller
+/// that might acquire arena.exclusive() outer (e.g., the recovery
+/// sweep audit pass).
 pub(crate) fn cleanup_after_superbatch(
     cq_idx: u32,
     superbatch_id: u64,
@@ -139,31 +166,27 @@ pub(crate) fn cleanup_after_superbatch(
     pool_keys_off: u32,
 ) {
     for &s_idx in staging_indices {
-        let released = {
+        let offsets = {
             let staging_guard = STAGING_QUEUE.share();
-            let mut arena_guard = SPILLOVER_ARENA.exclusive();
-            let released =
-                try_release_staging_entry(&staging_guard, &mut arena_guard, s_idx, superbatch_id);
-            if released {
+            let offsets = try_release_staging_slot(&staging_guard, s_idx, superbatch_id);
+            if offsets.is_some() {
                 signal_staging_slot_freed(&staging_guard);
             }
-            released
+            offsets
         };
-        // released is informational — false means ejected or already
-        // moved on; no further action needed on this entry.
-        let _ = released;
+        if let Some((payload_off, pool_keys_off_staging)) = offsets {
+            let mut arena_guard = SPILLOVER_ARENA.exclusive();
+            free_staging_arena_blocks(&mut arena_guard, payload_off, pool_keys_off_staging);
+        }
     }
 
     {
-        let committer_guard = COMMITTER_QUEUE.share();
         let mut arena_guard = SPILLOVER_ARENA.exclusive();
-        release_committer_queue_entry(
-            &committer_guard,
-            &mut arena_guard,
-            cq_idx,
-            staging_offsets_off,
-            pool_keys_off,
-        );
+        free_committer_queue_arena(&mut arena_guard, staging_offsets_off, pool_keys_off);
+    }
+    {
+        let committer_guard = COMMITTER_QUEUE.share();
+        finalize_committer_queue_slot(&committer_guard, cq_idx);
     }
 }
 
@@ -172,7 +195,6 @@ pub(crate) fn cleanup_after_superbatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shmem::CommitterQueue;
     use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
 
     fn fresh_arena() -> Box<SpilloverArena> {
@@ -212,18 +234,21 @@ mod tests {
     }
 
     #[test]
-    fn case_1_success_releases_slot_and_arena() {
+    fn case_1_success_releases_slot_then_caller_frees_arena() {
         let mut staging = fresh_staging_queue();
         let mut arena = fresh_arena();
         let sb_id: u64 = 42;
-        let (_p, _pk) = populate_slot(&mut staging, &mut arena, 7, 3, sb_id, 0);
+        populate_slot(&mut staging, &mut arena, 7, 3, sb_id, 0);
         assert_eq!(arena.outstanding_allocs(), 2);
 
-        let released = try_release_staging_entry(&staging, &mut arena, 7, sb_id);
+        let released = try_release_staging_slot(&staging, 7, sb_id);
+        let (p, pk) = released.expect("CAS 3→0 should succeed on matching sb_id");
 
-        assert!(released, "CAS 3→0 should succeed on matching sb_id");
         assert_eq!(staging.entries[7].valid.load(Relaxed), 0);
-        assert_eq!(arena.outstanding_allocs(), 0, "both arena blocks freed");
+        assert_eq!(arena.outstanding_allocs(), 2, "release does not free arena");
+
+        free_staging_arena_blocks(&mut arena, p, pk);
+        assert_eq!(arena.outstanding_allocs(), 0, "caller-side arena free");
     }
 
     #[test]
@@ -231,13 +256,12 @@ mod tests {
         let mut staging = fresh_staging_queue();
         let mut arena = fresh_arena();
         let sb_id: u64 = 42;
-        // After eject: valid=1 (pending), sb_id reset to 0, eject_count incremented.
         let (p, pk) = populate_slot(&mut staging, &mut arena, 5, 1, 0, 1);
         assert_eq!(arena.outstanding_allocs(), 2);
 
-        let released = try_release_staging_entry(&staging, &mut arena, 5, sb_id);
+        let released = try_release_staging_slot(&staging, 5, sb_id);
 
-        assert!(!released, "ejected entry should not be released by cleanup");
+        assert!(released.is_none(), "ejected entry should not release");
         assert_eq!(
             staging.entries[5].valid.load(Relaxed),
             1,
@@ -248,7 +272,6 @@ mod tests {
             2,
             "arena blocks belong to next router pack, must not be freed"
         );
-        // Sanity: offsets unchanged so router can re-pack.
         assert_eq!(staging.entries[5].payload_offset, p);
         assert_eq!(staging.entries[5].pool_keys_offset, pk);
     }
@@ -258,54 +281,41 @@ mod tests {
         let mut staging = fresh_staging_queue();
         let mut arena = fresh_arena();
         let cleanup_sb_id: u64 = 42;
-        // Router stamped sb_id but crashed before CAS 2→3 — slot is
-        // still at valid=2; sb_id may be either the new value or 0
-        // depending on where the crash landed. Use 0 to model the
-        // CAS-failed-before-store edge; either way the 3→0 guard
-        // must miss and the 2→0 fallback must take.
-        let (_p, _pk) = populate_slot(&mut staging, &mut arena, 9, 2, 0, 0);
+        populate_slot(&mut staging, &mut arena, 9, 2, 0, 0);
         assert_eq!(arena.outstanding_allocs(), 2);
 
-        let released = try_release_staging_entry(&staging, &mut arena, 9, cleanup_sb_id);
+        let released = try_release_staging_slot(&staging, 9, cleanup_sb_id);
+        let (p, pk) = released.expect("CAS 2→0 fallback should succeed");
 
-        assert!(released, "CAS 2→0 fallback should succeed");
         assert_eq!(staging.entries[9].valid.load(Relaxed), 0);
-        assert_eq!(
-            arena.outstanding_allocs(),
-            0,
-            "arena blocks freed by 2→0 fallback to prevent slot leak"
-        );
+        free_staging_arena_blocks(&mut arena, p, pk);
+        assert_eq!(arena.outstanding_allocs(), 0);
     }
 
     #[test]
     fn case_3_with_eject_in_flight_skips_2_to_0() {
-        // Defensive variant: if the slot is at valid=2 BUT
-        // eject_count > 0 (an eject is mid-flight; the eject path
-        // bumps eject_count Release BEFORE flipping valid 3→1), the
-        // 2→0 fallback must be skipped to avoid race-freeing an
-        // entry the eject is about to push back to pending.
+        // Defensive variant: valid=2 BUT eject_count > 0 means an
+        // eject is mid-flight (eject path bumps eject_count Release
+        // BEFORE flipping valid 3→1). 2→0 must skip.
         let mut staging = fresh_staging_queue();
         let mut arena = fresh_arena();
         let cleanup_sb_id: u64 = 42;
         populate_slot(&mut staging, &mut arena, 3, 2, cleanup_sb_id, 1);
         assert_eq!(arena.outstanding_allocs(), 2);
 
-        let released = try_release_staging_entry(&staging, &mut arena, 3, cleanup_sb_id);
+        let released = try_release_staging_slot(&staging, 3, cleanup_sb_id);
 
-        assert!(!released, "in-flight eject must block 2→0 fallback");
+        assert!(released.is_none(), "in-flight eject must block 2→0 fallback");
         assert_eq!(staging.entries[3].valid.load(Relaxed), 2);
         assert_eq!(arena.outstanding_allocs(), 2);
     }
 
     #[test]
     fn sb_id_mismatch_on_valid_3_skips_3_to_0_and_falls_through() {
-        // Concurrent re-routing race: the entry was completed by an
-        // earlier SuperBatch (sb_id=42) then re-packed by the router
-        // with a new sb_id=99. Cleanup running for the OLD sb_id=42
-        // must NOT CAS 3→0 (would free the new pack's arena and
-        // silently abandon the slot). With valid=3 + sb_id=99 +
-        // eject_count=0, the 2→0 fallback also skips because valid
-        // != 2.
+        // Re-routing race: entry was completed by an earlier SuperBatch
+        // (sb_id=42) then re-packed under a new sb_id=99. Cleanup for
+        // the OLD sb_id=42 must NOT CAS 3→0 (would free the new
+        // pack's arena). valid==3 also skips the 2→0 fallback.
         let mut staging = fresh_staging_queue();
         let mut arena = fresh_arena();
         let stale_sb_id: u64 = 42;
@@ -313,38 +323,49 @@ mod tests {
         populate_slot(&mut staging, &mut arena, 1, 3, new_sb_id, 0);
         assert_eq!(arena.outstanding_allocs(), 2);
 
-        let released = try_release_staging_entry(&staging, &mut arena, 1, stale_sb_id);
+        let released = try_release_staging_slot(&staging, 1, stale_sb_id);
 
-        assert!(
-            !released,
-            "stale cleanup must not free a re-routed slot's arena"
-        );
+        assert!(released.is_none(), "stale cleanup must not free a re-routed slot");
         assert_eq!(staging.entries[1].valid.load(Relaxed), 3);
         assert_eq!(arena.outstanding_allocs(), 2);
     }
 
     #[test]
-    fn release_committer_queue_entry_frees_arena_and_clears_identity() {
-        let mut committer = fresh_committer_queue();
+    fn free_committer_queue_arena_releases_both_blocks() {
         let mut arena = fresh_arena();
-        let staging_off = arena.alloc(32).expect("alloc staging_offsets");
-        let pool_off = arena.alloc(48).expect("alloc pool_keys");
+        let so = arena.alloc(32).expect("alloc staging_offsets");
+        let pk = arena.alloc(48).expect("alloc pool_keys");
+        assert_eq!(arena.outstanding_allocs(), 2);
+
+        free_committer_queue_arena(&mut arena, so, pk);
+        assert_eq!(arena.outstanding_allocs(), 0);
+    }
+
+    #[test]
+    fn free_committer_queue_arena_skips_zero_offsets() {
+        let mut arena = fresh_arena();
+        let so = arena.alloc(32).expect("alloc staging_offsets");
+        assert_eq!(arena.outstanding_allocs(), 1);
+
+        free_committer_queue_arena(&mut arena, so, 0);
+        assert_eq!(arena.outstanding_allocs(), 0);
+    }
+
+    #[test]
+    fn finalize_committer_queue_slot_cas_cycles_and_zeros_identity() {
+        let mut committer = fresh_committer_queue();
         let cq_idx = 11u32;
         {
             let slot = &mut committer.entries[cq_idx as usize];
             slot.valid = AtomicU8::new(2);
-            slot.staging_entry_offsets = staging_off;
-            slot.pool_keys_offset = pool_off;
             slot.committer_bgw_slot = AtomicU32::new(5);
             slot.committer_bgw_generation = AtomicU32::new(17);
             slot.committer_acquired_at_ns = AtomicU64::new(12345);
             slot.committer_tx_id = AtomicU64::new(99);
         }
-        assert_eq!(arena.outstanding_allocs(), 2);
 
-        release_committer_queue_entry(&committer, &mut arena, cq_idx, staging_off, pool_off);
+        finalize_committer_queue_slot(&committer, cq_idx);
 
-        assert_eq!(arena.outstanding_allocs(), 0);
         let slot = &committer.entries[cq_idx as usize];
         assert_eq!(slot.valid.load(Relaxed), 0);
         assert_eq!(slot.committer_bgw_slot.load(Relaxed), u32::MAX);
