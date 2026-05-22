@@ -1,0 +1,92 @@
+-- ledger-v3 migration 0006: WAC cumulative-sum reinterpretation (acct-h5gs).
+--
+-- =============================================================================
+-- WHAT CHANGED
+-- =============================================================================
+-- Storage layout is UNCHANGED. Schema is UNCHANGED. Column types are UNCHANGED.
+-- Only the per-method SEMANTIC of `pool_state.unit_cost` shifts for WAC pools.
+--
+-- The point of this migration is to (a) document the per-method semantic in
+-- the catalog itself so `\d+ pool_state` makes the rule visible, and (b) mark
+-- a single audit-trail point in the migration history (close acct-h5gs).
+--
+-- =============================================================================
+-- WAC CUMULATIVE-SUM REINTERPRETATION
+-- =============================================================================
+-- Prior to acct-h5gs (under the running-average model), every WAC receipt did:
+--     new_uc = (old_qty * old_uc + Q * C) / new_qty   [INTEGER DIVISION ROUNDS]
+-- and STORED the truncated new_uc. The next receipt read back the truncated
+-- value as old_uc, so error compounded linearly with receipt count. Under
+-- Path B multi-committer reordering, the accumulated drift between Path A
+-- (serial) and Path B (parallel commit_groups) became visible (|Δ| ≤ 4 in
+-- human units; acct-mcey).
+--
+-- acct-h5gs replaces the per-row running-average storage with a CUMULATIVE
+-- SUM. The `pool_state.unit_cost` column on WAC rows now stores
+--     value_sum = Σ_t (receipt_t.qty * receipt_t.unit_cost)
+--                 − Σ_d (depletion_d.amount)
+-- with NO per-receipt rounding. Receipt of (Q, C):
+--     qty      += Q
+--     unit_cost += Q * C       [EXACT, commutative, associative]
+-- Depletion of Q (Q > 0):
+--     amount    = (Q * unit_cost) / qty   [single bounded round]
+--     qty      -= Q
+--     unit_cost -= amount                  [exact subtraction]
+-- Display running unit cost = unit_cost / qty (computed on demand; never stored).
+--
+-- =============================================================================
+-- WHY THIS WORKS FOR EQUIVALENCE
+-- =============================================================================
+-- For receipt-only workloads (e.g. scenario s5: 1000 receipts on 1 pool):
+-- Path A and Path B both apply the same set of additive updates in any order
+-- and converge to the same (qty, unit_cost = value_sum) — commutative addition.
+-- equivalence --strict s5 expected to pass byte-identical.
+--
+-- For workloads with depletions (s2/s4): the post-depletion (qty, value_sum)
+-- pair is exact subtraction; only the per-depletion `amount` rounding event
+-- can differ between paths when concurrent commit_groups see different
+-- intermediate (qty, value_sum). Drift is bounded per-depletion and does NOT
+-- compound into subsequent state — value_sum AFTER a depletion is
+-- (pre_depletion_value_sum − amount) which is exact arithmetic on whatever
+-- amount was rounded to. The final value_sum at the end of the workload is
+-- order-dependent only by the per-depletion rounding contribution, not by
+-- compounding.
+--
+-- =============================================================================
+-- TRX_LINE.UNIT_COST UNDER WAC
+-- =============================================================================
+-- On receipts: trx_line.unit_cost = the caller-supplied input unit_cost
+-- (unchanged from pre-h5gs).
+--
+-- On depletions: trx_line.unit_cost = amount / qty_depleted (the average
+-- per-unit cost at depletion time, computed AFTER amount is rounded). This
+-- is a display/audit field; the ledger's value-preserving column is
+-- posting_line.amount which equals the rounded amount.
+--
+-- =============================================================================
+-- THE FOOTGUN
+-- =============================================================================
+-- pool_state.unit_cost column name is now MISLEADING for WAC rows — it stores
+-- a TOTAL, not a per-unit cost. Anyone reading pool_state for a WAC pool via
+-- ad-hoc SQL needs to know:
+--
+--     SELECT pool_id, qty,
+--            CASE pool.method
+--              WHEN 'wac' THEN unit_cost::float / NULLIF(qty, 0)
+--              ELSE unit_cost::float
+--            END AS running_unit_cost
+--       FROM pool_state JOIN pool ON pool.id = pool_state.pool_id;
+--
+-- The PoC accepts this footgun in exchange for a minimal-touch implementation
+-- (no schema/hydration/bulk_write rewrite). A future productionization should
+-- either split into separate value_sum / unit_cost columns or rename the
+-- column to `unit_cost_or_value_sum`. acct-h5gs notes catalog this.
+
+COMMENT ON COLUMN pool_state.qty IS
+    'For all methods: layer qty (FIFO/LIFO/Specific = per-layer; WAC = cumulative qty_sum).';
+
+COMMENT ON COLUMN pool_state.unit_cost IS
+    'PER-METHOD SEMANTIC (acct-h5gs cumulative-sum WAC). '
+    'FIFO/LIFO/Specific: per-layer unit_cost (caller-supplied at receipt; immutable across the layer''s lifetime). '
+    'WAC: cumulative value_sum = Σ(receipt_qty × receipt_unit_cost) over the pool''s lifetime, less Σ(per-depletion rounded amount). '
+    'Running per-unit cost for WAC = unit_cost / NULLIF(qty, 0); never stored.';

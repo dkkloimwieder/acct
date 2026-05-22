@@ -7,6 +7,18 @@ use std::collections::HashMap;
 
 use crate::method::PoolMethod;
 
+/// One row from `pool_state`.
+///
+/// Per-method semantic of `qty` and `unit_cost` (acct-h5gs cumulative-sum WAC):
+///
+/// | Field       | FIFO/LIFO/Specific (per-layer) | WAC (cumulative)          |
+/// |-------------|--------------------------------|---------------------------|
+/// | `qty`       | layer qty                      | qty_sum (total over pool) |
+/// | `unit_cost` | per-layer cost (immutable)     | value_sum (total value)   |
+///
+/// For WAC, the running per-unit cost is computed on demand as
+/// `unit_cost / qty` and never stored. See `crate::wac` for the math
+/// contract and migration 0006 for the catalog-level documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolStateRow {
     pub layer_seq: i64,
@@ -27,8 +39,10 @@ pub struct PoolStateRow {
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     /// Per-pool layers.
-    ///  - WAC: at most one row at layer_seq = 0.
-    ///  - FIFO / LIFO / Specific: one row per live receipt layer.
+    ///  - WAC: at most one row at layer_seq = 0 carrying
+    ///    `(qty = qty_sum, unit_cost = value_sum)` per [`PoolStateRow`].
+    ///  - FIFO / LIFO / Specific: one row per live receipt layer carrying
+    ///    `(qty = layer_qty, unit_cost = per_layer_cost)`.
     ///  - STD: empty (no layers; cost lookup goes through `std_cost_of`).
     pub pools: HashMap<i64, Vec<PoolStateRow>>,
 

@@ -146,7 +146,8 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
 
     if !result.wac_drifts.is_empty() {
         eprintln!(
-            "[equivalence] {} WAC unit_cost drift(s) (acct-mcey property — bounded by per-pool truncation accumulation across reordered commit_groups):",
+            "[equivalence] {} WAC value_sum drift(s) (per-depletion rounding under concurrent commit_groups; non-compounding per acct-h5gs cumulative-sum form). \
+             For receipt-only flows or serial-equivalence runs this should be 0; non-zero indicates the routed path saw different intermediate (qty, value_sum) at one or more depletions:",
             result.wac_drifts.len()
         );
         for w in result.wac_drifts.iter().take(10) {
@@ -476,11 +477,18 @@ async fn take_snapshot(pool: &PgPool) -> Result<LedgerSnapshot, String> {
 /// Result of comparing two ledger snapshots.
 ///
 /// `errors` are real divergences — exit nonzero.
-/// `wac_drifts` are pool_state.unit_cost mismatches on WAC pools where
-/// qty matches exactly; tracked separately because Path B's
-/// multi-committer commit_group reordering can change WAC running-avg
-/// truncation accumulation by a bounded amount (acct-mcey). Treated as
-/// errors only when `strict=true` (e.g. running with committer_count=1).
+///
+/// `wac_drifts` are pool_state.unit_cost-column mismatches on WAC pools
+/// where qty matches exactly. Tracked separately because the column
+/// carries different meaning per method (acct-h5gs cumulative-sum form):
+/// on WAC rows it stores `value_sum`, so a delta here means the routed
+/// path's depletion-time rounding produced a different cumulative value
+/// than the direct path's. Cumulative-sum makes receipts exact (zero
+/// drift) and bounds depletion drift per-event without compounding,
+/// so for the equivalence harness's serial-submission shape this
+/// bucket should be empty. Non-empty under a concurrent load test would
+/// indicate per-depletion rounding divergence — informational by
+/// default, upgraded to errors via `--strict`.
 #[derive(Default)]
 struct DiffResult {
     errors: Vec<String>,
@@ -513,8 +521,9 @@ fn diff_snapshots(a: &LedgerSnapshot, b: &LedgerSnapshot) -> DiffResult {
         }
     }
 
-    // pool_state: compare row-by-row. WAC unit_cost diffs (where qty
-    // matches) get classified as acct-mcey drift, not real errors.
+    // pool_state: compare row-by-row. On WAC pools the unit_cost column
+    // is value_sum (acct-h5gs per-method storage); deltas there route to
+    // the wac_drifts bucket, not the errors bucket.
     if a.pool_state.len() != b.pool_state.len() {
         diffs.push(format!(
             "pool_state row count differs: A={} B={}",
@@ -539,10 +548,16 @@ fn diff_snapshots(a: &LedgerSnapshot, b: &LedgerSnapshot) -> DiffResult {
         // pool_id, layer_seq, qty all match; only unit_cost differs.
         let method = a.pool_methods.get(&ar.pool_id).map(|s| s.as_str()).unwrap_or("?");
         if method == "wac" {
+            // For WAC, the column is value_sum (acct-h5gs). Δ here means
+            // per-depletion rounding divergence on this pool. running_avg
+            // = value_sum / qty for the human-readable per-unit cost.
             r.wac_drifts.push(format!(
-                "pool_state[{}] pool={} qty={} unit_cost A={} B={} (Δ={}; method={})",
+                "pool_state[{}] pool={} qty={} value_sum A={} B={} (Δ={}; running_avg A={} B={}; method={})",
                 i, ar.pool_id, ar.qty, ar.unit_cost, br.unit_cost,
-                ar.unit_cost - br.unit_cost, method
+                ar.unit_cost - br.unit_cost,
+                ar.unit_cost.checked_div(ar.qty).unwrap_or(0),
+                br.unit_cost.checked_div(br.qty).unwrap_or(0),
+                method
             ));
         } else {
             diffs.push(format!(
