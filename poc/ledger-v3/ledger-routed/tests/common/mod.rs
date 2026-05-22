@@ -94,6 +94,16 @@ pub fn po_receipt_line(pool_id: i64, qty: i64, unit_cost: i64, inv: i64, ap: i64
     )
 }
 
+/// Build a single transfer_shipment_line (depletion: negative qty) JSONB.
+/// Mirrors ledger-direct's helper for property-test parity.
+pub fn depletion_line(pool_id: i64, qty: i64, unit_cost: i64, inv: i64, ap: i64) -> String {
+    format!(
+        "[{{\"pool_id\":{pool_id},\"line_type\":\"transfer_shipment_line\",\
+          \"source_id\":2,\"qty\":-{qty},\"unit_cost\":{unit_cost},\
+          \"debit_account\":{ap},\"credit_account\":{inv}}}]"
+    )
+}
+
 /// Path B enqueue. Returns the shmem submission_seq (NOT trx.id —
 /// trx.id is allocated by the committer at COMMIT time and must be
 /// discovered via `poll_for_trx`).
