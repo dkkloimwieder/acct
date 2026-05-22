@@ -1,0 +1,67 @@
+{
+  "scenario": "s4",
+  "path": "routed",
+  "duration_secs": 31.051377451,
+  "callers": 200,
+  "throughput_trx_per_sec": 393.1226567730533,
+  "attempts_total": 21337,
+  "errors_total": 101,
+  "ack_latency_us": {
+    "p50": 35422,
+    "p95": 1738539,
+    "p99": 3508535,
+    "min": 371,
+    "max": 4999610,
+    "mean": 264664,
+    "count": 21236
+  },
+  "committed_latency_us": {
+    "p50": 34963718,
+    "p95": 56941871,
+    "p99": 59190018,
+    "min": 326369,
+    "max": 59693334,
+    "mean": 32484458,
+    "count": 12207
+  },
+  "commits_observed": 28966,
+  "rollbacks_observed": 101,
+  "wal_bytes_per_trx": 14098.74887799489,
+  "top_wait_events": [
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "ledger_v3_staging_queue",
+      "samples": 41969
+    },
+    {
+      "wait_event_type": "Extension",
+      "wait_event": "Extension",
+      "samples": 11143
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "ledger_v3_spillover_arena",
+      "samples": 6564
+    },
+    {
+      "wait_event_type": "Client",
+      "wait_event": "ClientRead",
+      "samples": 106
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "LockManager",
+      "samples": 16
+    }
+  ],
+  "routed": {
+    "eject_count_total": 0,
+    "commit_group_size_avg": 12.98044009779951,
+    "commit_group_size_p99": 63,
+    "committer_pipeline_ns_avg": 874536882.5910931,
+    "committer_drains_total": 247,
+    "router_window_defers_total": 25
+  },
+  "sampler_report_path": null,
+  "started_at": "2026-05-22T16:26:19.547957314Z"
+}

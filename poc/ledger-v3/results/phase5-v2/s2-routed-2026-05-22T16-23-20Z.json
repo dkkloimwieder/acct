@@ -1,0 +1,67 @@
+{
+  "scenario": "s2",
+  "path": "routed",
+  "duration_secs": 30.196023471,
+  "callers": 200,
+  "throughput_trx_per_sec": 1052.4564610476355,
+  "attempts_total": 38335,
+  "errors_total": 0,
+  "ack_latency_us": {
+    "p50": 35061,
+    "p95": 692060,
+    "p99": 1149239,
+    "min": 207,
+    "max": 3292528,
+    "mean": 157164,
+    "count": 38335
+  },
+  "committed_latency_us": {
+    "p50": 14193524,
+    "p95": 22615687,
+    "p99": 23538434,
+    "min": 126681,
+    "max": 24880611,
+    "mean": 13909627,
+    "count": 31780
+  },
+  "commits_observed": 43392,
+  "rollbacks_observed": 0,
+  "wal_bytes_per_trx": 1421.5564159292035,
+  "top_wait_events": [
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "ledger_v3_staging_queue",
+      "samples": 43850
+    },
+    {
+      "wait_event_type": "Extension",
+      "wait_event": "Extension",
+      "samples": 12292
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "ledger_v3_spillover_arena",
+      "samples": 2516
+    },
+    {
+      "wait_event_type": "Client",
+      "wait_event": "ClientRead",
+      "samples": 76
+    },
+    {
+      "wait_event_type": "Timeout",
+      "wait_event": "VacuumDelay",
+      "samples": 5
+    }
+  ],
+  "routed": {
+    "eject_count_total": 0,
+    "commit_group_size_avg": 7.341057066258139,
+    "commit_group_size_p99": 63,
+    "committer_pipeline_ns_avg": 12577797.970126389,
+    "committer_drains_total": 5222,
+    "router_window_defers_total": 0
+  },
+  "sampler_report_path": null,
+  "started_at": "2026-05-22T16:24:18.810513876Z"
+}

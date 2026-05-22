@@ -98,7 +98,7 @@ async fn main() -> std::process::ExitCode {
                     output,
                     no_sampler,
                     max_callers,
-                    poll_deadline: Duration::from_secs(30),
+                    drain_deadline: Duration::from_secs(30),
                 };
                 match driver_routed::run(opts).await {
                     Ok(()) => std::process::ExitCode::SUCCESS,

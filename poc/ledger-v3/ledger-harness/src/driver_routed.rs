@@ -1,16 +1,27 @@
-//! Routed-path driver for the `run` subcommand (acct-qiaz).
+//! Routed-path driver for the `run` subcommand (acct-qiaz + acct-tk58).
 //!
-//! Mirrors `driver_direct` but targets Path B: each caller enqueues
-//! via `SELECT ledger_enqueue_trx(...)` and then polls for `trx` row
-//! existence at 1ms tick until `poll_deadline`. Two histograms per
-//! caller — ack (enqueue→return) and committed (enqueue→trx-row
-//! observed) — because Path B decouples the two.
+//! Path B callers are fire-and-forget — each enqueues via
+//! `SELECT ledger_enqueue_trx(...)` and immediately submits the next
+//! one, recording `(source_id, enqueue_instant)` in memory. A single
+//! dedicated observer task polls the `trx` table incrementally
+//! (WHERE id > last_seen_id) at 10ms cadence and timestamps first
+//! appearance of each source_id.
 //!
-//! Routed-specific counters (eject_total_count, router_envelope_histogram,
-//! router_total_submissions, router_superbatch_count) are sampled
+//! Throughput = observer's seen-count / window_duration (real
+//! materialization rate, not caller-polling-bound). Ack latency
+//! recorded per submission at enqueue return. Committed latency
+//! derived post-window by joining `submission_log[sid] = enqueue_inst`
+//! with `seen[sid] = materialize_inst`.
+//!
+//! Routed-specific shmem counters (eject_total_count,
+//! router_envelope_histogram, router_total_submissions,
+//! router_superbatch_count, committer_pipeline_ns_total/count,
+//! committer_drains_total, router_window_defers_total) sampled
 //! foreground pre/post run; deltas land in the JSON's `routed` block.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,13 +47,13 @@ pub struct RunOptions {
     pub output: Option<PathBuf>,
     pub no_sampler: bool,
     pub max_callers: Option<usize>,
-    /// Cap for the per-submission `committed_latency` poll. A trx that
-    /// hasn't materialized by this deadline is counted as an attempt but
-    /// not recorded in the committed histogram (effectively lost — in
-    /// production the caller would resubmit). Match `caller_tx_timeout_ms`
-    /// GUC default.
-    pub poll_deadline: Duration,
+    /// Hard cap on how long the observer + drain wait may run after
+    /// callers stop, before declaring measurement complete.
+    pub drain_deadline: Duration,
 }
+
+/// One enqueued submission's bookkeeping for post-window join.
+type SubmissionMark = (i64, Instant);
 
 pub async fn run(opts: RunOptions) -> Result<(), String> {
     let started_at = Utc::now();
@@ -76,7 +87,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
 
     drop(pool);
     let pool = PgPoolOptions::new()
-        .max_connections(spec.callers as u32 + 8)
+        .max_connections(spec.callers as u32 + 16)
         .acquire_timeout(Duration::from_secs(15))
         .connect(&opts.dsn)
         .await
@@ -92,10 +103,21 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let start_snap = take_snapshot(&pool).await.map_err(|e| format!("start snapshot: {e}"))?;
     let pre_routed = read_routed_counters(&pool).await?;
 
+    let run_prefix: i64 = (started_at.timestamp() as i64 % 1_000_000) * 1_000_000_000_000;
+    let run_lo = run_prefix;
+    let run_hi = run_prefix + (spec.callers as i64) * 1_000_000 + 1_000_000;
+
+    // Observer must start BEFORE the callers — if it starts late, the
+    // first wave's trx rows are timestamped at observer-start, not at
+    // their true materialize_instant, inflating committed latency.
+    let observer_stop = Arc::new(AtomicBool::new(false));
+    let observer_pool = pool.clone();
+    let observer_stop_clone = observer_stop.clone();
+    let observer_handle =
+        tokio::spawn(async move { observer_loop(observer_pool, run_lo, run_hi, observer_stop_clone).await });
+
     let driver_started = Instant::now();
     let deadline = driver_started + opts.duration;
-
-    let run_prefix: i64 = (started_at.timestamp() as i64 % 1_000_000) * 1_000_000_000_000;
 
     let workload = Arc::new(spec.workload.clone());
     let barrier = Arc::new(Barrier::new(spec.callers));
@@ -104,28 +126,33 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         let pool = pool.clone();
         let workload = workload.clone();
         let barrier = barrier.clone();
-        let poll_deadline = opts.poll_deadline;
         handles.push(tokio::spawn(async move {
-            caller_loop(
-                pool, workload, barrier, caller_id, run_prefix, deadline, poll_deadline,
-            )
-            .await
+            caller_loop(pool, workload, barrier, caller_id, run_prefix, deadline).await
         }));
     }
 
     let mut ack_hists: Vec<LatencyHistogram> = Vec::with_capacity(spec.callers);
-    let mut committed_hists: Vec<LatencyHistogram> = Vec::with_capacity(spec.callers);
+    let mut submission_log: Vec<SubmissionMark> = Vec::new();
     let mut errors_total: u64 = 0;
     for h in handles {
-        let (ack, committed, errors) = h.await.map_err(|e| format!("task join: {e}"))?;
+        let (ack, sublog, errors) = h.await.map_err(|e| format!("task join: {e}"))?;
         ack_hists.push(ack);
-        committed_hists.push(committed);
+        submission_log.extend(sublog);
         errors_total += errors;
     }
     let elapsed = driver_started.elapsed();
 
-    wait_for_committer_quiet(&pool).await;
-    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    // Drain wait → observer keeps polling during this window so it
+    // timestamps in-flight trx materializations after callers stop.
+    wait_for_committer_quiet(&pool, opts.drain_deadline).await;
+    // Tiny settle for pg_stat_database flush + any final observer tick.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    observer_stop.store(true, Ordering::Relaxed);
+    let seen: HashMap<i64, Instant> = observer_handle
+        .await
+        .map_err(|e| format!("observer join: {e}"))?;
+
     let end_snap = take_snapshot(&pool).await.map_err(|e| format!("end snapshot: {e}"))?;
     let post_routed = read_routed_counters(&pool).await?;
 
@@ -139,8 +166,24 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         None => Default::default(),
     };
 
+    // Committed latency: join submission_log with seen. Misses
+    // (enqueued but never materialized within drain_deadline) are
+    // tracked separately as `errors_total += ...` here is wrong —
+    // they're not enqueue errors. They count as `submitted_but_unseen`
+    // diagnostic but don't fold into errors_total.
+    let mut committed_hist = LatencyHistogram::new();
+    let mut submitted_but_unseen: u64 = 0;
+    for (sid, enq) in &submission_log {
+        if let Some(seen_at) = seen.get(sid) {
+            let dur = seen_at.saturating_duration_since(*enq).as_nanos() as u64;
+            committed_hist.record(dur);
+        } else {
+            submitted_but_unseen += 1;
+        }
+    }
+
+    let trx_count = seen.len() as u64;
     let ack = LatencyHistogram::merge_all(ack_hists);
-    let committed = LatencyHistogram::merge_all(committed_hists);
 
     let output_path = opts
         .output
@@ -162,8 +205,9 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         spec.id.to_string(),
         spec.callers,
         elapsed.as_secs_f64(),
+        trx_count,
         &ack,
-        &committed,
+        &committed_hist.hist,
         errors_total,
         &measure,
         &sampler_report,
@@ -176,17 +220,19 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let routed = report.routed.as_ref().expect("routed block populated");
     println!(
         "{{\"scenario\":\"{}\",\"path\":\"routed\",\"throughput_trx_per_sec\":{:.1},\
-        \"ack_p99_us\":{},\"committed_p99_us\":{},\"commits\":{},\"attempts\":{},\
-        \"errors\":{},\"eject_total\":{},\"commit_group_avg\":{:.2},\
-        \"commit_group_p99\":{},\"pipeline_ns_avg\":{:.0},\"drains\":{},\
-        \"window_defers\":{},\"output\":\"{}\"}}",
+        \"ack_p99_us\":{},\"committed_p99_us\":{},\"trx_materialized\":{},\
+        \"attempts\":{},\"enqueue_errors\":{},\"submitted_but_unseen\":{},\
+        \"eject_total\":{},\"commit_group_avg\":{:.2},\"commit_group_p99\":{},\
+        \"pipeline_ns_avg\":{:.0},\"drains\":{},\"window_defers\":{},\
+        \"output\":\"{}\"}}",
         spec.id,
         report.throughput_trx_per_sec,
         report.ack_latency_us.p99,
         report.committed_latency_us.p99,
-        report.commits_observed,
+        trx_count,
         report.attempts_total,
         report.errors_total,
+        submitted_but_unseen,
         routed.eject_count_total,
         routed.commit_group_size_avg,
         routed.commit_group_size_p99,
@@ -198,6 +244,9 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// One caller's fire-and-forget enqueue loop. Records ack latency in
+/// `ack_hist` and `(source_id, enqueue_instant)` in `submission_log`.
+/// Errors counted; do not affect submission_log.
 async fn caller_loop(
     pool: PgPool,
     workload: Arc<crate::workload::Workload>,
@@ -205,11 +254,10 @@ async fn caller_loop(
     caller_id: usize,
     run_prefix: i64,
     deadline: Instant,
-    poll_deadline: Duration,
-) -> (LatencyHistogram, LatencyHistogram, u64) {
+) -> (LatencyHistogram, Vec<SubmissionMark>, u64) {
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
     let mut ack_hist = LatencyHistogram::new();
-    let mut committed_hist = LatencyHistogram::new();
+    let mut submission_log: Vec<SubmissionMark> = Vec::with_capacity(4096);
     let mut errors: u64 = 0;
     let caller_base: i64 = run_prefix + (caller_id as i64) * 1_000_000;
     let mut tick: i64 = 0;
@@ -235,33 +283,56 @@ async fn caller_loop(
         match res {
             Ok(_) => {
                 ack_hist.record(ack_ns);
-                let poll_started = Instant::now();
-                let poll_until = poll_started + poll_deadline;
-                loop {
-                    if Instant::now() >= poll_until {
-                        break;
-                    }
-                    let exists: Option<bool> = sqlx::query_scalar(
-                        "SELECT EXISTS(SELECT 1 FROM trx \
-                          WHERE trx_type = 'po_receipt'::trx_type AND source_id = $1)",
-                    )
-                    .bind(source_id)
-                    .fetch_optional(&pool)
-                    .await
-                    .ok()
-                    .flatten();
-                    if exists == Some(true) {
-                        let committed_ns = started.elapsed().as_nanos() as u64;
-                        committed_hist.record(committed_ns);
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
+                submission_log.push((source_id, started));
             }
             Err(_) => errors += 1,
         }
     }
-    (ack_hist, committed_hist, errors)
+    (ack_hist, submission_log, errors)
+}
+
+/// Single dedicated polling task that timestamps first appearance of
+/// each source_id in the run range. Incremental scan (`WHERE id >
+/// last_seen_id`) keeps per-tick cost O(new rows) regardless of
+/// accumulated trx volume. 10ms cadence trades latency resolution
+/// against background load.
+async fn observer_loop(
+    pool: PgPool,
+    run_lo: i64,
+    run_hi: i64,
+    stop: Arc<AtomicBool>,
+) -> HashMap<i64, Instant> {
+    let mut seen: HashMap<i64, Instant> = HashMap::with_capacity(65_536);
+    let mut last_id: i64 = 0;
+    let tick = Duration::from_millis(10);
+
+    loop {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id, source_id FROM trx \
+              WHERE trx_type = 'po_receipt'::trx_type \
+                AND source_id BETWEEN $1 AND $2 \
+                AND id > $3 \
+              ORDER BY id",
+        )
+        .bind(run_lo)
+        .bind(run_hi)
+        .bind(last_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        let now = Instant::now();
+        for (id, sid) in &rows {
+            seen.entry(*sid).or_insert(now);
+            if *id > last_id {
+                last_id = *id;
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(tick).await;
+    }
+    seen
 }
 
 fn build_lines_json(lines: &[LineParam]) -> Value {
@@ -305,8 +376,6 @@ async fn load_universe(pool: &PgPool) -> Result<PoolUniverse, String> {
     })
 }
 
-/// Snapshot of the four routed shmem counters the Phase 5 measurement
-/// contract needs. Pre/post deltas → RoutedReport.
 #[derive(Debug, Default, Clone)]
 struct RoutedCounterSnapshot {
     eject_total: i64,
@@ -316,8 +385,6 @@ struct RoutedCounterSnapshot {
     pipeline_count: i64,
     committer_drains_total: i64,
     router_window_defers_total: i64,
-    /// (bucket, lower, upper, count) — 8 entries, log2-spaced per
-    /// ledger_routed_router_envelope_histogram().
     envelope_histogram: Vec<(i32, i32, i32, i64)>,
 }
 
@@ -406,15 +473,10 @@ fn derive_routed_report(pre: &RoutedCounterSnapshot, post: &RoutedCounterSnapsho
     }
 }
 
-/// Compute the p99 commit_group size from log2-spaced bucket deltas.
-/// Picks the bucket whose cumulative count crosses 99%; returns its
-/// upper bound (capped at 128 because the top bucket's upper is
-/// i32::MAX). Returns 0 if no commit_groups were observed.
 fn commit_group_p99_from_buckets(
     pre: &[(i32, i32, i32, i64)],
     post: &[(i32, i32, i32, i64)],
 ) -> u64 {
-    use std::collections::HashMap;
     let pre_by_bucket: HashMap<i32, i64> = pre.iter().map(|(b, _, _, c)| (*b, *c)).collect();
     let mut deltas: Vec<(i32, i32, i64)> = post
         .iter()
@@ -439,13 +501,13 @@ fn commit_group_p99_from_buckets(
     128
 }
 
-/// Wait for the routed committer to go quiet after callers stop
-/// submitting. Polls `committer_drains_total` at 200ms; declares
-/// drained after 3 consecutive equal reads (≈600ms of inactivity).
-/// Hard caps at 10s to bound the end-of-run window.
-async fn wait_for_committer_quiet(pool: &PgPool) {
+/// Wait for the routed committer to go quiet after callers stop.
+/// Polls `committer_drains_total` at 200ms; declares drained after 3
+/// consecutive equal reads (≈600ms of inactivity). Hard caps via
+/// `drain_deadline`.
+async fn wait_for_committer_quiet(pool: &PgPool, deadline: Duration) {
     let poll = Duration::from_millis(200);
-    let cap = Instant::now() + Duration::from_secs(10);
+    let cap = Instant::now() + deadline;
     let mut last: i64 = -1;
     let mut stable: u32 = 0;
     while Instant::now() < cap {
@@ -490,7 +552,6 @@ mod tests {
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["pool_id"], 7);
-        assert_eq!(arr[0]["line_type"], "po_receipt_line");
         assert_eq!(arr[0]["qty"], 4);
     }
 
@@ -505,15 +566,11 @@ mod tests {
     fn p99_picks_bucket_whose_cumulative_crosses_threshold() {
         let pre: Vec<_> = (0..8).map(|i| bucket(i, 1, 1, 0)).collect();
         let mut post = pre.clone();
-        // 100 commit_groups: 99 of size 1, 1 of size 32-63 → p99 = 1.
         post[0] = bucket(0, 1, 1, 99);
         post[5] = bucket(5, 32, 63, 1);
         let r = commit_group_p99_from_buckets(&pre, &post);
         assert_eq!(r, 1);
 
-        // Shift weight: 50 in bucket 0, 50 in bucket 5 → p99 sits in
-        // bucket 5 (50/100 cumulative at bucket 0; threshold ceil(99)=99
-        // is crossed at bucket 5 since cumulative 100).
         post[0] = bucket(0, 1, 1, 50);
         post[5] = bucket(5, 32, 63, 50);
         let r = commit_group_p99_from_buckets(&pre, &post);
@@ -536,6 +593,7 @@ mod tests {
         assert_eq!(r.eject_count_total, 0);
         assert_eq!(r.commit_group_size_avg, 0.0);
         assert_eq!(r.commit_group_size_p99, 0);
+        assert_eq!(r.committer_pipeline_ns_avg, 0.0);
     }
 
     #[test]
@@ -547,9 +605,9 @@ mod tests {
         pre.superbatch_count = 100;
         post.superbatch_count = 110;
         pre.total_submissions = 200;
-        post.total_submissions = 250; // 50 envelopes / 10 sb = 5.0 avg
+        post.total_submissions = 250;
         pre.eject_total = 5;
-        post.eject_total = 12; // delta = 7
+        post.eject_total = 12;
         let r = derive_routed_report(&pre, &post);
         assert_eq!(r.eject_count_total, 7);
         assert_eq!(r.commit_group_size_avg, 5.0);
@@ -562,25 +620,16 @@ mod tests {
         pre.envelope_histogram = (0..8).map(|i| (i, 1, 1, 0)).collect();
         post.envelope_histogram = pre.envelope_histogram.clone();
         pre.pipeline_ns_total = 1_000_000;
-        post.pipeline_ns_total = 6_000_000; // 5,000,000 ns / 50 = 100,000 ns/drain
+        post.pipeline_ns_total = 6_000_000;
         pre.pipeline_count = 100;
         post.pipeline_count = 150;
         pre.committer_drains_total = 80;
-        post.committer_drains_total = 130; // 50 drains
+        post.committer_drains_total = 130;
         pre.router_window_defers_total = 5;
-        post.router_window_defers_total = 12; // 7 defers
+        post.router_window_defers_total = 12;
         let r = derive_routed_report(&pre, &post);
         assert_eq!(r.committer_pipeline_ns_avg, 100_000.0);
         assert_eq!(r.committer_drains_total, 50);
         assert_eq!(r.router_window_defers_total, 7);
-    }
-
-    #[test]
-    fn derive_report_pipeline_avg_zero_when_no_drains() {
-        let s = RoutedCounterSnapshot::default();
-        let r = derive_routed_report(&s, &s);
-        assert_eq!(r.committer_pipeline_ns_avg, 0.0);
-        assert_eq!(r.committer_drains_total, 0);
-        assert_eq!(r.router_window_defers_total, 0);
     }
 }

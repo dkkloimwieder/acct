@@ -1,0 +1,67 @@
+{
+  "scenario": "s5",
+  "path": "routed",
+  "duration_secs": 30.374498611,
+  "callers": 200,
+  "throughput_trx_per_sec": 1055.4248289185036,
+  "attempts_total": 34262,
+  "errors_total": 0,
+  "ack_latency_us": {
+    "p50": 27262,
+    "p95": 782237,
+    "p99": 1368391,
+    "min": 208,
+    "max": 3430940,
+    "mean": 176195,
+    "count": 34262
+  },
+  "committed_latency_us": {
+    "p50": 24545067,
+    "p95": 34795945,
+    "p99": 35802578,
+    "min": 442499,
+    "max": 37849399,
+    "mean": 21627197,
+    "count": 32058
+  },
+  "commits_observed": 42050,
+  "rollbacks_observed": 0,
+  "wal_bytes_per_trx": 1446.350535077289,
+  "top_wait_events": [
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "ledger_v3_staging_queue",
+      "samples": 42247
+    },
+    {
+      "wait_event_type": "Extension",
+      "wait_event": "Extension",
+      "samples": 14189
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "ledger_v3_spillover_arena",
+      "samples": 2379
+    },
+    {
+      "wait_event_type": "Client",
+      "wait_event": "ClientRead",
+      "samples": 112
+    },
+    {
+      "wait_event_type": "LWLock",
+      "wait_event": "XidGen",
+      "samples": 11
+    }
+  ],
+  "routed": {
+    "eject_count_total": 0,
+    "commit_group_size_avg": 24.737906137184115,
+    "commit_group_size_p99": 63,
+    "committer_pipeline_ns_avg": 154585967.84830996,
+    "committer_drains_total": 1213,
+    "router_window_defers_total": 50
+  },
+  "sampler_report_path": null,
+  "started_at": "2026-05-22T16:27:40.051452443Z"
+}

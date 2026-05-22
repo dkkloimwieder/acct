@@ -158,15 +158,16 @@ impl RunReport {
     }
 
     /// Path B constructor: ack and committed latencies come from
-    /// separate histograms. Throughput is derived from `committed.len()`
-    /// (actual trx materialization count) rather than `ack.len()` —
-    /// callers whose enqueue succeeded but whose trx didn't materialize
-    /// within `poll_deadline` are real losses, not throughput.
+    /// separate histograms. Throughput is derived from `trx_count` —
+    /// rows the dedicated observer task saw materialize in the run
+    /// range, independent of caller blocking shape (fire-and-forget
+    /// callers per acct-tk58).
     #[allow(clippy::too_many_arguments)]
     pub fn new_routed(
         scenario: impl Into<String>,
         callers: usize,
         duration_secs: f64,
+        trx_count: u64,
         ack: &Histogram<u64>,
         committed: &Histogram<u64>,
         errors_total: u64,
@@ -183,7 +184,7 @@ impl RunReport {
             duration_secs,
             callers,
             throughput_trx_per_sec: if duration_secs > 0.0 {
-                committed.len() as f64 / duration_secs
+                trx_count as f64 / duration_secs
             } else {
                 0.0
             },
