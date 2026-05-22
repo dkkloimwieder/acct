@@ -21,7 +21,7 @@ AS 'MODULE_PATHNAME', 'ledger_enqueue_trx_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:321
+-- ledger-routed/src/lib.rs:336
 -- ledger_routed::ledger_routed_arena_bump_offset
 CREATE  FUNCTION "ledger_routed_arena_bump_offset"() RETURNS bigint /* i64 */
 STRICT
@@ -30,7 +30,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_arena_bump_offset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:327
+-- ledger-routed/src/lib.rs:342
 -- ledger_routed::ledger_routed_arena_freelist_count
 CREATE  FUNCTION "ledger_routed_arena_freelist_count"() RETURNS bigint /* i64 */
 STRICT
@@ -39,7 +39,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_arena_freelist_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:316
+-- ledger-routed/src/lib.rs:331
 -- ledger_routed::ledger_routed_arena_outstanding
 CREATE  FUNCTION "ledger_routed_arena_outstanding"() RETURNS bigint /* i64 */
 STRICT
@@ -48,7 +48,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_arena_outstanding_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:303
+-- ledger-routed/src/lib.rs:318
 -- ledger_routed::ledger_routed_arena_total_allocs
 CREATE  FUNCTION "ledger_routed_arena_total_allocs"() RETURNS bigint /* i64 */
 STRICT
@@ -57,7 +57,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_arena_total_allocs_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:308
+-- ledger-routed/src/lib.rs:323
 -- ledger_routed::ledger_routed_arena_total_frees
 CREATE  FUNCTION "ledger_routed_arena_total_frees"() RETURNS bigint /* i64 */
 STRICT
@@ -66,7 +66,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_arena_total_frees_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:334
+-- ledger-routed/src/lib.rs:349
 -- ledger_routed::ledger_routed_hello
 CREATE  FUNCTION "ledger_routed_hello"() RETURNS TEXT /* String */
 STRICT

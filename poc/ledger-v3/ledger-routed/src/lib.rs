@@ -46,9 +46,12 @@ pgrx::pg_module_magic!();
 pub(crate) mod arena;
 pub(crate) mod bulk_write;
 pub(crate) mod cleanup;
+pub(crate) mod committer;
 pub(crate) mod enqueue;
+pub(crate) mod hydration;
 pub(crate) mod identity;
 pub(crate) mod payload;
+pub(crate) mod pool_lock;
 pub(crate) mod router;
 pub(crate) mod shmem;
 
@@ -291,6 +294,18 @@ pub extern "C-unwind" fn _PG_init() {
         .set_restart_time(Some(Duration::from_secs(5)))
         .enable_spi_access()
         .load();
+    // committer_count is read here at _PG_init; runtime SIGHUP changes
+    // don't respawn workers. Restart required to apply a new value.
+    let n_committers = COMMITTER_COUNT.get().max(1) as usize;
+    for i in 0..n_committers {
+        BackgroundWorkerBuilder::new(&format!("ledger_routed_committer_{}", i))
+            .set_function("ledger_routed_committer_main")
+            .set_library("ledger_routed")
+            .set_start_time(BgWorkerStartTime::RecoveryFinished)
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .enable_spi_access()
+            .load();
+    }
 }
 
 // ── Arena observability ─────────────────────────────────────────────
