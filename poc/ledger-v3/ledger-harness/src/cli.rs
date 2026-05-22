@@ -71,6 +71,12 @@ pub enum Cmd {
         /// keeps each run well under a minute.
         #[arg(long, default_value_t = 50)]
         submissions_per_caller: usize,
+        /// Upgrade WAC unit_cost drift on shared pools (acct-mcey) from
+        /// informational to error. Use with Path B configured for a
+        /// single committer (ALTER SYSTEM SET ledger_routed.committer_count
+        /// = 1 + postmaster restart) to require byte equivalence.
+        #[arg(long)]
+        strict: bool,
     },
 }
 

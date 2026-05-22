@@ -113,11 +113,13 @@ async fn main() -> std::process::ExitCode {
         Cmd::Equivalence {
             scenario,
             submissions_per_caller,
+            strict,
         } => {
             let opts = equivalence::EquivalenceOptions {
                 dsn: args.dsn,
                 scenario,
                 submissions_per_caller,
+                strict,
             };
             match equivalence::run(opts).await {
                 Ok(()) => std::process::ExitCode::SUCCESS,
