@@ -12,6 +12,7 @@
 mod cli;
 mod driver_direct;
 mod driver_routed;
+mod equivalence;
 mod measure;
 mod pool_universe;
 mod report;
@@ -109,10 +110,22 @@ async fn main() -> std::process::ExitCode {
                 }
             }
         },
-        Cmd::Equivalence { scenario, duration } => {
-            eprintln!("equivalence: scenario={scenario} duration={duration}");
-            eprintln!("[stub] body lands in acct-t9lo");
-            std::process::ExitCode::from(2)
+        Cmd::Equivalence {
+            scenario,
+            submissions_per_caller,
+        } => {
+            let opts = equivalence::EquivalenceOptions {
+                dsn: args.dsn,
+                scenario,
+                submissions_per_caller,
+            };
+            match equivalence::run(opts).await {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("equivalence failed: {e}");
+                    std::process::ExitCode::from(1)
+                }
+            }
         }
     }
 }

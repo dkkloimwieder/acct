@@ -67,8 +67,10 @@ pub enum Cmd {
     Equivalence {
         #[arg(long)]
         scenario: String,
-        #[arg(long, default_value = "30s")]
-        duration: humantime::Duration,
+        /// Submissions per caller. Total = callers × this. Default 50
+        /// keeps each run well under a minute.
+        #[arg(long, default_value_t = 50)]
+        submissions_per_caller: usize,
     },
 }
 
