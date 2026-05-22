@@ -1,0 +1,14 @@
+[equivalence] resetting + seeding universe for Path A...
+seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+[equivalence] capping callers to 20 (universe=100)
+[equivalence] scenario=s2 callers=20 submissions/caller=50 total=1000
+[equivalence] running Path A (direct)...
+[equivalence] direct: 1000 trx, 1000 trx_line, 71 pool_state, 1000 posting_line (2.58s)
+[equivalence] resetting + reseeding universe for Path B...
+seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+[equivalence] running Path B (routed)...
+[equivalence] routed: 1000 trx, 1000 trx_line, 71 pool_state, 1000 posting_line (0.97s)
+[equivalence] 1 WAC unit_cost drift(s) (acct-mcey property — bounded by per-pool truncation accumulation across reordered commit_groups):
+  pool_state[1] pool=2 qty=8570 unit_cost A=461 B=465 (Δ=-4; method=wac)
+EQUIVALENCE FAILED (strict): 1 WAC drifts upgraded to errors
+equivalence failed: 1 mismatches

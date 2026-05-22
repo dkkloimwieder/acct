@@ -1,0 +1,170 @@
+==> equivalence sweep timestamp: 2026-05-22T19-01-40Z
+==> outdir: results/phase6/equivalence
+
+==> s1 lenient at 19:01:40
+    exit=0 log=results/phase6/equivalence/s1-lenient-2026-05-22T19-01-40Z.log
+    | [equivalence] scenario=s1 callers=10 submissions/caller=50 total=500
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 500 trx, 500 trx_line, 100 pool_state, 500 posting_line (1.58s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 500 trx, 500 trx_line, 100 pool_state, 500 posting_line (1.11s)
+    | equivalence OK: scenario=s1 submissions=500 A=500 B=500 trx (identical)
+
+==> s2 lenient at 19:01:49
+    exit=0 log=results/phase6/equivalence/s2-lenient-2026-05-22T19-01-40Z.log
+    | [equivalence] scenario=s2 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 71 pool_state, 1000 posting_line (2.63s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 71 pool_state, 1000 posting_line (1.39s)
+    | equivalence OK: scenario=s2 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s3 lenient at 19:01:58
+    exit=0 log=results/phase6/equivalence/s3-lenient-2026-05-22T19-01-40Z.log
+    | [equivalence] scenario=s3 callers=10 submissions/caller=50 total=500
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 500 trx, 15327 trx_line, 100 pool_state, 15327 posting_line (2.76s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 500 trx, 15327 trx_line, 100 pool_state, 15327 posting_line (2.03s)
+    | equivalence OK: scenario=s3 submissions=500 A=500 B=500 trx (identical)
+
+==> s4 lenient at 19:02:09
+    exit=0 log=results/phase6/equivalence/s4-lenient-2026-05-22T19-01-40Z.log
+    |   pool_state[14] pool=15 qty=15487 unit_cost A=427 B=428 (Δ=-1; method=wac)
+    |   pool_state[17] pool=18 qty=12373 unit_cost A=448 B=447 (Δ=1; method=wac)
+    |   pool_state[19] pool=20 qty=11649 unit_cost A=464 B=465 (Δ=-1; method=wac)
+    |   pool_state[20] pool=21 qty=10789 unit_cost A=417 B=418 (Δ=-1; method=wac)
+    |   pool_state[23] pool=24 qty=10451 unit_cost A=453 B=451 (Δ=2; method=wac)
+    |   pool_state[24] pool=25 qty=8662 unit_cost A=475 B=476 (Δ=-1; method=wac)
+    |   ... 7 more WAC drifts suppressed
+    | equivalence OK: scenario=s4 submissions=1000 A=1000 B=1000 trx (17 WAC drift(s) within acct-mcey bound, ignored)
+
+==> s5 lenient at 19:02:27
+    exit=0 log=results/phase6/equivalence/s5-lenient-2026-05-22T19-01-40Z.log
+    | [equivalence] scenario=s5 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 1 pool_state, 1000 posting_line (2.75s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 1 pool_state, 1000 posting_line (1.17s)
+    | equivalence OK: scenario=s5 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s6 lenient at 19:02:37
+    exit=0 log=results/phase6/equivalence/s6-lenient-2026-05-22T19-01-40Z.log
+    | [equivalence] scenario=s6 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 20 pool_state, 1000 posting_line (2.66s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 20 pool_state, 1000 posting_line (1.07s)
+    | equivalence OK: scenario=s6 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s2 strict at 19:02:47
+    exit=1 log=results/phase6/equivalence/s2-strict-trial1-2026-05-22T19-01-40Z.log
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 71 pool_state, 1000 posting_line (0.99s)
+    | [equivalence] 1 WAC unit_cost drift(s) (acct-mcey property — bounded by per-pool truncation accumulation across reordered commit_groups):
+    |   pool_state[0] pool=1 qty=19788 unit_cost A=405 B=408 (Δ=-3; method=wac)
+    | EQUIVALENCE FAILED (strict): 1 WAC drifts upgraded to errors
+    | equivalence failed: 1 mismatches
+
+==> s2 strict at 19:02:57
+    exit=1 log=results/phase6/equivalence/s2-strict-trial2-2026-05-22T19-01-40Z.log
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 71 pool_state, 1000 posting_line (0.97s)
+    | [equivalence] 1 WAC unit_cost drift(s) (acct-mcey property — bounded by per-pool truncation accumulation across reordered commit_groups):
+    |   pool_state[1] pool=2 qty=8570 unit_cost A=461 B=465 (Δ=-4; method=wac)
+    | EQUIVALENCE FAILED (strict): 1 WAC drifts upgraded to errors
+    | equivalence failed: 1 mismatches
+
+==> s2 strict at 19:03:06
+    exit=0 log=results/phase6/equivalence/s2-strict-trial3-2026-05-22T19-01-40Z.log
+    | [equivalence] scenario=s2 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 71 pool_state, 1000 posting_line (2.86s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 71 pool_state, 1000 posting_line (1.20s)
+    | equivalence OK: scenario=s2 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s4 strict at 19:03:16
+    exit=1 log=results/phase6/equivalence/s4-strict-trial1-2026-05-22T19-01-40Z.log
+    |   pool_state[24] pool=25 qty=8662 unit_cost A=475 B=476 (Δ=-1; method=wac)
+    |   pool_state[35] pool=36 qty=6684 unit_cost A=492 B=493 (Δ=-1; method=wac)
+    |   pool_state[40] pool=41 qty=4345 unit_cost A=488 B=490 (Δ=-2; method=wac)
+    |   pool_state[43] pool=44 qty=4735 unit_cost A=433 B=432 (Δ=1; method=wac)
+    |   pool_state[59] pool=60 qty=3432 unit_cost A=463 B=464 (Δ=-1; method=wac)
+    |   pool_state[75] pool=76 qty=1604 unit_cost A=573 B=572 (Δ=1; method=wac)
+    | EQUIVALENCE FAILED (strict): 10 WAC drifts upgraded to errors
+    | equivalence failed: 10 mismatches
+
+==> s4 strict at 19:03:32
+    exit=1 log=results/phase6/equivalence/s4-strict-trial2-2026-05-22T19-01-40Z.log
+    |   pool_state[13] pool=14 qty=18244 unit_cost A=402 B=403 (Δ=-1; method=wac)
+    |   pool_state[31] pool=32 qty=6939 unit_cost A=469 B=471 (Δ=-2; method=wac)
+    |   pool_state[40] pool=41 qty=4345 unit_cost A=488 B=489 (Δ=-1; method=wac)
+    |   pool_state[43] pool=44 qty=4735 unit_cost A=433 B=432 (Δ=1; method=wac)
+    |   pool_state[59] pool=60 qty=3432 unit_cost A=463 B=464 (Δ=-1; method=wac)
+    |   pool_state[97] pool=98 qty=1861 unit_cost A=529 B=528 (Δ=1; method=wac)
+    | EQUIVALENCE FAILED (strict): 7 WAC drifts upgraded to errors
+    | equivalence failed: 7 mismatches
+
+==> s4 strict at 19:03:49
+    exit=1 log=results/phase6/equivalence/s4-strict-trial3-2026-05-22T19-01-40Z.log
+    |   pool_state[11] pool=12 qty=21413 unit_cost A=403 B=402 (Δ=1; method=wac)
+    |   pool_state[17] pool=18 qty=12373 unit_cost A=448 B=447 (Δ=1; method=wac)
+    |   pool_state[18] pool=19 qty=12384 unit_cost A=415 B=414 (Δ=1; method=wac)
+    |   pool_state[19] pool=20 qty=11649 unit_cost A=464 B=463 (Δ=1; method=wac)
+    |   pool_state[23] pool=24 qty=10451 unit_cost A=453 B=452 (Δ=1; method=wac)
+    |   ... 9 more WAC drifts suppressed
+    | EQUIVALENCE FAILED (strict): 19 WAC drifts upgraded to errors
+    | equivalence failed: 19 mismatches
+
+==> s5 strict at 19:04:05
+    exit=1 log=results/phase6/equivalence/s5-strict-trial1-2026-05-22T19-01-40Z.log
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 1 pool_state, 1000 posting_line (1.16s)
+    | [equivalence] 1 WAC unit_cost drift(s) (acct-mcey property — bounded by per-pool truncation accumulation across reordered commit_groups):
+    |   pool_state[0] pool=1 qty=52101 unit_cost A=249 B=248 (Δ=1; method=wac)
+    | EQUIVALENCE FAILED (strict): 1 WAC drifts upgraded to errors
+    | equivalence failed: 1 mismatches
+
+==> s5 strict at 19:04:14
+    exit=1 log=results/phase6/equivalence/s5-strict-trial2-2026-05-22T19-01-40Z.log
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 1 pool_state, 1000 posting_line (1.16s)
+    | [equivalence] 1 WAC unit_cost drift(s) (acct-mcey property — bounded by per-pool truncation accumulation across reordered commit_groups):
+    |   pool_state[0] pool=1 qty=52101 unit_cost A=249 B=248 (Δ=1; method=wac)
+    | EQUIVALENCE FAILED (strict): 1 WAC drifts upgraded to errors
+    | equivalence failed: 1 mismatches
+
+==> s5 strict at 19:04:24
+    exit=1 log=results/phase6/equivalence/s5-strict-trial3-2026-05-22T19-01-40Z.log
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWac → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 1 pool_state, 1000 posting_line (1.15s)
+    | [equivalence] 1 WAC unit_cost drift(s) (acct-mcey property — bounded by per-pool truncation accumulation across reordered commit_groups):
+    |   pool_state[0] pool=1 qty=52101 unit_cost A=249 B=250 (Δ=-1; method=wac)
+    | EQUIVALENCE FAILED (strict): 1 WAC drifts upgraded to errors
+    | equivalence failed: 1 mismatches
+
+==> sweep complete at 19:04:34
+==> index: results/phase6/equivalence/run-2026-05-22T19-01-40Z.log
