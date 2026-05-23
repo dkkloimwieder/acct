@@ -2,8 +2,18 @@
 
 **Issue:** acct-9mgx.1 (P2; sibling of acct-9mgx.{2..6})
 **Run window:** 2026-05-23
-**Equivalence sweep:** `results/phase6/equivalence/run-all-fifo-2026-05-23T12-31-44Z.log`
-**Bench:** `results/phase6/bench-9mgx1/run-2026-05-23T12-36-01Z.log`
+**Equivalence sweep (canonical, committer_count=1):** `results/phase6/equivalence/run-all-fifo-2026-05-23T13-04-03Z.log`
+**Bench (canonical, committer_count=1):** `results/phase6/bench-9mgx1/run-2026-05-23T13-06-47Z.log`
+
+## ⚠ Current default-config routed FIFO is inconsistent
+
+The routed path **does not honor submission-order FIFO under default GUCs** (`ledger_routed.committer_count = 4`, `ledger_routed.batch_size_max = 50`). The router splits a single pool's pending submissions across multiple commit_groups; sub-groups commit in parallel with no inter-sub-group ordering guarantee. Each individual depletion still consumes "oldest layer first" for its local view, but the global trx ordering is reordered — so depletion T₂₀₀ can drain the oldest layer before depletion T₁₀₀ runs, and T₁₀₀ then consumes from a different head layer than it would under serial submission order.
+
+That is not FIFO. It produces non-deterministic COGS for the same input workload.
+
+The current PoC ships single-committer (`committer_count = 1`) as the correctness workaround. The design fix — router refuses to split per-pool submissions for `fifo` / `lifo` / `specific` pools — is filed as **acct-aywu**. Until that lands, the routed path's `fifo` cost method requires `committer_count = 1`.
+
+All numbers in this doc are measured under `committer_count = 1`.
 
 ## Change
 
@@ -19,19 +29,20 @@ plumbing that the remaining `acct-9mgx.{2,3,4}` siblings will reuse.
   `--method-mix all-fifo`. Workload is a 2-tick alternating cycle per
   caller (R qty=10 with rotating unit_cost / D qty=-3 on caller's last
   receipt pool), submitted in **caller-major order** so each commit_group
-  starts with a receipt and stays stock-positive even when
-  `batch_size_max=50` splits the workload across the 4-committer pool.
-  Earlier tick-major and larger-depletion shapes hit InsufficientInventory
-  under s5 single-hot-pool concurrent commit_groups.
+  starts with a receipt and stays stock-positive — earlier tick-major
+  and larger-depletion shapes hit InsufficientInventory under s5
+  single-hot-pool.
 - New `DiffResult.fifo_drifts` bucket + `trx_lines_preserve_total_qty_per_pool`
   classifier. Per-line trx_line content differences on FIFO
   transfer_shipment trxs route here when per-pool ∑qty matches across
   paths. pool_state row-count differences and per-row mismatches on FIFO
   pools likewise route here. The load-bearing invariant — per-pool
   ∑pool_state.qty matches across paths — stays in the `errors` bucket
-  and is gated separately.
-- `--strict` upgrades `fifo_drifts` to errors (parallel to
-  `wac_drifts` / `wac_periodic_drifts` precedent).
+  and is gated separately. **Under `committer_count = 1` (correct config)
+  the fifo_drifts bucket is always empty; it only fires when the routed
+  path is misconfigured for multi-committer FIFO, in which case it
+  diagnoses the violation.**
+- `--strict` upgrades `fifo_drifts` to errors.
 - `run` subcommand: new `--method-mix` flag (+ `--seed-count` /
   `--seed-skus` / `--seed-locations` sizing args). When set, the harness
   TRUNCATEs the ledger tables and re-seeds the pool universe with the
@@ -45,119 +56,121 @@ plumbing that the remaining `acct-9mgx.{2,3,4}` siblings will reuse.
   200ms sleeps so a commit_group that lands right after the stability
   signal isn't reported as "stuck."
 
-## Diff contract (acct-9mgx.1)
-
-FIFO is **path-dependent** under concurrent commit_groups: each
-depletion consumes from the head layer, but under different
-commit_group orderings the head layer's qty/unit_cost at deplete-time
-differs. This is intrinsic to FIFO (unlike WAC's commutative
-cumulative-sum form per acct-h5gs); it is NOT a bug.
-
-| Bucket                  | Per-row byte check | Aggregate check                              |
-|-------------------------|--------------------|----------------------------------------------|
-| `pool_state` Σqty per pool | (n/a)           | **load-bearing**: total per-pool stock conserved |
-| `pool_state` per-row    | informational      | (covered via Σqty)                           |
-| `trx_groups` Σqty per (trx, pool) | (n/a)    | **load-bearing**: per-trx per-pool qty conserved |
-| `trx_groups` per-line   | informational      | (covered via per-trx per-pool ∑qty)          |
-
-Per-line and per-row differences become `fifo_drifts`. Workload
-identity guarantees the load-bearing invariants: both paths receive
-identical submissions in identical total qty.
-
-## Equivalence sweep — 6 scenarios + 9 strict trials
+## Equivalence sweep — 6 scenarios + 9 strict trials, committer_count=1
 
 | Scenario | Workload                | Submissions | Lenient | Strict T1 / T2 / T3 |
 |----------|-------------------------|------------:|:-------:|:-------------------:|
 | s1       | uniform / simple        |         500 | ✓ identical | — |
-| s2       | zipf(1.5) / simple      |        1000 | ✓ 155 drifts | ✗ 49 / ✗ 173 / ✗ 201 |
-| s3       | uniform / complex       |         500 | ✓ 51 drifts  | — |
-| s4       | zipf(1.2) / complex     |        1000 | ✓ 51 drifts  | ✗ 414 / ✓ identical / ✗ 454 |
-| s5       | single-hot-pool         |        1000 | ✓ 142 drifts | ✗ 309 / ✗ 75 / ✗ 158 |
-| s6       | disjoint stripes        |        1000 | ✓ identical  | — |
+| s2       | zipf(1.5) / simple      |        1000 | ✓ identical | ✓ / ✓ / ✓ |
+| s3       | uniform / complex       |         500 | ✓ identical | — |
+| s4       | zipf(1.2) / complex     |        1000 | ✓ identical | ✓ / ✓ / ✓ |
+| s5       | single-hot-pool         |        1000 | ✓ identical | ✓ / ✓ / ✓ |
+| s6       | disjoint stripes        |        1000 | ✓ identical | — |
 
-**All 6 lenient scenarios pass.** Per-pool ∑qty and per-(trx, pool) ∑qty
-are conserved across paths in every run; per-line breakdowns and
-pool_state layer composition drift on shared pools by exactly the
-FIFO path-dependence the bd description predicted.
+**15/15 byte-identical under `committer_count = 1`.** Same shape as
+acct-h5gs / 9mgx.5 WAC validation: trx, trx_line, pool_state, and
+posting_line all match byte-for-byte across paths in every run, lenient
+and strict.
 
-Strict-mode trials surface the drift — same pattern as acct-mcey for WAC
-running-avg and acct-9mgx.6 for wac_periodic. Strict variability is
-fundamental to FIFO + concurrent commit_groups; not a per-trial bug.
-Single-committer configuration (`ALTER SYSTEM SET ledger_routed.committer_count = 1`
-+ postmaster restart) is the workaround for strict-equivalence runs;
-disjoint-stripe scenarios (s6) pass strict trivially because they have
-no shared pools.
-
-The s4 strict T2 "identical" outcome is a lucky commit-group ordering
-that happened to mirror Path A's serial ordering — not a property to
-rely on.
-
-## Cross-method bench — s2 + s5 × direct + routed × AllFifo + AllWac
+## Cross-method bench — s2 + s5 × direct + routed × AllFifo + AllWac, committer_count=1
 
 20 callers, 30s duration, 1000-pool universe. Per-run JSONs in
 `results/phase6/bench-9mgx1/`.
 
 | Scenario | Path     | Method     | Throughput (tx/s) | p99 ack (ms) | Commits |
 |----------|----------|------------|------------------:|-------------:|--------:|
-| s2       | direct   | wac        |             616.2 |         94.4 |  18 360 |
-| s2       | direct   | **fifo**   |             472.1 |        150.1 |  14 160 |
-| s2       | routed   | wac        |           1 849.3 |         47.0 |  55 500 |
-| s2       | routed   | **fifo**   |           1 933.0 |         48.5 |  58 016 |
-| s5       | direct   | wac        |             298.1 |         86.1 |   8 891 |
-| s5       | direct   | **fifo**   |             204.8 |        158.3 |   6 255 |
-| s5       | routed   | wac        |           2 131.3 |         50.8 |  63 962 |
-| s5       | routed   | **fifo**   |           1 790.6 |         76.5 |  53 773 |
+| s2       | direct   | wac        |             589.0 |        111.7 |  17 657 |
+| s2       | direct   | **fifo**   |             439.3 |        173.0 |  13 271 |
+| s2       | routed   | wac        |           1 506.1 |        104.7 |  45 257 |
+| s2       | routed   | **fifo**   |           1 444.6 |        111.6 |  43 363 |
+| s5       | direct   | wac        |             304.6 |         80.5 |   9 242 |
+| s5       | direct   | **fifo**   |             207.8 |        148.9 |   6 333 |
+| s5       | routed   | wac        |           1 817.9 |         64.4 |  54 553 |
+| s5       | routed   | **fifo**   |           1 714.6 |         82.9 |  51 443 |
 
 **FIFO direct-path overhead is real and bounded.** On the direct path
-FIFO trails WAC by ~30% (472 vs 616 tx/s on s2; 205 vs 298 on s5) due
+FIFO trails WAC by ~25-32% (439 vs 589 on s2; 208 vs 305 on s5) due
 to per-event sequential layer consumption (each depletion's plan_apply
 walks layers and emits one trx_line per layer touched; WAC emits one
 trx_line per depletion regardless of layer count). p99 ack latency
-follows the same shape (1.6× WAC on direct).
+follows the same shape (~1.5× WAC on direct).
 
-**Routed-path overhead is mostly neutralized** by commit-group
-amortization. On s2 routed, FIFO is within 5% of WAC (slightly higher);
-on s5 routed, WAC pulls ~19% ahead because single-hot-pool
-amortization favors WAC's flat per-event work. ack p99 is comparable
-across methods (~50ms WAC vs ~50-77ms FIFO).
+**FIFO routed-path is within 4-6% of WAC** (1445 vs 1506 on s2; 1715 vs
+1818 on s5). Commit-group amortization neutralizes FIFO's per-event
+overhead; the residual gap is FIFO's bulk-write of per-layer trx_lines
++ pool_state UPDATE/DELETE vs WAC's two-row pool_state UPSERT.
 
-**Routed beats direct in every cell** — 3-10× throughput across both
-methods. This was already established for AllWac in acct-49 / acct-tk58;
-AllFifo confirms the shape carries across methods.
+**Routed beats direct in every cell** (3-8× throughput). Routed-path
+amortization wins for both methods even under the correctness-forced
+`committer_count = 1` configuration.
 
-Routed `committed_p99_us` is dominated by queue residency (submissions
-sit in the staging queue until their batch drains), not by per-trx
-work; it ranges 9-22s in this bench because the harness backpressures
-at staging_queue_size=16k while submitters are unbounded.
+`committed_p99_us` (routed) is dominated by queue residency (submissions
+sit in the staging queue until their batch drains), not per-trx work.
+
+## Bench under broken default config (for reference; not the canonical numbers)
+
+Run captured prior to discovering the per-pool ordering violation —
+`committer_count = 4`, `batch_size_max = 50`. **These numbers reflect
+broken FIFO behavior** (non-deterministic COGS) and are kept here only
+to quantify the correctness/throughput trade-off the routed path
+currently pays:
+
+| Scenario | Path     | Method     | Throughput (tx/s) cm=4 | Δ vs cm=1 |
+|----------|----------|------------|----------------------:|----------:|
+| s2       | routed   | fifo (BROKEN) |              1 933.0 |     +34 % |
+| s2       | routed   | wac        |               1 849.3 |     +23 % |
+| s5       | routed   | fifo (BROKEN) |              1 790.6 |      +4 % |
+| s5       | routed   | wac        |               2 131.3 |     +17 % |
+
+The 34% FIFO gap on s2 is the cost of correctness. acct-aywu's per-pool
+no-split routing should recover most of it (cross-pool parallelism
+restored while order-sensitive pools stay single-group).
+
+Broken-config sweep + bench logs preserved at
+`results/phase6/equivalence/run-all-fifo-2026-05-23T12-31-44Z.log` and
+`results/phase6/bench-9mgx1/*-2026-05-23T12-36-01Z.{json,log}` for
+audit; not the canonical reference.
 
 ## Cross-references
 
-- **acct-h5gs** (closed, 2026-05-22) — WAC cumulative-sum form; key
-  contrast with FIFO is that WAC's storage form is commutative under
-  receipts and bounded-rounding-only on depletions (zero drift under
-  serial equivalence), while FIFO's per-layer storage is path-dependent
-  under concurrent commit_groups.
-- **acct-mcey** (closed, 2026-05-22) — original `wac_drifts` diff bucket
-  pattern this work extends with `fifo_drifts`.
+- **acct-aywu** (open, P1, this work's followup) — router-side fix to
+  stop splitting per-pool submissions across commit_groups for
+  order-sensitive cost methods. Removes the `committer_count = 1`
+  requirement and restores cross-pool routed parallelism.
+- **acct-h5gs** (closed, 2026-05-22) — WAC cumulative-sum form. Key
+  contrast with FIFO: WAC's storage form is commutative under receipts
+  and bounded-rounding-only on depletions (correct under any
+  commit_count), while FIFO's per-layer storage is path-dependent and
+  requires submission-order serialization.
+- **acct-mcey** (closed, 2026-05-22) — `wac_drifts` diff bucket pattern
+  this work extends with `fifo_drifts`.
 - **acct-9mgx.5** (closed, 2026-05-23) — WAC-perpetual under the unified
-  harness. Reproduced h5gs's 15/15 byte-identical.
+  harness. Reproduced h5gs's 15/15 byte-identical (under default
+  multi-committer, because WAC is commutation-safe).
 - **acct-9mgx.6** (closed, 2026-05-23) — wac_periodic under the unified
   harness. Introduced `--method-mix`; this work extends with FIFO
   workload + diff classifier.
 - **acct-9mgx.{2,3,4}** (open) — LIFO / Specific / STD; the
   `--method-mix` run-subcommand reseed plumbing landed here is shared
-  by each.
+  by each. **LIFO and Specific will hit the same ordering violation
+  as FIFO** until acct-aywu lands; STD has no layer-ordering surface
+  and is safe.
 - **acct-9mgx.7** (open, blocked on .1–.6) — cross-method roll-up doc.
 
 ## Harness invocation
 
 ```bash
-# Lenient equivalence (drifts informational)
+# REQUIRED for correct FIFO on routed path:
+docker exec acct-postgres psql -U acct -d poc_v3 \
+    -c "ALTER SYSTEM SET ledger_routed.committer_count = 1;"
+docker restart acct-postgres
+
+# Lenient equivalence (drifts informational; should be 0 under cm=1)
 cargo run --release -p ledger-harness -- equivalence \
     --scenario s4 \
     --method-mix all-fifo
 
-# Strict equivalence (drifts upgrade to errors)
+# Strict equivalence (drifts upgrade to errors; should be 0 under cm=1)
 cargo run --release -p ledger-harness -- equivalence \
     --scenario s4 \
     --method-mix all-fifo \
@@ -179,30 +192,21 @@ cargo run --release -p ledger-harness -- run \
 ## What this DOES NOT change
 
 - **No ledger-core changes.** `fifo.rs` / `layered.rs` semantics
-  unchanged; this work only extends the harness.
-- **No SPI changes.** ledger_submit_trx / ledger_enqueue_trx
-  signatures unchanged.
-- **No schema changes.** FIFO has used the existing pool_state +
-  trx_line schema since the project's first migration.
-- **No ledger-direct / ledger-routed changes** for FIFO logic. The only
-  cross-module touch was renaming `equivalence::reset_ledger` to call
-  through `pool_universe::reset_ledger_tables` so the run subcommand
-  reseed shares the same TRUNCATE.
+  unchanged; per-trx FIFO consumption was always correct. The bug
+  was at the router layer, not the cost-method layer.
+- **No SPI changes.**
+- **No schema changes.**
 
 ## What's deferred
 
-- **acct-9mgx.7** (cross-method roll-up doc) — blocked on .1–.6.
-- **Production drift handling for FIFO**: under real-load concurrent
-  Path B, FIFO COGS can legitimately differ from a hypothetical serial
-  baseline (per-layer consumption is path-dependent). Whether that
-  matters depends on accounting policy. Not in scope for the PoC;
-  surfaced as a property of the design.
-- **Strict-mode CI gating for FIFO**: requires single-committer
-  configuration (mirrors the wac_periodic / wac running-avg pattern).
-  Not wired here.
+- **acct-aywu** — router-side fix (the real solution; this PoC ships
+  single-committer as the interim workaround).
+- **acct-9mgx.7** (cross-method roll-up doc).
 - **Per-method `run` workload variants**: the run subcommand still uses
-  the all-receipts po_receipt workload regardless of method-mix; the
-  bench measures layer-creation + bulk-write throughput per method,
-  not depletion-side dynamics. A depletion-aware run-subcommand
-  workload would be needed to characterize FIFO depletion throughput
-  specifically — deferred as a follow-up.
+  the all-receipts po_receipt workload regardless of method-mix. A
+  depletion-aware run-subcommand workload would be needed to
+  characterize FIFO depletion throughput specifically — deferred as a
+  follow-up if perf numbers warrant.
+- **Single-committer CI gating**: this PoC documents the requirement
+  but does not enforce it via test setup. acct-aywu obsoletes the
+  requirement entirely.

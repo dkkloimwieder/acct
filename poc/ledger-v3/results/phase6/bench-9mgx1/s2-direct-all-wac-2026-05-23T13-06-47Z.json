@@ -1,0 +1,34 @@
+{
+  "scenario": "s2",
+  "path": "direct",
+  "duration_secs": 30.107147605,
+  "callers": 20,
+  "throughput_trx_per_sec": 589.0295631013165,
+  "attempts_total": 17734,
+  "errors_total": 0,
+  "ack_latency_us": {
+    "p50": 4579,
+    "p95": 96600,
+    "p99": 111738,
+    "min": 2449,
+    "max": 134479,
+    "mean": 33890,
+    "count": 17734
+  },
+  "committed_latency_us": {
+    "p50": 4579,
+    "p95": 96600,
+    "p99": 111738,
+    "min": 2449,
+    "max": 134479,
+    "mean": 33890,
+    "count": 17734
+  },
+  "commits_observed": 17657,
+  "rollbacks_observed": 0,
+  "wal_bytes_per_trx": 1617.9427988899586,
+  "top_wait_events": [],
+  "routed": null,
+  "sampler_report_path": null,
+  "started_at": "2026-05-23T13:07:32.470438629Z"
+}
