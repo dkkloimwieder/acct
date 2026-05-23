@@ -15,6 +15,15 @@ The current PoC ships single-committer (`committer_count = 1`) as the correctnes
 
 All numbers in this doc are measured under `committer_count = 1`.
 
+**This cm=1 sweep is the gold-standard FIFO correctness baseline.** acct-aywu
+and acct-tm09 (the router-side fixes that will lift the cm=1 requirement)
+both pin their acceptance to "re-run this 15-trial sweep under default GUCs
+and verify byte-identical to the cm=1 reference at
+`results/phase6/equivalence/run-all-fifo-2026-05-23T13-04-03Z.log`." Per-run
+equivalence-vs-Path-A is the per-run check; equivalence-vs-cm=1-routed is
+the regression check that catches any cm-dependent divergence the Path-A
+comparison would miss.
+
 ## Change
 
 Extends the cross-path equivalence harness (acct-h5gs / 9mgx.5 / 9mgx.6
