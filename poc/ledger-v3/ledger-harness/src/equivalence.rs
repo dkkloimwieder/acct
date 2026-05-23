@@ -119,6 +119,12 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
             opts.submissions_per_caller,
             run_prefix,
         ),
+        MethodMix::AllStd => build_submissions_std(
+            &spec.workload,
+            spec.callers,
+            opts.submissions_per_caller,
+            run_prefix,
+        ),
         MethodMix::AllWac | MethodMix::Mixed => {
             build_submissions(&spec.workload, spec.callers, opts.submissions_per_caller, run_prefix)
         }
@@ -448,6 +454,82 @@ fn build_submissions_wac_periodic(
 /// Caller-major ordering does not affect FIFO equivalence semantics — both
 /// paths see the same SUBMISSIONS, just in a different submission-order
 /// shape than the other workloads use.
+/// STD-specific workload (acct-9mgx.4).
+///
+/// 2-tick cycle per caller, caller-major submission order, mirroring the
+/// FIFO shape. Even tick = receipt (qty=10), odd tick = depletion (qty=-3)
+/// on the caller's most-recent receipt pool. unit_cost varies per round
+/// (100, 107, 114, …) and is supplied on BOTH receipts and depletions —
+/// STD has no pool_state to look the cost up from, so the caller supplies
+/// the standard cost for every line (design-v3 §3.4; locked plan Q4).
+///
+/// STD pools produce zero pool_state rows. The cost on every event comes
+/// from the caller, so byte-equivalence across paths is just trx +
+/// trx_line + posting_line equality — there is no commit_group-ordering
+/// surface to diverge on. tm09's predecessor-wait isn't triggered for
+/// STD pools (the router's is_order_sensitive_method classifier returns
+/// false for "std"), so multi-committer routed runs parallelize freely.
+fn build_submissions_std(
+    workload: &crate::workload::Workload,
+    callers: usize,
+    per_caller: usize,
+    run_prefix: i64,
+) -> Vec<Submission> {
+    let mut rngs: Vec<StdRng> = (0..callers)
+        .map(|c| StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(c as u64)))
+        .collect();
+    let mut subs = Vec::with_capacity(callers * per_caller);
+    let inv = workload.universe.inv_account;
+    let ap = workload.universe.ap_account;
+
+    for caller_id in 0..callers {
+        let mut last_receipt_pool: Option<i64> = None;
+        for tick in 0..per_caller {
+            let is_receipt = tick % 2 == 0;
+            let uc: i64 = 100 + (tick as i64 / 2) * 7;
+            let source_id = run_prefix + (caller_id as i64) * 1_000_000 + tick as i64;
+            if is_receipt {
+                let lines = workload.next_lines(&mut rngs[caller_id], caller_id);
+                if let Some(l) = lines.first() {
+                    last_receipt_pool = Some(l.pool_id);
+                }
+                let lines: Vec<LineParam> = lines
+                    .into_iter()
+                    .map(|l| LineParam {
+                        qty: 10,
+                        unit_cost: uc,
+                        ..l
+                    })
+                    .collect();
+                subs.push(Submission {
+                    trx_type: "po_receipt",
+                    source_id,
+                    lines,
+                });
+            } else {
+                let Some(pool_id) = last_receipt_pool else {
+                    continue;
+                };
+                subs.push(Submission {
+                    trx_type: "transfer_shipment",
+                    source_id,
+                    lines: vec![LineParam {
+                        pool_id,
+                        line_type: "transfer_shipment_line",
+                        source_id: Some(2),
+                        qty: -3,
+                        unit_cost: uc,
+                        debit_account: ap,
+                        credit_account: inv,
+                    }],
+                });
+            }
+        }
+    }
+
+    subs
+}
+
 fn build_submissions_fifo(
     workload: &crate::workload::Workload,
     callers: usize,
