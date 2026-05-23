@@ -72,7 +72,8 @@ async fn single_enqueue_lands_consistent_rows() {
     .await
     .unwrap();
     assert_eq!(ps_qty, 10);
-    assert_eq!(ps_uc, 50);
+    // WAC stores value_sum in unit_cost (qty × per-unit = 10 × 50 = 500).
+    assert_eq!(ps_uc, 500);
     assert_eq!(last_tl, tl_id);
 
     let (pl_tl, amt, deb, cred): (i64, i64, i64, i64) = sqlx::query_as(

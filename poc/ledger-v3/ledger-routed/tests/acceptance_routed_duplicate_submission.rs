@@ -102,7 +102,8 @@ async fn duplicate_source_id_yields_one_trx_one_layer() {
             .await
             .unwrap();
     assert_eq!(ps_qty, 7, "pool_state qty must NOT double-count");
-    assert_eq!(ps_uc, 100);
+    // WAC stores value_sum (7 × 100 = 700).
+    assert_eq!(ps_uc, 700);
 }
 
 #[tokio::test]

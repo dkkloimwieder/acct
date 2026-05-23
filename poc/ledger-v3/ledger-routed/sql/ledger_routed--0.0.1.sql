@@ -256,3 +256,75 @@ LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_routed_staging_state_counts_wrapper';
 /* </end connected objects> */
 
+/* <begin connected objects> */
+-- ledger-routed/src/test_hooks.rs:29
+-- ledger_routed::test_hooks::ledger_routed_test_committer_pids
+CREATE  FUNCTION "ledger_routed_test_committer_pids"() RETURNS TABLE (
+	"slot" INT,  /* i32 */
+	"pid" INT,  /* i32 */
+	"generation" INT,  /* i32 */
+	"alive" bool  /* bool */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_test_committer_pids_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/test_hooks.rs:69
+-- ledger_routed::test_hooks::ledger_routed_test_committer_stall_hits
+CREATE  FUNCTION "ledger_routed_test_committer_stall_hits"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_test_committer_stall_hits_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/test_hooks.rs:86
+-- ledger_routed::test_hooks::ledger_routed_test_inject_orphan_cq
+CREATE  FUNCTION "ledger_routed_test_inject_orphan_cq"() RETURNS INT /* i32 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_test_inject_orphan_cq_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/test_hooks.rs:50
+-- ledger_routed::test_hooks::ledger_routed_test_router_pid
+CREATE  FUNCTION "ledger_routed_test_router_pid"() RETURNS INT /* i32 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_test_router_pid_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/test_hooks.rs:64
+-- ledger_routed::test_hooks::ledger_routed_test_run_router_recovery_sweep
+CREATE  FUNCTION "ledger_routed_test_run_router_recovery_sweep"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_test_run_router_recovery_sweep_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/test_hooks.rs:109
+-- ledger_routed::test_hooks::ledger_routed_test_set_bgworker_paused
+CREATE  FUNCTION "ledger_routed_test_set_bgworker_paused"(
+	"paused" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_test_set_bgworker_paused_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed/src/test_hooks.rs:55
+-- ledger_routed::test_hooks::ledger_routed_test_set_committer_stall_us
+CREATE  FUNCTION "ledger_routed_test_set_committer_stall_us"(
+	"us" INT /* i32 */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_test_set_committer_stall_us_wrapper';
+/* </end connected objects> */
+

@@ -34,9 +34,9 @@ pub async fn connect_pool() -> PgPool {
 /// reset once at the start are fine.
 pub async fn reset_state(pool: &PgPool) {
     sqlx::query(
-        "TRUNCATE TABLE posting_line_dimension, posting_line, \
+        "TRUNCATE TABLE posting_lines_provisional, posting_line_dimension, posting_line, \
                        trx_line, trx, pool_state, pool_lock, pool, \
-                       sku, location, account \
+                       sku, location, account, accounting_period \
                        RESTART IDENTITY CASCADE",
     )
     .execute(pool)

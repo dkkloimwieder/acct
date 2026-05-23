@@ -7,7 +7,18 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-direct/src/lib.rs:45
+-- ledger-direct/src/close_period.rs:59
+-- ledger_direct::close_period::ledger_close_period
+CREATE  FUNCTION "ledger_close_period"(
+	"period_id" bigint /* i64 */
+) RETURNS jsonb /* pgrx :: JsonB */
+STRICT VOLATILE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_close_period_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-direct/src/lib.rs:46
 -- ledger_direct::ledger_direct_hello
 CREATE  FUNCTION "ledger_direct_hello"() RETURNS TEXT /* String */
 STRICT

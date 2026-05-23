@@ -107,7 +107,8 @@ async fn overlapping_submissions_pack_and_seq_monotonic() {
             .await
             .unwrap();
     assert_eq!(ps_qty, N);
-    assert_eq!(ps_uc, 10);
+    // WAC stores value_sum (N receipts × qty=1 × unit_cost=10 = N×10 = 80).
+    assert_eq!(ps_uc, N * 10);
 }
 
 #[tokio::test]

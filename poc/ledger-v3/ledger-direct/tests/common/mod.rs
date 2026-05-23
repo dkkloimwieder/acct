@@ -33,14 +33,39 @@ pub async fn connect_pool() -> PgPool {
 ///   account is independent.
 pub async fn reset_state(pool: &PgPool) {
     sqlx::query(
-        "TRUNCATE TABLE posting_line_dimension, posting_line, \
+        "TRUNCATE TABLE posting_lines_provisional, posting_line_dimension, posting_line, \
                        trx_line, trx, pool_state, pool_lock, pool, \
-                       sku, location, account \
+                       sku, location, account, accounting_period \
                        RESTART IDENTITY CASCADE",
     )
     .execute(pool)
     .await
     .expect("reset_state TRUNCATE");
+}
+
+/// Insert an accounting_period in state='open'. Returns the period id.
+pub async fn seed_period(pool: &PgPool, start_date: &str, end_date: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO accounting_period (start_date, end_date, state) \
+         VALUES ($1::date, $2::date, 'open') RETURNING id",
+    )
+    .bind(start_date)
+    .bind(end_date)
+    .fetch_one(pool)
+    .await
+    .expect("insert accounting_period")
+}
+
+/// Call ledger_close_period and return the JSONB summary as serde_json::Value.
+pub async fn close_period(
+    pool: &PgPool,
+    period_id: i64,
+) -> sqlx::types::Json<serde_json::Value> {
+    sqlx::query_scalar("SELECT ledger_close_period($1)")
+        .bind(period_id)
+        .fetch_one(pool)
+        .await
+        .expect("ledger_close_period")
 }
 
 /// Seed a single FIFO pool plus the two accounts the standard PO

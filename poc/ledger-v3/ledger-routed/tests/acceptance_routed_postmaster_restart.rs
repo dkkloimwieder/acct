@@ -65,7 +65,8 @@ async fn postmaster_restart_preserves_durable_loses_inflight() {
             .await
             .unwrap();
     assert_eq!(pre_qty, 5);
-    assert_eq!(pre_uc, 20);
+    // WAC stores value_sum (5 × 20 = 100).
+    assert_eq!(pre_uc, 100);
 
     // ── Phase 2: in-flight submission inside held caller tx ──────────
     let mut conn_a = pool.acquire().await.expect("acquire Session A");

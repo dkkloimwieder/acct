@@ -86,6 +86,7 @@ pub fn hydrate_snapshot(pool_ids: &[i64]) -> Result<Snapshot, pgrx::spi::Error> 
                 "fifo" => PoolMethod::Fifo,
                 "lifo" => PoolMethod::Lifo,
                 "wac" => PoolMethod::Wac,
+                "wac_periodic" => PoolMethod::WacPeriodic,
                 "std" => PoolMethod::Std,
                 "specific" => PoolMethod::Specific,
                 _ => continue, // unknown enum value — surfaces as UnknownPool downstream

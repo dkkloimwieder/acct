@@ -24,6 +24,7 @@ pub enum PoolMethod {
     Fifo,
     Lifo,
     Wac,
+    WacPeriodic,
     Std,
     Specific,
 }
@@ -60,6 +61,9 @@ pub fn plan_apply(
             PoolMethod::Fifo => crate::fifo::apply_fifo(snapshot, line, &mut result, posted_at)?,
             PoolMethod::Lifo => crate::lifo::apply_lifo(snapshot, line, &mut result, posted_at)?,
             PoolMethod::Wac => crate::wac::apply_wac(snapshot, line, &mut result, posted_at)?,
+            PoolMethod::WacPeriodic => {
+                crate::wac_periodic::apply_wac_periodic(snapshot, line, &mut result, posted_at)?
+            }
             PoolMethod::Specific => {
                 crate::specific::apply_specific(snapshot, line, &mut result, posted_at)?
             }

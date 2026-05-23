@@ -30,7 +30,9 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use ledger_core::{PlanResult, PoolStateMutation, PostingLineRequest, TrxLineOutput};
+use ledger_core::{
+    PlanResult, PoolStateMutation, PostingLineRequest, ProvisionalPostingRequest, TrxLineOutput,
+};
 use pgrx::prelude::*;
 
 /// 9.1 — INSERT INTO trx. Returns the new trx.id.
@@ -260,15 +262,18 @@ pub fn apply_pool_state_mutations(
     Ok(())
 }
 
-/// 9.7 — Bulk INSERT INTO posting_line. Resolves `trx_line_idx` against
-/// the input-order `trx_line_ids` from step 9.2.
+/// 9.7 — Bulk INSERT INTO posting_line ... RETURNING id, in input order.
+///
+/// Returns the posting_line.id list so `insert_provisional_postings` can
+/// resolve `ProvisionalPostingRequest.posting_line_idx` (acct-s6fa). Resolves
+/// `trx_line_idx` against the input-order `trx_line_ids` from step 9.2.
 #[allow(dead_code)]
 pub fn insert_posting_lines(
     requests: &[PostingLineRequest],
     trx_line_ids: &[i64],
-) -> Result<(), pgrx::spi::Error> {
+) -> Result<Vec<i64>, pgrx::spi::Error> {
     if requests.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let tl_id: Vec<i64> = requests.iter().map(|r| trx_line_ids[r.trx_line_idx]).collect();
@@ -281,18 +286,65 @@ pub fn insert_posting_lines(
     let credit: Vec<i64> = requests.iter().map(|r| r.credit_account).collect();
     let posted_at: Vec<String> = requests.iter().map(|r| r.posted_at.to_rfc3339()).collect();
 
+    let ids: Vec<i64> = Spi::connect(|client| -> Result<Vec<i64>, pgrx::spi::Error> {
+        let mut out = Vec::with_capacity(requests.len());
+        let mut t = client.select(
+            "INSERT INTO posting_line (trx_line_id, event_type, amount, debit_account, credit_account, posted_at) \
+             SELECT tl, et::posting_event_type, amt, deb, cr, pa::timestamptz \
+               FROM UNNEST($1::bigint[], $2::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::text[]) \
+                    AS t(tl, et, amt, deb, cr, pa) \
+             RETURNING id",
+            None,
+            &[
+                tl_id.into(),
+                event_type.into(),
+                amount.into(),
+                debit.into(),
+                credit.into(),
+                posted_at.into(),
+            ],
+        )?;
+        while let Some(row) = t.next() {
+            out.push(row.get::<i64>(1)?.unwrap_or(0));
+        }
+        Ok(out)
+    })?;
+
+    debug_assert_eq!(ids.len(), requests.len());
+    Ok(ids)
+}
+
+/// 9.8 — Bulk INSERT INTO posting_lines_provisional (acct-s6fa).
+///
+/// One row per wac_periodic depletion in the submission. Skipped when
+/// `provisionals` is empty (no wac_periodic depletions touched).
+#[allow(dead_code)]
+pub fn insert_provisional_postings(
+    provisionals: &[ProvisionalPostingRequest],
+    posting_line_ids: &[i64],
+) -> Result<(), pgrx::spi::Error> {
+    if provisionals.is_empty() {
+        return Ok(());
+    }
+
+    let pl_id: Vec<i64> = provisionals
+        .iter()
+        .map(|p| posting_line_ids[p.posting_line_idx])
+        .collect();
+    let pool_id: Vec<i64> = provisionals.iter().map(|p| p.pool_id).collect();
+    let qty: Vec<i64> = provisionals.iter().map(|p| p.qty).collect();
+    let prov_amount: Vec<i64> = provisionals.iter().map(|p| p.provisional_amount).collect();
+
     Spi::run_with_args(
-        "INSERT INTO posting_line (trx_line_id, event_type, amount, debit_account, credit_account, posted_at) \
-         SELECT tl, et::posting_event_type, amt, deb, cr, pa::timestamptz \
-           FROM UNNEST($1::bigint[], $2::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::text[]) \
-                AS t(tl, et, amt, deb, cr, pa)",
+        "INSERT INTO posting_lines_provisional (posting_line_id, pool_id, qty, provisional_amount) \
+         SELECT pl, pi, q, pa \
+           FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[]) \
+                AS t(pl, pi, q, pa)",
         &[
-            tl_id.into(),
-            event_type.into(),
-            amount.into(),
-            debit.into(),
-            credit.into(),
-            posted_at.into(),
+            pl_id.into(),
+            pool_id.into(),
+            qty.into(),
+            prov_amount.into(),
         ],
     )?;
     Ok(())
@@ -313,6 +365,7 @@ pub fn apply_plan_result(
     let trx_id = insert_trx(trx_type, source_id, posted_at)?;
     let trx_line_ids = insert_trx_lines(trx_id, &plan.trx_lines)?;
     apply_pool_state_mutations(&plan.pool_state_mutations, &trx_line_ids)?;
-    insert_posting_lines(&plan.posting_lines, &trx_line_ids)?;
+    let posting_line_ids = insert_posting_lines(&plan.posting_lines, &trx_line_ids)?;
+    insert_provisional_postings(&plan.provisional_postings, &posting_line_ids)?;
     Ok(trx_id)
 }

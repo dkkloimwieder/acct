@@ -151,15 +151,37 @@ pub struct PostingLineRequest {
     pub posted_at: DateTime<Utc>,
 }
 
+/// Flag emitted by wac_periodic depletions. `posting_line_idx` is an INDEX
+/// into PlanResult.posting_lines; caller resolves to the real posting_line.id
+/// from the INSERT...RETURNING in bulk_write step 7.7, then inserts a
+/// posting_lines_provisional row carrying the provisional amount so the
+/// close hook can recompute variance per row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalPostingRequest {
+    pub posting_line_idx: usize,
+    pub pool_id: i64,
+    /// Depletion qty, positive (abs of the trx_line's signed qty).
+    pub qty: i64,
+    /// Amount that was posted at the mid-period running pool average.
+    pub provisional_amount: i64,
+}
+
 /// Output of plan_apply.
 ///
 /// Caller bulk-writes in FK order per design-v3 §4.2 step 7:
-///   trx → trx_line (RETURNING id) → pool_state (I/U/U/D) → posting_line.
+///   trx → trx_line (RETURNING id) → pool_state (I/U/U/D) → posting_line
+///   (RETURNING id) → posting_lines_provisional.
+///
+/// `provisional_postings` carries the wac_periodic depletion flags (acct-s6fa).
+/// Empty on submissions that touch no wac_periodic pools. Each entry's
+/// `posting_line_idx` indexes into `posting_lines` and the caller resolves it
+/// to the real posting_line.id from the INSERT...RETURNING in bulk_write.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanResult {
     pub trx_lines: Vec<TrxLineOutput>,
     pub pool_state_mutations: Vec<PoolStateMutation>,
     pub posting_lines: Vec<PostingLineRequest>,
+    pub provisional_postings: Vec<ProvisionalPostingRequest>,
 }
 
 impl PlanResult {
@@ -225,7 +247,8 @@ impl PlanResult {
     }
 
     pub fn merge(&mut self, other: PlanResult) {
-        let offset = self.trx_lines.len();
+        let trx_offset = self.trx_lines.len();
+        let posting_offset = self.posting_lines.len();
         self.trx_lines.extend(other.trx_lines);
         for mutation in other.pool_state_mutations {
             self.pool_state_mutations.push(match mutation {
@@ -240,7 +263,7 @@ impl PlanResult {
                     layer_seq,
                     qty,
                     unit_cost,
-                    last_trx_line_idx: last_trx_line_idx + offset,
+                    last_trx_line_idx: last_trx_line_idx + trx_offset,
                 },
                 PoolStateMutation::Upsert {
                     pool_id,
@@ -253,14 +276,18 @@ impl PlanResult {
                     layer_seq,
                     qty,
                     unit_cost,
-                    last_trx_line_idx: last_trx_line_idx + offset,
+                    last_trx_line_idx: last_trx_line_idx + trx_offset,
                 },
                 m @ (PoolStateMutation::Update { .. } | PoolStateMutation::Delete { .. }) => m,
             });
         }
         for mut posting in other.posting_lines {
-            posting.trx_line_idx += offset;
+            posting.trx_line_idx += trx_offset;
             self.posting_lines.push(posting);
+        }
+        for mut provisional in other.provisional_postings {
+            provisional.posting_line_idx += posting_offset;
+            self.provisional_postings.push(provisional);
         }
     }
 }

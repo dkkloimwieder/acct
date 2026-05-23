@@ -24,6 +24,7 @@ use pgrx::prelude::*;
 pgrx::pg_module_magic!();
 
 pub(crate) mod bulk_write;
+pub(crate) mod close_period;
 pub(crate) mod hydration;
 pub(crate) mod ledger_error_map;
 pub(crate) mod pool_lock;

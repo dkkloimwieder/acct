@@ -38,6 +38,7 @@ fn method_strategy() -> impl Strategy<Value = PoolMethod> {
         Just(PoolMethod::Fifo),
         Just(PoolMethod::Lifo),
         Just(PoolMethod::Wac),
+        Just(PoolMethod::WacPeriodic),
         Just(PoolMethod::Std),
         Just(PoolMethod::Specific),
     ]
@@ -73,7 +74,7 @@ fn layers_for_method_strategy(
 ) -> BoxedStrategy<Vec<PoolStateRow>> {
     match method {
         PoolMethod::Std => Just(Vec::new()).boxed(),
-        PoolMethod::Wac => (0i64..=1)
+        PoolMethod::Wac | PoolMethod::WacPeriodic => (0i64..=1)
             .prop_flat_map(|n| {
                 if n == 0 {
                     Just(Vec::new()).boxed()

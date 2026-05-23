@@ -30,6 +30,7 @@ pub(crate) mod lifo;
 pub(crate) mod specific;
 pub(crate) mod standard;
 pub(crate) mod wac;
+pub(crate) mod wac_periodic;
 
 // Shared logic for FIFO / LIFO / specific-id (layered methods).
 pub(crate) mod layered;
@@ -40,7 +41,7 @@ pub(crate) mod seq;
 pub use error::LedgerError;
 pub use method::{plan_apply, PoolMethod};
 pub use plan::{
-    LineType, PlanResult, PoolStateMutation, PostingEventType, PostingLineRequest, TrxLineOutput,
-    TrxLineRequest,
+    LineType, PlanResult, PoolStateMutation, PostingEventType, PostingLineRequest,
+    ProvisionalPostingRequest, TrxLineOutput, TrxLineRequest,
 };
 pub use snapshot::{PoolStateRow, Snapshot};
