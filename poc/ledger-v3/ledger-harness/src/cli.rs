@@ -61,6 +61,22 @@ pub enum Cmd {
         /// caller count (e.g. dev container at 320 vs S5/S6 wanting 1000).
         #[arg(long)]
         max_callers: Option<usize>,
+        /// If set, TRUNCATE all ledger tables and re-seed the pool
+        /// universe with this method assignment before driving. Used
+        /// for cross-method bench (acct-9mgx.{1..5}) to switch the
+        /// existing AllWac universe to AllFifo / AllWacPeriodic / etc.
+        /// without manually invoking seed-pools.
+        #[arg(long, value_enum)]
+        method_mix: Option<MethodMix>,
+        /// Pool universe size for --method-mix reseed (ignored otherwise).
+        #[arg(long, default_value_t = 10_000)]
+        seed_count: usize,
+        /// Distinct SKU count for --method-mix reseed.
+        #[arg(long, default_value_t = 1_000)]
+        seed_skus: usize,
+        /// Distinct location count for --method-mix reseed.
+        #[arg(long, default_value_t = 10)]
+        seed_locations: usize,
     },
     /// Run Path A and Path B against an identical workload and diff
     /// the resulting trx + pool_state tables (design-v3 §8.4).

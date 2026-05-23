@@ -106,15 +106,22 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
             spec.callers, universe_count
         );
     }
-    let submissions = if close_period_at_end {
-        build_submissions_wac_periodic(
+    let submissions = match opts.method_mix {
+        MethodMix::AllWacPeriodic => build_submissions_wac_periodic(
             &spec.workload,
             spec.callers,
             opts.submissions_per_caller,
             run_prefix,
-        )
-    } else {
-        build_submissions(&spec.workload, spec.callers, opts.submissions_per_caller, run_prefix)
+        ),
+        MethodMix::AllFifo => build_submissions_fifo(
+            &spec.workload,
+            spec.callers,
+            opts.submissions_per_caller,
+            run_prefix,
+        ),
+        MethodMix::AllWac | MethodMix::Mixed => {
+            build_submissions(&spec.workload, spec.callers, opts.submissions_per_caller, run_prefix)
+        }
     };
     eprintln!(
         "[equivalence] scenario={} callers={} submissions/caller={} total={}",
@@ -185,7 +192,7 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
         b_elapsed.as_secs_f64()
     );
 
-    let result = diff_snapshots(&direct_snap, &routed_snap, close_period_at_end);
+    let result = diff_snapshots(&direct_snap, &routed_snap, opts.method_mix);
 
     if !result.wac_drifts.is_empty() {
         eprintln!(
@@ -216,22 +223,42 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
         }
     }
 
+    if !result.fifo_drifts.is_empty() {
+        eprintln!(
+            "[equivalence] {} FIFO drift(s) (path-dependent layer consumption under concurrent commit_groups). \
+             FIFO depletions consume oldest layer first; under different commit_group ordering the 'oldest layer' may already be drained, so per-line trx_line breakdown (qty/unit_cost) and pool_state layer composition diverge. \
+             Load-bearing invariants verified separately as errors: per-pool ∑trx_line.qty and ∑pool_state.qty match across paths.",
+            result.fifo_drifts.len()
+        );
+        for w in result.fifo_drifts.iter().take(10) {
+            eprintln!("  {w}");
+        }
+        if result.fifo_drifts.len() > 10 {
+            eprintln!("  ... {} more FIFO drifts suppressed", result.fifo_drifts.len() - 10);
+        }
+    }
+
     let effective_errors = if opts.strict {
-        result.errors.len() + result.wac_drifts.len() + result.wac_periodic_drifts.len()
+        result.errors.len() + result.wac_drifts.len() + result.wac_periodic_drifts.len() + result.fifo_drifts.len()
     } else {
         result.errors.len()
     };
 
     if effective_errors == 0 {
-        let drift_msg = match (result.wac_drifts.is_empty(), result.wac_periodic_drifts.is_empty()) {
-            (true, true) => " (identical)".to_string(),
-            (false, true) => format!(" ({} WAC drift(s) within acct-mcey bound, ignored)", result.wac_drifts.len()),
-            (true, false) => format!(" ({} wac_periodic drift(s) within acct-9mgx.6 bound, ignored)", result.wac_periodic_drifts.len()),
-            (false, false) => format!(
-                " ({} WAC + {} wac_periodic drift(s), ignored)",
-                result.wac_drifts.len(),
-                result.wac_periodic_drifts.len()
-            ),
+        let drifts = [
+            ("WAC", result.wac_drifts.len()),
+            ("wac_periodic", result.wac_periodic_drifts.len()),
+            ("FIFO", result.fifo_drifts.len()),
+        ];
+        let parts: Vec<String> = drifts
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(name, n)| format!("{n} {name}"))
+            .collect();
+        let drift_msg = if parts.is_empty() {
+            " (identical)".to_string()
+        } else {
+            format!(" ({} drift(s), ignored)", parts.join(" + "))
         };
         println!(
             "equivalence OK: scenario={} submissions={} A={} B={} trx{}",
@@ -263,6 +290,12 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
                 eprintln!(
                     "EQUIVALENCE FAILED (strict): {} wac_periodic drifts upgraded to errors",
                     result.wac_periodic_drifts.len()
+                );
+            }
+            if !result.fifo_drifts.is_empty() {
+                eprintln!(
+                    "EQUIVALENCE FAILED (strict): {} FIFO drifts upgraded to errors",
+                    result.fifo_drifts.len()
                 );
             }
         }
@@ -383,6 +416,99 @@ fn build_submissions_wac_periodic(
     subs
 }
 
+/// FIFO-specific workload (acct-9mgx.1).
+///
+/// 2-tick cycle per caller: even tick = receipt (qty=10, varying unit_cost),
+/// odd tick = depletion (qty=-3) on the caller's most-recent receipt pool.
+/// Receipt unit_cost varies per round (10, 17, 24, …) so successive layers
+/// hold distinct costs — depletion-side trx_lines surface per-layer
+/// unit_cost asymmetry that would mask under uniform pricing.
+///
+/// Depletion pattern under qty=-3 (vs receipt qty=10):
+///   - Most depletions consume from a single layer (head qty descends by 3 each cycle).
+///   - Periodically the head layer's remaining qty drops below 3 and the
+///     depletion spans into the next layer, emitting 2 trx_lines and
+///     deleting the head layer.
+/// This mix exercises layer Insert + partial Update + full Delete +
+/// multi-line trx_line emission within the same caller.
+///
+/// **Submission order is caller-major** (caller-0's full ticks 0..per_caller,
+/// then caller-1's, etc.) — NOT tick-major like build_submissions /
+/// build_submissions_wac_periodic. Tick-major produced unsafe commit-group
+/// composition under batch_size_max=50 splitting on s5 (single hot pool):
+/// depletion-heavy groups raced ahead of receipt-heavy groups across the
+/// 4-committer pool and hit InsufficientInventory. In caller-major shape,
+/// each commit_group starts with the caller's first tick (always a receipt),
+/// then safely alternates — stock grows monotonically within every group
+/// regardless of cross-group commit ordering. Safe for any per_caller and
+/// any committer_count.
+///
+/// Path A submits serially in vector order; Path B's router preserves
+/// per-pool order within a commit_group via (posted_at, enqueued_at_micros).
+/// Caller-major ordering does not affect FIFO equivalence semantics — both
+/// paths see the same SUBMISSIONS, just in a different submission-order
+/// shape than the other workloads use.
+fn build_submissions_fifo(
+    workload: &crate::workload::Workload,
+    callers: usize,
+    per_caller: usize,
+    run_prefix: i64,
+) -> Vec<Submission> {
+    let mut rngs: Vec<StdRng> = (0..callers)
+        .map(|c| StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(c as u64)))
+        .collect();
+    let mut subs = Vec::with_capacity(callers * per_caller);
+    let inv = workload.universe.inv_account;
+    let ap = workload.universe.ap_account;
+
+    for caller_id in 0..callers {
+        let mut last_receipt_pool: Option<i64> = None;
+        for tick in 0..per_caller {
+            let is_receipt = tick % 2 == 0;
+            let receipt_uc: i64 = 10 + (tick as i64 / 2) * 7;
+            let source_id = run_prefix + (caller_id as i64) * 1_000_000 + tick as i64;
+            if is_receipt {
+                let lines = workload.next_lines(&mut rngs[caller_id], caller_id);
+                if let Some(l) = lines.first() {
+                    last_receipt_pool = Some(l.pool_id);
+                }
+                let lines: Vec<LineParam> = lines
+                    .into_iter()
+                    .map(|l| LineParam {
+                        qty: 10,
+                        unit_cost: receipt_uc,
+                        ..l
+                    })
+                    .collect();
+                subs.push(Submission {
+                    trx_type: "po_receipt",
+                    source_id,
+                    lines,
+                });
+            } else {
+                let Some(pool_id) = last_receipt_pool else {
+                    continue;
+                };
+                subs.push(Submission {
+                    trx_type: "transfer_shipment",
+                    source_id,
+                    lines: vec![LineParam {
+                        pool_id,
+                        line_type: "transfer_shipment_line",
+                        source_id: Some(2),
+                        qty: -3,
+                        unit_cost: 0,
+                        debit_account: ap,
+                        credit_account: inv,
+                    }],
+                });
+            }
+        }
+    }
+
+    subs
+}
+
 async fn submit_direct(pool: &PgPool, submissions: &[Submission]) -> Result<(), String> {
     let posted_at = "2026-05-21T12:00:00+00:00";
     for s in submissions {
@@ -412,14 +538,24 @@ async fn submit_routed(pool: &PgPool, submissions: &[Submission]) -> Result<(), 
             .await
             .map_err(|e| format!("enqueue_routed trx_type={} sid={}: {e}", s.trx_type, s.source_id))?;
     }
-    // Wait for committer to drain everything.
+    // Wait for committer to drain everything. wait_for_committer_quiet
+    // returns when committer_drains_total stops advancing for 600ms,
+    // but the very last commit_group sometimes lands AFTER that signal —
+    // its drain bump arrives one poll after a "stable" window. Retry
+    // the pending count up to 5× before declaring stuck, with brief
+    // sleeps between (200ms × 5 = 1s extra grace, additive to the 60s cap).
     wait_for_committer_quiet(pool).await;
-    // Verification poll: every submission must have materialized.
-    let pending = submissions_pending_count(pool, submissions).await?;
-    if pending > 0 {
-        return Err(format!(
-            "{pending} submissions failed to materialize within drain window — routed committer is stuck"
-        ));
+    for retry in 0..5 {
+        let pending = submissions_pending_count(pool, submissions).await?;
+        if pending == 0 {
+            return Ok(());
+        }
+        if retry == 4 {
+            return Err(format!(
+                "{pending} submissions failed to materialize within drain window — routed committer is stuck"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     Ok(())
 }
@@ -474,16 +610,9 @@ async fn wait_for_committer_quiet(pool: &PgPool) {
 }
 
 async fn reset_ledger(pool: &PgPool) -> Result<(), String> {
-    sqlx::query(
-        "TRUNCATE TABLE posting_lines_provisional, posting_line_dimension, posting_line, \
-                       trx_line, trx, pool_state, pool_lock, pool, \
-                       sku, location, account, accounting_period \
-                       RESTART IDENTITY CASCADE",
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| format!("TRUNCATE: {e}"))?;
-    Ok(())
+    crate::pool_universe::reset_ledger_tables(pool)
+        .await
+        .map_err(|e| format!("TRUNCATE: {e}"))
 }
 
 /// Seed one accounting_period wide enough to cover all the canned
@@ -744,10 +873,21 @@ struct DiffResult {
     /// depends on commit_group ordering. Pool_state end-state matches
     /// byte-for-byte (the load-bearing invariant); these are noise.
     wac_periodic_drifts: Vec<String>,
+    /// FIFO-specific drifts (acct-9mgx.1). FIFO is path-dependent under
+    /// concurrent commit_groups: per-depletion layer-consumption order
+    /// differs across paths, so per-line trx_line breakdowns (per-layer
+    /// qty + unit_cost) and pool_state layer composition may legitimately
+    /// differ even when total per-pool qty is conserved. Load-bearing
+    /// invariants enforced as errors: (a) ∑trx_line.qty per (trx, pool)
+    /// matches, (b) ∑pool_state.qty per pool matches. Per-row + per-line
+    /// content differences route to this bucket.
+    fifo_drifts: Vec<String>,
 }
 
-fn diff_snapshots(a: &LedgerSnapshot, b: &LedgerSnapshot, wac_periodic_mode: bool) -> DiffResult {
+fn diff_snapshots(a: &LedgerSnapshot, b: &LedgerSnapshot, method_mix: MethodMix) -> DiffResult {
     let mut r = DiffResult::default();
+    let wac_periodic_mode = method_mix == MethodMix::AllWacPeriodic;
+    let fifo_mode = method_mix == MethodMix::AllFifo;
     let a_keys: std::collections::BTreeSet<_> = a.trx_groups.keys().collect();
     let b_keys: std::collections::BTreeSet<_> = b.trx_groups.keys().collect();
 
@@ -773,6 +913,11 @@ fn diff_snapshots(a: &LedgerSnapshot, b: &LedgerSnapshot, wac_periodic_mode: boo
                     || (k.0 == "transfer_shipment" && trx_lines_differ_only_in_cost(av, bv, &a.pool_methods)))
             {
                 r.wac_periodic_drifts.push(msg);
+            } else if fifo_mode
+                && k.0 == "transfer_shipment"
+                && trx_lines_preserve_total_qty_per_pool(av, bv, &a.pool_methods)
+            {
+                r.fifo_drifts.push(msg);
             } else {
                 r.errors.push(msg);
             }
@@ -836,7 +981,47 @@ fn diff_snapshots(a: &LedgerSnapshot, b: &LedgerSnapshot, wac_periodic_mode: boo
 
     // pool_state: compare row-by-row. On WAC pools the unit_cost column
     // is value_sum (acct-h5gs per-method storage); deltas there route to
-    // the wac_drifts bucket, not the errors bucket.
+    // the wac_drifts bucket, not the errors bucket. On FIFO under
+    // concurrent commit_groups, layer composition is path-dependent;
+    // the per-pool aggregate ∑qty invariant is the load-bearing check
+    // (computed below); per-row diffs route to fifo_drifts.
+    if fifo_mode {
+        let a_pool_qty = aggregate_pool_state_qty_per_pool(&a.pool_state);
+        let b_pool_qty = aggregate_pool_state_qty_per_pool(&b.pool_state);
+        let pools: std::collections::BTreeSet<_> = a_pool_qty
+            .keys()
+            .chain(b_pool_qty.keys())
+            .collect();
+        for pid in pools {
+            let aq = a_pool_qty.get(pid).copied().unwrap_or(0);
+            let bq = b_pool_qty.get(pid).copied().unwrap_or(0);
+            if aq != bq {
+                r.errors.push(format!(
+                    "pool_state Σqty for pool {pid} differs: A={aq} B={bq} \
+                     (FIFO total per-pool stock must be conserved across paths)"
+                ));
+            }
+        }
+        if a.pool_state.len() != b.pool_state.len() {
+            r.fifo_drifts.push(format!(
+                "pool_state row count differs: A={} B={} (FIFO layer composition is path-dependent under concurrent commit_groups)",
+                a.pool_state.len(),
+                b.pool_state.len()
+            ));
+        }
+        let n = a.pool_state.len().min(b.pool_state.len());
+        for i in 0..n {
+            let ar = &a.pool_state[i];
+            let br = &b.pool_state[i];
+            if ar != br {
+                r.fifo_drifts.push(format!("pool_state[{i}] A={ar:?} B={br:?}"));
+                if r.fifo_drifts.len() > 50 {
+                    break;
+                }
+            }
+        }
+        return r;
+    }
     if a.pool_state.len() != b.pool_state.len() {
         r.errors.push(format!(
             "pool_state row count differs: A={} B={}",
@@ -902,6 +1087,44 @@ fn aggregate_provisional_per_pool(
         entry.2 += r.provisional_amount + r.variance_amount.unwrap_or(0);
     }
     out
+}
+
+/// Sum of `pool_state.qty` per pool. The FIFO load-bearing invariant:
+/// across paths, total per-pool stock must match even when per-layer
+/// composition diverges under concurrent commit_group ordering.
+fn aggregate_pool_state_qty_per_pool(rows: &[PoolStateRow]) -> HashMap<i64, i64> {
+    let mut out: HashMap<i64, i64> = HashMap::new();
+    for r in rows {
+        *out.entry(r.pool_id).or_insert(0) += r.qty;
+    }
+    out
+}
+
+/// Two depletion-side trx_line vectors on the same (trx_type, source_id)
+/// where per-pool ∑qty matches across the two paths AND every touched
+/// pool's method is FIFO. Used to classify transfer_shipment trx diffs
+/// as fifo_drifts in fifo_mode. Differing layer-breakdown is allowed
+/// (path-dependent FIFO consumption); total qty per pool is the invariant.
+fn trx_lines_preserve_total_qty_per_pool(
+    av: &[TrxLineCanon],
+    bv: &[TrxLineCanon],
+    pool_methods: &HashMap<i64, String>,
+) -> bool {
+    let mut a_per_pool: HashMap<i64, i64> = HashMap::new();
+    let mut b_per_pool: HashMap<i64, i64> = HashMap::new();
+    for l in av {
+        if pool_methods.get(&l.pool_id).map(|s| s.as_str()) != Some("fifo") {
+            return false;
+        }
+        *a_per_pool.entry(l.pool_id).or_insert(0) += l.qty;
+    }
+    for l in bv {
+        if pool_methods.get(&l.pool_id).map(|s| s.as_str()) != Some("fifo") {
+            return false;
+        }
+        *b_per_pool.entry(l.pool_id).or_insert(0) += l.qty;
+    }
+    a_per_pool == b_per_pool
 }
 
 /// Two depletion-side trx_line vectors that differ ONLY in unit_cost on

@@ -73,43 +73,74 @@ async fn main() -> std::process::ExitCode {
             output,
             no_sampler,
             max_callers,
-        } => match path {
-            Path::Direct => {
-                let opts = driver_direct::RunOptions {
-                    dsn: args.dsn,
-                    scenario,
-                    duration: duration.into(),
-                    output,
-                    no_sampler,
-                    max_callers,
-                };
-                match driver_direct::run(opts).await {
-                    Ok(()) => std::process::ExitCode::SUCCESS,
+            method_mix,
+            seed_count,
+            seed_skus,
+            seed_locations,
+        } => {
+            if let Some(mix) = method_mix {
+                let pool = match PgPoolOptions::new()
+                    .max_connections(4)
+                    .acquire_timeout(Duration::from_secs(10))
+                    .connect(&args.dsn)
+                    .await
+                {
+                    Ok(p) => p,
                     Err(e) => {
-                        eprintln!("run direct failed: {e}");
-                        std::process::ExitCode::from(1)
+                        eprintln!("connect (reseed) failed: {e}");
+                        return std::process::ExitCode::from(1);
+                    }
+                };
+                if let Err(e) = pool_universe::reset_ledger_tables(&pool).await {
+                    eprintln!("reseed TRUNCATE failed: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+                if let Err(e) =
+                    pool_universe::seed(&pool, seed_count, seed_skus, seed_locations, mix).await
+                {
+                    eprintln!("reseed seed-pools failed: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+                eprintln!("[run] reseeded {} pools mix={:?} for bench", seed_count, mix);
+            }
+            match path {
+                Path::Direct => {
+                    let opts = driver_direct::RunOptions {
+                        dsn: args.dsn,
+                        scenario,
+                        duration: duration.into(),
+                        output,
+                        no_sampler,
+                        max_callers,
+                    };
+                    match driver_direct::run(opts).await {
+                        Ok(()) => std::process::ExitCode::SUCCESS,
+                        Err(e) => {
+                            eprintln!("run direct failed: {e}");
+                            std::process::ExitCode::from(1)
+                        }
+                    }
+                }
+                Path::Routed => {
+                    let opts = driver_routed::RunOptions {
+                        dsn: args.dsn,
+                        scenario,
+                        duration: duration.into(),
+                        output,
+                        no_sampler,
+                        max_callers,
+                        drain_deadline: Duration::from_secs(30),
+                    };
+                    match driver_routed::run(opts).await {
+                        Ok(()) => std::process::ExitCode::SUCCESS,
+                        Err(e) => {
+                            eprintln!("run routed failed: {e}");
+                            std::process::ExitCode::from(1)
+                        }
                     }
                 }
             }
-            Path::Routed => {
-                let opts = driver_routed::RunOptions {
-                    dsn: args.dsn,
-                    scenario,
-                    duration: duration.into(),
-                    output,
-                    no_sampler,
-                    max_callers,
-                    drain_deadline: Duration::from_secs(30),
-                };
-                match driver_routed::run(opts).await {
-                    Ok(()) => std::process::ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("run routed failed: {e}");
-                        std::process::ExitCode::from(1)
-                    }
-                }
-            }
-        },
+        }
         Cmd::Equivalence {
             scenario,
             submissions_per_caller,

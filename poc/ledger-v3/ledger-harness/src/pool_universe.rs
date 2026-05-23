@@ -13,6 +13,21 @@ use sqlx::PgPool;
 
 use crate::cli::MethodMix;
 
+/// Drop all ledger data so a fresh universe can be seeded. Used by the
+/// equivalence harness and the run subcommand (when --method-mix is set
+/// and the existing universe doesn't match).
+pub async fn reset_ledger_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "TRUNCATE TABLE posting_lines_provisional, posting_line_dimension, posting_line, \
+                       trx_line, trx, pool_state, pool_lock, pool, \
+                       sku, location, account, accounting_period \
+                       RESTART IDENTITY CASCADE",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct PoolUniverse {
     pub pool_ids: Vec<i64>,
