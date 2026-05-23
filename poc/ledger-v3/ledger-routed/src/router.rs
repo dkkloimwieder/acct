@@ -61,7 +61,10 @@ use crate::shmem::{
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_guard;
 use pgrx::pg_sys;
+use pgrx::prelude::*;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::time::Duration;
 
@@ -127,6 +130,89 @@ pub extern "C-unwind" fn ledger_routed_router_main(_arg: pg_sys::Datum) {
     }
 }
 
+// ── Per-pool method cache (acct-aywu) ───────────────────────────────
+//
+// Order-sensitive cost methods (fifo / lifo / specific) can't have
+// their per-pool submissions split across commit_groups — splitting
+// would let sub-groups commit in parallel out of submission order,
+// violating layer/lot consumption order.
+//
+// Cache populates lazily via SPI on first encounter of an unknown
+// pool_id (one SELECT per tick that introduces new pools). pool.method
+// is treated as immutable post-creation; if a pool's method changes,
+// the router restart is the cache-bust mechanism.
+//
+// Cache is per-router-process (single-threaded BGWorker; thread_local
+// suffices). Bounded by the pool universe size — 10k pools at the PoC
+// scale is ~80 KB of HashMap entries.
+
+thread_local! {
+    static POOL_ORDER_SENSITIVE_CACHE: RefCell<HashMap<i64, bool>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Look up `is_order_sensitive` for each requested pool_id, populating
+/// the cache via one SPI call for any not-yet-seen ids. Pools not
+/// found in the DB are cached as `false` (split-safe) so we don't
+/// re-query — the harm of treating a missing FIFO pool as split-safe
+/// is bounded by pool_lock serialization at the committer.
+fn populate_method_cache(pool_ids: &HashSet<i64>) {
+    let unknown: Vec<i64> = POOL_ORDER_SENSITIVE_CACHE.with(|c| {
+        let cache = c.borrow();
+        pool_ids
+            .iter()
+            .filter(|p| !cache.contains_key(*p))
+            .copied()
+            .collect()
+    });
+    if unknown.is_empty() {
+        return;
+    }
+    let ids = unknown.clone();
+    let fetched: Vec<(i64, String)> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::connect(|client| -> Result<Vec<(i64, String)>, pgrx::spi::Error> {
+            let mut out: Vec<(i64, String)> = Vec::new();
+            let mut t = client.select(
+                "SELECT id, method::text FROM pool WHERE id = ANY($1::bigint[])",
+                None,
+                &[ids.into()],
+            )?;
+            while let Some(row) = t.next() {
+                let pid: i64 = row.get::<i64>(1)?.unwrap_or(0);
+                let m: String = row.get::<String>(2)?.unwrap_or_default();
+                out.push((pid, m));
+            }
+            Ok(out)
+        })
+        .unwrap_or_default()
+    }));
+    POOL_ORDER_SENSITIVE_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        for pid in &unknown {
+            cache.insert(*pid, false);
+        }
+        for (pid, method) in fetched {
+            cache.insert(pid, is_order_sensitive_method(&method));
+        }
+    });
+}
+
+/// Maps the cost-method enum text to whether its per-pool depletion
+/// semantics depend on layer/lot consumption order.
+pub(crate) fn is_order_sensitive_method(method: &str) -> bool {
+    matches!(method, "fifo" | "lifo" | "specific")
+}
+
+fn group_must_not_split(group: &[Candidate]) -> bool {
+    POOL_ORDER_SENSITIVE_CACHE.with(|c| {
+        let cache = c.borrow();
+        group
+            .iter()
+            .flat_map(|cand| cand.pool_keys.iter())
+            .any(|pid| cache.get(pid).copied().unwrap_or(false))
+    })
+}
+
 // ── Per-tick pipeline ───────────────────────────────────────────────
 
 /// One scan-and-pack iteration. Returns the number of commit_groups
@@ -180,9 +266,37 @@ fn router_tick() -> u32 {
     let candidates = hydrate_candidates(&candidates_meta);
     let groups = affinity_group(candidates);
 
+    // acct-aywu: ensure the method cache covers every pool touched
+    // this tick before classifying groups as order-sensitive.
+    let mut all_pool_ids: HashSet<i64> = HashSet::new();
+    for g in &groups {
+        for c in g {
+            for k in &c.pool_keys {
+                all_pool_ids.insert(*k);
+            }
+        }
+    }
+    populate_method_cache(&all_pool_ids);
+
     let mut emitted = 0u32;
     'outer: for mut group in groups {
-        let group_chunks = group.len().div_ceil(batch_max as usize);
+        // acct-aywu: order-sensitive pools (fifo / lifo / specific)
+        // can't have their per-pool submissions split across
+        // commit_groups. If any pool in this group is order-sensitive,
+        // emit the whole group as one chunk regardless of batch_max.
+        let must_not_split = group_must_not_split(&group);
+        let chunk_cap = if must_not_split {
+            group.len().max(1)
+        } else {
+            batch_max as usize
+        };
+        if must_not_split {
+            COMMITTER_QUEUE
+                .share()
+                .router_order_sensitive_groups_total
+                .fetch_add(1, Relaxed);
+        }
+        let group_chunks = group.len().div_ceil(chunk_cap);
         if group_chunks > 1 {
             COMMITTER_QUEUE
                 .share()
@@ -190,7 +304,7 @@ fn router_tick() -> u32 {
                 .fetch_add((group_chunks - 1) as u64, Relaxed);
         }
         while !group.is_empty() {
-            let take = group.len().min(batch_max as usize);
+            let take = group.len().min(chunk_cap);
             let chunk: Vec<Candidate> = group.drain(..take).collect();
             match emit_superbatch_chunk(chunk, committer_capacity) {
                 EmitOutcome::Emitted => {
@@ -1102,6 +1216,29 @@ mod tests {
         assert!(try_revert_orphan_staging(&q, 3, &active));
         // valid now == 1 — second call sees the wrong source state
         assert!(!try_revert_orphan_staging(&q, 3, &active));
+    }
+
+    // ── acct-aywu: order-sensitive method classifier ────────────────
+
+    #[test]
+    fn is_order_sensitive_method_classifies_layered_methods() {
+        assert!(is_order_sensitive_method("fifo"));
+        assert!(is_order_sensitive_method("lifo"));
+        assert!(is_order_sensitive_method("specific"));
+    }
+
+    #[test]
+    fn is_order_sensitive_method_classifies_split_safe_methods() {
+        assert!(!is_order_sensitive_method("wac"));
+        assert!(!is_order_sensitive_method("wac_periodic"));
+        assert!(!is_order_sensitive_method("std"));
+    }
+
+    #[test]
+    fn is_order_sensitive_method_unknown_defaults_to_split_safe() {
+        assert!(!is_order_sensitive_method(""));
+        assert!(!is_order_sensitive_method("garbage"));
+        assert!(!is_order_sensitive_method("FIFO"));
     }
 
     #[test]

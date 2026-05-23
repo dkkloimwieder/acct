@@ -1,0 +1,5 @@
+seed-pools: 1000 pools, 1000 skus, 10 locations, mix=AllFifo → seeded
+[run] reseeded 1000 pools mix=AllFifo for bench
+scenario s2: capping callers 200 -> 20 via --max-callers
+scenario s2: routing lock-amortization — 200 callers, zipf(1.5), simple, all-wac (callers=20, duration=30s)
+{"scenario":"s2","path":"routed","throughput_trx_per_sec":1583.2,"ack_p99_us":134610,"committed_p99_us":16693329,"trx_materialized":47570,"attempts":47570,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":7.41,"commit_group_p99":128,"pipeline_ns_avg":3485153,"drains":6421,"window_defers":8,"output":"results/phase6/bench-9mgx1/s2-routed-all-fifo-2026-05-23T15-03-10Z.json"}

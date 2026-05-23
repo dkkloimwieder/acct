@@ -61,6 +61,17 @@ fn ledger_routed_router_max_envelope_count() -> i64 {
         .load(Relaxed) as i64
 }
 
+/// Commit_groups emitted whole (chunking step skipped) because at
+/// least one pool in the group is order-sensitive (fifo / lifo /
+/// specific). Per acct-aywu: order-sensitive groups never split.
+#[pg_extern]
+fn ledger_routed_router_order_sensitive_groups_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .router_order_sensitive_groups_total
+        .load(Relaxed) as i64
+}
+
 // ── Scalar committer counters ───────────────────────────────────────
 
 #[pg_extern]

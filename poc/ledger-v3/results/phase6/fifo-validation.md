@@ -2,24 +2,29 @@
 
 **Issue:** acct-9mgx.1 (P2; sibling of acct-9mgx.{2..6})
 **Run window:** 2026-05-23
-**Equivalence sweep (canonical, committer_count=1):** `results/phase6/equivalence/run-all-fifo-2026-05-23T13-04-03Z.log`
-**Bench (canonical, committer_count=1):** `results/phase6/bench-9mgx1/run-2026-05-23T13-06-47Z.log`
+**Equivalence sweep (canonical, committer_count=1, with acct-aywu):** `results/phase6/equivalence/run-all-fifo-2026-05-23T14-49-38Z.log`
+**Bench (canonical, committer_count=1, with acct-aywu):** `results/phase6/bench-9mgx1/run-2026-05-23T15-03-10Z.log`
+**Pre-aywu reference (cm=1):** `results/phase6/equivalence/run-all-fifo-2026-05-23T13-04-03Z.log` + `bench-9mgx1/run-2026-05-23T13-06-47Z.log`
 
-## ⚠ Current default-config routed FIFO is inconsistent
+## Routed FIFO correctness status
 
-The routed path **does not honor submission-order FIFO under default GUCs** (`ledger_routed.committer_count = 4`, `ledger_routed.batch_size_max = 50`). The router splits a single pool's pending submissions across multiple commit_groups; sub-groups commit in parallel with no inter-sub-group ordering guarantee. Each individual depletion still consumes "oldest layer first" for its local view, but the global trx ordering is reordered — so depletion T₂₀₀ can drain the oldest layer before depletion T₁₀₀ runs, and T₁₀₀ then consumes from a different head layer than it would under serial submission order.
+`committer_count = 1` produces byte-identical FIFO across Path A and Path B (15/15 sweep below). This is the gold-standard correctness baseline.
 
-That is not FIFO. It produces non-deterministic COGS for the same input workload.
+`committer_count = 4` (default) is broken in two distinct ways:
 
-The current PoC ships single-committer (`committer_count = 1`) as the correctness workaround. The design fix — router refuses to split per-pool submissions for `fifo` / `lifo` / `specific` pools — is filed as **acct-aywu**. Until that lands, the routed path's `fifo` cost method requires `committer_count = 1`.
+1. **Intra-window split** — when one router scan finds more than `batch_size_max` submissions for the same FIFO pool, it splits them across multiple commit_groups that commit in parallel with no inter-sub-group ordering. **Fixed by acct-aywu**: router learns each pool's cost method and emits order-sensitive groups (`fifo` / `lifo` / `specific`) whole, regardless of `batch_size_max`. Verified via the new `ledger_routed_router_order_sensitive_groups_total()` counter.
 
-All numbers in this doc are measured under `committer_count = 1`.
+2. **Inter-window race** — across multiple router ticks, two windows can emit independent commit_groups for the same FIFO pool. Those groups race on `trx_line UNIQUE(pool_id, trx_seq)`; pristine-replay excludes the loser, silently dropping one submission per race. Empirically: cm=4 s4 sweep with aywu in place still produces 999/1000 trx (vs 1000/1000 under cm=1). **NOT fixed by aywu** — scoped to **acct-tm09** (per-pool sequence numbers + happens-before DAG).
 
-**This cm=1 sweep is the gold-standard FIFO correctness baseline.** acct-aywu
-and acct-tm09 (the router-side fixes that will lift the cm=1 requirement)
-both pin their acceptance to "re-run this 15-trial sweep under default GUCs
-and verify byte-identical to the cm=1 reference at
-`results/phase6/equivalence/run-all-fifo-2026-05-23T13-04-03Z.log`." Per-run
+Until acct-tm09 lands, default-GUC routed FIFO is still incorrect. cm=1 remains the required production config for the FIFO cost method.
+
+All numbers in this doc are measured under `committer_count = 1` with acct-aywu in place.
+
+**This cm=1 sweep is the gold-standard FIFO correctness baseline.** acct-tm09
+(the router-side fix that will lift the cm=1 requirement) pins its acceptance
+to "re-run this 15-trial sweep under default GUCs and verify byte-identical
+to the cm=1 reference at
+`results/phase6/equivalence/run-all-fifo-2026-05-23T14-49-38Z.log`." Per-run
 equivalence-vs-Path-A is the per-run check; equivalence-vs-cm=1-routed is
 the regression check that catches any cm-dependent divergence the Path-A
 comparison would miss.
@@ -81,40 +86,58 @@ acct-h5gs / 9mgx.5 WAC validation: trx, trx_line, pool_state, and
 posting_line all match byte-for-byte across paths in every run, lenient
 and strict.
 
-## Cross-method bench — s2 + s5 × direct + routed × AllFifo + AllWac, committer_count=1
+## Cross-method bench — s2 + s5 × direct + routed × AllFifo + AllWac, committer_count=1 (post-aywu)
 
 20 callers, 30s duration, 1000-pool universe. Per-run JSONs in
 `results/phase6/bench-9mgx1/`.
 
 | Scenario | Path     | Method     | Throughput (tx/s) | p99 ack (ms) | Commits |
 |----------|----------|------------|------------------:|-------------:|--------:|
-| s2       | direct   | wac        |             589.0 |        111.7 |  17 657 |
-| s2       | direct   | **fifo**   |             439.3 |        173.0 |  13 271 |
-| s2       | routed   | wac        |           1 506.1 |        104.7 |  45 257 |
-| s2       | routed   | **fifo**   |           1 444.6 |        111.6 |  43 363 |
-| s5       | direct   | wac        |             304.6 |         80.5 |   9 242 |
-| s5       | direct   | **fifo**   |             207.8 |        148.9 |   6 333 |
-| s5       | routed   | wac        |           1 817.9 |         64.4 |  54 553 |
-| s5       | routed   | **fifo**   |           1 714.6 |         82.9 |  51 443 |
+| s2       | direct   | wac        |             617.5 |         95.0 |  18 485 |
+| s2       | direct   | **fifo**   |             451.4 |        162.9 |  13 622 |
+| s2       | routed   | wac        |           1 459.2 |        108.1 |  43 829 |
+| s2       | routed   | **fifo**   |           1 583.2 |        134.6 |  47 570 |
+| s5       | direct   | wac        |             294.7 |         95.3 |   8 832 |
+| s5       | direct   | **fifo**   |             194.8 |        175.9 |   5 966 |
+| s5       | routed   | wac        |           1 732.0 |         66.2 |  52 047 |
+| s5       | routed   | **fifo**   |           2 037.7 |        241.3 |  61 138 |
 
 **FIFO direct-path overhead is real and bounded.** On the direct path
-FIFO trails WAC by ~25-32% (439 vs 589 on s2; 208 vs 305 on s5) due
-to per-event sequential layer consumption (each depletion's plan_apply
+FIFO trails WAC by ~27-34% (451 vs 618 on s2; 195 vs 295 on s5) due to
+per-event sequential layer consumption (each depletion's plan_apply
 walks layers and emits one trx_line per layer touched; WAC emits one
 trx_line per depletion regardless of layer count). p99 ack latency
-follows the same shape (~1.5× WAC on direct).
+follows the same shape (~1.7-1.9× WAC on direct).
 
-**FIFO routed-path is within 4-6% of WAC** (1445 vs 1506 on s2; 1715 vs
-1818 on s5). Commit-group amortization neutralizes FIFO's per-event
-overhead; the residual gap is FIFO's bulk-write of per-layer trx_lines
-+ pool_state UPDATE/DELETE vs WAC's two-row pool_state UPSERT.
+**Routed FIFO now BEATS routed WAC** (1583 vs 1459 on s2; 2038 vs 1732
+on s5). The aywu no-split rule packs order-sensitive pools into much
+larger commit_groups (s5 routed fifo `commit_group_avg = 123.8` vs
+WAC's `37.96`) which amortizes the per-batch fixed cost more
+aggressively. The cm=1 single-committer config means WAC's potential
+cross-pool parallelism is unavailable to either method, so the larger
+average commit_group is pure win for FIFO. p99 ack latency goes up
+correspondingly (241ms on s5 routed fifo vs 66ms WAC) — that's the
+straightforward latency cost of preserving submission order: bigger
+groups take longer to pipeline. Under cm=4 + acct-tm09, WAC would
+likely reclaim its throughput lead via cross-pool parallelism.
 
-**Routed beats direct in every cell** (3-8× throughput). Routed-path
-amortization wins for both methods even under the correctness-forced
-`committer_count = 1` configuration.
+**Routed beats direct in every cell** (3-10× throughput).
 
 `committed_p99_us` (routed) is dominated by queue residency (submissions
 sit in the staging queue until their batch drains), not per-trx work.
+
+### Pre-aywu cm=1 numbers (for delta reference)
+
+| Scenario | Path     | Method     | tx/s pre-aywu | tx/s post-aywu | Δ        |
+|----------|----------|------------|--------------:|---------------:|---------:|
+| s2       | routed   | wac        |       1 506.1 |        1 459.2 | −3 %     |
+| s2       | routed   | **fifo**   |       1 444.6 |        1 583.2 | **+10 %**|
+| s5       | routed   | wac        |       1 817.9 |        1 732.0 | −5 %     |
+| s5       | routed   | **fifo**   |       1 714.6 |        2 037.7 | **+19 %**|
+
+WAC deltas are within run-to-run noise (WAC pools still split at
+batch_size_max=50; aywu does not change WAC behavior). FIFO gains track
+the predicted no-split throughput win, larger on the hotter pool (s5).
 
 ## Bench under broken default config (for reference; not the canonical numbers)
 
@@ -124,16 +147,18 @@ broken FIFO behavior** (non-deterministic COGS) and are kept here only
 to quantify the correctness/throughput trade-off the routed path
 currently pays:
 
-| Scenario | Path     | Method     | Throughput (tx/s) cm=4 | Δ vs cm=1 |
-|----------|----------|------------|----------------------:|----------:|
-| s2       | routed   | fifo (BROKEN) |              1 933.0 |     +34 % |
-| s2       | routed   | wac        |               1 849.3 |     +23 % |
-| s5       | routed   | fifo (BROKEN) |              1 790.6 |      +4 % |
-| s5       | routed   | wac        |               2 131.3 |     +17 % |
+| Scenario | Path     | Method     | Throughput (tx/s) cm=4 | Δ vs cm=1 post-aywu |
+|----------|----------|------------|----------------------:|--------------------:|
+| s2       | routed   | fifo (BROKEN) |              1 933.0 |              +22 % |
+| s2       | routed   | wac        |               1 849.3 |              +27 % |
+| s5       | routed   | fifo (BROKEN) |              1 790.6 |              −12 % |
+| s5       | routed   | wac        |               2 131.3 |              +23 % |
 
-The 34% FIFO gap on s2 is the cost of correctness. acct-aywu's per-pool
-no-split routing should recover most of it (cross-pool parallelism
-restored while order-sensitive pools stay single-group).
+acct-aywu has CLOSED the cm=1-vs-broken-cm=4 throughput gap for FIFO
+on s5 (post-aywu cm=1 fifo at 2037 tx/s actually BEATS the cm=4 broken
+number of 1791 tx/s). s2 still trails the broken cm=4 number by 22%,
+which is the cross-pool parallelism that cm=4 unlocks but cm=1 can't
+use — recovered by acct-tm09 once it lands.
 
 Broken-config sweep + bench logs preserved at
 `results/phase6/equivalence/run-all-fifo-2026-05-23T12-31-44Z.log` and
@@ -142,10 +167,17 @@ audit; not the canonical reference.
 
 ## Cross-references
 
-- **acct-aywu** (open, P1, this work's followup) — router-side fix to
-  stop splitting per-pool submissions across commit_groups for
-  order-sensitive cost methods. Removes the `committer_count = 1`
-  requirement and restores cross-pool routed parallelism.
+- **acct-aywu** (closed 2026-05-23, this work's followup) — router-side
+  fix to stop splitting per-pool submissions across commit_groups for
+  order-sensitive cost methods (intra-window). LANDED. Closes the
+  intra-window split but does not address the inter-window race;
+  cm=1 is still required until acct-tm09 lands. Exposed
+  `ledger_routed_router_order_sensitive_groups_total()` as the
+  attribution counter.
+- **acct-tm09** (open, P1) — inter-window per-pool sequence numbers
+  and happens-before DAG. The remaining barrier to default-GUC routed
+  FIFO correctness. After tm09, the cm=1 requirement is fully lifted
+  and routed FIFO regains cross-pool parallelism.
 - **acct-h5gs** (closed, 2026-05-22) — WAC cumulative-sum form. Key
   contrast with FIFO: WAC's storage form is commutative under receipts
   and bounded-rounding-only on depletions (correct under any
@@ -169,7 +201,7 @@ audit; not the canonical reference.
 ## Harness invocation
 
 ```bash
-# REQUIRED for correct FIFO on routed path:
+# REQUIRED for correct FIFO on routed path (until acct-tm09 lands):
 docker exec acct-postgres psql -U acct -d poc_v3 \
     -c "ALTER SYSTEM SET ledger_routed.committer_count = 1;"
 docker restart acct-postgres
@@ -208,8 +240,9 @@ cargo run --release -p ledger-harness -- run \
 
 ## What's deferred
 
-- **acct-aywu** — router-side fix (the real solution; this PoC ships
-  single-committer as the interim workaround).
+- **acct-tm09** — router-side fix for inter-window per-pool ordering;
+  the last barrier to default-GUC routed FIFO correctness. The cm=1
+  workaround stays in place until tm09 lands.
 - **acct-9mgx.7** (cross-method roll-up doc).
 - **Per-method `run` workload variants**: the run subcommand still uses
   the all-receipts po_receipt workload regardless of method-mix. A
@@ -217,5 +250,5 @@ cargo run --release -p ledger-harness -- run \
   characterize FIFO depletion throughput specifically — deferred as a
   follow-up if perf numbers warrant.
 - **Single-committer CI gating**: this PoC documents the requirement
-  but does not enforce it via test setup. acct-aywu obsoletes the
+  but does not enforce it via test setup. acct-tm09 obsoletes the
   requirement entirely.

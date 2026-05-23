@@ -1,0 +1,53 @@
+==> bench timestamp: 2026-05-23T15-03-10Z
+==> outdir: results/phase6/bench-9mgx1
+
+==> s2 direct all-fifo at 15:03:10
+    exit=0 json=results/phase6/bench-9mgx1/s2-direct-all-fifo-2026-05-23T15-03-10Z.json
+    | scenario s2: capping callers 200 -> 20 via --max-callers
+    | scenario s2: routing lock-amortization — 200 callers, zipf(1.5), simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s2","path":"direct","throughput_trx_per_sec":451.4,"p99_us":162922,"commits":13618,"attempts":13622,"errors":0,"output":"results/phase6/bench-9mgx1/s2-direct-all-fifo-2026-05-23T15-03-10Z.json"}
+
+==> s2 direct all-wac at 15:03:49
+    exit=0 json=results/phase6/bench-9mgx1/s2-direct-all-wac-2026-05-23T15-03-10Z.json
+    | scenario s2: capping callers 200 -> 20 via --max-callers
+    | scenario s2: routing lock-amortization — 200 callers, zipf(1.5), simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s2","path":"direct","throughput_trx_per_sec":617.5,"p99_us":94961,"commits":18485,"attempts":18575,"errors":0,"output":"results/phase6/bench-9mgx1/s2-direct-all-wac-2026-05-23T15-03-10Z.json"}
+
+==> s2 routed all-fifo at 15:04:28
+    exit=0 json=results/phase6/bench-9mgx1/s2-routed-all-fifo-2026-05-23T15-03-10Z.json
+    | scenario s2: capping callers 200 -> 20 via --max-callers
+    | scenario s2: routing lock-amortization — 200 callers, zipf(1.5), simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s2","path":"routed","throughput_trx_per_sec":1583.2,"ack_p99_us":134610,"committed_p99_us":16693329,"trx_materialized":47570,"attempts":47570,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":7.41,"commit_group_p99":128,"pipeline_ns_avg":3485153,"drains":6421,"window_defers":8,"output":"results/phase6/bench-9mgx1/s2-routed-all-fifo-2026-05-23T15-03-10Z.json"}
+
+==> s2 routed all-wac at 15:05:17
+    exit=0 json=results/phase6/bench-9mgx1/s2-routed-all-wac-2026-05-23T15-03-10Z.json
+    | scenario s2: capping callers 200 -> 20 via --max-callers
+    | scenario s2: routing lock-amortization — 200 callers, zipf(1.5), simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s2","path":"routed","throughput_trx_per_sec":1459.2,"ack_p99_us":108068,"committed_p99_us":19360907,"trx_materialized":43829,"attempts":43829,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":7.47,"commit_group_p99":63,"pipeline_ns_avg":3761087,"drains":5869,"window_defers":9,"output":"results/phase6/bench-9mgx1/s2-routed-all-wac-2026-05-23T15-03-10Z.json"}
+
+==> s5 direct all-fifo at 15:06:04
+    exit=0 json=results/phase6/bench-9mgx1/s5-direct-all-fifo-2026-05-23T15-03-10Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"direct","throughput_trx_per_sec":194.8,"p99_us":175898,"commits":5966,"attempts":5872,"errors":0,"output":"results/phase6/bench-9mgx1/s5-direct-all-fifo-2026-05-23T15-03-10Z.json"}
+
+==> s5 direct all-wac at 15:06:43
+    exit=0 json=results/phase6/bench-9mgx1/s5-direct-all-wac-2026-05-23T15-03-10Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"direct","throughput_trx_per_sec":294.7,"p99_us":95289,"commits":8832,"attempts":8868,"errors":0,"output":"results/phase6/bench-9mgx1/s5-direct-all-wac-2026-05-23T15-03-10Z.json"}
+
+==> s5 routed all-fifo at 15:07:22
+    exit=0 json=results/phase6/bench-9mgx1/s5-routed-all-fifo-2026-05-23T15-03-10Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"routed","throughput_trx_per_sec":2037.7,"ack_p99_us":241303,"committed_p99_us":15669919,"trx_materialized":61138,"attempts":61138,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":123.76,"commit_group_p99":128,"pipeline_ns_avg":85396464,"drains":494,"window_defers":82,"output":"results/phase6/bench-9mgx1/s5-routed-all-fifo-2026-05-23T15-03-10Z.json"}
+
+==> s5 routed all-wac at 15:08:16
+    exit=0 json=results/phase6/bench-9mgx1/s5-routed-all-wac-2026-05-23T15-03-10Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"routed","throughput_trx_per_sec":1732.0,"ack_p99_us":66191,"committed_p99_us":15242100,"trx_materialized":52047,"attempts":52047,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":37.96,"commit_group_p99":63,"pipeline_ns_avg":23278616,"drains":1371,"window_defers":105,"output":"results/phase6/bench-9mgx1/s5-routed-all-wac-2026-05-23T15-03-10Z.json"}
+
+==> bench complete at 15:09:06
+==> index: results/phase6/bench-9mgx1/run-2026-05-23T15-03-10Z.log

@@ -156,7 +156,11 @@ pub struct CommitterQueue {
     // ── Router stats ───────────────────────────────────────────────
     pub router_superbatch_count: AtomicU64,
     pub router_total_envelopes: AtomicU64,
-    pub router_force_pack_count: AtomicU64,
+    /// Number of commit_groups emitted without applying the
+    /// `batch_size_max` chunking step because at least one pool in the
+    /// group is order-sensitive (fifo / lifo / specific). Read by
+    /// `ledger_routed_router_order_sensitive_groups_total`. See acct-aywu.
+    pub router_order_sensitive_groups_total: AtomicU64,
     pub router_ticks_total: AtomicU64,
     pub router_entries_scanned_total: AtomicU64,
     pub committer_drains_total: AtomicU64,
