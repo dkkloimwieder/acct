@@ -40,6 +40,13 @@ pub const LEDGER_V3_SPILLOVER_ARENA_BYTES: usize =
     LEDGER_V3_SPILLOVER_ARENA_MB * 1024 * 1024;
 pub const LEDGER_V3_COMMITTER_IDENTITY_SLOTS: usize = 64;
 
+/// acct-tm09: per-pool sequence-number table size. Pool_ids are dense
+/// BIGINT IDENTITY values starting at 1; the PoC seeds <= 10k pools so
+/// 16384 slots leaves headroom. Production deployments with >16384
+/// pools must move to a hash-keyed scheme (filed as acct-xjhq-followup
+/// if it surfaces). Out-of-range pool_id raises ERROR.
+pub const LEDGER_V3_POOL_SEQ_TABLE_SIZE: usize = 16384;
+
 // ── StagingEntry / StagingQueue ─────────────────────────────────────
 
 #[repr(C)]
@@ -143,6 +150,13 @@ pub struct CommitterQueueEntry {
     pub committer_acquired_at_ns: AtomicU64,
     pub committer_tx_id: AtomicU64,
     pub enqueued_at_micros: u64,
+    /// acct-tm09: arena offset to u64[pool_keys_count] of per-pool
+    /// sequence numbers, parallel to the pool_keys array. Value 0 in a
+    /// slot means "no wait" (pool is split-safe; tm09 doesn't sequence
+    /// it). When `pool_seqs_offset == 0` the entire group is
+    /// split-safe and no per-pool wait is needed.
+    pub pool_seqs_offset: u32,
+    pub _pad_seqs: [u8; 4],
 }
 
 #[repr(C, align(64))]
@@ -235,6 +249,19 @@ pub struct CommitterQueue {
     pub committer_stage_bulk_insert_ns: AtomicU64,
     pub committer_stage_post_ns: AtomicU64,
 
+    // ── tm09 predecessor-wait observability ────────────────────────
+    /// Number of order-sensitive pool waits the committer entered
+    /// (incremented per (commit_group, pool) that needed any wait).
+    pub committer_tm09_waits_total: AtomicU64,
+    /// Number of times the predecessor wait hit the committer_lease_ms
+    /// deadline. Indicates upstream commit_groups are not making
+    /// progress (router emit failure that didn't roll-forward seqs,
+    /// dead committer awaiting takeover, etc).
+    pub committer_tm09_wait_timeouts_total: AtomicU64,
+    /// Cumulative nanoseconds spent in the tm09 predecessor wait loop
+    /// across all committers since extension load.
+    pub committer_tm09_wait_ns_total: AtomicU64,
+
     // ── Committer identity slots ───────────────────────────────────
     pub identity_slots: [CommitterIdentitySlot; LEDGER_V3_COMMITTER_IDENTITY_SLOTS],
     pub entries: [CommitterQueueEntry; LEDGER_V3_COMMITTER_QUEUE_SIZE],
@@ -292,6 +319,40 @@ impl Default for SpilloverArena {
 
 unsafe impl PGRXSharedMemory for SpilloverArena {}
 
+// ── PoolSeqTable (acct-tm09) ────────────────────────────────────────
+//
+// Per-pool sequence-number table for inter-window FIFO ordering.
+// Layout: two parallel atomic arrays indexed by pool_id directly.
+//   latest_assigned[pool_id]  — monotonic counter; router fetch_add
+//                               when emitting a commit_group that
+//                               touches the pool (only for
+//                               order-sensitive pools).
+//   latest_committed[pool_id] — committer bumps after the commit_group
+//                               COMMITs; lazily advanced (CAS-monotonic).
+//
+// Committer blocks on `latest_committed[pi] >= my_seq[pi] - 1` for
+// every order-sensitive pool in its commit_group BEFORE acquiring
+// pool_lock. Per-pool wait — disjoint-pool commit_groups don't
+// serialize.
+//
+// Zero-init is the correct initial state. Postmaster restart wipes
+// shmem; no DB seeding needed since assigned/committed seqs are
+// router-side ordering tokens, not persisted trx_seqs.
+
+#[repr(C, align(64))]
+pub struct PoolSeqTable {
+    pub latest_assigned: [AtomicU64; LEDGER_V3_POOL_SEQ_TABLE_SIZE],
+    pub latest_committed: [AtomicU64; LEDGER_V3_POOL_SEQ_TABLE_SIZE],
+}
+
+impl Default for PoolSeqTable {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+unsafe impl PGRXSharedMemory for PoolSeqTable {}
+
 // ── PgLwLock statics ────────────────────────────────────────────────
 
 use pgrx::PgLwLock;
@@ -302,6 +363,75 @@ pub static COMMITTER_QUEUE: PgLwLock<CommitterQueue> =
     unsafe { PgLwLock::new(c"ledger_v3_committer_queue") };
 pub static SPILLOVER_ARENA: PgLwLock<SpilloverArena> =
     unsafe { PgLwLock::new(c"ledger_v3_spillover_arena") };
+pub static POOL_SEQ_TABLE: PgLwLock<PoolSeqTable> =
+    unsafe { PgLwLock::new(c"ledger_v3_pool_seq_table") };
+
+// ── Pool-seq helpers (acct-tm09) ────────────────────────────────────
+
+/// Map pool_id to a slot index. Returns Err for out-of-range pool_ids.
+/// pool_id 0 is invalid (BIGINT IDENTITY starts at 1) and treated as
+/// out-of-range so a stray 0 surfaces as a bug instead of silently
+/// aliasing slot 0.
+#[inline]
+pub(crate) fn pool_seq_idx(pool_id: i64) -> Result<usize, String> {
+    if pool_id <= 0 {
+        return Err(format!("tm09: invalid pool_id {pool_id} (must be > 0)"));
+    }
+    let idx = pool_id as usize;
+    if idx >= LEDGER_V3_POOL_SEQ_TABLE_SIZE {
+        return Err(format!(
+            "tm09: pool_id {} exceeds POOL_SEQ_TABLE_SIZE {}",
+            pool_id, LEDGER_V3_POOL_SEQ_TABLE_SIZE
+        ));
+    }
+    Ok(idx)
+}
+
+/// Atomically allocate the next sequence number for `pool_id`. Returns
+/// Err if pool_id is out of range. Called by the router exactly once
+/// per (commit_group × order-sensitive pool).
+#[allow(dead_code)]
+pub(crate) fn assign_pool_seq(pool_id: i64) -> Result<u64, String> {
+    use std::sync::atomic::Ordering::AcqRel;
+    let idx = pool_seq_idx(pool_id)?;
+    let table = POOL_SEQ_TABLE.share();
+    Ok(table.latest_assigned[idx].fetch_add(1, AcqRel) + 1)
+}
+
+/// Read the latest committed sequence number for `pool_id`. Returns 0
+/// for out-of-range pool_ids (treated as "nothing committed yet").
+#[allow(dead_code)]
+pub(crate) fn pool_seq_committed_load(pool_id: i64) -> u64 {
+    use std::sync::atomic::Ordering::Acquire;
+    let idx = match pool_seq_idx(pool_id) {
+        Ok(i) => i,
+        Err(_) => return 0,
+    };
+    let table = POOL_SEQ_TABLE.share();
+    table.latest_committed[idx].load(Acquire)
+}
+
+/// Advance latest_committed[pool_id] to `new_seq` via CAS-monotonic
+/// max. Lazy: if another committer already bumped past us (e.g., we're
+/// closing the gap on a failed seq via roll-forward), this is a no-op.
+#[allow(dead_code)]
+pub(crate) fn pool_seq_commit_advance(pool_id: i64, new_seq: u64) {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let idx = match pool_seq_idx(pool_id) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let table = POOL_SEQ_TABLE.share();
+    let mut cur = table.latest_committed[idx].load(Relaxed);
+    while new_seq > cur {
+        match table.latest_committed[idx]
+            .compare_exchange(cur, new_seq, Release, Relaxed)
+        {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+}
 
 // ── Backpressure CV plumbing ────────────────────────────────────────
 //
@@ -391,4 +521,39 @@ pub(crate) fn now_us() -> u64 {
 #[allow(dead_code)]
 pub(crate) fn now_ns() -> u64 {
     now_us().saturating_mul(1000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_seq_idx_accepts_first_valid_pool_id() {
+        assert_eq!(pool_seq_idx(1).expect("pool_id=1 valid"), 1);
+    }
+
+    #[test]
+    fn pool_seq_idx_accepts_last_valid_pool_id() {
+        let last = (LEDGER_V3_POOL_SEQ_TABLE_SIZE - 1) as i64;
+        assert_eq!(pool_seq_idx(last).expect("last id valid"), last as usize);
+    }
+
+    #[test]
+    fn pool_seq_idx_rejects_zero() {
+        // BIGINT IDENTITY starts at 1; 0 is reserved as "no pool".
+        assert!(pool_seq_idx(0).is_err());
+    }
+
+    #[test]
+    fn pool_seq_idx_rejects_negative() {
+        assert!(pool_seq_idx(-1).is_err());
+        assert!(pool_seq_idx(i64::MIN).is_err());
+    }
+
+    #[test]
+    fn pool_seq_idx_rejects_overflow() {
+        let overflow = LEDGER_V3_POOL_SEQ_TABLE_SIZE as i64;
+        assert!(pool_seq_idx(overflow).is_err());
+        assert!(pool_seq_idx(i64::MAX).is_err());
+    }
 }

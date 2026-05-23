@@ -72,6 +72,39 @@ fn ledger_routed_router_order_sensitive_groups_total() -> i64 {
         .load(Relaxed) as i64
 }
 
+/// acct-tm09: count of commit_groups whose committer entered the
+/// per-pool predecessor wait loop (incremented once per group that
+/// actually slept, not once per touched OS pool).
+#[pg_extern]
+fn ledger_routed_committer_tm09_waits_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_tm09_waits_total
+        .load(Relaxed) as i64
+}
+
+/// acct-tm09: count of committer waits that hit the committer_lease_ms
+/// deadline without seeing predecessor commit. Indicates a stuck or
+/// abandoned predecessor seq (router emit roll-forward bug, dead
+/// committer awaiting takeover, etc).
+#[pg_extern]
+fn ledger_routed_committer_tm09_wait_timeouts_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_tm09_wait_timeouts_total
+        .load(Relaxed) as i64
+}
+
+/// acct-tm09: cumulative nanoseconds spent in the per-pool predecessor
+/// wait loop across all committers since extension load.
+#[pg_extern]
+fn ledger_routed_committer_tm09_wait_ns_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_tm09_wait_ns_total
+        .load(Relaxed) as i64
+}
+
 // ── Scalar committer counters ───────────────────────────────────────
 
 #[pg_extern]

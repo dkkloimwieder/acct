@@ -1,0 +1,5 @@
+seed-pools: 1000 pools, 1000 skus, 10 locations, mix=AllFifo → seeded
+[run] reseeded 1000 pools mix=AllFifo for bench
+scenario s5: capping callers 1000 -> 20 via --max-callers
+scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+{"scenario":"s5","path":"routed","throughput_trx_per_sec":2266.6,"ack_p99_us":216530,"committed_p99_us":14545846,"trx_materialized":68149,"attempts":68149,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":140.22,"commit_group_p99":128,"pipeline_ns_avg":359257817,"drains":486,"window_defers":83,"output":"results/phase6/bench-9mgx1/s5-routed-all-fifo-2026-05-23T15-46-50Z.json"}

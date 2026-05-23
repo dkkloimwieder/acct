@@ -213,6 +213,18 @@ fn group_must_not_split(group: &[Candidate]) -> bool {
     })
 }
 
+/// acct-tm09 lookup helper. Reads the cache populated by
+/// `populate_method_cache`. Returns false for unknown pools
+/// (defensively: missing cache entry means we couldn't tell, so don't
+/// gate ordering on it). The router always populates the cache for
+/// every pool in the current tick before this is called.
+fn pool_is_order_sensitive(pool_id: i64) -> bool {
+    POOL_ORDER_SENSITIVE_CACHE.with(|c| {
+        let cache = c.borrow();
+        cache.get(&pool_id).copied().unwrap_or(false)
+    })
+}
+
 // ── Per-tick pipeline ───────────────────────────────────────────────
 
 /// One scan-and-pack iteration. Returns the number of commit_groups
@@ -362,12 +374,38 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
     pool_union_sorted.sort();
     let pool_keys_count = pool_union_sorted.len() as u16;
 
-    let arena_alloc =
-        allocate_superbatch_arena(envelope_count, &packed, pool_keys_count, &pool_union_sorted);
-    let (staging_offsets_off, pool_keys_off) = match arena_alloc {
+    // acct-tm09: assign per-pool sequence numbers for order-sensitive
+    // pools. Non-OS pools get 0 (no wait). If any OS pool exists in
+    // the group, the seqs array is allocated in arena and stamped on
+    // the CQE; committer reads it at claim time and waits on
+    // predecessor commits before acquiring pool_lock.
+    let pool_seqs: Vec<u64> = pool_union_sorted
+        .iter()
+        .map(|&pid| {
+            if pool_is_order_sensitive(pid) {
+                crate::shmem::assign_pool_seq(pid).unwrap_or(0)
+            } else {
+                0
+            }
+        })
+        .collect();
+    let any_os_seq = pool_seqs.iter().any(|&s| s > 0);
+    let seqs_arg: Option<&[u64]> = if any_os_seq { Some(&pool_seqs) } else { None };
+
+    let arena_alloc = allocate_superbatch_arena(
+        envelope_count,
+        &packed,
+        pool_keys_count,
+        &pool_union_sorted,
+        seqs_arg,
+    );
+    let (staging_offsets_off, pool_keys_off, pool_seqs_off) = match arena_alloc {
         Some(t) => t,
         None => {
             rollback_packed_to_pending(&packed);
+            if any_os_seq {
+                rollforward_failed_pool_seqs(&pool_union_sorted, &pool_seqs);
+            }
             return EmitOutcome::Exhausted;
         }
     };
@@ -395,6 +433,7 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
             slot.staging_entry_offsets = staging_offsets_off;
             slot.pool_keys_offset = pool_keys_off;
             slot.pool_keys_count = pool_keys_count;
+            slot.pool_seqs_offset = pool_seqs_off;
             slot.committer_bgw_slot.store(u32::MAX, Relaxed);
             slot.committer_bgw_generation.store(0, Relaxed);
             slot.committer_acquired_at_ns.store(0, Relaxed);
@@ -412,7 +451,10 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
         Some(id) => id,
         None => {
             rollback_packed_to_pending(&packed);
-            free_superbatch_arena(staging_offsets_off, pool_keys_off);
+            free_superbatch_arena(staging_offsets_off, pool_keys_off, pool_seqs_off);
+            if any_os_seq {
+                rollforward_failed_pool_seqs(&pool_union_sorted, &pool_seqs);
+            }
             return EmitOutcome::Exhausted;
         }
     };
@@ -642,18 +684,23 @@ fn hydrate_candidates(metas: &[CandidateMeta]) -> Vec<Candidate> {
 
 // ── Arena ownership ─────────────────────────────────────────────────
 
-/// Allocate the two commit_group-owned arena blocks atomically — if
-/// either fails, free whatever succeeded and return None. Writes the
-/// block contents on success.
+/// Allocate the commit_group-owned arena blocks atomically — if any
+/// allocation fails, free whatever succeeded and return None. Writes
+/// the block contents on success.
 ///
 /// Block 1: staging_indices (envelope_count × u32 LE)
 /// Block 2: pool_keys (pool_keys_count × i64 LE, sorted, deduplicated)
+/// Block 3 (acct-tm09, optional): pool_seqs (pool_keys_count × u64 LE,
+///   parallel to pool_keys; per-pool sequence number, 0 = no wait).
+///   Allocated only when `pool_seqs` is `Some`; returns 0 in the third
+///   slot otherwise.
 fn allocate_superbatch_arena(
     envelope_count: u16,
     packed: &[Candidate],
     pool_keys_count: u16,
     pool_sorted: &[i64],
-) -> Option<(u32, u32)> {
+    pool_seqs: Option<&[u64]>,
+) -> Option<(u32, u32, u32)> {
     let mut arena = SPILLOVER_ARENA.exclusive();
     let offsets_bytes = (envelope_count as u32) * 4;
     let so_off = arena.alloc(offsets_bytes.max(1))?;
@@ -670,6 +717,22 @@ fn allocate_superbatch_arena(
         0
     };
 
+    let seqs_off = match pool_seqs {
+        Some(_seqs) if pool_keys_count > 0 => {
+            match arena.alloc(pool_keys_count as u32 * 8) {
+                Some(v) => v,
+                None => {
+                    arena.free(so_off);
+                    if pool_off != 0 {
+                        arena.free(pool_off);
+                    }
+                    return None;
+                }
+            }
+        }
+        _ => 0,
+    };
+
     let mut so_buf: Vec<u8> = Vec::with_capacity(offsets_bytes as usize);
     for cand in packed {
         so_buf.extend_from_slice(&cand.staging_idx.to_le_bytes());
@@ -684,7 +747,17 @@ fn allocate_superbatch_arena(
         arena.write_bytes(pool_off, &pool_buf);
     }
 
-    Some((so_off, pool_off))
+    if let Some(seqs) = pool_seqs {
+        if seqs_off != 0 {
+            let mut seqs_buf: Vec<u8> = Vec::with_capacity(pool_keys_count as usize * 8);
+            for s in seqs {
+                seqs_buf.extend_from_slice(&s.to_le_bytes());
+            }
+            arena.write_bytes(seqs_off, &seqs_buf);
+        }
+    }
+
+    Some((so_off, pool_off, seqs_off))
 }
 
 /// CAS each packed staging entry's valid 2→1 (processing → pending).
@@ -698,13 +771,34 @@ fn rollback_packed_to_pending(packed: &[Candidate]) {
     }
 }
 
-fn free_superbatch_arena(staging_offsets_off: u32, pool_keys_off: u32) {
+fn free_superbatch_arena(
+    staging_offsets_off: u32,
+    pool_keys_off: u32,
+    pool_seqs_off: u32,
+) {
     let mut arena = SPILLOVER_ARENA.exclusive();
     if staging_offsets_off != 0 {
         arena.free(staging_offsets_off);
     }
     if pool_keys_off != 0 {
         arena.free(pool_keys_off);
+    }
+    if pool_seqs_off != 0 {
+        arena.free(pool_seqs_off);
+    }
+}
+
+/// acct-tm09: when a commit_group emit fails after seqs were assigned
+/// (arena exhausted, CQ full), advance latest_committed to my_seq for
+/// each assigned pool. Treats the failed seq as a no-op commit so
+/// subsequent commit_groups don't wait forever on a phantom
+/// predecessor.
+fn rollforward_failed_pool_seqs(pool_sorted: &[i64], pool_seqs: &[u64]) {
+    for (i, &pid) in pool_sorted.iter().enumerate() {
+        let seq = pool_seqs[i];
+        if seq > 0 {
+            crate::shmem::pool_seq_commit_advance(pid, seq);
+        }
     }
 }
 

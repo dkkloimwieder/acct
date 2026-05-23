@@ -62,7 +62,7 @@ pub(crate) mod test_hooks;
 
 use shmem::{
     COMMITTER_QUEUE, LEDGER_V3_COMMITTER_QUEUE_SIZE, LEDGER_V3_SPILLOVER_ARENA_MB,
-    LEDGER_V3_STAGING_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE,
+    LEDGER_V3_STAGING_QUEUE_SIZE, POOL_SEQ_TABLE, SPILLOVER_ARENA, STAGING_QUEUE,
 };
 
 // ── GUCs ────────────────────────────────────────────────────────────
@@ -145,6 +145,7 @@ pub extern "C-unwind" fn _PG_init() {
     pg_shmem_init!(STAGING_QUEUE);
     pg_shmem_init!(COMMITTER_QUEUE);
     pg_shmem_init!(SPILLOVER_ARENA);
+    pg_shmem_init!(POOL_SEQ_TABLE);
 
     GucRegistry::define_int_guc(
         c"ledger_routed.staging_queue_size",

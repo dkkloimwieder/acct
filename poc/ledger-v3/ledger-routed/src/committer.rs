@@ -111,13 +111,14 @@ pub extern "C-unwind" fn ledger_routed_committer_main(_arg: pg_sys::Datum) {
         }
 
         while let Some(cq_idx) = claim_next_committer_entry() {
-            let (sb_id, staging_offsets_off, pool_keys_off) = {
+            let (sb_id, staging_offsets_off, pool_keys_off, pool_seqs_off) = {
                 let cq = COMMITTER_QUEUE.share();
                 let entry = &cq.entries[cq_idx as usize];
                 (
                     entry.superbatch_id,
                     entry.staging_entry_offsets,
                     entry.pool_keys_offset,
+                    entry.pool_seqs_offset,
                 )
             };
 
@@ -170,6 +171,7 @@ pub extern "C-unwind" fn ledger_routed_committer_main(_arg: pg_sys::Datum) {
                 &drained_staging_indices,
                 staging_offsets_off,
                 pool_keys_off,
+                pool_seqs_off,
             );
         }
     }
@@ -298,6 +300,19 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
         .into_iter()
         .collect();
 
+    // acct-tm09: wait for per-pool predecessor commit_groups before
+    // taking pool_lock. The router stamped this CQE with per-pool seqs
+    // for order-sensitive pools; we block until latest_committed reaches
+    // (my_seq - 1) for each such pool. Spin-sleep 100us; cap at
+    // committer_lease_ms total wait. Per-pool wait — disjoint-pool
+    // commit_groups don't serialize against each other.
+    if let Err(e) = wait_for_predecessor_pool_seqs(cq_idx) {
+        return ProcessOutcome::TxError {
+            message: format!("tm09 predecessor wait: {e}"),
+            staging_indices,
+        };
+    }
+
     // Step 6: pool_lock FOR UPDATE
     if let Err(e) = pool_lock::acquire_pool_locks(&pool_ids) {
         return ProcessOutcome::TxError {
@@ -345,12 +360,26 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
     let committed_count = match result {
         Ok(n) => n,
         Err(e) => {
+            // tm09: even on bulk-write failure, advance the pool seqs
+            // so subsequent commit_groups don't wait forever on our
+            // assigned-but-failed seq. The DB tx is rolling back; the
+            // seq token was a router-side ordering primitive, not a
+            // persisted record.
+            advance_committed_pool_seqs(cq_idx);
             return ProcessOutcome::TxError {
                 message: e,
                 staging_indices,
             };
         }
     };
+
+    // tm09: advance latest_committed for each touched order-sensitive
+    // pool. Runs INSIDE the tx scope so that if a panic happens before
+    // COMMIT, the BackgroundWorker::transaction wrapper rolls back the
+    // DB tx — but the shmem advance has already happened, which is
+    // safe (it only unblocks future commit_groups; the failed seq is
+    // never re-tried).
+    advance_committed_pool_seqs(cq_idx);
 
     let post_t0 = now_ns();
     let post_ns = now_ns().saturating_sub(post_t0);
@@ -359,6 +388,122 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
     ProcessOutcome::Committed {
         committed_count,
         staging_indices,
+    }
+}
+
+// ── acct-tm09: per-pool predecessor wait + commit advance ───────────
+
+fn wait_for_predecessor_pool_seqs(cq_idx: u32) -> Result<(), String> {
+    let (pool_keys_count, pool_keys_off, pool_seqs_off) = {
+        let cq = COMMITTER_QUEUE.share();
+        let entry = &cq.entries[cq_idx as usize];
+        (
+            entry.pool_keys_count,
+            entry.pool_keys_offset,
+            entry.pool_seqs_offset,
+        )
+    };
+    if pool_seqs_off == 0 || pool_keys_count == 0 {
+        return Ok(()); // no order-sensitive pools, no wait
+    }
+
+    let arena = SPILLOVER_ARENA.share();
+    let pk_bytes = arena.read_bytes(pool_keys_off, pool_keys_count as u32 * 8);
+    let ps_bytes = arena.read_bytes(pool_seqs_off, pool_keys_count as u32 * 8);
+    drop(arena);
+
+    let pool_keys: Vec<i64> = pk_bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let pool_seqs: Vec<u64> = ps_bytes
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    // tm09 wait bound: use caller_tx_timeout_ms (default 30s), NOT
+    // committer_lease_ms (100ms). The lease was tuned for v21's small
+    // commit_groups; aywu's no-split rule allows much larger groups
+    // (250+ submissions) whose pipeline_ns can exceed 100ms. Cascading
+    // timeouts under same-pool workloads would block all committers.
+    // The caller_tx_timeout is the upstream bound on how long a
+    // submission can stay in flight; if predecessors haven't committed
+    // by then, the workload is genuinely stuck.
+    let timeout_ms = crate::caller_tx_timeout_ms_now() as u64;
+    let deadline_ns = now_ns().saturating_add(timeout_ms.saturating_mul(1_000_000));
+    let wait_t0 = now_ns();
+    let mut waited_for_any = false;
+
+    for (i, &pid) in pool_keys.iter().enumerate() {
+        let my_seq = pool_seqs[i];
+        if my_seq == 0 {
+            continue;
+        }
+        let predecessor = my_seq.saturating_sub(1);
+        loop {
+            let committed = crate::shmem::pool_seq_committed_load(pid);
+            if committed >= predecessor {
+                break;
+            }
+            if now_ns() > deadline_ns {
+                let elapsed = now_ns().saturating_sub(wait_t0);
+                let cq = COMMITTER_QUEUE.share();
+                cq.committer_tm09_wait_timeouts_total
+                    .fetch_add(1, Relaxed);
+                cq.committer_tm09_wait_ns_total
+                    .fetch_add(elapsed, Relaxed);
+                return Err(format!(
+                    "predecessor seq {} for pool {} not committed within {}ms (my_seq={}, latest_committed={})",
+                    predecessor, pid, timeout_ms, my_seq, committed
+                ));
+            }
+            waited_for_any = true;
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    let elapsed = now_ns().saturating_sub(wait_t0);
+    if waited_for_any {
+        let cq = COMMITTER_QUEUE.share();
+        cq.committer_tm09_waits_total.fetch_add(1, Relaxed);
+        cq.committer_tm09_wait_ns_total.fetch_add(elapsed, Relaxed);
+    }
+    Ok(())
+}
+
+fn advance_committed_pool_seqs(cq_idx: u32) {
+    let (pool_keys_count, pool_keys_off, pool_seqs_off) = {
+        let cq = COMMITTER_QUEUE.share();
+        let entry = &cq.entries[cq_idx as usize];
+        (
+            entry.pool_keys_count,
+            entry.pool_keys_offset,
+            entry.pool_seqs_offset,
+        )
+    };
+    if pool_seqs_off == 0 || pool_keys_count == 0 {
+        return;
+    }
+
+    let arena = SPILLOVER_ARENA.share();
+    let pk_bytes = arena.read_bytes(pool_keys_off, pool_keys_count as u32 * 8);
+    let ps_bytes = arena.read_bytes(pool_seqs_off, pool_keys_count as u32 * 8);
+    drop(arena);
+
+    let pool_keys: Vec<i64> = pk_bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let pool_seqs: Vec<u64> = ps_bytes
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    for (i, &pid) in pool_keys.iter().enumerate() {
+        let my_seq = pool_seqs[i];
+        if my_seq > 0 {
+            crate::shmem::pool_seq_commit_advance(pid, my_seq);
+        }
     }
 }
 

@@ -115,18 +115,23 @@ pub(crate) fn free_staging_arena_blocks(
     }
 }
 
-/// Free the two arena blocks owned by a CommitterQueueEntry
-/// (staging_indices + deduplicated pool_keys union).
+/// Free the arena blocks owned by a CommitterQueueEntry
+/// (staging_indices + deduplicated pool_keys union + optional tm09
+/// pool_seqs). Any offset may be 0 (sentinel for "no block allocated").
 pub(crate) fn free_committer_queue_arena(
     arena: &mut SpilloverArena,
     staging_offsets_off: u32,
     pool_keys_off: u32,
+    pool_seqs_off: u32,
 ) {
     if staging_offsets_off != 0 {
         arena.free(staging_offsets_off);
     }
     if pool_keys_off != 0 {
         arena.free(pool_keys_off);
+    }
+    if pool_seqs_off != 0 {
+        arena.free(pool_seqs_off);
     }
 }
 
@@ -164,6 +169,7 @@ pub(crate) fn cleanup_after_superbatch(
     staging_indices: &[u32],
     staging_offsets_off: u32,
     pool_keys_off: u32,
+    pool_seqs_off: u32,
 ) {
     for &s_idx in staging_indices {
         let offsets = {
@@ -182,7 +188,12 @@ pub(crate) fn cleanup_after_superbatch(
 
     {
         let mut arena_guard = SPILLOVER_ARENA.exclusive();
-        free_committer_queue_arena(&mut arena_guard, staging_offsets_off, pool_keys_off);
+        free_committer_queue_arena(
+            &mut arena_guard,
+            staging_offsets_off,
+            pool_keys_off,
+            pool_seqs_off,
+        );
     }
     {
         let committer_guard = COMMITTER_QUEUE.share();
@@ -331,13 +342,14 @@ mod tests {
     }
 
     #[test]
-    fn free_committer_queue_arena_releases_both_blocks() {
+    fn free_committer_queue_arena_releases_all_blocks() {
         let mut arena = fresh_arena();
         let so = arena.alloc(32).expect("alloc staging_offsets");
         let pk = arena.alloc(48).expect("alloc pool_keys");
-        assert_eq!(arena.outstanding_allocs(), 2);
+        let ps = arena.alloc(48).expect("alloc pool_seqs");
+        assert_eq!(arena.outstanding_allocs(), 3);
 
-        free_committer_queue_arena(&mut arena, so, pk);
+        free_committer_queue_arena(&mut arena, so, pk, ps);
         assert_eq!(arena.outstanding_allocs(), 0);
     }
 
@@ -347,7 +359,19 @@ mod tests {
         let so = arena.alloc(32).expect("alloc staging_offsets");
         assert_eq!(arena.outstanding_allocs(), 1);
 
-        free_committer_queue_arena(&mut arena, so, 0);
+        free_committer_queue_arena(&mut arena, so, 0, 0);
+        assert_eq!(arena.outstanding_allocs(), 0);
+    }
+
+    #[test]
+    fn free_committer_queue_arena_releases_seqs_independently() {
+        // tm09: split-safe groups have pool_seqs_off = 0; free still works.
+        let mut arena = fresh_arena();
+        let so = arena.alloc(32).expect("alloc staging_offsets");
+        let pk = arena.alloc(48).expect("alloc pool_keys");
+        assert_eq!(arena.outstanding_allocs(), 2);
+
+        free_committer_queue_arena(&mut arena, so, pk, 0);
         assert_eq!(arena.outstanding_allocs(), 0);
     }
 
