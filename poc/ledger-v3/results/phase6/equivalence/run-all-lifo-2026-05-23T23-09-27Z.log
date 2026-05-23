@@ -1,0 +1,171 @@
+==> equivalence sweep timestamp: 2026-05-23T23-09-27Z
+==> method-mix: all-lifo
+==> outdir: results/phase6/equivalence
+
+==> s1 lenient at 23:09:27
+    exit=0 log=results/phase6/equivalence/s1-lenient-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s1 callers=10 submissions/caller=50 total=500
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 500 trx, 500 trx_line, 250 pool_state, 500 posting_line, 0 provisional (1.43s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 500 trx, 500 trx_line, 250 pool_state, 500 posting_line, 0 provisional (0.87s)
+    | equivalence OK: scenario=s1 submissions=500 A=500 B=500 trx (identical)
+
+==> s2 lenient at 23:09:35
+    exit=0 log=results/phase6/equivalence/s2-lenient-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s2 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (2.95s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (0.97s)
+    | equivalence OK: scenario=s2 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s3 lenient at 23:09:45
+    exit=0 log=results/phase6/equivalence/s3-lenient-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s3 callers=10 submissions/caller=50 total=500
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 500 trx, 7951 trx_line, 7701 pool_state, 7951 posting_line, 0 provisional (2.31s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 500 trx, 7951 trx_line, 7701 pool_state, 7951 posting_line, 0 provisional (1.32s)
+    | equivalence OK: scenario=s3 submissions=500 A=500 B=500 trx (identical)
+
+==> s4 lenient at 23:09:54
+    exit=0 log=results/phase6/equivalence/s4-lenient-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s4 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 15731 trx_line, 15231 pool_state, 15731 posting_line, 0 provisional (5.74s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 15731 trx_line, 15231 pool_state, 15731 posting_line, 0 provisional (1.87s)
+    | equivalence OK: scenario=s4 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s5 lenient at 23:10:08
+    exit=0 log=results/phase6/equivalence/s5-lenient-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s5 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (3.21s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (1.12s)
+    | equivalence OK: scenario=s5 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s6 lenient at 23:10:18
+    exit=0 log=results/phase6/equivalence/s6-lenient-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s6 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (2.92s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (0.96s)
+    | equivalence OK: scenario=s6 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s2 strict at 23:10:28
+    exit=0 log=results/phase6/equivalence/s2-strict-trial1-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s2 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (2.99s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (0.95s)
+    | equivalence OK: scenario=s2 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s2 strict at 23:10:38
+    exit=0 log=results/phase6/equivalence/s2-strict-trial2-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s2 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (2.97s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (0.96s)
+    | equivalence OK: scenario=s2 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s2 strict at 23:10:48
+    exit=0 log=results/phase6/equivalence/s2-strict-trial3-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s2 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (2.98s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (0.94s)
+    | equivalence OK: scenario=s2 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s4 strict at 23:10:57
+    exit=0 log=results/phase6/equivalence/s4-strict-trial1-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s4 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 15731 trx_line, 15231 pool_state, 15731 posting_line, 0 provisional (5.78s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 15731 trx_line, 15231 pool_state, 15731 posting_line, 0 provisional (1.89s)
+    | equivalence OK: scenario=s4 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s4 strict at 23:11:11
+    exit=0 log=results/phase6/equivalence/s4-strict-trial2-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s4 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 15731 trx_line, 15231 pool_state, 15731 posting_line, 0 provisional (5.79s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 15731 trx_line, 15231 pool_state, 15731 posting_line, 0 provisional (1.88s)
+    | equivalence OK: scenario=s4 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s4 strict at 23:11:25
+    exit=0 log=results/phase6/equivalence/s4-strict-trial3-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s4 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 15731 trx_line, 15231 pool_state, 15731 posting_line, 0 provisional (5.76s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 15731 trx_line, 15231 pool_state, 15731 posting_line, 0 provisional (1.89s)
+    | equivalence OK: scenario=s4 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s5 strict at 23:11:38
+    exit=0 log=results/phase6/equivalence/s5-strict-trial1-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s5 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (3.14s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (1.14s)
+    | equivalence OK: scenario=s5 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s5 strict at 23:11:48
+    exit=0 log=results/phase6/equivalence/s5-strict-trial2-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s5 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (3.14s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (1.15s)
+    | equivalence OK: scenario=s5 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> s5 strict at 23:11:59
+    exit=0 log=results/phase6/equivalence/s5-strict-trial3-all-lifo-2026-05-23T23-09-27Z.log
+    | [equivalence] scenario=s5 callers=20 submissions/caller=50 total=1000
+    | [equivalence] running Path A (direct)...
+    | [equivalence] direct: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (3.17s)
+    | [equivalence] resetting + reseeding universe for Path B...
+    | seed-pools: 100 pools, 10 skus, 10 locations, mix=AllLifo → seeded
+    | [equivalence] running Path B (routed)...
+    | [equivalence] routed: 1000 trx, 1000 trx_line, 500 pool_state, 1000 posting_line, 0 provisional (1.12s)
+    | equivalence OK: scenario=s5 submissions=1000 A=1000 B=1000 trx (identical)
+
+==> sweep complete at 23:12:09
+==> index: results/phase6/equivalence/run-all-lifo-2026-05-23T23-09-27Z.log

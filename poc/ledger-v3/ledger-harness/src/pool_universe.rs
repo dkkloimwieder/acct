@@ -177,6 +177,7 @@ fn method_for_index(i: usize, count: usize, mix: MethodMix) -> &'static str {
         MethodMix::AllWac => "wac",
         MethodMix::AllWacPeriodic => "wac_periodic",
         MethodMix::AllFifo => "fifo",
+        MethodMix::AllLifo => "lifo",
         MethodMix::AllStd => "std",
         MethodMix::Mixed => {
             let pct = (i * 100) / count.max(1);

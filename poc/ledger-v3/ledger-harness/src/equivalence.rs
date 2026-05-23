@@ -119,6 +119,12 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
             opts.submissions_per_caller,
             run_prefix,
         ),
+        MethodMix::AllLifo => build_submissions_lifo(
+            &spec.workload,
+            spec.callers,
+            opts.submissions_per_caller,
+            run_prefix,
+        ),
         MethodMix::AllStd => build_submissions_std(
             &spec.workload,
             spec.callers,
@@ -244,8 +250,27 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
         }
     }
 
+    if !result.lifo_drifts.is_empty() {
+        eprintln!(
+            "[equivalence] {} LIFO drift(s) (path-dependent layer consumption under concurrent commit_groups). \
+             LIFO depletions consume newest layer first; under different commit_group ordering the 'newest layer' may have been emitted by a different group, so per-line trx_line breakdown (qty/unit_cost) and pool_state layer composition diverge. \
+             Load-bearing invariants verified separately as errors: per-pool ∑trx_line.qty and ∑pool_state.qty match across paths.",
+            result.lifo_drifts.len()
+        );
+        for w in result.lifo_drifts.iter().take(10) {
+            eprintln!("  {w}");
+        }
+        if result.lifo_drifts.len() > 10 {
+            eprintln!("  ... {} more LIFO drifts suppressed", result.lifo_drifts.len() - 10);
+        }
+    }
+
     let effective_errors = if opts.strict {
-        result.errors.len() + result.wac_drifts.len() + result.wac_periodic_drifts.len() + result.fifo_drifts.len()
+        result.errors.len()
+            + result.wac_drifts.len()
+            + result.wac_periodic_drifts.len()
+            + result.fifo_drifts.len()
+            + result.lifo_drifts.len()
     } else {
         result.errors.len()
     };
@@ -255,6 +280,7 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
             ("WAC", result.wac_drifts.len()),
             ("wac_periodic", result.wac_periodic_drifts.len()),
             ("FIFO", result.fifo_drifts.len()),
+            ("LIFO", result.lifo_drifts.len()),
         ];
         let parts: Vec<String> = drifts
             .iter()
@@ -302,6 +328,12 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
                 eprintln!(
                     "EQUIVALENCE FAILED (strict): {} FIFO drifts upgraded to errors",
                     result.fifo_drifts.len()
+                );
+            }
+            if !result.lifo_drifts.is_empty() {
+                eprintln!(
+                    "EQUIVALENCE FAILED (strict): {} LIFO drifts upgraded to errors",
+                    result.lifo_drifts.len()
                 );
             }
         }
@@ -531,6 +563,89 @@ fn build_submissions_std(
 }
 
 fn build_submissions_fifo(
+    workload: &crate::workload::Workload,
+    callers: usize,
+    per_caller: usize,
+    run_prefix: i64,
+) -> Vec<Submission> {
+    let mut rngs: Vec<StdRng> = (0..callers)
+        .map(|c| StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(c as u64)))
+        .collect();
+    let mut subs = Vec::with_capacity(callers * per_caller);
+    let inv = workload.universe.inv_account;
+    let ap = workload.universe.ap_account;
+
+    for caller_id in 0..callers {
+        let mut last_receipt_pool: Option<i64> = None;
+        for tick in 0..per_caller {
+            let is_receipt = tick % 2 == 0;
+            let receipt_uc: i64 = 10 + (tick as i64 / 2) * 7;
+            let source_id = run_prefix + (caller_id as i64) * 1_000_000 + tick as i64;
+            if is_receipt {
+                let lines = workload.next_lines(&mut rngs[caller_id], caller_id);
+                if let Some(l) = lines.first() {
+                    last_receipt_pool = Some(l.pool_id);
+                }
+                let lines: Vec<LineParam> = lines
+                    .into_iter()
+                    .map(|l| LineParam {
+                        qty: 10,
+                        unit_cost: receipt_uc,
+                        ..l
+                    })
+                    .collect();
+                subs.push(Submission {
+                    trx_type: "po_receipt",
+                    source_id,
+                    lines,
+                });
+            } else {
+                let Some(pool_id) = last_receipt_pool else {
+                    continue;
+                };
+                subs.push(Submission {
+                    trx_type: "transfer_shipment",
+                    source_id,
+                    lines: vec![LineParam {
+                        pool_id,
+                        line_type: "transfer_shipment_line",
+                        source_id: Some(2),
+                        qty: -3,
+                        unit_cost: 0,
+                        debit_account: ap,
+                        credit_account: inv,
+                    }],
+                });
+            }
+        }
+    }
+
+    subs
+}
+
+/// LIFO-specific workload (acct-9mgx.2).
+///
+/// 2-tick cycle per caller, caller-major submission order. Even tick =
+/// receipt (qty=10, varying unit_cost), odd tick = depletion (qty=-3) on
+/// the caller's most-recent receipt pool. Receipt unit_cost varies per
+/// round (10, 17, 24, …) so successive layers hold distinct costs —
+/// depletion-side trx_lines surface per-layer unit_cost asymmetry that
+/// would mask under uniform pricing.
+///
+/// LIFO consumes newest layer first. Under qty=-3 (vs receipt qty=10):
+///   - Most depletions consume from the most-recent layer (tail qty
+///     descends by 3 each cycle).
+///   - Periodically the tail layer's remaining qty drops below 3 and the
+///     depletion spans into the prior layer, emitting 2 trx_lines and
+///     deleting the tail layer.
+/// This mix exercises layer Insert + partial Update + full Delete +
+/// multi-line trx_line emission within the same caller.
+///
+/// Caller-major submission order (caller-0's full ticks 0..per_caller,
+/// then caller-1's, etc.) — every commit_group starts with a receipt, so
+/// stock grows monotonically within every group regardless of cross-group
+/// commit ordering. Safe for any per_caller and any committer_count.
+fn build_submissions_lifo(
     workload: &crate::workload::Workload,
     callers: usize,
     per_caller: usize,
@@ -964,12 +1079,21 @@ struct DiffResult {
     /// matches, (b) ∑pool_state.qty per pool matches. Per-row + per-line
     /// content differences route to this bucket.
     fifo_drifts: Vec<String>,
+    /// LIFO-specific drifts (acct-9mgx.2). Symmetric to fifo_drifts:
+    /// LIFO consumes newest layer first, so under concurrent commit_groups
+    /// the per-depletion "newest layer" identity may differ across paths.
+    /// Per-line trx_line breakdowns and pool_state layer composition
+    /// can legitimately differ even when total per-pool qty is conserved.
+    /// Same load-bearing invariants as fifo_drifts: ∑trx_line.qty per
+    /// (trx, pool) and ∑pool_state.qty per pool match across paths.
+    lifo_drifts: Vec<String>,
 }
 
 fn diff_snapshots(a: &LedgerSnapshot, b: &LedgerSnapshot, method_mix: MethodMix) -> DiffResult {
     let mut r = DiffResult::default();
     let wac_periodic_mode = method_mix == MethodMix::AllWacPeriodic;
     let fifo_mode = method_mix == MethodMix::AllFifo;
+    let lifo_mode = method_mix == MethodMix::AllLifo;
     let a_keys: std::collections::BTreeSet<_> = a.trx_groups.keys().collect();
     let b_keys: std::collections::BTreeSet<_> = b.trx_groups.keys().collect();
 
@@ -1000,6 +1124,11 @@ fn diff_snapshots(a: &LedgerSnapshot, b: &LedgerSnapshot, method_mix: MethodMix)
                 && trx_lines_preserve_total_qty_per_pool(av, bv, &a.pool_methods)
             {
                 r.fifo_drifts.push(msg);
+            } else if lifo_mode
+                && k.0 == "transfer_shipment"
+                && trx_lines_preserve_total_qty_per_pool_lifo(av, bv, &a.pool_methods)
+            {
+                r.lifo_drifts.push(msg);
             } else {
                 r.errors.push(msg);
             }
@@ -1104,6 +1233,43 @@ fn diff_snapshots(a: &LedgerSnapshot, b: &LedgerSnapshot, method_mix: MethodMix)
         }
         return r;
     }
+    if lifo_mode {
+        let a_pool_qty = aggregate_pool_state_qty_per_pool(&a.pool_state);
+        let b_pool_qty = aggregate_pool_state_qty_per_pool(&b.pool_state);
+        let pools: std::collections::BTreeSet<_> = a_pool_qty
+            .keys()
+            .chain(b_pool_qty.keys())
+            .collect();
+        for pid in pools {
+            let aq = a_pool_qty.get(pid).copied().unwrap_or(0);
+            let bq = b_pool_qty.get(pid).copied().unwrap_or(0);
+            if aq != bq {
+                r.errors.push(format!(
+                    "pool_state Σqty for pool {pid} differs: A={aq} B={bq} \
+                     (LIFO total per-pool stock must be conserved across paths)"
+                ));
+            }
+        }
+        if a.pool_state.len() != b.pool_state.len() {
+            r.lifo_drifts.push(format!(
+                "pool_state row count differs: A={} B={} (LIFO layer composition is path-dependent under concurrent commit_groups)",
+                a.pool_state.len(),
+                b.pool_state.len()
+            ));
+        }
+        let n = a.pool_state.len().min(b.pool_state.len());
+        for i in 0..n {
+            let ar = &a.pool_state[i];
+            let br = &b.pool_state[i];
+            if ar != br {
+                r.lifo_drifts.push(format!("pool_state[{i}] A={ar:?} B={br:?}"));
+                if r.lifo_drifts.len() > 50 {
+                    break;
+                }
+            }
+        }
+        return r;
+    }
     if a.pool_state.len() != b.pool_state.len() {
         r.errors.push(format!(
             "pool_state row count differs: A={} B={}",
@@ -1202,6 +1368,32 @@ fn trx_lines_preserve_total_qty_per_pool(
     }
     for l in bv {
         if pool_methods.get(&l.pool_id).map(|s| s.as_str()) != Some("fifo") {
+            return false;
+        }
+        *b_per_pool.entry(l.pool_id).or_insert(0) += l.qty;
+    }
+    a_per_pool == b_per_pool
+}
+
+/// LIFO analogue of `trx_lines_preserve_total_qty_per_pool`. Used to
+/// classify transfer_shipment trx diffs as lifo_drifts in lifo_mode.
+/// Differing layer-breakdown is allowed (path-dependent LIFO consumption);
+/// total qty per pool is the invariant.
+fn trx_lines_preserve_total_qty_per_pool_lifo(
+    av: &[TrxLineCanon],
+    bv: &[TrxLineCanon],
+    pool_methods: &HashMap<i64, String>,
+) -> bool {
+    let mut a_per_pool: HashMap<i64, i64> = HashMap::new();
+    let mut b_per_pool: HashMap<i64, i64> = HashMap::new();
+    for l in av {
+        if pool_methods.get(&l.pool_id).map(|s| s.as_str()) != Some("lifo") {
+            return false;
+        }
+        *a_per_pool.entry(l.pool_id).or_insert(0) += l.qty;
+    }
+    for l in bv {
+        if pool_methods.get(&l.pool_id).map(|s| s.as_str()) != Some("lifo") {
             return false;
         }
         *b_per_pool.entry(l.pool_id).or_insert(0) += l.qty;

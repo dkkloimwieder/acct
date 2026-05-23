@@ -1,0 +1,5 @@
+seed-pools: 1000 pools, 1000 skus, 10 locations, mix=AllWac → seeded
+[run] reseeded 1000 pools mix=AllWac for bench
+scenario s2: capping callers 200 -> 20 via --max-callers
+scenario s2: routing lock-amortization — 200 callers, zipf(1.5), simple, all-wac (callers=20, duration=30s)
+{"scenario":"s2","path":"routed","throughput_trx_per_sec":1908.4,"ack_p99_us":49938,"committed_p99_us":9806282,"trx_materialized":57304,"attempts":73553,"enqueue_errors":0,"submitted_but_unseen":16249,"eject_total":0,"commit_group_avg":7.60,"commit_group_p99":63,"pipeline_ns_avg":11069650,"drains":9682,"window_defers":9,"output":"results/phase6/bench-9mgx2/s2-routed-all-wac-2026-05-23T23-12-36Z.json"}
