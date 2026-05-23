@@ -21,7 +21,7 @@ AS 'MODULE_PATHNAME', 'ledger_enqueue_trx_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:354
+-- ledger-routed/src/lib.rs:351
 -- ledger_routed::ledger_routed_arena_bump_offset
 CREATE  FUNCTION "ledger_routed_arena_bump_offset"() RETURNS bigint /* i64 */
 STRICT
@@ -30,7 +30,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_arena_bump_offset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:360
+-- ledger-routed/src/lib.rs:357
 -- ledger_routed::ledger_routed_arena_freelist_count
 CREATE  FUNCTION "ledger_routed_arena_freelist_count"() RETURNS bigint /* i64 */
 STRICT
@@ -39,7 +39,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_arena_freelist_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:349
+-- ledger-routed/src/lib.rs:346
 -- ledger_routed::ledger_routed_arena_outstanding
 CREATE  FUNCTION "ledger_routed_arena_outstanding"() RETURNS bigint /* i64 */
 STRICT
@@ -48,7 +48,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_arena_outstanding_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:336
+-- ledger-routed/src/lib.rs:333
 -- ledger_routed::ledger_routed_arena_total_allocs
 CREATE  FUNCTION "ledger_routed_arena_total_allocs"() RETURNS bigint /* i64 */
 STRICT
@@ -57,7 +57,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_arena_total_allocs_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:341
+-- ledger-routed/src/lib.rs:338
 -- ledger_routed::ledger_routed_arena_total_frees
 CREATE  FUNCTION "ledger_routed_arena_total_frees"() RETURNS bigint /* i64 */
 STRICT
@@ -168,7 +168,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_eject_total_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/lib.rs:367
+-- ledger-routed/src/lib.rs:364
 -- ledger_routed::ledger_routed_hello
 CREATE  FUNCTION "ledger_routed_hello"() RETURNS TEXT /* String */
 STRICT
@@ -178,11 +178,11 @@ AS 'MODULE_PATHNAME', 'ledger_routed_hello_wrapper';
 
 /* <begin connected objects> */
 -- ledger-routed/src/stats.rs:156
--- ledger_routed::stats::ledger_routed_next_superbatch_id
-CREATE  FUNCTION "ledger_routed_next_superbatch_id"() RETURNS bigint /* i64 */
+-- ledger_routed::stats::ledger_routed_next_commit_group_id
+CREATE  FUNCTION "ledger_routed_next_commit_group_id"() RETURNS bigint /* i64 */
 STRICT
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'ledger_routed_next_superbatch_id_wrapper';
+AS 'MODULE_PATHNAME', 'ledger_routed_next_commit_group_id_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -195,6 +195,15 @@ AS 'MODULE_PATHNAME', 'ledger_routed_recovery_complete_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- ledger-routed/src/stats.rs:22
+-- ledger_routed::stats::ledger_routed_router_commit_group_count
+CREATE  FUNCTION "ledger_routed_router_commit_group_count"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_router_commit_group_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- ledger-routed/src/stats.rs:40
 -- ledger_routed::stats::ledger_routed_router_entries_scanned_total
 CREATE  FUNCTION "ledger_routed_router_entries_scanned_total"() RETURNS bigint /* i64 */
@@ -204,26 +213,12 @@ AS 'MODULE_PATHNAME', 'ledger_routed_router_entries_scanned_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/stats.rs:207
--- ledger_routed::stats::ledger_routed_router_envelope_histogram
-CREATE  FUNCTION "ledger_routed_router_envelope_histogram"() RETURNS TABLE (
-	"bucket" INT,  /* i32 */
-	"lower" INT,  /* i32 */
-	"upper" INT,  /* i32 */
-	"count" bigint  /* i64 */
-)
-STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'ledger_routed_router_envelope_histogram_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
 -- ledger-routed/src/stats.rs:56
--- ledger_routed::stats::ledger_routed_router_max_envelope_count
-CREATE  FUNCTION "ledger_routed_router_max_envelope_count"() RETURNS bigint /* i64 */
+-- ledger_routed::stats::ledger_routed_router_max_submission_count_per_group
+CREATE  FUNCTION "ledger_routed_router_max_submission_count_per_group"() RETURNS bigint /* i64 */
 STRICT
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'ledger_routed_router_max_envelope_count_wrapper';
+AS 'MODULE_PATHNAME', 'ledger_routed_router_max_submission_count_per_group_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -236,12 +231,17 @@ AS 'MODULE_PATHNAME', 'ledger_routed_router_order_sensitive_groups_total_wrapper
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed/src/stats.rs:22
--- ledger_routed::stats::ledger_routed_router_superbatch_count
-CREATE  FUNCTION "ledger_routed_router_superbatch_count"() RETURNS bigint /* i64 */
+-- ledger-routed/src/stats.rs:207
+-- ledger_routed::stats::ledger_routed_router_submission_histogram
+CREATE  FUNCTION "ledger_routed_router_submission_histogram"() RETURNS TABLE (
+	"bucket" INT,  /* i32 */
+	"lower" INT,  /* i32 */
+	"upper" INT,  /* i32 */
+	"count" bigint  /* i64 */
+)
 STRICT
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'ledger_routed_router_superbatch_count_wrapper';
+AS 'MODULE_PATHNAME', 'ledger_routed_router_submission_histogram_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */

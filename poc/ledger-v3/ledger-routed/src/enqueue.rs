@@ -296,7 +296,7 @@ fn push_entry_into_queue(
         slot.pool_keys_offset = pool_keys_offset;
         slot.enqueued_at_micros = enqueued_at_micros;
         slot.backend_pid = backend_pid;
-        slot.superbatch_id.store(0, Relaxed);
+        slot.commit_group_id.store(0, Relaxed);
         slot.eject_count.store(0, Relaxed);
 
         match slot.valid.compare_exchange(0, 1, Release, Relaxed) {

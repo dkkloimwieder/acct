@@ -1,6 +1,4 @@
-//! Spillover-arena allocator. Verbatim port of
-//! `poc/queue-extension-v21/src/arena.rs` (M1.2 / acct-q3nm) with the
-//! `SpilloverArena` import path updated for v3's module layout.
+//! Spillover-arena allocator.
 //!
 //! All operations run under exclusive `PgLwLock<SpilloverArena>`;
 //! atomic ops use Relaxed because the LWLock provides
@@ -34,8 +32,7 @@
 //! No coalesce on free. For workloads with consistent allocation
 //! sizes (the §10.4 characterization scenarios), pure freelist reuse
 //! keeps `bump_offset` stable. If mixed-size workloads in soak tests
-//! surface monotone arena growth, switch to a slab allocator per
-//! follow-up (v21's `acct-v21-fu-arena-fragmentation` shape).
+//! surface monotone arena growth, switch to a slab allocator.
 //!
 //! ## Caller contract
 //!
@@ -77,15 +74,15 @@ impl SpilloverArena {
         }
         let size = align_up(size, ALLOC_ALIGN);
 
-        // Latent v21 bug fix: offset 0 is the freelist-end sentinel
+        // Offset 0 is the freelist-end sentinel
         // (`freelist_head_offset == 0` means "empty list"); but
         // `PGRXSharedMemory` zero-fills `bump_offset`, so the very
-        // first bump-allocation puts a real block header at offset 0.
-        // Freeing that block sets `freelist_head_offset == 0` which is
-        // indistinguishable from empty — the block is lost, the
-        // freelist walk skips it. v21 masks this under high churn (the
-        // first-ever block rarely returns to the head). Lazy-init bumps
-        // past offset 0 once so no real block header ever lives there.
+        // first bump-allocation would otherwise put a real block header
+        // at offset 0. Freeing that block would set
+        // `freelist_head_offset == 0`, indistinguishable from empty —
+        // the block would be lost and the freelist walk would skip it.
+        // Lazy-init bumps past offset 0 once so no real block header
+        // ever lives there.
         if self.bump_offset.load(Relaxed) == 0 {
             self.bump_offset.store(BLOCK_HEADER_BYTES, Relaxed);
         }

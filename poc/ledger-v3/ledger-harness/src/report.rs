@@ -81,7 +81,7 @@ pub struct RoutedReport {
     pub committer_pipeline_ns_avg: f64,
     /// Number of commit_groups the committer pool drained during the
     /// run window. Sanity siblings: `committer_drains_total ==
-    /// router_superbatch_count` in steady state (each routed envelope
+    /// router_commit_group_count` in steady state (each routed submission
     /// flips to drained once); divergence flags in-flight stragglers.
     pub committer_drains_total: u64,
     /// Router window-defer count delta. Routed candidates that the

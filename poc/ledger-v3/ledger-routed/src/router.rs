@@ -1,13 +1,5 @@
 //! Router BGWorker for ledger-routed (Path B).
 //!
-//! Ports v21's window-router (acct-r29s + acct-zplt) with v3 changes
-//! per plan §E:
-//!   - Single pool_id domain (i64) — no SKU + WIP split
-//!   - No starvation backstop (deferred)
-//!   - No persistent_staging audit (no persistent_staging in v3)
-//!   - No boot recovery sweep (lands with acct-r2ud)
-//!   - No test-hook pg_externs (land with acct-p0d8)
-//!
 //! ## Per-tick pipeline (design-v3 §5.3)
 //!
 //!   1. `collect_candidates` — head-scan up to `router_window_size`
@@ -15,30 +7,30 @@
 //!      request_seq, pool_keys_offset/count, enqueued_at_micros).
 //!   2. `batch_window_us` gate — if the OLDEST candidate has been
 //!      pending for less than the window, defer emission to let more
-//!      envelopes accumulate.
+//!      submissions accumulate.
 //!   3. `hydrate_candidates` — read each candidate's pool_keys (i64
 //!      array) from the spillover arena under one share-lock.
 //!   4. `affinity_group` — union-find on pool_id overlap, emitting one
 //!      `Vec<Candidate>` per connected component, oldest-first by
 //!      `min(request_seq)`, members within each group sorted by
 //!      request_seq.
-//!   5. `emit_superbatch_chunk` per group, splitting oversized
+//!   5. `emit_commit_group` per group, splitting oversized
 //!      components into chunks of size `batch_size_max`. Each chunk:
 //!        a. CAS staging valid 1→2 (Acquire on success)
 //!        b. allocate two arena blocks (`staging_indices` u32 array +
 //!           deduplicated/sorted pool-keys u64 array)
 //!        c. claim a `CommitterQueueEntry`, stamp fields, CAS valid 0→1
 //!           with Release (publishes to committers)
-//!        d. data-before-flag: store `superbatch_id` on each staging
+//!        d. data-before-flag: store `commit_group_id` on each staging
 //!           entry with Release BEFORE CAS staging valid 2→3 with
 //!           Release. Recovery sweeps Acquire-load valid first then
-//!           Acquire-load superbatch_id; the store order guarantees
+//!           Acquire-load commit_group_id; the store order guarantees
 //!           consistency if a router crash leaves valid=3.
 //!
 //! ## Data-before-flag (design-v3 §5.6)
 //!
-//! Honors v21's invariant: `superbatch_id.store(sb_id, Release)` MUST
-//! precede `valid.compare_exchange(2, 3, Release, Relaxed)`. The two
+//! `commit_group_id.store(cg_id, Release)` MUST precede
+//! `valid.compare_exchange(2, 3, Release, Relaxed)`. The two
 //! test-injection atomics on `CommitterQueue` (`test_inject_router_delay_us`
 //! and `test_reorder_router_stores`) are honored so an acct-p0d8
 //! regression test can stress the ordering — they default to zero
@@ -256,7 +248,7 @@ fn router_tick() -> u32 {
 
     // Time-coalesce gate: defer emission if the OLDEST candidate has
     // been pending for less than batch_window_us, giving more
-    // envelopes a chance to accumulate in the same commit_group.
+    // submissions a chance to accumulate in the same commit_group.
     // Window=0 disables the gate.
     let window_us = crate::batch_window_us_now() as u64;
     if window_us > 0 {
@@ -312,13 +304,13 @@ fn router_tick() -> u32 {
         if group_chunks > 1 {
             COMMITTER_QUEUE
                 .share()
-                .router_cross_sb_for_update_waits
+                .router_cross_commit_group_for_update_waits
                 .fetch_add((group_chunks - 1) as u64, Relaxed);
         }
         while !group.is_empty() {
             let take = group.len().min(chunk_cap);
             let chunk: Vec<Candidate> = group.drain(..take).collect();
-            match emit_superbatch_chunk(chunk, committer_capacity) {
+            match emit_commit_group(chunk, committer_capacity) {
                 EmitOutcome::Emitted => {
                     emitted += 1;
                 }
@@ -346,7 +338,7 @@ enum EmitOutcome {
 
 /// Emit one commit_group from a single chunk of candidates. Caller
 /// guarantees the chunk is sorted by request_seq ascending.
-fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> EmitOutcome {
+fn emit_commit_group(chunk: Vec<Candidate>, committer_capacity: u32) -> EmitOutcome {
     let mut packed: Vec<Candidate> = Vec::with_capacity(chunk.len());
     let mut pool_union: HashSet<i64> = HashSet::new();
     {
@@ -369,7 +361,7 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
         return EmitOutcome::Empty;
     }
 
-    let envelope_count = packed.len() as u16;
+    let submission_count = packed.len() as u16;
     let mut pool_union_sorted: Vec<i64> = pool_union.into_iter().collect();
     pool_union_sorted.sort();
     let pool_keys_count = pool_union_sorted.len() as u16;
@@ -392,8 +384,8 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
     let any_os_seq = pool_seqs.iter().any(|&s| s > 0);
     let seqs_arg: Option<&[u64]> = if any_os_seq { Some(&pool_seqs) } else { None };
 
-    let arena_alloc = allocate_superbatch_arena(
-        envelope_count,
+    let arena_alloc = allocate_commit_group_arena(
+        submission_count,
         &packed,
         pool_keys_count,
         &pool_union_sorted,
@@ -425,11 +417,11 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
             }
         }
         if let Some(cq_idx) = found {
-            let sb_id = queue.next_superbatch_id.fetch_add(1, Relaxed) + 1;
+            let cg_id = queue.next_commit_group_id.fetch_add(1, Relaxed) + 1;
             let now_micros = crate::shmem::now_us();
             let slot = &mut queue.entries[cq_idx as usize];
-            slot.superbatch_id = sb_id;
-            slot.envelope_count = envelope_count;
+            slot.commit_group_id = cg_id;
+            slot.submission_count = submission_count;
             slot.staging_entry_offsets = staging_offsets_off;
             slot.pool_keys_offset = pool_keys_off;
             slot.pool_keys_count = pool_keys_count;
@@ -441,17 +433,17 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
             slot.enqueued_at_micros = now_micros;
             let _ = slot.valid.compare_exchange(0, 1, Release, Relaxed);
             queue.tail.store((tail + 1) % committer_capacity, Relaxed);
-            Some(sb_id)
+            Some(cg_id)
         } else {
             None
         }
     };
 
-    let sb_id = match cq_result {
+    let cg_id = match cq_result {
         Some(id) => id,
         None => {
             rollback_packed_to_pending(&packed);
-            free_superbatch_arena(staging_offsets_off, pool_keys_off, pool_seqs_off);
+            free_commit_group_arena(staging_offsets_off, pool_keys_off, pool_seqs_off);
             if any_os_seq {
                 rollforward_failed_pool_seqs(&pool_union_sorted, &pool_seqs);
             }
@@ -459,7 +451,7 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
         }
     };
 
-    // Data-before-flag: superbatch_id Release BEFORE CAS valid 2→3
+    // Data-before-flag: commit_group_id Release BEFORE CAS valid 2→3
     // Release. Honor the two test-injection atomics so acct-p0d8 can
     // stress the ordering window. Production defaults are 0/0 (no-op).
     {
@@ -480,9 +472,9 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
                 if delay_us > 0 {
                     std::thread::sleep(Duration::from_micros(delay_us as u64));
                 }
-                slot.superbatch_id.store(sb_id, Release);
+                slot.commit_group_id.store(cg_id, Release);
             } else {
-                slot.superbatch_id.store(sb_id, Release);
+                slot.commit_group_id.store(cg_id, Release);
                 if delay_us > 0 {
                     std::thread::sleep(Duration::from_micros(delay_us as u64));
                 }
@@ -491,7 +483,7 @@ fn emit_superbatch_chunk(chunk: Vec<Candidate>, committer_capacity: u32) -> Emit
         }
     }
 
-    record_superbatch_stats(envelope_count);
+    record_commit_group_stats(submission_count);
     EmitOutcome::Emitted
 }
 
@@ -688,21 +680,21 @@ fn hydrate_candidates(metas: &[CandidateMeta]) -> Vec<Candidate> {
 /// allocation fails, free whatever succeeded and return None. Writes
 /// the block contents on success.
 ///
-/// Block 1: staging_indices (envelope_count × u32 LE)
+/// Block 1: staging_indices (submission_count × u32 LE)
 /// Block 2: pool_keys (pool_keys_count × i64 LE, sorted, deduplicated)
 /// Block 3 (acct-tm09, optional): pool_seqs (pool_keys_count × u64 LE,
 ///   parallel to pool_keys; per-pool sequence number, 0 = no wait).
 ///   Allocated only when `pool_seqs` is `Some`; returns 0 in the third
 ///   slot otherwise.
-fn allocate_superbatch_arena(
-    envelope_count: u16,
+fn allocate_commit_group_arena(
+    submission_count: u16,
     packed: &[Candidate],
     pool_keys_count: u16,
     pool_sorted: &[i64],
     pool_seqs: Option<&[u64]>,
 ) -> Option<(u32, u32, u32)> {
     let mut arena = SPILLOVER_ARENA.exclusive();
-    let offsets_bytes = (envelope_count as u32) * 4;
+    let offsets_bytes = (submission_count as u32) * 4;
     let so_off = arena.alloc(offsets_bytes.max(1))?;
 
     let pool_off = if pool_keys_count > 0 {
@@ -771,7 +763,7 @@ fn rollback_packed_to_pending(packed: &[Candidate]) {
     }
 }
 
-fn free_superbatch_arena(
+fn free_commit_group_arena(
     staging_offsets_off: u32,
     pool_keys_off: u32,
     pool_seqs_off: u32,
@@ -804,29 +796,29 @@ fn rollforward_failed_pool_seqs(pool_sorted: &[i64], pool_seqs: &[u64]) {
 
 // ── Stats ───────────────────────────────────────────────────────────
 
-/// Log2-spaced bucket index for an envelope count (0..=7). Bucket 0
+/// Log2-spaced bucket index for an submission count (0..=7). Bucket 0
 /// is size-1, bucket 7 is the >=128 overflow.
-fn envelope_histogram_bucket(envelope_count: u16) -> usize {
-    if envelope_count == 0 {
+fn submission_histogram_bucket(submission_count: u16) -> usize {
+    if submission_count == 0 {
         return 0;
     }
-    let lg = 31 - (envelope_count as u32).leading_zeros();
+    let lg = 31 - (submission_count as u32).leading_zeros();
     (lg as usize).min(7)
 }
 
-fn record_superbatch_stats(envelope_count: u16) {
+fn record_commit_group_stats(submission_count: u16) {
     let queue = COMMITTER_QUEUE.share();
-    queue.router_superbatch_count.fetch_add(1, Relaxed);
+    queue.router_commit_group_count.fetch_add(1, Relaxed);
     queue
-        .router_total_envelopes
-        .fetch_add(envelope_count as u64, Relaxed);
-    let bucket = envelope_histogram_bucket(envelope_count);
-    queue.router_envelope_histogram[bucket].fetch_add(1, Relaxed);
-    let mut prev = queue.router_max_envelope_count.load(Relaxed);
-    while envelope_count > prev {
-        match queue.router_max_envelope_count.compare_exchange(
+        .router_total_submissions
+        .fetch_add(submission_count as u64, Relaxed);
+    let bucket = submission_histogram_bucket(submission_count);
+    queue.router_submission_histogram[bucket].fetch_add(1, Relaxed);
+    let mut prev = queue.router_max_submission_count_per_group.load(Relaxed);
+    while submission_count > prev {
+        match queue.router_max_submission_count_per_group.compare_exchange(
             prev,
-            envelope_count,
+            submission_count,
             Relaxed,
             Relaxed,
         ) {
@@ -842,17 +834,15 @@ fn record_superbatch_stats(envelope_count: u16) {
 // Postmaster restarts the router (set_restart_time(5s) — see lib.rs);
 // the new router runs this sweep before entering the tick loop.
 //
-// Three-phase shape (ported from v21 `router::try_recover_router_orphan`
-// with v3 simplifications — single pool_id domain, no submission_status
-// UPSERT in Phase 2):
+// Three-phase shape:
 //
 //   Phase 1 (queue-driven re-stamp): for each CommitterQueueEntry at
 //     valid==1 (ready, no committer claim yet), iterate linked staging
-//     entries. Any linked staging at (valid==2, sb_id==0 OR sb_id ==
-//     CQ.sb_id) means the old router pushed the queue entry but died
+//     entries. Any linked staging at (valid==2, cg_id==0 OR cg_id ==
+//     CQ.cg_id) means the old router pushed the queue entry but died
 //     before completing the per-entry stamp+CAS (the Phase 6
-//     data-before-flag block in emit_superbatch_chunk). Roll FORWARD:
-//     store sb_id (Release) + CAS staging 2→3 (Release). The
+//     data-before-flag block in emit_commit_group). Roll FORWARD:
+//     store cg_id (Release) + CAS staging 2→3 (Release). The
 //     committer's normal claim+drain will pick up the now-ready slot.
 //
 //   Phase 2 (queue-driven take-over dead committer): for each
@@ -861,21 +851,20 @@ fn record_superbatch_stats(envelope_count: u16) {
 //     the CQ to valid==1 + clear identity. The next committer's
 //     claim_next_committer_entry sees valid==1 and re-claims;
 //     pristine-replay's UNIQUE handling catches any prior writes the
-//     dead committer's tx managed to land. Distinct from v21 Phase 2
-//     which freed arena + UPSERT'd submission_status — v3's
-//     "trx exists iff committed" semantics let the new committer
-//     drain through the existing CQ payload.
+//     dead committer's tx managed to land. v3's "trx exists iff
+//     committed" semantics let the new committer drain through the
+//     existing CQ payload — no submission_status side-table to reconcile.
 //
 //   Phase 3 (staging-driven orphan-no-queue): for each StagingEntry
-//     at valid==2 whose sb_id isn't backed by an active CQ entry
-//     (sb_id==0 OR sb_id != any live CQ entry's sb_id), revert
-//     valid 2→1 + reset sb_id to 0. The router crashed before
-//     pushing the CQ entry (Phase 5 of emit_superbatch_chunk).
+//     at valid==2 whose cg_id isn't backed by an active CQ entry
+//     (cg_id==0 OR cg_id != any live CQ entry's cg_id), revert
+//     valid 2→1 + reset cg_id to 0. The router crashed before
+//     pushing the CQ entry (Phase 5 of emit_commit_group).
 //
-// Memory ordering: Acquire loads on staging.{valid, superbatch_id,
-// eject_count} pair with Release stores in emit_superbatch_chunk's
+// Memory ordering: Acquire loads on staging.{valid, commit_group_id,
+// eject_count} pair with Release stores in emit_commit_group's
 // data-before-flag block. CAS attempts use Release to publish the
-// reverted state to a concurrent emit_superbatch_chunk on the next
+// reverted state to a concurrent emit_commit_group on the next
 // router tick.
 //
 // Idempotent under repeated firings — CAS election semantics mean a
@@ -897,14 +886,14 @@ fn sweep_queue_phase() -> u64 {
     let queue_capacity = LEDGER_V3_COMMITTER_QUEUE_SIZE as u32;
 
     for q_idx in 0..queue_capacity {
-        let (q_valid, q_sb_id, q_envelope_count, q_so_off, q_owner_slot, q_owner_gen) = {
+        let (q_valid, q_cg_id, q_submission_count, q_so_off, q_owner_slot, q_owner_gen) = {
             let queue = COMMITTER_QUEUE.share();
             let slot = &queue.entries[q_idx as usize];
             let v = slot.valid.load(Acquire);
             (
                 v,
-                slot.superbatch_id,
-                slot.envelope_count,
+                slot.commit_group_id,
+                slot.submission_count,
                 slot.staging_entry_offsets,
                 slot.committer_bgw_slot.load(Acquire),
                 slot.committer_bgw_generation.load(Acquire),
@@ -915,13 +904,13 @@ fn sweep_queue_phase() -> u64 {
             1 => {
                 // Phase 1: re-stamp linked staging entries the old
                 // router never reached in the data-before-flag block.
-                if q_envelope_count == 0 || q_so_off == 0 {
+                if q_submission_count == 0 || q_so_off == 0 {
                     continue;
                 }
-                let staging_indices = read_staging_indices(q_so_off, q_envelope_count);
+                let staging_indices = read_staging_indices(q_so_off, q_submission_count);
                 let queue = STAGING_QUEUE.share();
                 for s_idx in staging_indices {
-                    if try_restamp_staging_to_routed(&queue, s_idx, q_sb_id) {
+                    if try_restamp_staging_to_routed(&queue, s_idx, q_cg_id) {
                         recovered += 1;
                     }
                 }
@@ -966,17 +955,17 @@ fn sweep_staging_phase() -> u64 {
     let staging_capacity = LEDGER_V3_STAGING_QUEUE_SIZE as u32;
     let queue_capacity = LEDGER_V3_COMMITTER_QUEUE_SIZE as u32;
 
-    // Build a set of sb_ids backed by an active CQ entry. Staging at
-    // valid==2 whose sb_id is in this set was either handled by
+    // Build a set of cg_ids backed by an active CQ entry. Staging at
+    // valid==2 whose cg_id is in this set was either handled by
     // sweep_queue_phase or is intentionally in-flight; staging at
-    // valid==2 whose sb_id isn't in this set is genuinely orphaned.
-    let active_sb_ids: HashSet<u64> = {
+    // valid==2 whose cg_id isn't in this set is genuinely orphaned.
+    let active_cg_ids: HashSet<u64> = {
         let queue = COMMITTER_QUEUE.share();
         let mut s = HashSet::new();
         for q_idx in 0..queue_capacity {
             let slot = &queue.entries[q_idx as usize];
             if slot.valid.load(Acquire) != 0 {
-                s.insert(slot.superbatch_id);
+                s.insert(slot.commit_group_id);
             }
         }
         s
@@ -984,7 +973,7 @@ fn sweep_staging_phase() -> u64 {
 
     let staging = STAGING_QUEUE.share();
     for s_idx in 0..staging_capacity {
-        if try_revert_orphan_staging(&staging, s_idx, &active_sb_ids) {
+        if try_revert_orphan_staging(&staging, s_idx, &active_cg_ids) {
             signal_staging_slot_freed(&staging);
             recovered += 1;
         }
@@ -993,61 +982,61 @@ fn sweep_staging_phase() -> u64 {
     recovered
 }
 
-/// Phase 1 pure helper: if `s_idx` is at valid==2 with sb_id==0 or
-/// matching the queue's sb_id, complete the router's interrupted
-/// data-before-flag stamp (store sb_id Release + CAS valid 2→3
+/// Phase 1 pure helper: if `s_idx` is at valid==2 with cg_id==0 or
+/// matching the queue's cg_id, complete the router's interrupted
+/// data-before-flag stamp (store cg_id Release + CAS valid 2→3
 /// Release). Returns true on successful re-stamp.
 pub(crate) fn try_restamp_staging_to_routed(
     queue: &StagingQueue,
     s_idx: u32,
-    q_sb_id: u64,
+    q_cg_id: u64,
 ) -> bool {
     let slot = &queue.entries[s_idx as usize];
     if slot.valid.load(Acquire) != 2 {
         return false;
     }
-    let s_sb = slot.superbatch_id.load(Acquire);
-    if s_sb != 0 && s_sb != q_sb_id {
-        return false; // belongs to a different (later) SuperBatch
+    let s_cg = slot.commit_group_id.load(Acquire);
+    if s_cg != 0 && s_cg != q_cg_id {
+        return false; // belongs to a different (later) CommitGroup
     }
-    slot.superbatch_id.store(q_sb_id, Release);
+    slot.commit_group_id.store(q_cg_id, Release);
     slot.valid.compare_exchange(2, 3, Release, Relaxed).is_ok()
 }
 
-/// Phase 3 pure helper: if `s_idx` is at valid==2 with an sb_id not
-/// in `active_sb_ids`, CAS revert valid 2→1 + reset sb_id Release.
+/// Phase 3 pure helper: if `s_idx` is at valid==2 with an cg_id not
+/// in `active_cg_ids`, CAS revert valid 2→1 + reset cg_id Release.
 /// Returns true on successful revert. Caller broadcasts the
 /// backpressure CV after each successful revert.
 pub(crate) fn try_revert_orphan_staging(
     queue: &StagingQueue,
     s_idx: u32,
-    active_sb_ids: &HashSet<u64>,
+    active_cg_ids: &HashSet<u64>,
 ) -> bool {
     let slot = &queue.entries[s_idx as usize];
     if slot.valid.load(Acquire) != 2 {
         return false;
     }
-    let s_sb = slot.superbatch_id.load(Acquire);
-    if s_sb != 0 && active_sb_ids.contains(&s_sb) {
+    let s_cg = slot.commit_group_id.load(Acquire);
+    if s_cg != 0 && active_cg_ids.contains(&s_cg) {
         return false;
     }
     if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
-        slot.superbatch_id.store(0, Release);
+        slot.commit_group_id.store(0, Release);
         return true;
     }
     false
 }
 
-/// Read an envelope_count-length array of u32 staging indices from
+/// Read an submission_count-length array of u32 staging indices from
 /// the spillover arena at `offset`. Mirror of the same helper in
 /// committer.rs / cleanup.rs (small enough to copy-paste; resist
 /// premature abstraction).
-fn read_staging_indices(offset: u32, envelope_count: u16) -> Vec<u32> {
-    if envelope_count == 0 || offset == 0 {
+fn read_staging_indices(offset: u32, submission_count: u16) -> Vec<u32> {
+    if submission_count == 0 || offset == 0 {
         return Vec::new();
     }
     let arena = SPILLOVER_ARENA.share();
-    let bytes = arena.read_bytes(offset, envelope_count as u32 * 4);
+    let bytes = arena.read_bytes(offset, submission_count as u32 * 4);
     bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1225,21 +1214,21 @@ mod tests {
         unsafe { Box::<StagingQueue>::new_zeroed().assume_init() }
     }
 
-    fn set_staging(slot_state: u8, sb_id: u64) -> Box<StagingQueue> {
+    fn set_staging(slot_state: u8, cg_id: u64) -> Box<StagingQueue> {
         let mut q = fresh_staging_queue();
         let slot = &mut q.entries[3];
         slot.valid = std::sync::atomic::AtomicU8::new(slot_state);
-        slot.superbatch_id = std::sync::atomic::AtomicU64::new(sb_id);
+        slot.commit_group_id = std::sync::atomic::AtomicU64::new(cg_id);
         q
     }
 
     #[test]
-    fn restamp_promotes_valid_2_sb_zero_to_routed_with_sb_id() {
+    fn restamp_promotes_valid_2_sb_zero_to_routed_with_cg_id() {
         let q = set_staging(2, 0);
         let promoted = try_restamp_staging_to_routed(&q, 3, 42);
         assert!(promoted);
         assert_eq!(q.entries[3].valid.load(Relaxed), 3);
-        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 42);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 42);
     }
 
     #[test]
@@ -1250,14 +1239,14 @@ mod tests {
     }
 
     #[test]
-    fn restamp_skips_when_sb_id_mismatches() {
-        // Staging at valid=2 with sb_id=99 belongs to a later SB; the
-        // current Phase 1 sweep iterating CQ sb_id=42 must NOT
+    fn restamp_skips_when_cg_id_mismatches() {
+        // Staging at valid=2 with cg_id=99 belongs to a later SB; the
+        // current Phase 1 sweep iterating CQ cg_id=42 must NOT
         // re-stamp it (would corrupt the later SB).
         let q = set_staging(2, 99);
         assert!(!try_restamp_staging_to_routed(&q, 3, 42));
         assert_eq!(q.entries[3].valid.load(Relaxed), 2);
-        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 99);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 99);
     }
 
     #[test]
@@ -1274,25 +1263,25 @@ mod tests {
         let active: HashSet<u64> = HashSet::new();
         assert!(try_revert_orphan_staging(&q, 3, &active));
         assert_eq!(q.entries[3].valid.load(Relaxed), 1);
-        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 0);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 0);
     }
 
     #[test]
-    fn revert_orphan_promotes_when_sb_id_set_but_not_active() {
+    fn revert_orphan_promotes_when_cg_id_set_but_not_active() {
         let q = set_staging(2, 77);
         let active: HashSet<u64> = HashSet::new(); // 77 not present
         assert!(try_revert_orphan_staging(&q, 3, &active));
         assert_eq!(q.entries[3].valid.load(Relaxed), 1);
-        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 0);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 0);
     }
 
     #[test]
-    fn revert_orphan_skips_when_sb_id_active() {
+    fn revert_orphan_skips_when_cg_id_active() {
         let q = set_staging(2, 77);
         let active: HashSet<u64> = [77u64].into_iter().collect();
         assert!(!try_revert_orphan_staging(&q, 3, &active));
         assert_eq!(q.entries[3].valid.load(Relaxed), 2);
-        assert_eq!(q.entries[3].superbatch_id.load(Relaxed), 77);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 77);
     }
 
     #[test]
@@ -1336,19 +1325,19 @@ mod tests {
     }
 
     #[test]
-    fn envelope_histogram_bucket_known_values() {
-        assert_eq!(envelope_histogram_bucket(0), 0);
-        assert_eq!(envelope_histogram_bucket(1), 0);
-        assert_eq!(envelope_histogram_bucket(2), 1);
-        assert_eq!(envelope_histogram_bucket(3), 1);
-        assert_eq!(envelope_histogram_bucket(4), 2);
-        assert_eq!(envelope_histogram_bucket(7), 2);
-        assert_eq!(envelope_histogram_bucket(8), 3);
-        assert_eq!(envelope_histogram_bucket(15), 3);
-        assert_eq!(envelope_histogram_bucket(16), 4);
-        assert_eq!(envelope_histogram_bucket(64), 6);
-        assert_eq!(envelope_histogram_bucket(127), 6);
-        assert_eq!(envelope_histogram_bucket(128), 7);
-        assert_eq!(envelope_histogram_bucket(u16::MAX), 7);
+    fn submission_histogram_bucket_known_values() {
+        assert_eq!(submission_histogram_bucket(0), 0);
+        assert_eq!(submission_histogram_bucket(1), 0);
+        assert_eq!(submission_histogram_bucket(2), 1);
+        assert_eq!(submission_histogram_bucket(3), 1);
+        assert_eq!(submission_histogram_bucket(4), 2);
+        assert_eq!(submission_histogram_bucket(7), 2);
+        assert_eq!(submission_histogram_bucket(8), 3);
+        assert_eq!(submission_histogram_bucket(15), 3);
+        assert_eq!(submission_histogram_bucket(16), 4);
+        assert_eq!(submission_histogram_bucket(64), 6);
+        assert_eq!(submission_histogram_bucket(127), 6);
+        assert_eq!(submission_histogram_bucket(128), 7);
+        assert_eq!(submission_histogram_bucket(u16::MAX), 7);
     }
 }

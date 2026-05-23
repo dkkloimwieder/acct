@@ -7,7 +7,7 @@
 //!   2. Open one PG transaction (`BackgroundWorker::transaction`)
 //!   3. Decode submissions from arena via `payload::decode_submission`
 //!   4. pg_xact_status batched lookup → eject in-progress callers
-//!      (bump `eject_count` + `last_eject_at_ns` + reset sb_id +
+//!      (bump `eject_count` + `last_eject_at_ns` + reset cg_id +
 //!      CAS valid 3→1; router cooldown filter from acct-r4sb skips
 //!      them on subsequent ticks). Aborted callers excluded silently
 //!      (v3 has no submission_status table; "trx exists iff committed").
@@ -21,7 +21,7 @@
 //!      handler marks the failing index in a shared Cell and the
 //!      outer loop excludes + retries.
 //!   10. Implicit COMMIT on `BackgroundWorker::transaction` scope exit
-//!   11. `cleanup::cleanup_after_superbatch` outside the tx scope
+//!   11. `cleanup::cleanup_after_commit_group` outside the tx scope
 //!
 //! Identity is per-BGWorker-process state held in a thread-local
 //! `RefCell<Option<(u32, u32)>>`. Claimed at startup via
@@ -111,11 +111,11 @@ pub extern "C-unwind" fn ledger_routed_committer_main(_arg: pg_sys::Datum) {
         }
 
         while let Some(cq_idx) = claim_next_committer_entry() {
-            let (sb_id, staging_offsets_off, pool_keys_off, pool_seqs_off) = {
+            let (cg_id, staging_offsets_off, pool_keys_off, pool_seqs_off) = {
                 let cq = COMMITTER_QUEUE.share();
                 let entry = &cq.entries[cq_idx as usize];
                 (
-                    entry.superbatch_id,
+                    entry.commit_group_id,
                     entry.staging_entry_offsets,
                     entry.pool_keys_offset,
                     entry.pool_seqs_offset,
@@ -123,7 +123,7 @@ pub extern "C-unwind" fn ledger_routed_committer_main(_arg: pg_sys::Datum) {
             };
 
             let outcome = BackgroundWorker::transaction(AssertUnwindSafe(|| {
-                process_commit_group(cq_idx, sb_id)
+                process_commit_group(cq_idx, cg_id)
             }));
 
             // Cleanup runs OUTSIDE the tx scope: it operates on shmem
@@ -137,8 +137,8 @@ pub extern "C-unwind" fn ledger_routed_committer_main(_arg: pg_sys::Datum) {
                     committed_count: _,
                     staging_indices,
                 } => {
-                    // router_total_envelopes is router-side (counted in
-                    // record_superbatch_stats); committer just increments
+                    // router_total_submissions is router-side (counted in
+                    // record_commit_group_stats); committer just increments
                     // its drain counter.
                     COMMITTER_QUEUE
                         .share()
@@ -165,9 +165,9 @@ pub extern "C-unwind" fn ledger_routed_committer_main(_arg: pg_sys::Datum) {
             };
             let _ = drained_status;
 
-            cleanup::cleanup_after_superbatch(
+            cleanup::cleanup_after_commit_group(
                 cq_idx,
-                sb_id,
+                cg_id,
                 &drained_staging_indices,
                 staging_offsets_off,
                 pool_keys_off,
@@ -247,7 +247,7 @@ enum CallerTxStatus {
     Unknown,
 }
 
-fn process_commit_group(cq_idx: u32, _sb_id: u64) -> ProcessOutcome {
+fn process_commit_group(cq_idx: u32, _cg_id: u64) -> ProcessOutcome {
     let pipeline_t0 = now_ns();
     let outcome = process_commit_group_inner(cq_idx);
     let pipeline_ns = now_ns().saturating_sub(pipeline_t0);
@@ -422,13 +422,12 @@ fn wait_for_predecessor_pool_seqs(cq_idx: u32) -> Result<(), String> {
         .collect();
 
     // tm09 wait bound: use caller_tx_timeout_ms (default 30s), NOT
-    // committer_lease_ms (100ms). The lease was tuned for v21's small
-    // commit_groups; aywu's no-split rule allows much larger groups
-    // (250+ submissions) whose pipeline_ns can exceed 100ms. Cascading
-    // timeouts under same-pool workloads would block all committers.
-    // The caller_tx_timeout is the upstream bound on how long a
-    // submission can stay in flight; if predecessors haven't committed
-    // by then, the workload is genuinely stuck.
+    // committer_lease_ms (100ms). aywu's no-split rule allows large
+    // commit_groups (250+ submissions) whose pipeline_ns can exceed
+    // 100ms; cascading lease-bounded timeouts under same-pool workloads
+    // would block all committers. The caller_tx_timeout is the upstream
+    // bound on how long a submission can stay in flight; if predecessors
+    // haven't committed by then, the workload is genuinely stuck.
     let timeout_ms = crate::caller_tx_timeout_ms_now() as u64;
     let deadline_ns = now_ns().saturating_add(timeout_ms.saturating_mul(1_000_000));
     let wait_t0 = now_ns();
@@ -701,7 +700,7 @@ fn write_plans_in_subtx(plans: &[PlannedSubmission]) -> WriteOutcome {
 /// Batched pg_xact_status lookup over the unique XIDs in `decoded`,
 /// then per-submission classification. Submissions whose caller
 /// user-tx is in_progress get ejected (eject_count + last_eject_at_ns
-/// bumped; sb_id reset; staging valid CAS 3→1 so router re-packs after
+/// bumped; cg_id reset; staging valid CAS 3→1 so router re-packs after
 /// cooldown). Aborted callers excluded silently (v3 has no
 /// submission_status table). Returns the Committed set.
 fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Error> {
@@ -767,7 +766,7 @@ fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Er
                 let exceeds_count = new_count > max_ejects;
                 let exceeds_timeout = elapsed_us > timeout_us;
                 if exceeds_count || exceeds_timeout {
-                    // Terminal-fail: drop the envelope. Staging slot
+                    // Terminal-fail: drop the submission. Staging slot
                     // stays at valid==3 and gets cleaned up by the
                     // normal 3→0 CAS — the caller's user-tx, if it
                     // eventually commits, lacks a corresponding trx
@@ -788,7 +787,7 @@ fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Er
             let slot = &queue.entries[s_idx as usize];
             slot.eject_count.fetch_add(1, Release);
             slot.last_eject_at_ns.store(now_n, Release);
-            slot.superbatch_id.store(0, Release);
+            slot.commit_group_id.store(0, Release);
             let _ = slot.valid.compare_exchange(3, 1, Release, Relaxed);
             eject_total += 1;
         }
@@ -842,16 +841,16 @@ fn decoded_clone(d: &Decoded) -> Decoded {
 // ── Arena reads ─────────────────────────────────────────────────────
 
 fn read_staging_indices(cq_idx: u32) -> Vec<u32> {
-    let (staging_offsets_off, envelope_count) = {
+    let (staging_offsets_off, submission_count) = {
         let cq = COMMITTER_QUEUE.share();
         let entry = &cq.entries[cq_idx as usize];
-        (entry.staging_entry_offsets, entry.envelope_count)
+        (entry.staging_entry_offsets, entry.submission_count)
     };
-    if envelope_count == 0 || staging_offsets_off == 0 {
+    if submission_count == 0 || staging_offsets_off == 0 {
         return Vec::new();
     }
     let arena = SPILLOVER_ARENA.share();
-    let bytes = arena.read_bytes(staging_offsets_off, envelope_count as u32 * 4);
+    let bytes = arena.read_bytes(staging_offsets_off, submission_count as u32 * 4);
     bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))

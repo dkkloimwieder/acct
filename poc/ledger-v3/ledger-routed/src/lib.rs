@@ -67,10 +67,7 @@ use shmem::{
 
 // ── GUCs ────────────────────────────────────────────────────────────
 //
-// Plan §E retained list: 9 operational + 3 shmem-size + 1 target_database.
-// Dropped from v21: persistent_staging, persistent_staging_gc_retention_hours,
-// status_insert_mode, skip_wip_locks, drain_batch_size,
-// router_starvation_threshold_ticks (starvation backstop deferred).
+// 9 operational + 3 shmem-size + 1 target_database per plan §E.
 
 static STAGING_QUEUE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(16384);
 static COMMITTER_QUEUE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(2048);
@@ -290,7 +287,7 @@ pub extern "C-unwind" fn _PG_init() {
     //
     // Router only at this point (acct-zedi). Committer pool registers
     // with acct-usn2; recovery worker with acct-r2ud. set_restart_time
-    // = 5s so PG relaunches the worker after a crash (matches v21).
+    // = 5s so PG relaunches the worker after a crash.
     use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
     use std::time::Duration;
     // Recovery worker runs ONCE at postmaster start (set_restart_time
@@ -399,7 +396,7 @@ mod tests {
         let _head: u32 = staging.head.load(Relaxed);
         drop(staging);
         let committer = COMMITTER_QUEUE.share();
-        let _superbatch_id: u64 = committer.next_superbatch_id.load(Relaxed);
+        let _commit_group_id: u64 = committer.next_commit_group_id.load(Relaxed);
         drop(committer);
         let arena = SPILLOVER_ARENA.share();
         let _bump: u32 = arena.bump_offset.load(Relaxed);

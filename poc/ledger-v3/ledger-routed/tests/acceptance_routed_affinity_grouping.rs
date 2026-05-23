@@ -7,7 +7,7 @@
 //!
 //! Verifies:
 //!   - N submissions to the same pool pack into a SMALLER count of
-//!     commit_groups than naive 1-per-group (router_envelope_histogram
+//!     commit_groups than naive 1-per-group (router_submission_histogram
 //!     bucket >= 1 has nonzero count)
 //!   - All N submissions land as trx rows
 //!   - trx_seq values on the touched pool are strictly monotonic in
@@ -80,12 +80,12 @@ async fn overlapping_submissions_pack_and_seq_monotonic() {
         );
     }
 
-    // Affinity-pack evidence: router_envelope_histogram has buckets
+    // Affinity-pack evidence: router_submission_histogram has buckets
     // >=1 (size >= 2) populated. If every commit_group were size 1,
     // only bucket 0 would have a nonzero count.
     let rows: Vec<(i32, i32, i32, i64)> = sqlx::query_as(
         "SELECT bucket, lower, upper, count \
-           FROM ledger_routed_router_envelope_histogram() \
+           FROM ledger_routed_router_submission_histogram() \
           ORDER BY bucket",
     )
     .fetch_all(&pool)
@@ -94,7 +94,7 @@ async fn overlapping_submissions_pack_and_seq_monotonic() {
     let multi_bucket_count: i64 = rows.iter().skip(1).map(|r| r.3).sum();
     assert!(
         multi_bucket_count > 0,
-        "router must produce at least one multi-envelope commit_group; \
+        "router must produce at least one multi-submission commit_group; \
          histogram: {rows:?}"
     );
 

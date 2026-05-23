@@ -1,5 +1,4 @@
-//! Committer identity slot registry — verbatim port from v21
-//! `src/lib.rs` 651-743.
+//! Committer identity slot registry.
 //!
 //! Application-level analog of PG's `BackgroundWorkerData.slot[]`: each
 //! running committer worker claims one entry at startup and releases at

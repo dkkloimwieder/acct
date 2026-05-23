@@ -10,8 +10,7 @@
 //!      (which the encoder fills in after the lines block is
 //!      allocated).
 //!
-//! The split matches v21's pattern (separate payload + pool_keys
-//! blobs) and lets each block be freed independently by the
+//! The split lets each block be freed independently by the
 //! committer's cleanup step. JSON encoding per locked design plan §E:
 //! "rev to repr(C) only if measurement shows arena pressure."
 //!

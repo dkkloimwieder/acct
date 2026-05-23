@@ -1,21 +1,9 @@
-//! Shmem layout for ledger-routed (Path B). Ported from
-//! `poc/queue-extension-v21/src/lib.rs` 105-427 with v3 renames per
-//! plan §E:
+//! Shmem layout for ledger-routed (Path B).
 //!
-//!   v21                                     v3
-//!   ----------------------------------------------
-//!   event_type_id                           trx_type_id
-//!   sku_pool_count / wip_pool_count         pool_count
-//!   sku_pool_keys_offset                    pool_keys_offset
-//!   wip_pool_keys_offset                    dropped (single domain)
-//!   sku_pool_keys_count + wip_pool_keys_count   pool_keys_count
-//!   sku_pool_keys_offset + wip_pool_keys_offset (in CommitterQueueEntry)  pool_keys_offset
-//!   sku_pool_keys_count + wip_pool_keys_count (in CommitterQueueEntry)    pool_keys_count
-//!
-//! Field bag is unchanged otherwise — v21's StagingEntry/Queue +
-//! CommitterEntry/Queue + SpilloverArena carry the load-bearing
-//! atomics, CV plumbing, identity slots, observability counters, and
-//! BGWorker rendezvous fields verbatim. v3 inherits all of that.
+//! StagingEntry/Queue + CommitterEntry/Queue + SpilloverArena +
+//! PoolSeqTable carry the load-bearing atomics, CV plumbing, identity
+//! slots, observability counters, and BGWorker rendezvous fields.
+//! Single `pool_id` namespace per design-v3 §1.
 //!
 //! The PgLwLock statics + their wiring live in `lib.rs::_PG_init`.
 
@@ -30,8 +18,7 @@ use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64};
 // + bound the GUC ranges, but the actual shmem allocation is driven
 // by these constants. Mismatch between GUC value at startup and
 // compiled constant is reported as a NOTICE at _PG_init time;
-// resizing requires recompile. v3 keeps v21's sizes; the bake-off
-// alternates that didn't pan out for v21 don't change for v3.
+// resizing requires recompile.
 
 pub const LEDGER_V3_STAGING_QUEUE_SIZE: usize = 16384;
 pub const LEDGER_V3_COMMITTER_QUEUE_SIZE: usize = 2048;
@@ -57,25 +44,22 @@ pub struct StagingEntry {
     pub request_seq: u64,
     pub correlation_id: [u8; 16],
     pub user_tx_xid: u64,
-    /// Renamed from v21's `event_type_id`. Index into a per-extension
-    /// trx-type table the caller maps the SQL `trx_type` enum into at
-    /// enqueue time. The shmem layer is enum-agnostic; the dispatch
-    /// per-trx-type lives in the committer (Path B) / SPI surface
-    /// (Path A).
+    /// Index into a per-extension trx-type table the caller maps the
+    /// SQL `trx_type` enum into at enqueue time. The shmem layer is
+    /// enum-agnostic; the dispatch per-trx-type lives in the committer
+    /// (Path B) / SPI surface (Path A).
     pub trx_type_id: u16,
     pub _pad_trx: [u8; 2],
     pub payload_offset: u32,
     pub payload_length: u32,
-    /// Renamed from v21's `sku_pool_count + wip_pool_count`. v3
-    /// collapses the dual-domain (SKU pools + WIP pools) into a
-    /// single `pool_id` namespace per design-v3 §1.
+    /// Number of pool_ids this submission touches.
     pub pool_count: u16,
     pub _pad_pool: [u8; 2],
     pub pool_keys_offset: u32,
     pub enqueued_at_micros: u64,
     pub backend_pid: i32,
     pub _pad_pid: [u8; 4],
-    pub superbatch_id: AtomicU64,
+    pub commit_group_id: AtomicU64,
     pub eject_count: AtomicU32,
     pub _pad2: [u8; 4],
     /// Timestamp of the most recent eject (`now_ns()` units, PG epoch).
@@ -129,12 +113,10 @@ pub struct CommitterQueueEntry {
     /// 0=empty 1=ready 2=in_flight 3=completed
     pub valid: AtomicU8,
     pub _pad: [u8; 7],
-    pub superbatch_id: u64,
-    pub envelope_count: u16,
-    pub _pad_env: [u8; 2],
+    pub commit_group_id: u64,
+    pub submission_count: u16,
+    pub _pad_submission: [u8; 2],
     pub staging_entry_offsets: u32,
-    /// Renamed from v21's `sku_pool_keys_offset + wip_pool_keys_offset`.
-    /// Single domain in v3 per plan §E.
     pub pool_keys_offset: u32,
     pub pool_keys_count: u16,
     pub _pad_pool: [u8; 2],
@@ -165,11 +147,11 @@ pub struct CommitterQueue {
     pub tail: AtomicU32,
     pub lock_tranche_id: u32,
     pub _pad: [u8; 4],
-    pub next_superbatch_id: AtomicU64,
+    pub next_commit_group_id: AtomicU64,
 
     // ── Router stats ───────────────────────────────────────────────
-    pub router_superbatch_count: AtomicU64,
-    pub router_total_envelopes: AtomicU64,
+    pub router_commit_group_count: AtomicU64,
+    pub router_total_submissions: AtomicU64,
     /// Number of commit_groups emitted without applying the
     /// `batch_size_max` chunking step because at least one pool in the
     /// group is order-sensitive (fifo / lifo / specific). Read by
@@ -178,13 +160,13 @@ pub struct CommitterQueue {
     pub router_ticks_total: AtomicU64,
     pub router_entries_scanned_total: AtomicU64,
     pub committer_drains_total: AtomicU64,
-    pub router_cross_sb_for_update_waits: AtomicU64,
+    pub router_cross_commit_group_for_update_waits: AtomicU64,
     pub router_window_defers_total: AtomicU64,
-    /// Envelope-count histogram for SuperBatches (log2-spaced 8
+    /// Submission-count histogram for CommitGroups (log2-spaced 8
     /// buckets): 0:[1], 1:[2-3], 2:[4-7], 3:[8-15], 4:[16-31],
     /// 5:[32-63], 6:[64-127], 7:[128+].
-    pub router_envelope_histogram: [AtomicU64; 8],
-    pub router_max_envelope_count: AtomicU16,
+    pub router_submission_histogram: [AtomicU64; 8],
+    pub router_max_submission_count_per_group: AtomicU16,
     pub _pad_stats: [u8; 6],
 
     // ── Test injection ─────────────────────────────────────────────
@@ -220,7 +202,7 @@ pub struct CommitterQueue {
     // ── Slot-leak audit counters ───────────────────────────────────
     pub audit_reclaims_count: AtomicU64,
     pub audit_orphans_recovered_count: AtomicU64,
-    pub audit_lost_envelopes_count: AtomicU64,
+    pub audit_lost_submissions_count: AtomicU64,
     pub audit_last_run_at_ns: AtomicU64,
 
     // ── Committer pool counters ────────────────────────────────────
@@ -233,8 +215,8 @@ pub struct CommitterQueue {
     pub committer_pipeline_ns_total: AtomicU64,
     pub committer_pipeline_count: AtomicU64,
     /// Per-stage cumulative ns across all committer workers since
-    /// extension load. Stages match v21's acct-pl3b breakdown adapted
-    /// to v3's 8-step pipeline (design-v3 §5.4):
+    /// extension load. Stages map to the 8-step pipeline
+    /// (design-v3 §5.4):
     ///   parse_ns        — Step 3 deserialize submissions from arena
     ///   pre_apply_ns    — Steps 4-7 eject loop + lock acquire +
     ///                     snapshot hydrate

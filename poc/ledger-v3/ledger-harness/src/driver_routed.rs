@@ -14,8 +14,8 @@
 //! with `seen[sid] = materialize_inst`.
 //!
 //! Routed-specific shmem counters (eject_total_count,
-//! router_envelope_histogram, router_total_submissions,
-//! router_superbatch_count, committer_pipeline_ns_total/count,
+//! router_submission_histogram, router_total_submissions,
+//! router_commit_group_count, committer_pipeline_ns_total/count,
 //! committer_drains_total, router_window_defers_total) sampled
 //! foreground pre/post run; deltas land in the JSON's `routed` block.
 
@@ -379,13 +379,13 @@ async fn load_universe(pool: &PgPool) -> Result<PoolUniverse, String> {
 #[derive(Debug, Default, Clone)]
 struct RoutedCounterSnapshot {
     eject_total: i64,
-    superbatch_count: i64,
+    commit_group_count: i64,
     total_submissions: i64,
     pipeline_ns_total: i64,
     pipeline_count: i64,
     committer_drains_total: i64,
     router_window_defers_total: i64,
-    envelope_histogram: Vec<(i32, i32, i32, i64)>,
+    submission_histogram: Vec<(i32, i32, i32, i64)>,
 }
 
 async fn read_routed_counters(pool: &PgPool) -> Result<RoutedCounterSnapshot, String> {
@@ -393,10 +393,10 @@ async fn read_routed_counters(pool: &PgPool) -> Result<RoutedCounterSnapshot, St
         .fetch_one(pool)
         .await
         .map_err(|e| format!("read eject_total: {e}"))?;
-    let superbatch_count: i64 = sqlx::query_scalar("SELECT ledger_routed_router_superbatch_count()")
+    let commit_group_count: i64 = sqlx::query_scalar("SELECT ledger_routed_router_commit_group_count()")
         .fetch_one(pool)
         .await
-        .map_err(|e| format!("read superbatch_count: {e}"))?;
+        .map_err(|e| format!("read commit_group_count: {e}"))?;
     let total_submissions: i64 =
         sqlx::query_scalar("SELECT ledger_routed_router_total_submissions()")
             .fetch_one(pool)
@@ -421,36 +421,36 @@ async fn read_routed_counters(pool: &PgPool) -> Result<RoutedCounterSnapshot, St
             .fetch_one(pool)
             .await
             .map_err(|e| format!("read router_window_defers_total: {e}"))?;
-    let envelope_histogram: Vec<(i32, i32, i32, i64)> = sqlx::query_as(
-        "SELECT bucket, lower, upper, count FROM ledger_routed_router_envelope_histogram() \
+    let submission_histogram: Vec<(i32, i32, i32, i64)> = sqlx::query_as(
+        "SELECT bucket, lower, upper, count FROM ledger_routed_router_submission_histogram() \
           ORDER BY bucket",
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("read envelope_histogram: {e}"))?;
+    .map_err(|e| format!("read submission_histogram: {e}"))?;
     Ok(RoutedCounterSnapshot {
         eject_total,
-        superbatch_count,
+        commit_group_count,
         total_submissions,
         pipeline_ns_total,
         pipeline_count,
         committer_drains_total,
         router_window_defers_total,
-        envelope_histogram,
+        submission_histogram,
     })
 }
 
 fn derive_routed_report(pre: &RoutedCounterSnapshot, post: &RoutedCounterSnapshot) -> RoutedReport {
     let eject_delta = (post.eject_total - pre.eject_total).max(0) as u64;
-    let sb_delta = post.superbatch_count - pre.superbatch_count;
+    let cg_delta = post.commit_group_count - pre.commit_group_count;
     let sub_delta = post.total_submissions - pre.total_submissions;
-    let avg = if sb_delta > 0 {
-        sub_delta as f64 / sb_delta as f64
+    let avg = if cg_delta > 0 {
+        sub_delta as f64 / cg_delta as f64
     } else {
         0.0
     };
 
-    let p99 = commit_group_p99_from_buckets(&pre.envelope_histogram, &post.envelope_histogram);
+    let p99 = commit_group_p99_from_buckets(&pre.submission_histogram, &post.submission_histogram);
 
     let pipeline_ns_delta = post.pipeline_ns_total - pre.pipeline_ns_total;
     let pipeline_count_delta = post.pipeline_count - pre.pipeline_count;
@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_report_handles_zero_superbatches() {
+    fn derive_report_handles_zero_commit_groups() {
         let s = RoutedCounterSnapshot::default();
         let r = derive_routed_report(&s, &s);
         assert_eq!(r.eject_count_total, 0);
@@ -600,10 +600,10 @@ mod tests {
     fn derive_report_computes_avg_from_deltas() {
         let mut pre = RoutedCounterSnapshot::default();
         let mut post = RoutedCounterSnapshot::default();
-        pre.envelope_histogram = (0..8).map(|i| (i, 1, 1, 0)).collect();
-        post.envelope_histogram = pre.envelope_histogram.clone();
-        pre.superbatch_count = 100;
-        post.superbatch_count = 110;
+        pre.submission_histogram = (0..8).map(|i| (i, 1, 1, 0)).collect();
+        post.submission_histogram = pre.submission_histogram.clone();
+        pre.commit_group_count = 100;
+        post.commit_group_count = 110;
         pre.total_submissions = 200;
         post.total_submissions = 250;
         pre.eject_total = 5;
@@ -617,8 +617,8 @@ mod tests {
     fn derive_report_computes_pipeline_avg_and_diagnostic_deltas() {
         let mut pre = RoutedCounterSnapshot::default();
         let mut post = RoutedCounterSnapshot::default();
-        pre.envelope_histogram = (0..8).map(|i| (i, 1, 1, 0)).collect();
-        post.envelope_histogram = pre.envelope_histogram.clone();
+        pre.submission_histogram = (0..8).map(|i| (i, 1, 1, 0)).collect();
+        post.submission_histogram = pre.submission_histogram.clone();
         pre.pipeline_ns_total = 1_000_000;
         post.pipeline_ns_total = 6_000_000;
         pre.pipeline_count = 100;

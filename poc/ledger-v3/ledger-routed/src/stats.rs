@@ -8,7 +8,7 @@
 //! All accessors are atomic loads under `COMMITTER_QUEUE.share()` —
 //! no LWLock contention beyond the read-side of the queue lock.
 //! Returned BIGINT values are non-decreasing (monotonic counters)
-//! except `recovery_complete` (0 then 1) and `next_superbatch_id`
+//! except `recovery_complete` (0 then 1) and `next_commit_group_id`
 //! (also monotonic but reflects allocation index, not throughput).
 
 use crate::shmem::COMMITTER_QUEUE;
@@ -20,16 +20,16 @@ use std::sync::atomic::Ordering::Relaxed;
 // ── Scalar router counters ──────────────────────────────────────────
 
 #[pg_extern]
-fn ledger_routed_router_superbatch_count() -> i64 {
-    COMMITTER_QUEUE.share().router_superbatch_count.load(Relaxed) as i64
+fn ledger_routed_router_commit_group_count() -> i64 {
+    COMMITTER_QUEUE.share().router_commit_group_count.load(Relaxed) as i64
 }
 
 /// Total submissions packed into commit_groups since extension load.
-/// Maps to `CommitterQueue.router_total_envelopes` (the v3 schema's
-/// "envelope" is one enqueued submission).
+/// Maps to `CommitterQueue.router_total_submissions` (the v3 schema's
+/// "submission" is one enqueued submission).
 #[pg_extern]
 fn ledger_routed_router_total_submissions() -> i64 {
-    COMMITTER_QUEUE.share().router_total_envelopes.load(Relaxed) as i64
+    COMMITTER_QUEUE.share().router_total_submissions.load(Relaxed) as i64
 }
 
 #[pg_extern]
@@ -54,10 +54,10 @@ fn ledger_routed_router_window_defers_total() -> i64 {
 }
 
 #[pg_extern]
-fn ledger_routed_router_max_envelope_count() -> i64 {
+fn ledger_routed_router_max_submission_count_per_group() -> i64 {
     COMMITTER_QUEUE
         .share()
-        .router_max_envelope_count
+        .router_max_submission_count_per_group
         .load(Relaxed) as i64
 }
 
@@ -154,8 +154,8 @@ fn ledger_routed_eject_total_count() -> i64 {
 }
 
 #[pg_extern]
-fn ledger_routed_next_superbatch_id() -> i64 {
-    COMMITTER_QUEUE.share().next_superbatch_id.load(Relaxed) as i64
+fn ledger_routed_next_commit_group_id() -> i64 {
+    COMMITTER_QUEUE.share().next_commit_group_id.load(Relaxed) as i64
 }
 
 #[pg_extern]
@@ -198,14 +198,14 @@ fn ledger_routed_committer_stage_timings() -> TableIterator<
     TableIterator::new(rows)
 }
 
-// ── Composite: router envelope histogram ────────────────────────────
+// ── Composite: router submission histogram ────────────────────────────
 
-/// Log2-spaced bucket histogram of SuperBatch envelope counts.
+/// Log2-spaced bucket histogram of CommitGroup submission counts.
 /// Bucket 0=[1], 1=[2-3], 2=[4-7], 3=[8-15], 4=[16-31], 5=[32-63],
 /// 6=[64-127], 7=[128+]. The harness uses this to characterize the
 /// effective batch-size distribution under different workloads.
 #[pg_extern]
-fn ledger_routed_router_envelope_histogram() -> TableIterator<
+fn ledger_routed_router_submission_histogram() -> TableIterator<
     'static,
     (
         name!(bucket, i32),
@@ -227,7 +227,7 @@ fn ledger_routed_router_envelope_histogram() -> TableIterator<
     ];
     let mut rows: Vec<(i32, i32, i32, i64)> = Vec::with_capacity(8);
     for (bucket, &(lower, upper)) in bounds.iter().enumerate() {
-        let count = q.router_envelope_histogram[bucket].load(Relaxed) as i64;
+        let count = q.router_submission_histogram[bucket].load(Relaxed) as i64;
         rows.push((bucket as i32, lower, upper, count));
     }
     TableIterator::new(rows)
