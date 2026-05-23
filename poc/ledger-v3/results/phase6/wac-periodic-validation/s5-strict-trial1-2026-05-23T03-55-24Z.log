@@ -1,0 +1,15 @@
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running `target/release/ledger-harness equivalence --scenario s5 --submissions-per-caller 50 --method-mix all-wac-periodic --strict`
+[equivalence] resetting + seeding universe for Path A (method_mix=AllWacPeriodic)...
+seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWacPeriodic → seeded
+[equivalence] capping callers to 20 (universe=100)
+[equivalence] scenario=s5 callers=20 submissions/caller=50 total=1000
+[equivalence] running Path A (direct)...
+[equivalence] direct close_period(1): {"period_id":1,"pools_affected":1,"provisional_finalized":500,"variance_posted":500,"zero_variance":0}
+[equivalence] direct: 1001 trx, 1025 trx_line, 1 pool_state, 1500 posting_line, 500 provisional (3.75s)
+[equivalence] resetting + reseeding universe for Path B...
+seed-pools: 100 pools, 10 skus, 10 locations, mix=AllWacPeriodic → seeded
+[equivalence] running Path B (routed)...
+[equivalence] routed close_period(1): {"period_id":1,"pools_affected":1,"provisional_finalized":500,"variance_posted":500,"zero_variance":0}
+[equivalence] routed: 1001 trx, 1025 trx_line, 1 pool_state, 1500 posting_line, 500 provisional (1.55s)
+equivalence OK: scenario=s5 submissions=1000 A=1001 B=1001 trx (identical)

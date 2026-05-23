@@ -77,6 +77,11 @@ pub enum Cmd {
         /// = 1 + postmaster restart) to require byte equivalence.
         #[arg(long)]
         strict: bool,
+        /// Pool method assignment for the seeded universe. AllWacPeriodic
+        /// additionally seeds an accounting_period and triggers
+        /// ledger_close_period after each path's submissions (acct-9mgx.6).
+        #[arg(long, value_enum, default_value_t = MethodMix::AllWac)]
+        method_mix: MethodMix,
     },
 }
 
@@ -86,10 +91,11 @@ pub enum Path {
     Routed,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum, Default)]
+#[derive(Copy, Clone, Debug, ValueEnum, Default, PartialEq, Eq)]
 pub enum MethodMix {
     #[default]
     AllWac,
+    AllWacPeriodic,
     AllFifo,
     Mixed,
 }

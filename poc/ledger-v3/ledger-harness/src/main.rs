@@ -114,12 +114,14 @@ async fn main() -> std::process::ExitCode {
             scenario,
             submissions_per_caller,
             strict,
+            method_mix,
         } => {
             let opts = equivalence::EquivalenceOptions {
                 dsn: args.dsn,
                 scenario,
                 submissions_per_caller,
                 strict,
+                method_mix,
             };
             match equivalence::run(opts).await {
                 Ok(()) => std::process::ExitCode::SUCCESS,

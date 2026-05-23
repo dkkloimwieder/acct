@@ -1,0 +1,2 @@
+[equivalence] routed: 1001 trx, 1500 trx_line, 20 pool_state, 1500 posting_line, 500 provisional (1.41s)
+equivalence OK: scenario=s6 submissions=1000 A=1001 B=1001 trx (identical)
