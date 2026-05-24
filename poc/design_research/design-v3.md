@@ -227,24 +227,28 @@ Each pool_method determines how trx_line rows interact with pool_state. The Rust
 
 ### 3.1 WAC
 
-pool_state has exactly one row per pool, at layer_seq = 0. The row carries the pool's total qty and the running average unit_cost.
+pool_state has exactly one row per pool, at layer_seq = 0. The row carries the pool's total `qty` and a **cumulative `value_sum`** — stored in the column physically named `unit_cost` per the per-method storage contract (§3.7). The running per-unit cost is `value_sum / qty`, computed on demand; never stored.
 
 **Receipt** of qty Q at unit_cost C:
 - Allocate trx_seq from the pool's lock-held sequence.
-- INSERT trx_line (qty=Q, unit_cost=C, trx_seq).
+- INSERT trx_line (qty=Q, unit_cost=C, trx_seq) — trx_line.unit_cost is the caller-supplied input.
 - UPSERT pool_state at layer_seq=0:
-  - If row doesn't exist: insert with qty=Q, unit_cost=C.
-  - Otherwise: new_qty = old_qty + Q. Then:
-    - If new_qty > 0: new_unit_cost = (old_qty × old_unit_cost + Q × C) / new_qty. Standard weighted-average formula.
-    - If new_qty <= 0: preserve old_unit_cost (cannot compute a meaningful average into an unreplenished short position; the previous average serves as the basis for any subsequent receipt that brings the pool back positive). This guard handles both the qty=0 case directly and the negative-qty oversold case (e.g., old_qty=-10, Q=5 → new_qty=-5).
-- The formula-step guard (new_qty <= 0 path) is load-bearing. Naive implementation of the weighted-average formula divides by new_qty without checking, panicking the Rust core or raising a SQL exception when new_qty = 0. Both paths must check before the division.
+  - If row doesn't exist: insert with `qty = Q`, `value_sum = Q × C`.
+  - Otherwise: `qty += Q`, `value_sum += Q × C`. EXACT additive update — no rounding, no division.
 
-**Depletion** of qty Q:
-- Read pool_state at layer_seq=0. If qty < Q, error InsufficientInventory.
+The receipt step is commutative and associative across concurrent commit_groups: any order of `(qty, value_sum) += (Q_i, Q_i × C_i)` updates converges to the same `(Σ qty_i, Σ Q_i × C_i)` total. This is the load-bearing property that lets Path A and Path B produce byte-identical pool_state for receipt-only workloads even when Path B reorders commit_groups across committers (see §10.4 crossover characterization).
+
+**Depletion** of qty Q (Q > 0):
+- Read pool_state at layer_seq=0 under the pool's FOR UPDATE lock. If `qty < Q`, error InsufficientInventory.
+- Compute `amount = (Q × value_sum) / qty` — SINGLE bounded round per depletion (integer division). This is the only rounding event in the WAC lifecycle.
 - Allocate trx_seq.
-- applied_unit_cost = current pool_state.unit_cost.
-- INSERT trx_line (qty=-Q, unit_cost=applied_unit_cost, trx_seq).
-- UPDATE pool_state at layer_seq=0: new_qty = qty - Q. unit_cost unchanged (avg only changes on receipts).
+- INSERT trx_line (qty=-Q, unit_cost = amount / Q, trx_seq) — trx_line.unit_cost is a display/audit field carrying the per-unit cost at depletion; the value-preserving column is posting_line.amount = the rounded amount.
+- UPDATE pool_state at layer_seq=0: `qty -= Q`; `value_sum -= amount` — exact subtraction on whatever the amount rounded to.
+- INSERT posting_line with the rounded amount.
+
+Because the post-depletion `value_sum` is exact subtraction of the rounded amount, drift does not compound: subsequent depletions see a `value_sum` that already accounts for the prior per-depletion rounding. Cross-path drift in mixed receipt+depletion workloads is bounded per-depletion (|Δ| ≤ 4 units in the worst case observed under stress; see acct-h5gs + acct-mcey), not linear in receipt count.
+
+**Why no divide-by-zero guard.** Under cumulative-sum the receipt step has no division. The depletion step's `(Q × value_sum) / qty` is gated by `qty >= Q > 0`, so `qty > 0` at the divide. Both directions are safe by construction — the prior running-average formulation's load-bearing `new_qty <= 0` guard is no longer needed.
 
 ### 3.2 FIFO
 
@@ -290,6 +294,21 @@ Same storage layout and depletion math as WAC (§3.1): `pool_state` has exactly 
 - At period close, `ledger_close_period` (§4.5) walks unfinalized rows, recomputes `final_avg = Σ(in-period receipt value) / Σ(in-period qty)` per pool, and posts variance per provisional row.
 
 A pool with provisional depletions in the period but no in-period receipts cannot have a final_avg computed; the close hook raises an error (main acct's analog is P0020 `wac_periodic_close_no_receipts`).
+
+### 3.7 Per-method storage contract for `pool_state.unit_cost`
+
+The `pool_state.unit_cost` column physically holds different per-method semantics. Readers (including ad-hoc SQL) MUST dispatch on `pool.method` before interpreting the value.
+
+| Method        | `qty` semantic         | `unit_cost` semantic                                                            |
+|---------------|------------------------|---------------------------------------------------------------------------------|
+| `fifo`        | per-layer qty          | per-layer unit_cost (caller-supplied at receipt; immutable across the layer)    |
+| `lifo`        | per-layer qty          | same as fifo                                                                    |
+| `specific`    | per-layer qty (always 1) | per-layer unit_cost (caller-supplied at receipt)                              |
+| `wac`         | pool total qty (qty_sum) | cumulative `value_sum` = Σ(receipt_qty × receipt_unit_cost) − Σ(rounded depletion amount). Running per-unit cost = unit_cost / qty (computed on demand; never stored). |
+| `wac_periodic`| same as `wac`          | same as `wac`                                                                   |
+| `std`         | (no `pool_state` rows; standard cost lives in `standard_costs`)                                        |
+
+See §13.8 for the operational footgun this creates for ad-hoc SQL.
 
 ## 4. Path A: direct write
 
@@ -750,7 +769,7 @@ Lazy is easier for development; explicit is safer for production (forces deliber
 
 ### 13.3 Stale pool_state rows after total depletion
 
-Under WAC, when a pool's qty drops to zero, the pool_state row stays (qty=0, unit_cost=preserved). When the pool is later replenished, the next receipt establishes a fresh basis. Operational concern: pool_state grows with one row per pool ever touched, even if currently empty. For most workloads this is fine (pool count is bounded by sku × location). Could be cleaned by a periodic vacuum process. Not a hot-path concern.
+Under WAC (and wac_periodic), when a pool's qty drops to zero, the pool_state row stays at `(qty=0, value_sum=0)` — the cumulative-sum form depletes both fields to zero exactly (modulo the per-depletion rounding residue, which can leave `value_sum` slightly non-zero but bounded; see §3.1). The next receipt establishes a fresh basis: `(qty=Q, value_sum=Q × C)` → running per-unit cost `C`. Operational concern: pool_state grows with one row per pool ever touched, even if currently empty. For most workloads this is fine (pool count is bounded by sku × location). Could be cleaned by a periodic vacuum process. Not a hot-path concern.
 
 ### 13.4 commit_group has no DB representation
 
@@ -777,3 +796,23 @@ The ledger needs to know which accounts to debit/credit for each trx_type / line
 (b) Ledger has a rules table mapping (trx_type, line_type) → (debit_account, credit_account) for each (sku, location, dimensions). Caller doesn't specify; ledger looks up.
 
 (a) is right for the PoC. (b) is a real production concern but separate from the cost-ledger PoC scope.
+
+### 13.8 `pool_state.unit_cost` column-naming footgun
+
+Per the per-method storage contract (§3.7), the column physically named `unit_cost` holds different semantics per method: a per-unit cost for layered methods (`fifo`/`lifo`/`specific`), and a cumulative `value_sum` for total-pool methods (`wac`/`wac_periodic`). The name fits the layered case; under WAC it stores a *total*, not a per-unit cost.
+
+Ad-hoc SQL that reads `pool_state.unit_cost` without dispatching on `pool.method` produces wrong numbers for WAC pools. The correct read pattern:
+
+```sql
+SELECT pool_id,
+       qty,
+       CASE pool.method
+         WHEN 'wac'           THEN unit_cost::float / NULLIF(qty, 0)
+         WHEN 'wac_periodic'  THEN unit_cost::float / NULLIF(qty, 0)
+         ELSE unit_cost::float
+       END AS running_unit_cost
+  FROM pool_state
+  JOIN pool ON pool.id = pool_state.pool_id;
+```
+
+The PoC accepts this footgun in exchange for a minimal-touch implementation (no schema/hydration/bulk_write rewrite). A future productionization should either split into separate `value_sum` and `per_unit_cost` columns or rename the column to `unit_cost_or_value_sum`. See acct-h5gs commit history and the migration 0006 preamble for the cumulative-sum landing context; acct-mcey for the cross-path equivalence drift that motivated the storage shift.
