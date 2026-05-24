@@ -1,0 +1,66 @@
+==> resweep timestamp: 2026-05-24T12-44-22Z
+==> outdir: results/phase6/bench-w2dn
+
+==> s4 batch_size_max=50 at 12:44:22
+    exit=0 json=results/phase6/bench-w2dn/resweep-s4-bsm50-2026-05-24T12-44-22Z.json
+    | scenario s4: capping callers 200 -> 20 via --max-callers
+    | scenario s4: production-like stress — 200 callers, zipf(1.2), complex, mixed (callers=20, duration=30s)
+    | {"scenario":"s4","path":"routed","throughput_trx_per_sec":576.2,"ack_p99_us":229769,"committed_p99_us":55297703,"trx_materialized":17371,"attempts":24882,"enqueue_errors":0,"submitted_but_unseen":7511,"eject_total":0,"commit_group_avg":27.34,"commit_group_p99":63,"pipeline_ns_avg":519277152,"drains":454,"window_defers":45,"output":"results/phase6/bench-w2dn/resweep-s4-bsm50-2026-05-24T12-44-22Z.json"}
+
+==> s4 batch_size_max=1000 at 12:45:29
+    exit=0 json=results/phase6/bench-w2dn/resweep-s4-bsm1000-2026-05-24T12-44-22Z.json
+    | scenario s4: capping callers 200 -> 20 via --max-callers
+    | scenario s4: production-like stress — 200 callers, zipf(1.2), complex, mixed (callers=20, duration=30s)
+    | {"scenario":"s4","path":"routed","throughput_trx_per_sec":349.8,"ack_p99_us":1042284,"committed_p99_us":30685528,"trx_materialized":10708,"attempts":26207,"enqueue_errors":0,"submitted_but_unseen":15499,"eject_total":0,"commit_group_avg":74.66,"commit_group_p99":128,"pipeline_ns_avg":1332545500,"drains":92,"window_defers":41,"output":"results/phase6/bench-w2dn/resweep-s4-bsm1000-2026-05-24T12-44-22Z.json"}
+
+==> s4 batch_size_max=5000 at 12:46:09
+    exit=0 json=results/phase6/bench-w2dn/resweep-s4-bsm5000-2026-05-24T12-44-22Z.json
+    | scenario s4: capping callers 200 -> 20 via --max-callers
+    | scenario s4: production-like stress — 200 callers, zipf(1.2), complex, mixed (callers=20, duration=30s)
+    | {"scenario":"s4","path":"routed","throughput_trx_per_sec":312.5,"ack_p99_us":1056440,"committed_p99_us":28571598,"trx_materialized":9431,"attempts":25774,"enqueue_errors":0,"submitted_but_unseen":16343,"eject_total":0,"commit_group_avg":79.06,"commit_group_p99":128,"pipeline_ns_avg":1658027764,"drains":72,"window_defers":40,"output":"results/phase6/bench-w2dn/resweep-s4-bsm5000-2026-05-24T12-44-22Z.json"}
+
+==> s4 batch_size_max=10000 at 12:46:48
+    exit=0 json=results/phase6/bench-w2dn/resweep-s4-bsm10000-2026-05-24T12-44-22Z.json
+    | scenario s4: capping callers 200 -> 20 via --max-callers
+    | scenario s4: production-like stress — 200 callers, zipf(1.2), complex, mixed (callers=20, duration=30s)
+    | {"scenario":"s4","path":"routed","throughput_trx_per_sec":293.1,"ack_p99_us":1045430,"committed_p99_us":28521267,"trx_materialized":8844,"attempts":25218,"enqueue_errors":0,"submitted_but_unseen":16374,"eject_total":0,"commit_group_avg":71.24,"commit_group_p99":128,"pipeline_ns_avg":1598594351,"drains":74,"window_defers":42,"output":"results/phase6/bench-w2dn/resweep-s4-bsm10000-2026-05-24T12-44-22Z.json"}
+
+==> s4 batch_size_max=50000 at 12:47:26
+    exit=0 json=results/phase6/bench-w2dn/resweep-s4-bsm50000-2026-05-24T12-44-22Z.json
+    | scenario s4: capping callers 200 -> 20 via --max-callers
+    | scenario s4: production-like stress — 200 callers, zipf(1.2), complex, mixed (callers=20, duration=30s)
+    | {"scenario":"s4","path":"routed","throughput_trx_per_sec":322.7,"ack_p99_us":1118830,"committed_p99_us":29276241,"trx_materialized":9846,"attempts":25738,"enqueue_errors":0,"submitted_but_unseen":15892,"eject_total":0,"commit_group_avg":73.54,"commit_group_p99":128,"pipeline_ns_avg":1377018830,"drains":88,"window_defers":37,"output":"results/phase6/bench-w2dn/resweep-s4-bsm50000-2026-05-24T12-44-22Z.json"}
+
+==> s5 batch_size_max=50 at 12:48:06
+    exit=0 json=results/phase6/bench-w2dn/resweep-s5-bsm50-2026-05-24T12-44-22Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"routed","throughput_trx_per_sec":1820.2,"ack_p99_us":63143,"committed_p99_us":14839447,"trx_materialized":54615,"attempts":54615,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":36.63,"commit_group_p99":63,"pipeline_ns_avg":103849498,"drains":1491,"window_defers":114,"output":"results/phase6/bench-w2dn/resweep-s5-bsm50-2026-05-24T12-44-22Z.json"}
+
+==> s5 batch_size_max=1000 at 12:48:56
+    exit=0 json=results/phase6/bench-w2dn/resweep-s5-bsm1000-2026-05-24T12-44-22Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"routed","throughput_trx_per_sec":2458.3,"ack_p99_us":232521,"committed_p99_us":10326376,"trx_materialized":74119,"attempts":74119,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":143.36,"commit_group_p99":128,"pipeline_ns_avg":281763770,"drains":517,"window_defers":88,"output":"results/phase6/bench-w2dn/resweep-s5-bsm1000-2026-05-24T12-44-22Z.json"}
+
+==> s5 batch_size_max=5000 at 12:49:41
+    exit=0 json=results/phase6/bench-w2dn/resweep-s5-bsm5000-2026-05-24T12-44-22Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"routed","throughput_trx_per_sec":2579.9,"ack_p99_us":223084,"committed_p99_us":9856614,"trx_materialized":77410,"attempts":77410,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":160.60,"commit_group_p99":128,"pipeline_ns_avg":321665322,"drains":482,"window_defers":101,"output":"results/phase6/bench-w2dn/resweep-s5-bsm5000-2026-05-24T12-44-22Z.json"}
+
+==> s5 batch_size_max=10000 at 12:50:28
+    exit=0 json=results/phase6/bench-w2dn/resweep-s5-bsm10000-2026-05-24T12-44-22Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"routed","throughput_trx_per_sec":2437.4,"ack_p99_us":212074,"committed_p99_us":9118416,"trx_materialized":73152,"attempts":73152,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":171.72,"commit_group_p99":128,"pipeline_ns_avg":345262974,"drains":426,"window_defers":85,"output":"results/phase6/bench-w2dn/resweep-s5-bsm10000-2026-05-24T12-44-22Z.json"}
+
+==> s5 batch_size_max=50000 at 12:51:13
+    exit=0 json=results/phase6/bench-w2dn/resweep-s5-bsm50000-2026-05-24T12-44-22Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"routed","throughput_trx_per_sec":2438.1,"ack_p99_us":220200,"committed_p99_us":10015997,"trx_materialized":73237,"attempts":73237,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":165.69,"commit_group_p99":128,"pipeline_ns_avg":331838156,"drains":442,"window_defers":85,"output":"results/phase6/bench-w2dn/resweep-s5-bsm50000-2026-05-24T12-44-22Z.json"}
+
+==> restoring default batch_size_max
+==> resweep complete at 12:51:58
+==> index: results/phase6/bench-w2dn/resweep-2026-05-24T12-44-22Z.log

@@ -207,17 +207,17 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_int_guc(
         c"ledger_routed.batch_size_max",
         c"Maximum submissions per commit_group",
-        c"Hard cap on submissions packed into a single commit_group. Larger batches amortize sub-tx + WAL costs; smaller batches keep per-batch wall-time below committer_lease_ms.",
+        c"Hard cap on submissions packed into a single commit_group. Load-bearing for committer throughput: pipeline_ns scales superlinearly with cg_size × lines_per_submission, so the cap bounds lock-hold time on contended pool tails. Default 50 is the lowest-regret pick across measured workloads (acct-e5fz). Raise (up to 100000) for hot-pool simple workloads that benefit from amortization (per acct-w2dn s5 sweet spot near 5000); leave at default for complex multi-line workloads.",
         &BATCH_SIZE_MAX,
         1,
-        10_000,
+        100_000,
         GucContext::Sighup,
         GucFlags::empty(),
     );
     GucRegistry::define_int_guc(
         c"ledger_routed.batch_window_us",
         c"Router batch coalesce window in microseconds",
-        c"How long the router waits to coalesce submissions before emitting a commit_group. Trades latency for batch size. 0 disables the gate.",
+        c"How long the router waits to coalesce submissions before emitting a commit_group. Once the window elapses the router emits with whatever's accumulated (up to batch_size_max). Trades latency for batch size; bounds submission queue residency ≤ batch_window_us + commit_time. 0 disables the gate.",
         &BATCH_WINDOW_US,
         0,
         5_000_000,

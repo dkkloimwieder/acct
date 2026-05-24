@@ -6,16 +6,22 @@
 //!      staging entries with `valid == 1`; capture (staging_idx,
 //!      request_seq, pool_keys_offset/count, enqueued_at_micros).
 //!   2. `batch_window_us` gate — if the OLDEST candidate has been
-//!      pending for less than the window, defer emission to let more
-//!      submissions accumulate.
+//!      pending for less than the window, defer this tick to let more
+//!      submissions accumulate. Bounds submission queue residency
+//!      ≤ `batch_window_us + commit_time`.
 //!   3. `hydrate_candidates` — read each candidate's pool_keys (i64
 //!      array) from the spillover arena under one share-lock.
 //!   4. `affinity_group` — union-find on pool_id overlap, emitting one
 //!      `Vec<Candidate>` per connected component, oldest-first by
 //!      `min(request_seq)`, members within each group sorted by
 //!      request_seq.
-//!   5. `emit_commit_group` per group, splitting oversized
-//!      components into chunks of size `batch_size_max`. Each chunk:
+//!   5. `emit_commit_group` per group, chunking oversized components
+//!      into batches of `batch_size_max`. The cap is load-bearing for
+//!      committer pipeline throughput on complex (multi-line) workloads
+//!      — pipeline_ns scales superlinearly with cg_size × lines, so the
+//!      cap bounds lock-hold time on contended pool tails (see
+//!      acct-e5fz / acct-w2dn). Order-sensitive groups (acct-aywu)
+//!      bypass the cap and emit whole.
 //!        a. CAS staging valid 1→2 (Acquire on success)
 //!        b. allocate two arena blocks (`staging_indices` u32 array +
 //!           deduplicated/sorted pool-keys u64 array)

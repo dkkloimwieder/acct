@@ -1,0 +1,10 @@
+ ledger_routed.batch_size_max 
+------------------------------
+ 50000
+(1 row)
+
+ ledger_routed.batch_window_us 
+-------------------------------
+ 500
+(1 row)
+

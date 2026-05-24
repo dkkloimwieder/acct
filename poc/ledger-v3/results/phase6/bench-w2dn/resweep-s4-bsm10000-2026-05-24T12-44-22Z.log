@@ -1,0 +1,5 @@
+seed-pools: 1000 pools, 1000 skus, 10 locations, mix=AllWac → seeded
+[run] reseeded 1000 pools mix=AllWac for bench
+scenario s4: capping callers 200 -> 20 via --max-callers
+scenario s4: production-like stress — 200 callers, zipf(1.2), complex, mixed (callers=20, duration=30s)
+{"scenario":"s4","path":"routed","throughput_trx_per_sec":293.1,"ack_p99_us":1045430,"committed_p99_us":28521267,"trx_materialized":8844,"attempts":25218,"enqueue_errors":0,"submitted_but_unseen":16374,"eject_total":0,"commit_group_avg":71.24,"commit_group_p99":128,"pipeline_ns_avg":1598594351,"drains":74,"window_defers":42,"output":"results/phase6/bench-w2dn/resweep-s4-bsm10000-2026-05-24T12-44-22Z.json"}

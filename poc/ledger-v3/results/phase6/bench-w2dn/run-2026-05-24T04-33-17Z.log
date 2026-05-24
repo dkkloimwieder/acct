@@ -1,0 +1,23 @@
+==> bench timestamp: 2026-05-24T04-33-17Z
+==> outdir: results/phase6/bench-w2dn
+
+==> s2 batch_size_max=default at 04:33:17
+    exit=0 json=results/phase6/bench-w2dn/s2-bsm-default-2026-05-24T04-33-17Z.json
+    | scenario s2: capping callers 200 -> 20 via --max-callers
+    | scenario s2: routing lock-amortization — 200 callers, zipf(1.5), simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s2","path":"routed","throughput_trx_per_sec":1602.2,"ack_p99_us":42926,"committed_p99_us":5586812,"trx_materialized":48110,"attempts":107604,"enqueue_errors":0,"submitted_but_unseen":59494,"eject_total":0,"commit_group_avg":7.60,"commit_group_p99":128,"pipeline_ns_avg":5933656,"drains":14153,"window_defers":13,"output":"results/phase6/bench-w2dn/s2-bsm-default-2026-05-24T04-33-17Z.json"}
+
+==> s4 batch_size_max=default at 04:33:58
+    exit=0 json=results/phase6/bench-w2dn/s4-bsm-default-2026-05-24T04-33-17Z.json
+    | scenario s4: capping callers 200 -> 20 via --max-callers
+    | scenario s4: production-like stress — 200 callers, zipf(1.2), complex, mixed (callers=20, duration=30s)
+    | {"scenario":"s4","path":"routed","throughput_trx_per_sec":371.7,"ack_p99_us":986710,"committed_p99_us":30031216,"trx_materialized":11152,"attempts":26982,"enqueue_errors":0,"submitted_but_unseen":15830,"eject_total":0,"commit_group_avg":66.79,"commit_group_p99":128,"pipeline_ns_avg":1128457722,"drains":108,"window_defers":40,"output":"results/phase6/bench-w2dn/s4-bsm-default-2026-05-24T04-33-17Z.json"}
+
+==> s5 batch_size_max=default at 04:34:36
+    exit=0 json=results/phase6/bench-w2dn/s5-bsm-default-2026-05-24T04-33-17Z.json
+    | scenario s5: capping callers 1000 -> 20 via --max-callers
+    | scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+    | {"scenario":"s5","path":"routed","throughput_trx_per_sec":2947.5,"ack_p99_us":176553,"committed_p99_us":7402946,"trx_materialized":88443,"attempts":88443,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":156.54,"commit_group_p99":128,"pipeline_ns_avg":249375260,"drains":565,"window_defers":112,"output":"results/phase6/bench-w2dn/s5-bsm-default-2026-05-24T04-33-17Z.json"}
+
+==> bench complete at 04:35:21
+==> index: results/phase6/bench-w2dn/run-2026-05-24T04-33-17Z.log

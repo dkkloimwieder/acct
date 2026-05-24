@@ -1,0 +1,11 @@
+ALTER SYSTEM
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+ ledger_routed.batch_size_max 
+------------------------------
+ 5000
+(1 row)
+
