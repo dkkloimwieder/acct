@@ -316,16 +316,42 @@ See §13.8 for the operational footgun this creates for ad-hoc SQL.
 
 One function, callable inside the caller's user-tx:
 
-```rust
+```sql
 ledger_submit_trx(
-    trx_type: trx_type,
-    source_id: BIGINT,
-    posted_at: TIMESTAMPTZ,
-    lines: ARRAY of (line_type, source_id, pool_id, qty, unit_cost, debit_account, credit_account)
+    trx_type    TEXT,                -- SQL trx_type enum text (po_receipt, wo_completion, ...)
+    source_id   BIGINT,
+    posted_at   TEXT,                -- RFC3339, e.g. '2026-05-21T12:00:00+00:00'
+    lines       JSONB                -- see shape below
 ) RETURNS BIGINT  -- trx.id
 ```
 
+`lines` is a JSONB array of objects:
+
+```json
+[
+  {
+    "line_type":       "po_receipt_line",
+    "source_id":       12345,
+    "pool_id":         42,
+    "qty":             100,
+    "unit_cost":       500,
+    "debit_account":   1001,
+    "credit_account":  2001
+  }
+]
+```
+
 Caller invokes inside their own user-tx, alongside whatever other work they're doing (e.g., updating po_receipt, wo_completion in their own domain schema). The function does the full ledger work synchronously.
+
+#### 4.1.1 Why JSONB, not SQL composite-array
+
+The original design called for `lines` as `ARRAY of (line_type, source_id, pool_id, qty, unit_cost, debit_account, credit_account)`. The shipped implementation uses JSONB because pgrx 0.18's binding for SQL composite-typed arrays (`enum_type[]` over a record-typed element) is awkward and has thin documentation. JSONB:
+
+- Binds cleanly through `pgrx::JsonB` with serde_json::Value round-trip
+- Lets the caller send `line_type` as the SQL enum text (e.g. `"po_receipt_line"`) — the extension decodes against a private text → `LineType` map
+- Trades SQL-side enum type-checking on the caller's payload (a bad string raises an error inside the extension instead of at the caller's bind site) for ergonomics
+
+The two trade-offs we accept: (a) malformed payloads surface as `ERRCODE_INVALID_PARAMETER_VALUE` raised by the extension rather than a planner-time type error, and (b) the JSONB encoding is less compact than a SQL composite array on the wire. Neither has shown up as a measurement signal; revisit if a profiler points there.
 
 ### 4.2 Function logic
 
@@ -405,13 +431,13 @@ Returns a JSONB summary `{ period_id, provisional_finalized, variance_posted, ze
 
 ### 5.1 SPI surface
 
-```rust
+```sql
 ledger_enqueue_trx(
-    trx_type: trx_type,
-    source_id: BIGINT,
-    posted_at: TIMESTAMPTZ,
-    lines: ARRAY of (line_type, source_id, pool_id, qty, unit_cost, debit_account, credit_account)
-) RETURNS BIGINT  -- submission_id (shmem-local; not trx.id)
+    trx_type    TEXT,                -- SQL trx_type enum text
+    source_id   BIGINT,
+    posted_at   TEXT,                -- RFC3339
+    lines       JSONB                -- same shape as ledger_submit_trx; see §4.1
+) RETURNS BIGINT  -- submission_id (shmem-local request_seq; NOT trx.id)
 ```
 
 Caller invokes inside their own user-tx (or as a standalone call). The function:
@@ -441,10 +467,22 @@ Background worker that scans the staging window every `batch_window_us` (default
 1. Read up to `router_window_size` (default 1000) pending entries from staging queue head.
 2. Skip entries whose `eject_count > 0 AND now - last_eject_at_ns < eject_cooldown_ms` (default 10ms cooldown).
 3. Build union-find by pool_id overlap. Each connected component becomes a candidate commit_group.
-4. For components exceeding `batch_size_max` (default 50 trxs): split into chunks.
+4. For components exceeding `batch_size_max` (default 50 trxs) that are **method-split-safe** (`wac`, `wac_periodic`, `std`): split into chunks of `batch_size_max`. **Order-sensitive** components (`fifo`, `lifo`, `specific` — see §5.3.1) bypass the cap and emit whole.
 5. For each commit_group: CAS staging entries pending → processing → routed; push commit_group to committer queue.
 
 Affinity grouping ensures overlapping trxs go to the same committer (avoids committer-vs-committer lock contention on hot pools).
+
+#### 5.3.1 Order-sensitive grouping
+
+Layered methods (`fifo`, `lifo`, `specific`) carry a per-pool ordering invariant: the depletion sequence on a layer chain must follow `trx_seq` order, because each depletion reads the current layer head (FIFO ASC / LIFO DESC) and the per-layer `last_trx_line_id` snapshots the receipt that established the layer. If the router were to split an overlapping group of `fifo` submissions across two commit_groups, the two committers would race to read the same pool's layers, with no guarantee that the earlier-`request_seq` submission's depletion runs first. Cross-path equivalence (§8.4) would break: Path A serializes per-pool naturally, Path B would not.
+
+Total-pool methods (`wac`, `wac_periodic`, `std`) are split-safe because their per-pool state collapses to a single (qty, value_sum) tuple under exact-additive receipts and bounded-rounding depletions (§3.1). Concurrent commit_groups for the same pool produce byte-identical end-state regardless of order, modulo per-depletion rounding residue — which does not compound.
+
+The classifier `is_order_sensitive_method(method) := method IN ('fifo','lifo','specific')` is the router's per-tick guard. Implemented as a thread-local cache of (pool_id → bool) populated at hydration so step 4's chunking decision is a single hash lookup per group.
+
+**Mixed-method components.** A connected component touching at least one order-sensitive pool is treated as order-sensitive overall (must emit whole). The conservative classification means a `wac`-heavy component contaminated by a single `fifo` pool's overlap won't chunk — accepted as the price of avoiding a per-pool-per-method split rule.
+
+Implementation: `pool_is_order_sensitive` lookup in `router.rs::group_must_not_split` (acct-aywu).
 
 ### 5.4 Committer
 
@@ -473,6 +511,20 @@ Pool of BGWorkers (default 4). Each:
 11. Step 11 cleanup: CAS staging entries routed → empty, free arena blocks. Three-case CAS handling per v2.1 §7.8 (success, ejected entries left at pending, router-died-mid-stamp entries cleaned via CAS 2→0).
 
 One fsync per commit_group. With N submissions per commit_group, fsync cost amortizes by N. Each committed submission produces exactly one trx row; failed submissions produce nothing.
+
+#### 5.4.1 Per-pool predecessor-wait coordination
+
+The router's affinity grouping puts overlapping submissions into the SAME commit_group so a single committer serializes per-pool work (§5.3). It does NOT prevent two NON-overlapping commit_groups from touching the same pool when their `request_seq` ranges interleave — e.g., commit_group A holds submissions 1, 5, 9 on pool P, commit_group B holds submissions 2, 6, 10 on pool P, both routed in the same tick to different committers. Without further coordination, committer A and committer B race on the per-pool `trx_seq` allocation: their `MAX(trx_seq) + 1` reads can interleave under PG's READ COMMITTED, producing seq assignments that don't match `request_seq` order.
+
+For total-pool methods this is harmless (state is commutative under exact-additive receipts; depletion math doesn't depend on seq). For order-sensitive methods (§5.3.1) this would also be guarded by the all-into-one-group rule — but the rule applies only WITHIN a tick. Successive ticks can still route overlapping work to different committers; the order-sensitive guarantee then needs cross-committer enforcement.
+
+**Mechanism.** Each committer commit_group stamps a `(pool_id, my_seq)` pair per touched pool, where `my_seq` is the commit_group's claim ordering for that pool (computed at router-emit time from `request_seq`). Before bulk-writing, each committer waits for `latest_committed_pool_seq[pid] >= my_seq − 1` for every touched pool — its immediate predecessor in pool-seq order. After successful COMMIT (and also after a failed bulk-write, to avoid wedging downstream waiters), the committer advances `latest_committed_pool_seq[pid]` to `my_seq` for each touched pool.
+
+The wait is bounded by `caller_tx_timeout_ms` (default 30s) — chosen to match the upper bound on caller-tx residency, since a predecessor that hasn't committed within that window must have ejected. Timeouts increment `committer_tm09_wait_timeouts_total` and the committer proceeds (the timeout case is treated as "predecessor will never commit; don't wedge").
+
+Today the wait is a spin-sleep coordination primitive; a condition-variable + broadcast replacement is deferred (saves the spin's CPU burn). The semantics — bounded waits, post-failure advance, per-pool independence — are stable; the primitive choice is replaceable behind it.
+
+Implementation: `committer.rs::wait_for_predecessor_pool_seqs` (acct-tm09). Replacement tracking: acct-xjhq.
 
 ### 5.5 Recovery
 
