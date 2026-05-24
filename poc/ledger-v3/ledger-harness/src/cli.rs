@@ -114,6 +114,7 @@ pub enum MethodMix {
     AllWacPeriodic,
     AllFifo,
     AllLifo,
+    AllSpecific,
     AllStd,
     Mixed,
 }

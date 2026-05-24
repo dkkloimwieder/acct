@@ -1,0 +1,5 @@
+seed-pools: 1000 pools, 1000 skus, 10 locations, mix=AllSpecific → seeded
+[run] reseeded 1000 pools mix=AllSpecific for bench
+scenario s5: capping callers 1000 -> 20 via --max-callers
+scenario s5: pathological for direct — 1000 callers, single hot pool, simple, all-wac (callers=20, duration=30s)
+{"scenario":"s5","path":"routed","throughput_trx_per_sec":2409.1,"ack_p99_us":201719,"committed_p99_us":15820914,"trx_materialized":72473,"attempts":72473,"enqueue_errors":0,"submitted_but_unseen":0,"eject_total":0,"commit_group_avg":130.11,"commit_group_p99":128,"pipeline_ns_avg":320879846,"drains":557,"window_defers":100,"output":"results/phase6/bench-9mgx3/s5-routed-all-specific-2026-05-24T00-55-28Z.json"}

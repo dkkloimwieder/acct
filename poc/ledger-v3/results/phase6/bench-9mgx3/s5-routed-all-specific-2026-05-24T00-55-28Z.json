@@ -1,0 +1,41 @@
+{
+  "scenario": "s5",
+  "path": "routed",
+  "duration_secs": 30.083619033,
+  "callers": 20,
+  "throughput_trx_per_sec": 2409.0519136178823,
+  "attempts_total": 72473,
+  "errors_total": 0,
+  "ack_latency_us": {
+    "p50": 1139,
+    "p95": 42205,
+    "p99": 201719,
+    "min": 152,
+    "max": 510394,
+    "mean": 8278,
+    "count": 72473
+  },
+  "committed_latency_us": {
+    "p50": 7969177,
+    "p95": 14948499,
+    "p99": 15820914,
+    "min": 466616,
+    "max": 16148070,
+    "mean": 8379353,
+    "count": 72473
+  },
+  "commits_observed": 76795,
+  "rollbacks_observed": 0,
+  "wal_bytes_per_trx": 1244.1189139917963,
+  "top_wait_events": [],
+  "routed": {
+    "eject_count_total": 0,
+    "commit_group_size_avg": 130.11310592459606,
+    "commit_group_size_p99": 128,
+    "committer_pipeline_ns_avg": 320879845.60143626,
+    "committer_drains_total": 557,
+    "router_window_defers_total": 100
+  },
+  "sampler_report_path": null,
+  "started_at": "2026-05-24T00:59:35.753285857Z"
+}
