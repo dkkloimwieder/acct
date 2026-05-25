@@ -649,24 +649,28 @@ fn write_plans_in_subtx(plans: &[PlannedSubmission]) -> WriteOutcome {
         pg_sys::BeginInternalSubTransaction(savepoint_name.as_ptr());
     }
 
-    // Track which plan is mid-write so the UNIQUE-catch handler can
-    // report its index. Cell is UnwindSafe; the AssertUnwindSafe wrap
-    // on the closure satisfies pgrx's PgTryBuilder bound.
-    let in_flight: Cell<Option<usize>> = Cell::new(None);
+    // Records the index of the plan that was being written when the
+    // try-block last entered apply_plan_result. It is read ONLY AFTER
+    // .execute() returns (see the read below the builder) — never from
+    // inside catch_when, whose closure captures by FnMut(*mut ErrorData)
+    // and runs in a separate scope. The value left in the Cell when a
+    // UNIQUE violation unwinds the try-block is the offending index.
+    // Cell is UnwindSafe; the AssertUnwindSafe wrap on the closure
+    // satisfies pgrx's PgTryBuilder bound.
+    let last_attempted_idx: Cell<Option<usize>> = Cell::new(None);
 
     let result: Result<usize, pgrx::spi::Error> = PgTryBuilder::new(AssertUnwindSafe(|| {
         for p in plans {
-            in_flight.set(Some(p.idx_in_kept));
+            last_attempted_idx.set(Some(p.idx_in_kept));
             bulk_write::apply_plan_result(&p.trx_type, p.source_id, p.posted_at, &p.plan)?;
         }
-        in_flight.set(None);
+        last_attempted_idx.set(None);
         Ok(plans.len())
     }))
     .catch_when(PgSqlErrorCode::ERRCODE_UNIQUE_VIOLATION, |_| {
-        // Reuse the in_flight Cell-captured idx via the outer scope.
-        // We can't reach the Cell from inside catch_when directly
-        // because the closure captures by FnMut(*mut ErrorData) — but
-        // we read it AFTER execute() returns, via the outcome below.
+        // Do NOT read last_attempted_idx here: catch_when captures by
+        // FnMut(*mut ErrorData) in a separate scope. The index is read
+        // after .execute() returns, via the outcome below.
         Ok(usize::MAX)
     })
     .execute();
@@ -676,7 +680,7 @@ fn write_plans_in_subtx(plans: &[PlannedSubmission]) -> WriteOutcome {
         unsafe {
             pg_sys::RollbackAndReleaseCurrentSubTransaction();
         }
-        let idx = in_flight.get().unwrap_or(0);
+        let idx = last_attempted_idx.get().unwrap_or(0);
         return WriteOutcome::UniqueViolationAt { idx };
     }
     match result {
