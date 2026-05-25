@@ -724,6 +724,18 @@ fn ledger_routed_c_test_set_bgworker_paused(paused: bool) {
         .store(u8::from(paused), Release);
 }
 
+/// Pause/resume just the committer pool. The router-affinity test keeps the
+/// committer paused so emitted commit_groups stay at `ready` for inspection
+/// while the router still runs.
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_set_committer_paused(paused: bool) {
+    COMMITTER_QUEUE
+        .share()
+        .test_committer_paused
+        .store(u8::from(paused), Release);
+}
+
 // ── Tests for the pure helpers ──────────────────────────────────────
 
 #[cfg(test)]

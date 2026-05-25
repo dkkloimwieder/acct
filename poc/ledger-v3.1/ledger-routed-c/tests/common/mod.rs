@@ -138,14 +138,23 @@ pub async fn enqueue_pools(
     enqueue(pool, "po_receipt", source_id, lines).await
 }
 
-/// Flip the shmem pause flag so the router (and committer) skip ticking.
-/// Requires the `test_hooks` build (the runner installs it).
+/// Pause/resume the router tick loop. Requires the `test_hooks` build.
 pub async fn set_router_paused(pool: &PgPool, paused: bool) {
     sqlx::query("SELECT ledger_routed_c_test_set_bgworker_paused($1)")
         .bind(paused)
         .execute(pool)
         .await
         .expect("set_bgworker_paused (needs test_hooks build)");
+}
+
+/// Pause/resume just the committer pool (leaves the router running). Requires
+/// the `test_hooks` build.
+pub async fn set_committer_paused(pool: &PgPool, paused: bool) {
+    sqlx::query("SELECT ledger_routed_c_test_set_committer_paused($1)")
+        .bind(paused)
+        .execute(pool)
+        .await
+        .expect("set_committer_paused (needs test_hooks build)");
 }
 
 /// The live `batch_size_max` GUC (max submissions per commit_group).
@@ -221,4 +230,191 @@ pub async fn committer_queue_count(pool: &PgPool, state: &str) -> i64 {
     .fetch_one(pool)
     .await
     .expect("committer_queue_state_counts")
+}
+
+// ── Committer pipeline helpers (P3.3) ───────────────────────────────
+
+/// A seeded single-pool fixture (deterministic ids).
+pub struct Fixture {
+    pub sku_id: i64,
+    pub loc_id: i64,
+    pub pool_id: i64,
+    pub inv_acct: i64,
+    pub ap_acct: i64,
+    pub var_acct: i64,
+}
+
+async fn seed_account(pool: &PgPool, id: i64, code: &str, name: &str, ty: &str) {
+    sqlx::query(
+        "INSERT INTO account (id, code, name, type) \
+         VALUES ($1, $2, $3, $4::account_type) ON CONFLICT DO NOTHING",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(name)
+    .bind(ty)
+    .execute(pool)
+    .await
+    .expect("insert account");
+}
+
+/// Seed a pool of `method` + `basis` plus its sku/location/accounts. The
+/// committer hydrates routing from these rows and FK-references the pool when it
+/// writes pool_state, so the committer tests (unlike the affinity test) must
+/// seed the DB.
+pub async fn seed_pool(
+    pool: &PgPool,
+    pool_id: i64,
+    sku_id: i64,
+    loc_id: i64,
+    method: &str,
+    basis: &str,
+) -> Fixture {
+    sqlx::query("INSERT INTO sku (id, code, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+        .bind(sku_id)
+        .bind(format!("SKU-{sku_id}"))
+        .bind(format!("Test SKU {sku_id}"))
+        .execute(pool)
+        .await
+        .expect("insert sku");
+    sqlx::query("INSERT INTO location (id, code, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+        .bind(loc_id)
+        .bind(format!("LOC-{loc_id}"))
+        .bind(format!("Test Loc {loc_id}"))
+        .execute(pool)
+        .await
+        .expect("insert location");
+
+    let (inv_acct, ap_acct, var_acct) = (1000i64, 2000i64, 3000i64);
+    seed_account(pool, inv_acct, "1000", "Inventory", "asset").await;
+    seed_account(pool, ap_acct, "2000", "AP", "liability").await;
+    seed_account(pool, var_acct, "3000", "PPV", "expense").await;
+
+    let identity_key = if method == "specific" { pool_id } else { 0 };
+    sqlx::query(
+        "INSERT INTO pool (id, sku_id, location_id, identity_key, method, provisional_basis) \
+         VALUES ($1, $2, $3, $4, $5::pool_method, $6::pool_provisional_basis) ON CONFLICT DO NOTHING",
+    )
+    .bind(pool_id)
+    .bind(sku_id)
+    .bind(loc_id)
+    .bind(identity_key)
+    .bind(method)
+    .bind(basis)
+    .execute(pool)
+    .await
+    .expect("insert pool");
+
+    Fixture { sku_id, loc_id, pool_id, inv_acct, ap_acct, var_acct }
+}
+
+/// Establish a standard_cost for a (sku, location).
+pub async fn seed_standard_cost(pool: &PgPool, sku_id: i64, loc_id: i64, unit_cost: i64) {
+    sqlx::query(
+        "INSERT INTO standard_cost (sku_id, location_id, unit_cost) VALUES ($1, $2, $3) \
+         ON CONFLICT (sku_id, location_id) DO UPDATE SET unit_cost = EXCLUDED.unit_cost",
+    )
+    .bind(sku_id)
+    .bind(loc_id)
+    .bind(unit_cost)
+    .execute(pool)
+    .await
+    .expect("insert standard_cost");
+}
+
+/// Seed the aggregate (`layer_id = 0`) pool_state row so depletions have a
+/// starting balance to draw down.
+pub async fn seed_aggregate(pool: &PgPool, pool_id: i64, qty: i64, unit_cost: i64) {
+    sqlx::query(
+        "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost) VALUES ($1, 0, $2, $3) \
+         ON CONFLICT (pool_id, layer_id) DO UPDATE SET qty = EXCLUDED.qty, unit_cost = EXCLUDED.unit_cost",
+    )
+    .bind(pool_id)
+    .bind(qty)
+    .bind(unit_cost)
+    .execute(pool)
+    .await
+    .expect("seed aggregate");
+}
+
+/// A depletion line (negative qty) against `f`'s pool. Path C overrides the
+/// recorded cost with the provisional basis (running avg or standard).
+pub fn depletion_line(f: &Fixture, qty: i64) -> Value {
+    json!({
+        "pool_id": f.pool_id,
+        "line_type": "transfer_shipment_line",
+        "qty": -qty,
+        "unit_cost": 0,
+        "debit_account": f.ap_acct,
+        "credit_account": f.inv_acct,
+    })
+}
+
+/// A receipt line (positive qty) against `f`'s pool.
+pub fn receipt_line_for(f: &Fixture, qty: i64, unit_cost: i64) -> Value {
+    json!({
+        "pool_id": f.pool_id,
+        "line_type": "po_receipt_line",
+        "qty": qty,
+        "unit_cost": unit_cost,
+        "debit_account": f.inv_acct,
+        "credit_account": f.ap_acct,
+    })
+}
+
+/// Aggregate row `(qty, unit_cost)` for a pool, or None.
+pub async fn aggregate(pool: &PgPool, pool_id: i64) -> Option<(i64, i64)> {
+    sqlx::query_as("SELECT qty, unit_cost FROM pool_state WHERE pool_id = $1 AND layer_id = 0")
+        .bind(pool_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read aggregate")
+}
+
+/// Count of trx rows for a given source_id (0 = the submission was dropped /
+/// deduped and produced no trx).
+pub async fn trx_count_for_source(pool: &PgPool, source_id: i64) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM trx WHERE source_id = $1")
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .expect("trx count for source")
+}
+
+/// Read a committer stat accessor `ledger_routed_c_committer_<name>()`.
+pub async fn committer_stat(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT ledger_routed_c_committer_{name}()"))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("committer stat {name}: {e}"))
+}
+
+/// Poll until the total trx count reaches `expected`, or panic on timeout.
+pub async fn await_trx_count(pool: &PgPool, expected: i64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let n = trx_count(pool).await;
+        if n >= expected {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {expected} trx rows; got {n}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Poll until `committer_drains_total` advances by at least `delta` beyond
+/// `base`, confirming the committer finished processing this test's groups.
+pub async fn await_committer_drains(pool: &PgPool, base: i64, delta: i64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if committer_stat(pool, "drains_total").await - base >= delta {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {delta} committer drains beyond {base}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

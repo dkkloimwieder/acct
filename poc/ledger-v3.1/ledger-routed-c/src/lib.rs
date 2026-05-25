@@ -22,14 +22,19 @@
 use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, pg_shmem_init};
 use std::ffi::CString;
+use std::sync::atomic::Ordering::Relaxed;
 
 ::pgrx::pg_module_magic!();
 
 pub(crate) mod arena;
+pub(crate) mod bulk_write;
+pub(crate) mod cleanup;
 pub(crate) mod committer;
 pub(crate) mod enqueue;
+pub(crate) mod hydration;
 pub(crate) mod identity;
 pub(crate) mod payload;
+pub(crate) mod pool_lock;
 pub(crate) mod recovery;
 pub(crate) mod router;
 pub(crate) mod shmem;
@@ -301,6 +306,63 @@ fn ledger_routed_c_arena_bump_offset() -> i64 {
 #[pg_extern]
 fn ledger_routed_c_arena_freelist_count() -> i64 {
     SPILLOVER_ARENA.share().freelist_count() as i64
+}
+
+// ── Committer observability ─────────────────────────────────────────
+//
+// Cumulative since extension load (cluster lifetime). Tests measure deltas /
+// run against a freshly-restarted container. The pool-lock + aggregate-upsert
+// counters verify the §6.7 batching win: a hot-pool commit_group adds one each,
+// where direct flavor adds one per submission.
+
+#[pg_extern]
+fn ledger_routed_c_committer_drains_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_drains_total.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_pool_lock_acquisitions_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_pool_lock_acquisitions_total
+        .load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_aggregate_upserts_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_aggregate_upserts_total
+        .load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_trx_committed_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_trx_committed_total
+        .load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_dedup_skips_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_dedup_skips_total
+        .load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_dropped_submissions_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_dropped_submissions_total
+        .load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_tx_failures_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_tx_failures.load(Relaxed) as i64
 }
 
 // ── Smoke entry point ───────────────────────────────────────────────

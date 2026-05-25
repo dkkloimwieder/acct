@@ -183,7 +183,13 @@ pub struct CommitterQueue {
     /// pg_terminate_backend the router to trigger boot sweep on restart.
     pub router_pid: AtomicI32,
     pub test_reorder_router_stores: AtomicU8,
+    /// Test-only: when 1, the router skips its tick body (stays parked on the
+    /// latch). Lets a test stage a whole batch before the router groups it.
     pub test_bgworker_paused: AtomicU8,
+    /// Test-only: when 1, the committer skips claiming/draining commit_groups.
+    /// Independent of `test_bgworker_paused` so the router-affinity test can run
+    /// the router while keeping emitted groups at `ready` for inspection.
+    pub test_committer_paused: AtomicU8,
     /// Postmaster-startup recovery flag. 0 = recovery not yet
     /// complete; router + committer BGWorkers spin at startup until
     /// set. 1 = recovery sweep finished (Release stored by the
@@ -202,6 +208,25 @@ pub struct CommitterQueue {
     pub committer_claim_count: AtomicU64,
     pub committer_takeover_count: AtomicU64,
     pub committer_tx_failures: AtomicU64,
+    /// Per-pool FOR UPDATE acquisitions across all committed commit_groups
+    /// (incremented by `pool_ids.len()` per `acquire_pool_locks`). The routed
+    /// batching win: a whole commit_group's submissions to one hot pool add 1
+    /// here, where direct flavor would add one per submission (§6.7).
+    pub committer_pool_lock_acquisitions_total: AtomicU64,
+    /// Aggregate (`layer_id = 0`) rows UPSERTed across all committed
+    /// commit_groups (one per touched aggregate-bearing pool per group — the
+    /// final-snapshot collapse, NOT one per submission).
+    pub committer_aggregate_upserts_total: AtomicU64,
+    /// trx rows committed across all commit_groups (one per included
+    /// submission). The harness polls trx existence; this is the in-shmem
+    /// mirror for fast cross-checks.
+    pub committer_trx_committed_total: AtomicU64,
+    /// Submissions excluded by pre-flight dedup (already in trx, or a
+    /// within-batch (trx_type, source_id) duplicate). §6.4 step 5.
+    pub committer_dedup_skips_total: AtomicU64,
+    /// Submissions dropped by drop-and-continue (per-submission
+    /// plan_apply_provisional Err — e.g. insufficient inventory). §6.4 step 9.
+    pub committer_dropped_submissions_total: AtomicU64,
 
     // ── Eject + pipeline observability ─────────────────────────────
     pub eject_total_count: AtomicU64,

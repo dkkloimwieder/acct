@@ -29,6 +29,10 @@ async fn route_batch(
     mine: &[i64],
     batches: &[Vec<i64>],
 ) -> Vec<(i64, i64, Vec<i64>)> {
+    // Keep the committer parked for the whole binary so emitted commit_groups
+    // stay at `ready` for inspection (and so it never tries to drain these
+    // pools, which aren't seeded in the DB). Idempotent across calls.
+    set_committer_paused(pool, true).await;
     set_router_paused(pool, true).await;
     // Let any in-progress tick finish and the worker park on the flag.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
