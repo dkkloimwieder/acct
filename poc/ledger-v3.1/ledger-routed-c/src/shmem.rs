@@ -110,7 +110,11 @@ unsafe impl PGRXSharedMemory for StagingQueue {}
 
 #[repr(C)]
 pub struct CommitterQueueEntry {
-    /// 0=empty 1=ready 2=in_flight 3=completed
+    /// 0=empty 1=ready 2=in_flight 3=completed 4=poisoned. `poisoned` is a
+    /// terminal dead-letter state (§6.8): a committer hit a non-retryable SQL
+    /// error (UNIQUE survived dedup, or a deadlock that exhausted its retry
+    /// budget). The slot is never re-claimed (claim only takes valid==1) and is
+    /// left at 4 for observability; `committer_poisoned_total` counts it.
     pub valid: AtomicU8,
     pub _pad: [u8; 7],
     pub commit_group_id: u64,
@@ -173,6 +177,11 @@ pub struct CommitterQueue {
     /// committer to remain in flight long enough for pg_terminate_backend
     /// to land mid-pipeline (acct-p0d8 orphan_recovery).
     pub test_inject_committer_stall_us: AtomicU32,
+    /// Test-only: number of synthetic deadlocks (SQLSTATE 40P01) the committer
+    /// write phase should raise before letting the write proceed. Decremented
+    /// once per injected raise. Lets the §6.8 retry-on-deadlock path be
+    /// exercised deterministically. Production builds never set it nonzero.
+    pub test_inject_committer_deadlock_count: AtomicU32,
     /// Number of times the committer pipeline entered the stall sleep
     /// path under nonzero `test_inject_committer_stall_us`. Read by
     /// the test_hooks `ledger_routed_test_committer_stall_hits` SPI.
@@ -190,13 +199,17 @@ pub struct CommitterQueue {
     /// Independent of `test_bgworker_paused` so the router-affinity test can run
     /// the router while keeping emitted groups at `ready` for inspection.
     pub test_committer_paused: AtomicU8,
+    /// Test-only one-shot: when 1, the next committer to enter its write phase
+    /// raises a non-retryable SQL error (forces the §6.8 poison path), then
+    /// clears the flag (swap-to-0). Production builds never set it nonzero.
+    pub test_inject_committer_fatal: AtomicU8,
     /// Postmaster-startup recovery flag. 0 = recovery not yet
     /// complete; router + committer BGWorkers spin at startup until
     /// set. 1 = recovery sweep finished (Release stored by the
     /// recovery worker; router/committers Acquire-load before opening
     /// for traffic).
     pub recovery_complete: AtomicU8,
-    pub _pad_test: [u8; 2],
+    pub _pad_test: [u8; 1],
 
     // ── Slot-leak audit counters ───────────────────────────────────
     pub audit_reclaims_count: AtomicU64,
@@ -208,6 +221,13 @@ pub struct CommitterQueue {
     pub committer_claim_count: AtomicU64,
     pub committer_takeover_count: AtomicU64,
     pub committer_tx_failures: AtomicU64,
+    /// commit_groups moved to the terminal `poisoned` state (valid==4) after a
+    /// non-retryable SQL error or a deadlock that exhausted its retry budget
+    /// (§6.8). Their submissions are lost (no trx); the CQ slot is a dead-letter.
+    pub committer_poisoned_total: AtomicU64,
+    /// Cumulative count of deadlock-driven write-phase retries (§6.8): one per
+    /// re-attempt after a 40P01 / 40001, across all commit_groups.
+    pub committer_deadlock_retries_total: AtomicU64,
     /// Per-pool FOR UPDATE acquisitions across all committed commit_groups
     /// (incremented by `pool_ids.len()` per `acquire_pool_locks`). The routed
     /// batching win: a whole commit_group's submissions to one hot pool add 1

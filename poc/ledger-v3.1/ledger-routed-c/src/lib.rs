@@ -11,11 +11,12 @@
 //! and COMMITs (drop-and-continue on per-submission failure — Path C has no
 //! cross-trx hot-path state, so there is no pristine-snapshot replay, §6.4 / §14.2).
 //!
-//! **P3.1 scope (`acct-2ttr.4`)**: shmem layout (staging + committer queues +
-//! spillover arena + committer identity registry, §6.2), the arena allocator, the
-//! payload codec, `ledger_enqueue_trx_c`, GUCs, and BGWorker registration with
-//! lifecycle-only worker shells. Router logic is P3.2, the committer pipeline P3.3,
-//! recovery/error handling P3.4.
+//! Phases: P3.1 (`acct-2ttr.4`) shmem layout (staging + committer queues +
+//! spillover arena + committer identity registry, §6.2) + arena allocator +
+//! payload codec + `ledger_enqueue_trx_c` + GUCs + BGWorker registration; P3.2
+//! (`acct-2ttr.5`) the router (§6.3); P3.3 (`acct-2ttr.6`) the committer pipeline
+//! (§6.4); P3.4 (`acct-2ttr.7`) recovery (§6.5: router boot sweep + committer-death
+//! takeover) + committer SQL error handling (§6.8: retry-on-deadlock + poison).
 
 #![allow(unexpected_cfgs)]
 
@@ -363,6 +364,39 @@ fn ledger_routed_c_committer_dropped_submissions_total() -> i64 {
 #[pg_extern]
 fn ledger_routed_c_committer_tx_failures_total() -> i64 {
     COMMITTER_QUEUE.share().committer_tx_failures.load(Relaxed) as i64
+}
+
+/// commit_groups moved to the terminal `poisoned` state (§6.8): a non-retryable
+/// SQL error or a deadlock that exhausted its retry budget. Their submissions
+/// are lost (no trx); the CQ slot is a dead-letter at valid==4.
+#[pg_extern]
+fn ledger_routed_c_committer_poisoned_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_poisoned_total.load(Relaxed) as i64
+}
+
+/// Cumulative deadlock-driven write-phase retries (§6.8): one per re-attempt
+/// after a 40P01 / 40001.
+#[pg_extern]
+fn ledger_routed_c_committer_deadlock_retries_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_deadlock_retries_total
+        .load(Relaxed) as i64
+}
+
+/// commit_groups reclaimed from a dead committer by the router boot sweep
+/// (§6.5 Phase 2): each reverted in_flight→ready entry increments this.
+#[pg_extern]
+fn ledger_routed_c_committer_takeover_count() -> i64 {
+    COMMITTER_QUEUE.share().committer_takeover_count.load(Relaxed) as i64
+}
+
+/// Whether the postmaster-startup recovery sweep has completed (§6.5). Router +
+/// committers block until this is set; tests poll it before driving traffic.
+#[pg_extern]
+fn ledger_routed_c_recovery_complete() -> bool {
+    use std::sync::atomic::Ordering::Acquire;
+    COMMITTER_QUEUE.share().recovery_complete.load(Acquire) != 0
 }
 
 // ── Smoke entry point ───────────────────────────────────────────────

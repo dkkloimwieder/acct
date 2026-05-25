@@ -69,10 +69,20 @@ UPDATE → hydrate → **drop-and-continue** apply (process submissions in enque
 working snapshot; a submission whose `plan_apply_provisional` fails is dropped, the rest continue
 — **no pristine-snapshot replay**, §14.2) → batch write → COMMIT → cleanup. The write collapses a
 whole commit_group's depletions into **one aggregate UPDATE per pool** (the final working-snapshot
-state), one `pool_lock` acquisition, and one fsync — the §6.7 batching win. **Recovery + SQL error
-handling (P3.4)** (committer-death reclaim, retry-on-deadlock, poison) remains a shell.
-Observability: `ledger_routed_c_committer_{drains,pool_lock_acquisitions,aggregate_upserts,trx_committed,dedup_skips,dropped_submissions,tx_failures}_total()`
-and `ledger_routed_c_committer_queue_state_counts()` / `ledger_routed_c_ready_commit_groups()`.
+state), one `pool_lock` acquisition, and one fsync — the §6.7 batching win.
+
+P3.4 adds **recovery + committer SQL error handling**. The router runs a boot-recovery sweep
+(§6.5) at startup: it re-stamps interrupted data-before-flag stores, takes over commit_groups
+whose owning committer died (CQ `in_flight→ready`, reclaimed by a live committer — the committer's
+pre-flight dedup is the recovery source of truth, no pristine-replay), and reverts orphaned staging
+entries. The committer wraps its lock→hydrate→apply→write phase in a subtransaction (§6.8): a
+transient SQLSTATE (40P01 deadlock / 40001 serialization) is retried with exponential backoff (≤5);
+a non-retryable SQLSTATE — or an exhausted retry budget — **poisons** the commit_group (terminal CQ
+state `valid==4` dead-letter, submissions lost).
+Observability: `ledger_routed_c_committer_{drains,pool_lock_acquisitions,aggregate_upserts,trx_committed,dedup_skips,dropped_submissions,tx_failures,poisoned,deadlock_retries}_total()`
+(`poisoned` / `deadlock_retries` new in P3.4) plus `ledger_routed_c_committer_takeover_count()`,
+and `ledger_routed_c_committer_queue_state_counts()` (now incl. `poisoned`) /
+`ledger_routed_c_ready_commit_groups()` / `ledger_routed_c_recovery_complete()`.
 
 > Preloading both `ledger_routed` (v3) and `ledger_routed_c` (v3.1) plus the other PoC streams'
 > workers needs headroom: the dev container's `max_worker_processes` was raised to 32 so the full
@@ -81,7 +91,7 @@ and `ledger_routed_c_committer_queue_state_counts()` / `ledger_routed_c_ready_co
 ## Crates
 - `ledger-core` — pure Rust, no pgrx: per-method state transitions + provisional dispatch (§8). ✓
 - `ledger-direct-c` — pgrx extension: `ledger_submit_trx_c` (§5). ✓
-- `ledger-routed-c` — pgrx extension: `ledger_enqueue_trx_c` + shmem (§6.1/§6.2) + router (§6.3) + committer (§6.4); recovery (§6.5) shell. ◐ (P3.3)
+- `ledger-routed-c` — pgrx extension: `ledger_enqueue_trx_c` + shmem (§6.1/§6.2) + router (§6.3) + committer (§6.4) + recovery (§6.5) + SQL error handling (§6.8). ✓ (P3.4)
 - `ledger-harness` — multi-session measurement binary (§10).
 
 ## Phases — epic `acct-2ttr`
@@ -93,7 +103,7 @@ and `ledger_routed_c_committer_queue_state_counts()` / `ledger_routed_c_ready_co
 | P3.1  | `acct-2ttr.4` | ledger-routed-c shmem + `ledger_enqueue_trx_c` | ✓ |
 | P3.2  | `acct-2ttr.5` | router BGWorker (window scan + union-find affinity) | ✓ |
 | P3.3  | `acct-2ttr.6` | committer pool (provisional dispatch, drop-and-continue) | ✓ |
-| P3.4  | `acct-2ttr.7` | recovery + committer SQL error handling | |
+| P3.4  | `acct-2ttr.7` | recovery + committer SQL error handling | ✓ |
 | P4    | `acct-2ttr.8` | harness (3 submission modes + deep-pool seeding + lock-hold metric) | |
 | P5    | `acct-2ttr.9` | characterization & PoC report | |
 

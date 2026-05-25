@@ -46,12 +46,19 @@
 //! recovery test (P3.4) stress the ordering window; both default to zero
 //! and have no production effect.
 //!
-//! The boot-recovery sweep (`try_recover_router_orphan`) lands in P3.4;
-//! this file ships steady-state routing only.
+//! ## Boot-recovery sweep (§6.5)
+//!
+//! `try_recover_router_orphan` runs once at `router_main` startup (after the
+//! recovery worker flips `recovery_complete`) and reconciles shmem state a prior
+//! router / committer left mid-operation: re-stamping interrupted
+//! data-before-flag stores, taking over commit_groups whose owning committer
+//! died, and reverting orphaned staging entries. It is idempotent and is also
+//! callable on demand via the `test_hooks` SPI.
 
+use crate::identity::is_committer_alive;
 use crate::shmem::{
     COMMITTER_QUEUE, LEDGER_V3_COMMITTER_QUEUE_SIZE, LEDGER_V3_STAGING_QUEUE_SIZE, SPILLOVER_ARENA,
-    STAGING_QUEUE,
+    STAGING_QUEUE, StagingQueue, signal_staging_slot_freed,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_guard;
@@ -92,7 +99,11 @@ pub extern "C-unwind" fn ledger_routed_c_router_main(_arg: pg_sys::Datum) {
 
     wait_for_recovery_complete();
 
-    // The boot-recovery sweep is P3.4; P3.2 runs steady-state routing only.
+    // Boot-recovery sweep (§6.5): reconcile any shmem state a prior router /
+    // committer left mid-operation before opening for steady-state routing.
+    // Phase ordering is load-bearing (see try_recover_router_orphan).
+    try_recover_router_orphan();
+
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
         if BackgroundWorker::sighup_received() {
             unsafe {
@@ -629,7 +640,7 @@ fn record_commit_group_stats(submission_count: u16) {
 fn ledger_routed_c_committer_queue_state_counts()
 -> TableIterator<'static, (name!(state, String), name!(count, i64))> {
     let queue = COMMITTER_QUEUE.share();
-    let mut counts = [0i64; 4];
+    let mut counts = [0i64; 5];
     for slot in queue.entries.iter() {
         let v = slot.valid.load(Relaxed) as usize;
         if v < counts.len() {
@@ -637,7 +648,7 @@ fn ledger_routed_c_committer_queue_state_counts()
         }
     }
     drop(queue);
-    let states = ["empty", "ready", "in_flight", "done"];
+    let states = ["empty", "ready", "in_flight", "done", "poisoned"];
     let rows: Vec<(String, i64)> = states
         .iter()
         .enumerate()
@@ -707,6 +718,210 @@ fn ledger_routed_c_ready_commit_groups() -> TableIterator<
     TableIterator::new(rows.into_iter())
 }
 
+// ── Boot recovery sweep (§6.5) ──────────────────────────────────────
+//
+// Recover from a router BGWorker SIGKILL/panic or a committer death.
+// Postmaster restarts the router (set_restart_time(5s) — see lib.rs);
+// the new router runs this sweep before entering the tick loop. Also
+// invoked on demand by the test_hooks SPI.
+//
+// Two-phase shape (Path C has no PoolSeqTable, so the v3 "tm09" seq
+// rollforward is absent; otherwise this mirrors the v3 sweep):
+//
+//   Phase 1 (queue-driven re-stamp): for each CommitterQueueEntry at
+//     valid==1 (ready, no committer claim yet), iterate linked staging
+//     entries. Any linked staging at (valid==2, cg_id==0 OR cg_id ==
+//     CQ.cg_id) means the old router pushed the queue entry but died
+//     before completing the per-entry stamp+CAS (the data-before-flag
+//     block in emit_commit_group). Roll FORWARD: store cg_id (Release)
+//     + CAS staging 2→3 (Release). The committer's normal claim+drain
+//     picks up the now-ready slot.
+//
+//   Phase 2 (queue-driven take-over dead committer): for each
+//     CommitterQueueEntry at valid==2 with a dead committer identity
+//     (is_committer_alive returns false), revert the CQ to valid==1 +
+//     clear identity. The next committer's claim_next_committer_entry
+//     sees valid==1 and re-claims. v3.1 needs no pristine-replay here:
+//     the committer's PRE-FLIGHT DEDUP (dedup_against_trx) is the
+//     recovery source of truth — any submissions the dead committer
+//     already wrote to trx are skipped, the rest reprocessed; the trx
+//     UNIQUE constraint backstops races.
+//
+//   Phase 3 (staging-driven orphan-no-queue): for each StagingEntry at
+//     valid==2 whose cg_id isn't backed by an active CQ entry, revert
+//     valid 2→1 + reset cg_id to 0. The router crashed before pushing
+//     the CQ entry.
+//
+// Phase ordering is load-bearing: sweep_queue_phase (Phase 1+2) MUST run
+// before sweep_staging_phase (Phase 3). A staging entry the queue phase
+// is about to re-stamp carries cg_id==0 (the router crashed before the
+// cg_id store), so it is never in active_cg_ids — running the staging
+// phase first would revert it as an orphan, dropping a submission the
+// queue phase was about to recover.
+//
+// Idempotent: a second call finds slots already at their post-recovery
+// state and skips (CAS election semantics).
+
+/// Run one full router-orphan recovery sweep. Returns the number of shmem slots
+/// reconciled (re-stamped, reverted, or CQ-cleared). Idempotent.
+pub(crate) fn try_recover_router_orphan() -> u64 {
+    let mut recovered: u64 = 0;
+    recovered += sweep_queue_phase();
+    recovered += sweep_staging_phase();
+    recovered
+}
+
+fn sweep_queue_phase() -> u64 {
+    let mut recovered: u64 = 0;
+    let queue_capacity = LEDGER_V3_COMMITTER_QUEUE_SIZE as u32;
+
+    for q_idx in 0..queue_capacity {
+        let (q_valid, q_cg_id, q_submission_count, q_so_off, q_owner_slot, q_owner_gen) = {
+            let queue = COMMITTER_QUEUE.share();
+            let slot = &queue.entries[q_idx as usize];
+            let v = slot.valid.load(Acquire);
+            (
+                v,
+                slot.commit_group_id,
+                slot.submission_count,
+                slot.staging_entry_offsets,
+                slot.committer_bgw_slot.load(Acquire),
+                slot.committer_bgw_generation.load(Acquire),
+            )
+        };
+
+        match q_valid {
+            1 => {
+                // Phase 1: re-stamp linked staging entries the old router never
+                // reached in the data-before-flag block.
+                if q_submission_count == 0 || q_so_off == 0 {
+                    continue;
+                }
+                let staging_indices = read_staging_indices_at(q_so_off, q_submission_count);
+                let queue = STAGING_QUEUE.share();
+                for s_idx in staging_indices {
+                    if try_restamp_staging_to_routed(&queue, s_idx, q_cg_id) {
+                        recovered += 1;
+                    }
+                }
+            }
+            2 => {
+                // Phase 2: in-flight with a possibly-dead committer. Unclaimed
+                // sentinel (generation == 0) means there was never an owner.
+                if q_owner_gen == 0 {
+                    continue;
+                }
+                if is_committer_alive(q_owner_slot, q_owner_gen) {
+                    continue;
+                }
+                // Revert CQ valid 2→1 + clear identity so the next committer's
+                // claim_next_committer_entry can take over. Staging entries stay
+                // at valid==3; the new committer re-decodes via the CQ payload and
+                // re-runs the pipeline — pre-flight dedup (dedup_against_trx) skips
+                // anything the dead committer's tx committed before dying.
+                let queue = COMMITTER_QUEUE.share();
+                let slot = &queue.entries[q_idx as usize];
+                if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
+                    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+                    slot.committer_bgw_generation.store(0, Relaxed);
+                    slot.committer_acquired_at_ns.store(0, Relaxed);
+                    slot.committer_tx_id.store(0, Relaxed);
+                    queue.committer_takeover_count.fetch_add(1, Relaxed);
+                    recovered += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    recovered
+}
+
+fn sweep_staging_phase() -> u64 {
+    let mut recovered: u64 = 0;
+    let staging_capacity = LEDGER_V3_STAGING_QUEUE_SIZE as u32;
+    let queue_capacity = LEDGER_V3_COMMITTER_QUEUE_SIZE as u32;
+
+    // cg_ids backed by an active CQ entry. Staging at valid==2 whose cg_id is in
+    // this set was either handled by sweep_queue_phase or is intentionally
+    // in-flight; staging at valid==2 whose cg_id isn't is genuinely orphaned.
+    let active_cg_ids: HashSet<u64> = {
+        let queue = COMMITTER_QUEUE.share();
+        let mut s = HashSet::new();
+        for q_idx in 0..queue_capacity {
+            let slot = &queue.entries[q_idx as usize];
+            if slot.valid.load(Acquire) != 0 {
+                s.insert(slot.commit_group_id);
+            }
+        }
+        s
+    };
+
+    let staging = STAGING_QUEUE.share();
+    for s_idx in 0..staging_capacity {
+        if try_revert_orphan_staging(&staging, s_idx, &active_cg_ids) {
+            signal_staging_slot_freed(&staging);
+            recovered += 1;
+        }
+    }
+
+    recovered
+}
+
+/// Phase 1 pure helper: if `s_idx` is at valid==2 with cg_id==0 or matching the
+/// queue's cg_id, complete the router's interrupted data-before-flag stamp
+/// (store cg_id Release + CAS valid 2→3 Release). Returns true on re-stamp.
+pub(crate) fn try_restamp_staging_to_routed(queue: &StagingQueue, s_idx: u32, q_cg_id: u64) -> bool {
+    let slot = &queue.entries[s_idx as usize];
+    if slot.valid.load(Acquire) != 2 {
+        return false;
+    }
+    let s_cg = slot.commit_group_id.load(Acquire);
+    if s_cg != 0 && s_cg != q_cg_id {
+        return false; // belongs to a different (later) commit_group
+    }
+    slot.commit_group_id.store(q_cg_id, Release);
+    slot.valid.compare_exchange(2, 3, Release, Relaxed).is_ok()
+}
+
+/// Phase 3 pure helper: if `s_idx` is at valid==2 with a cg_id not in
+/// `active_cg_ids`, CAS revert valid 2→1 + reset cg_id Release. Returns true on
+/// revert. Caller broadcasts the backpressure CV after each successful revert.
+pub(crate) fn try_revert_orphan_staging(
+    queue: &StagingQueue,
+    s_idx: u32,
+    active_cg_ids: &HashSet<u64>,
+) -> bool {
+    let slot = &queue.entries[s_idx as usize];
+    if slot.valid.load(Acquire) != 2 {
+        return false;
+    }
+    let s_cg = slot.commit_group_id.load(Acquire);
+    if s_cg != 0 && active_cg_ids.contains(&s_cg) {
+        return false;
+    }
+    if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
+        slot.commit_group_id.store(0, Release);
+        return true;
+    }
+    false
+}
+
+/// Read a `submission_count`-length array of u32 staging indices from the
+/// spillover arena at `offset`. Router-local mirror of the committer's reader
+/// (small enough to copy-paste; resist premature abstraction).
+fn read_staging_indices_at(offset: u32, submission_count: u16) -> Vec<u32> {
+    if submission_count == 0 || offset == 0 {
+        return Vec::new();
+    }
+    let arena = SPILLOVER_ARENA.share();
+    let bytes = arena.read_bytes(offset, submission_count as u32 * 4);
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 // ── Test hooks ──────────────────────────────────────────────────────
 
 /// Pause/resume the router (and committer) tick loops by flipping the
@@ -734,6 +949,108 @@ fn ledger_routed_c_test_set_committer_paused(paused: bool) {
         .share()
         .test_committer_paused
         .store(u8::from(paused), Release);
+}
+
+/// The router worker's OS PID (published at `router_main` startup). Lets a test
+/// pg_terminate_backend the router to trigger the boot sweep on its restart.
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_router_pid() -> i32 {
+    COMMITTER_QUEUE.share().router_pid.load(Acquire)
+}
+
+/// Set the committer stall (µs) the pipeline honors between pool_lock acquire and
+/// the write. Tests use it to keep the committer in flight long enough to act on
+/// it mid-pipeline (§6.8 / §9.3).
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_set_committer_stall_us(us: i32) {
+    let v = if us < 0 { 0u32 } else { us as u32 };
+    COMMITTER_QUEUE
+        .share()
+        .test_inject_committer_stall_us
+        .store(v, Release);
+}
+
+/// Read the committer stall-hit counter (times the pipeline entered the stall).
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_committer_stall_hits() -> i64 {
+    COMMITTER_QUEUE.share().test_committer_stall_hits.load(Acquire) as i64
+}
+
+/// Arm `n` synthetic deadlocks (SQLSTATE 40P01) for the committer write phase to
+/// raise (one per re-attempt). Drives the §6.8 retry-on-deadlock path.
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_set_inject_deadlock_count(n: i32) {
+    let v = if n < 0 { 0u32 } else { n as u32 };
+    COMMITTER_QUEUE
+        .share()
+        .test_inject_committer_deadlock_count
+        .store(v, Release);
+}
+
+/// Arm a one-shot non-retryable SQL error in the next committer write phase
+/// (forces the §6.8 poison path).
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_set_inject_fatal(on: bool) {
+    COMMITTER_QUEUE
+        .share()
+        .test_inject_committer_fatal
+        .store(u8::from(on), Release);
+}
+
+/// Invoke the router boot sweep synchronously (without restarting the router).
+/// Returns the number of slots reconciled. Pause the BGWorkers first so the
+/// router can't race-claim the slots being swept.
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_run_router_recovery_sweep() -> i64 {
+    try_recover_router_orphan() as i64
+}
+
+/// Inject a synthetic orphaned CommitterQueueEntry: find the first CQ slot at
+/// valid==0, stamp it valid==2 with a phony owner identity (slot 0, generation
+/// u32::MAX) that can never match a live committer. Returns the chosen CQ index
+/// (-1 if none free). Exercises the boot-sweep Phase 2 take-over path without a
+/// real committer SIGKILL — a real SIGKILL on a BGW makes the postmaster restart
+/// ALL backends (shmem may be corrupt), which is indistinguishable from the
+/// postmaster-restart scenario. Pause the BGWorkers before calling.
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_inject_orphan_cq() -> i32 {
+    // Exclusive guard: we mutate the entry's plain (non-atomic) data fields, not
+    // just the atomics. BGWorkers are paused by the caller, so there's no
+    // contention.
+    let mut guard = COMMITTER_QUEUE.exclusive();
+    let capacity = LEDGER_V3_COMMITTER_QUEUE_SIZE.min(guard.entries.len());
+    for idx in 0..capacity {
+        let entry = &mut guard.entries[idx];
+        if entry.valid.load(Acquire) != 0 {
+            continue;
+        }
+        // Zero the data fields: a finalized (valid==0) slot retains stale
+        // staging_entry_offsets / pool_keys_offset / submission_count /
+        // commit_group_id from its prior use, and those arena offsets are already
+        // freed. Leaving them would make the committer that later drains this
+        // reverted orphan double-free them (freelist corruption → an alloc spin
+        // holding the arena LWLock). A real Phase-2 orphan carries VALID offsets
+        // (the dead committer died before cleanup), so production never hits this;
+        // the synthetic hook must clear them to behave like a freshly-emitted
+        // empty group whose drain is a clean no-op.
+        entry.commit_group_id = 0;
+        entry.submission_count = 0;
+        entry.staging_entry_offsets = 0;
+        entry.pool_keys_offset = 0;
+        entry.pool_keys_count = 0;
+        entry.committer_bgw_slot.store(0, Release);
+        entry.committer_bgw_generation.store(u32::MAX, Release);
+        entry.valid.store(2, Release);
+        return idx as i32;
+    }
+    -1
 }
 
 // ── Tests for the pure helpers ──────────────────────────────────────
@@ -902,5 +1219,94 @@ mod tests {
         assert_eq!(submission_histogram_bucket(127), 6);
         assert_eq!(submission_histogram_bucket(128), 7);
         assert_eq!(submission_histogram_bucket(u16::MAX), 7);
+    }
+
+    // ── Router-orphan sweep helpers (§6.5) ──────────────────────────
+
+    fn fresh_staging_queue() -> Box<StagingQueue> {
+        unsafe { Box::<StagingQueue>::new_zeroed().assume_init() }
+    }
+
+    fn set_staging(slot_state: u8, cg_id: u64) -> Box<StagingQueue> {
+        let mut q = fresh_staging_queue();
+        let slot = &mut q.entries[3];
+        slot.valid = std::sync::atomic::AtomicU8::new(slot_state);
+        slot.commit_group_id = std::sync::atomic::AtomicU64::new(cg_id);
+        q
+    }
+
+    #[test]
+    fn restamp_promotes_valid_2_cg_zero_to_routed_with_cg_id() {
+        let q = set_staging(2, 0);
+        assert!(try_restamp_staging_to_routed(&q, 3, 42));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 3);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 42);
+    }
+
+    #[test]
+    fn restamp_skips_when_valid_is_not_2() {
+        let q = set_staging(1, 0);
+        assert!(!try_restamp_staging_to_routed(&q, 3, 42));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn restamp_skips_when_cg_id_mismatches() {
+        // Staging at valid=2 with cg_id=99 belongs to a later commit_group; the
+        // Phase 1 sweep iterating CQ cg_id=42 must NOT re-stamp it.
+        let q = set_staging(2, 99);
+        assert!(!try_restamp_staging_to_routed(&q, 3, 42));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 2);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 99);
+    }
+
+    #[test]
+    fn restamp_idempotent_second_call_is_noop() {
+        let q = set_staging(2, 0);
+        assert!(try_restamp_staging_to_routed(&q, 3, 42));
+        assert!(!try_restamp_staging_to_routed(&q, 3, 42));
+    }
+
+    #[test]
+    fn revert_orphan_promotes_valid_2_to_pending_when_cg_not_active() {
+        let q = set_staging(2, 0);
+        let active: HashSet<u64> = HashSet::new();
+        assert!(try_revert_orphan_staging(&q, 3, &active));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 1);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn revert_orphan_promotes_when_cg_id_set_but_not_active() {
+        let q = set_staging(2, 77);
+        let active: HashSet<u64> = HashSet::new(); // 77 not present
+        assert!(try_revert_orphan_staging(&q, 3, &active));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 1);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn revert_orphan_skips_when_cg_id_active() {
+        let q = set_staging(2, 77);
+        let active: HashSet<u64> = [77u64].into_iter().collect();
+        assert!(!try_revert_orphan_staging(&q, 3, &active));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 2);
+        assert_eq!(q.entries[3].commit_group_id.load(Relaxed), 77);
+    }
+
+    #[test]
+    fn revert_orphan_skips_when_valid_is_not_2() {
+        let q = set_staging(3, 0);
+        let active: HashSet<u64> = HashSet::new();
+        assert!(!try_revert_orphan_staging(&q, 3, &active));
+        assert_eq!(q.entries[3].valid.load(Relaxed), 3);
+    }
+
+    #[test]
+    fn revert_orphan_idempotent_second_call_is_noop() {
+        let q = set_staging(2, 0);
+        let active: HashSet<u64> = HashSet::new();
+        assert!(try_revert_orphan_staging(&q, 3, &active));
+        assert!(!try_revert_orphan_staging(&q, 3, &active));
     }
 }

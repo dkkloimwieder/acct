@@ -30,7 +30,17 @@
 //!
 //! Path C deltas vs the v3 strict committer: no tm09 per-pool predecessor wait
 //! (no PoolSeqTable), and pristine-replay is replaced by drop-and-continue.
-//! Retry-on-deadlock and poison classification (§6.8) are P3.4.
+//!
+//! §6.8 SQL error handling: the whole lock → hydrate → apply → write phase runs
+//! in a nested subtransaction. A transient SQLSTATE (40P01 deadlock / 40001
+//! serialization) rolls the subtx back and retries with exponential backoff (up
+//! to MAX_DEADLOCK_RETRIES) — the pre-flight dedup catches anything other
+//! committers finished meanwhile. A non-retryable SQLSTATE (UNIQUE survived
+//! dedup, check / not-null, …), or exhausting the retry budget, POISONs the
+//! commit_group: its CQ entry moves to the terminal valid==4 dead-letter state
+//! and its submissions are lost. Committer-death recovery itself is the router
+//! boot sweep's job (router.rs §6.5 Phase 2); this committer's pre-flight dedup
+//! is the recovery source of truth when a reclaimed group is reprocessed.
 
 #![allow(dead_code)]
 
@@ -49,7 +59,13 @@ use pgrx::PgTryBuilder;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_guard;
 use pgrx::pg_sys;
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
+
+/// §6.8 retry-on-deadlock budget: a commit_group whose write phase hits a
+/// transient SQLSTATE (40P01 deadlock / 40001 serialization) is retried up to
+/// this many times with exponential backoff before being poisoned.
+const MAX_DEADLOCK_RETRIES: u32 = 5;
 
 use crate::bulk_write;
 use crate::cleanup;
@@ -119,35 +135,60 @@ pub extern "C-unwind" fn ledger_routed_c_committer_main(_arg: pg_sys::Datum) {
                 process_commit_group(cq_idx, cg_id)
             }));
 
-            let staging_indices = match outcome {
+            // Cleanup runs OUTSIDE the tx scope (shmem CAS + arena, no tracked
+            // rows). Committed / AllEjected / TxError release their slots back to
+            // empty; Poisoned (§6.8) releases the staging slots + arena but leaves
+            // the CQ entry at the terminal valid==4 dead-letter state.
+            match outcome {
                 ProcessOutcome::Committed { staging_indices, .. } => {
                     COMMITTER_QUEUE
                         .share()
                         .committer_drains_total
                         .fetch_add(1, Relaxed);
-                    staging_indices
+                    cleanup::cleanup_after_commit_group(
+                        cq_idx,
+                        cg_id,
+                        &staging_indices,
+                        staging_offsets_off,
+                        pool_keys_off,
+                    );
                 }
-                ProcessOutcome::AllEjected { staging_indices } => staging_indices,
+                ProcessOutcome::AllEjected { staging_indices } => {
+                    cleanup::cleanup_after_commit_group(
+                        cq_idx,
+                        cg_id,
+                        &staging_indices,
+                        staging_offsets_off,
+                        pool_keys_off,
+                    );
+                }
                 ProcessOutcome::TxError { staging_indices, .. } => {
                     COMMITTER_QUEUE
                         .share()
                         .committer_tx_failures
                         .fetch_add(1, Relaxed);
-                    staging_indices
+                    cleanup::cleanup_after_commit_group(
+                        cq_idx,
+                        cg_id,
+                        &staging_indices,
+                        staging_offsets_off,
+                        pool_keys_off,
+                    );
                 }
-            };
-
-            // Cleanup runs OUTSIDE the tx scope (shmem CAS + arena, no tracked
-            // rows). P3.4 will refine the TxError path to retry/poison; for now
-            // every outcome releases its slots so nothing is stranded without a
-            // recovery sweep.
-            cleanup::cleanup_after_commit_group(
-                cq_idx,
-                cg_id,
-                &staging_indices,
-                staging_offsets_off,
-                pool_keys_off,
-            );
+                ProcessOutcome::Poisoned { staging_indices, .. } => {
+                    COMMITTER_QUEUE
+                        .share()
+                        .committer_poisoned_total
+                        .fetch_add(1, Relaxed);
+                    cleanup::cleanup_after_poison(
+                        cq_idx,
+                        cg_id,
+                        &staging_indices,
+                        staging_offsets_off,
+                        pool_keys_off,
+                    );
+                }
+            }
         }
     }
 
@@ -202,6 +243,13 @@ pub(crate) enum ProcessOutcome {
         staging_indices: Vec<u32>,
     },
     TxError {
+        message: String,
+        staging_indices: Vec<u32>,
+    },
+    /// Terminal: a non-retryable SQL error (UNIQUE survived dedup, NOT-NULL,
+    /// check, disk-full, …) or a deadlock that exhausted MAX_DEADLOCK_RETRIES.
+    /// The CQ entry is moved to valid==4 (dead-letter); submissions are lost.
+    Poisoned {
         message: String,
         staging_indices: Vec<u32>,
     },
@@ -285,68 +333,103 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
         };
     }
 
-    // Step 6: pool-id union.
-    let pool_ids: Vec<i64> = kept
+    // Step 6: pre-decode lines (pure — no DB). Malformed submissions are dropped
+    // here (consistent with drop-and-continue) and counted once, before the
+    // retry loop, so a retry never re-pays the decode.
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(kept.len());
+    let mut predrop: u64 = 0;
+    for d in &kept {
+        let posted_at = DateTime::<Utc>::from_timestamp_micros(d.submission.posted_at_micros);
+        let lines = decode_lines(&d.lines);
+        match (posted_at, lines) {
+            (Some(posted_at), Ok(lines)) => prepared.push(Prepared {
+                trx_type: d.submission.trx_type.clone(),
+                source_id: d.submission.source_id,
+                posted_at,
+                lines,
+            }),
+            _ => predrop += 1,
+        }
+    }
+    if prepared.is_empty() {
+        if predrop > 0 {
+            COMMITTER_QUEUE
+                .share()
+                .committer_dropped_submissions_total
+                .fetch_add(predrop, Relaxed);
+        }
+        return ProcessOutcome::Committed {
+            committed_count: 0,
+            staging_indices,
+        };
+    }
+
+    let pool_ids: Vec<i64> = prepared
         .iter()
-        .flat_map(|d| d.lines.iter().map(|l| l.pool_id))
+        .flat_map(|p| p.lines.iter().map(|l| l.pool_id))
         .collect::<BTreeSet<i64>>()
         .into_iter()
         .collect();
 
-    // Step 7: pool_lock FOR UPDATE.
-    if let Err(e) = pool_lock::acquire_pool_locks(&pool_ids) {
-        return ProcessOutcome::TxError {
-            message: format!("pool_lock: {e}"),
-            staging_indices,
-        };
-    }
-    COMMITTER_QUEUE
-        .share()
-        .committer_pool_lock_acquisitions_total
-        .fetch_add(pool_ids.len() as u64, Relaxed);
-
-    // Step 8: hydrate the working snapshot.
-    let snapshot = match hydration::hydrate_snapshot(&pool_ids) {
-        Ok(s) => s,
-        Err(e) => {
-            return ProcessOutcome::TxError {
-                message: format!("hydrate_snapshot: {e}"),
-                staging_indices,
-            };
-        }
-    };
-
-    // Steps 9 + 10: drop-and-continue apply, then batch write.
-    match apply_and_write(snapshot, &kept) {
-        Ok(summary) => {
-            let cq = COMMITTER_QUEUE.share();
-            cq.committer_trx_committed_total
-                .fetch_add(summary.committed as u64, Relaxed);
-            cq.committer_aggregate_upserts_total
-                .fetch_add(summary.aggregate_upserts as u64, Relaxed);
-            if summary.dropped > 0 {
-                cq.committer_dropped_submissions_total
-                    .fetch_add(summary.dropped, Relaxed);
+    // Steps 7-10 with §6.8 retry-on-deadlock: the whole lock → hydrate → apply →
+    // write phase runs in a nested subtransaction. A transient SQLSTATE (40P01 /
+    // 40001) rolls the subtx back and re-attempts after backoff (the pre-flight
+    // dedup catches anything other committers finished meanwhile); a non-retryable
+    // SQLSTATE — or exhausting the retry budget — poisons the commit_group.
+    let mut attempt: u32 = 0;
+    loop {
+        match attempt_commit_phase(&pool_ids, &prepared) {
+            PhaseOutcome::Committed(summary) => {
+                let cq = COMMITTER_QUEUE.share();
+                cq.committer_pool_lock_acquisitions_total
+                    .fetch_add(pool_ids.len() as u64, Relaxed);
+                cq.committer_trx_committed_total
+                    .fetch_add(summary.committed as u64, Relaxed);
+                cq.committer_aggregate_upserts_total
+                    .fetch_add(summary.aggregate_upserts as u64, Relaxed);
+                let dropped = summary.dropped + predrop;
+                if dropped > 0 {
+                    cq.committer_dropped_submissions_total
+                        .fetch_add(dropped, Relaxed);
+                }
+                return ProcessOutcome::Committed {
+                    committed_count: summary.committed,
+                    staging_indices,
+                };
             }
-            ProcessOutcome::Committed {
-                committed_count: summary.committed,
-                staging_indices,
+            PhaseOutcome::Retryable(msg) => {
+                attempt += 1;
+                if attempt > MAX_DEADLOCK_RETRIES {
+                    return ProcessOutcome::Poisoned {
+                        message: format!("deadlock retries exhausted: {msg}"),
+                        staging_indices,
+                    };
+                }
+                COMMITTER_QUEUE
+                    .share()
+                    .committer_deadlock_retries_total
+                    .fetch_add(1, Relaxed);
+                std::thread::sleep(retry_backoff(attempt));
+            }
+            PhaseOutcome::Fatal(msg) => {
+                return ProcessOutcome::Poisoned {
+                    message: msg,
+                    staging_indices,
+                };
             }
         }
-        Err(e) => ProcessOutcome::TxError {
-            message: e,
-            staging_indices,
-        },
     }
 }
 
-// ── Drop-and-continue apply + batch write ───────────────────────────
+// ── Drop-and-continue apply + batch write (§6.4 steps 9-10, §6.8) ────
 
-struct PlannedSubmission {
+/// A submission whose payload is decoded and ready to apply against the working
+/// snapshot. Pre-decoded once before the retry loop.
+struct Prepared {
     trx_type: String,
     source_id: i64,
     posted_at: DateTime<Utc>,
-    plan: PlanResult,
+    lines: Vec<TrxLineRequest>,
 }
 
 struct WriteSummary {
@@ -355,30 +438,86 @@ struct WriteSummary {
     aggregate_upserts: usize,
 }
 
-/// Process `kept` in submission_id order against one evolving working snapshot.
+/// What the subtx closure produced: a clean write, or a caught Postgres ERROR
+/// carrying its SQLSTATE (so classification happens after the savepoint unwinds).
+enum PhaseStep {
+    Wrote(WriteSummary),
+    Caught(PgSqlErrorCode),
+}
+
+/// Outcome of one write-phase attempt (§6.8 classification).
+enum PhaseOutcome {
+    Committed(WriteSummary),
+    /// Transient SQLSTATE (40P01 deadlock / 40001 serialization): the caller
+    /// rolls back, backs off, and retries.
+    Retryable(String),
+    /// Non-retryable SQLSTATE (UNIQUE survived dedup, check / not-null, disk-full,
+    /// …) or a Rust-level SPI error: the caller poisons the commit_group.
+    Fatal(String),
+}
+
+/// One write-phase attempt inside a nested subtransaction (§6.4 steps 7-10):
+/// acquire pool_locks → (test injection) → hydrate → drop-and-continue plan →
+/// batch write. On success the savepoint is released; on any caught Postgres
+/// ERROR the savepoint is rolled back and the SQLSTATE classified into
+/// Retryable / Fatal. Holding the whole phase in the subtx means a deadlock
+/// retry re-acquires locks and re-hydrates a fresh snapshot cleanly.
+fn attempt_commit_phase(pool_ids: &[i64], prepared: &[Prepared]) -> PhaseOutcome {
+    let savepoint = CString::new("rc_commit_group").expect("savepoint name has no NUL");
+    unsafe { pg_sys::BeginInternalSubTransaction(savepoint.as_ptr()) };
+
+    // The SQLSTATE of a caught Postgres ERROR is threaded through the closure's
+    // RETURN value (PhaseStep::Caught) rather than a captured cell — the catch
+    // closure captures nothing, so it trivially satisfies catch_others's
+    // RefUnwindSafe bound. Err = a Rust-level SPI error short-circuited a `?`.
+    let result: Result<PhaseStep, pgrx::spi::Error> = PgTryBuilder::new(AssertUnwindSafe(|| {
+        pool_lock::acquire_pool_locks(pool_ids)?;
+        // Test-only injection sites (production builds Acquire-load 0 / skip).
+        maybe_inject_deadlock();
+        maybe_inject_fatal();
+        maybe_stall();
+        let snapshot = hydration::hydrate_snapshot(pool_ids)?;
+        let summary = plan_and_write(snapshot, prepared)?;
+        Ok(PhaseStep::Wrote(summary))
+    }))
+    .catch_others(|caught| Ok(PhaseStep::Caught(sqlstate_of(&caught))))
+    .execute();
+
+    match result {
+        Ok(PhaseStep::Wrote(summary)) => {
+            unsafe { pg_sys::ReleaseCurrentSubTransaction() };
+            PhaseOutcome::Committed(summary)
+        }
+        Ok(PhaseStep::Caught(code)) => {
+            unsafe { pg_sys::RollbackAndReleaseCurrentSubTransaction() };
+            classify_phase_error(Some(code), None)
+        }
+        Err(e) => {
+            unsafe { pg_sys::RollbackAndReleaseCurrentSubTransaction() };
+            classify_phase_error(None, Some(e))
+        }
+    }
+}
+
+/// Drop-and-continue forward pass + batch write, run INSIDE the caller's subtx.
 /// Each submission is applied to a trial clone; on success the clone becomes the
 /// snapshot and the plan is queued, on `plan_apply_provisional` Err the clone is
-/// discarded (drop-and-continue — the snapshot is unchanged, no replay). After
-/// the forward pass, write everything in one subtx: per-submission trx /
-/// trx_line / layer-mutations / posting_line, then the aggregate row once per
-/// touched pool from the final snapshot.
-fn apply_and_write(mut snapshot: Snapshot, kept: &[Decoded]) -> Result<WriteSummary, String> {
-    let mut planned: Vec<PlannedSubmission> = Vec::with_capacity(kept.len());
+/// discarded (no replay — Path C has no cross-trx hot-path state). Then writes:
+/// per-submission trx / trx_line / layer-mutations / posting_line, and the
+/// aggregate row once per touched pool from the final snapshot (the §6.7
+/// collapse). A Postgres ERROR (e.g. UNIQUE survived dedup) longjmps past the
+/// `?` to the caller's catch_others; a Rust-level SPI error returns via `?`.
+fn plan_and_write(
+    mut snapshot: Snapshot,
+    prepared: &[Prepared],
+) -> Result<WriteSummary, pgrx::spi::Error> {
+    let mut planned: Vec<(&Prepared, PlanResult)> = Vec::with_capacity(prepared.len());
     let mut agg_pools: BTreeSet<i64> = BTreeSet::new();
     let mut dropped: u64 = 0;
 
-    for d in kept {
-        let posted_at = DateTime::<Utc>::from_timestamp_micros(d.submission.posted_at_micros)
-            .ok_or_else(|| {
-                format!(
-                    "submission posted_at_micros {} out of range",
-                    d.submission.posted_at_micros
-                )
-            })?;
-        let line_requests = decode_lines(&d.lines).map_err(|e| format!("decode lines: {e}"))?;
-
+    for p in prepared {
         let mut trial = snapshot.clone();
-        match plan_apply_provisional(&mut trial, &line_requests, posted_at) {
+        match plan_apply_provisional(&mut trial, &p.lines, p.posted_at) {
             Ok(plan) => {
                 for m in &plan.pool_state_mutations {
                     if let PoolStateMutation::UpsertAggregate { pool_id, .. } = m {
@@ -386,12 +525,7 @@ fn apply_and_write(mut snapshot: Snapshot, kept: &[Decoded]) -> Result<WriteSumm
                     }
                 }
                 snapshot = trial;
-                planned.push(PlannedSubmission {
-                    trx_type: d.submission.trx_type.clone(),
-                    source_id: d.submission.source_id,
-                    posted_at,
-                    plan,
-                });
+                planned.push((p, plan));
             }
             Err(_) => dropped += 1,
         }
@@ -405,7 +539,23 @@ fn apply_and_write(mut snapshot: Snapshot, kept: &[Decoded]) -> Result<WriteSumm
         });
     }
 
-    // Final aggregate per touched pool, read from the post-pass snapshot.
+    for (p, plan) in &planned {
+        let trx_id = bulk_write::insert_trx(&p.trx_type, p.source_id, p.posted_at)?;
+        let trx_line_ids = bulk_write::insert_trx_lines(trx_id, &plan.trx_lines)?;
+        // Aggregate (layer_id = 0) mutations are collapsed and written once at the
+        // end; here only this submission's layer mutations (specific
+        // InsertLayer/DeleteLayer), keyed to its own trx_line ids.
+        let layer_muts: Vec<PoolStateMutation> = plan
+            .pool_state_mutations
+            .iter()
+            .filter(|m| !matches!(m, PoolStateMutation::UpsertAggregate { .. }))
+            .cloned()
+            .collect();
+        bulk_write::apply_pool_state_mutations(&layer_muts, &trx_line_ids)?;
+        bulk_write::insert_posting_lines(&plan.posting_lines, &trx_line_ids)?;
+    }
+
+    // Collapsed aggregate per touched pool, read from the post-pass snapshot.
     let agg_muts: Vec<PoolStateMutation> = agg_pools
         .iter()
         .filter_map(|&pid| {
@@ -417,8 +567,7 @@ fn apply_and_write(mut snapshot: Snapshot, kept: &[Decoded]) -> Result<WriteSumm
         })
         .collect();
     let aggregate_upserts = agg_muts.len();
-
-    write_in_subtx(&planned, &agg_muts)?;
+    bulk_write::apply_pool_state_mutations(&agg_muts, &[])?;
 
     Ok(WriteSummary {
         committed: planned.len(),
@@ -427,56 +576,97 @@ fn apply_and_write(mut snapshot: Snapshot, kept: &[Decoded]) -> Result<WriteSumm
     })
 }
 
-/// Write the whole commit_group inside one nested savepoint. Per submission:
-/// trx → trx_line (RETURNING ids) → that submission's *layer* mutations →
-/// posting_line. Then the collapsed aggregate UPSERT batch. On UNIQUE_VIOLATION
-/// (a dedup-surviving race — recovery territory, P3.4) the savepoint rolls back
-/// and the caller poisons via TxError; on any other SQL error likewise.
-fn write_in_subtx(
-    planned: &[PlannedSubmission],
-    agg_muts: &[PoolStateMutation],
-) -> Result<(), String> {
-    let savepoint = CString::new("rc_commit_group").expect("savepoint name has no NUL");
-    unsafe { pg_sys::BeginInternalSubTransaction(savepoint.as_ptr()) };
+// ── §6.8 SQL-error classification ───────────────────────────────────
 
-    // Ok(true) = wrote cleanly; Ok(false) = UNIQUE violation sentinel.
-    let result: Result<bool, pgrx::spi::Error> = PgTryBuilder::new(AssertUnwindSafe(|| {
-        for p in planned {
-            let trx_id = bulk_write::insert_trx(&p.trx_type, p.source_id, p.posted_at)?;
-            let trx_line_ids = bulk_write::insert_trx_lines(trx_id, &p.plan.trx_lines)?;
-            // Aggregate (layer_id = 0) mutations are collapsed and written once
-            // at the end; here we apply only this submission's layer mutations
-            // (specific InsertLayer/DeleteLayer), keyed to its own trx_line ids.
-            let layer_muts: Vec<PoolStateMutation> = p
-                .plan
-                .pool_state_mutations
-                .iter()
-                .filter(|m| !matches!(m, PoolStateMutation::UpsertAggregate { .. }))
-                .cloned()
-                .collect();
-            bulk_write::apply_pool_state_mutations(&layer_muts, &trx_line_ids)?;
-            bulk_write::insert_posting_lines(&p.plan.posting_lines, &trx_line_ids)?;
+/// Map a caught error into the retry/poison decision. 40P01 (deadlock) and
+/// 40001 (serialization) are transient → Retryable; everything else, including a
+/// Rust-level SPI error with no caught SQLSTATE, is Fatal. PoC posture: this is
+/// the basic resilience measure (§6.8 final para); finer per-SQLSTATE handling is
+/// production hardening.
+fn classify_phase_error(
+    caught: Option<PgSqlErrorCode>,
+    spi_err: Option<pgrx::spi::Error>,
+) -> PhaseOutcome {
+    match caught {
+        Some(PgSqlErrorCode::ERRCODE_T_R_DEADLOCK_DETECTED)
+        | Some(PgSqlErrorCode::ERRCODE_T_R_SERIALIZATION_FAILURE) => {
+            PhaseOutcome::Retryable(format!("{:?}", caught.unwrap()))
         }
-        // Collapsed aggregate upsert (UpsertAggregate ignores trx_line ids).
-        bulk_write::apply_pool_state_mutations(agg_muts, &[])?;
-        Ok(true)
-    }))
-    .catch_when(PgSqlErrorCode::ERRCODE_UNIQUE_VIOLATION, |_| Ok(false))
-    .execute();
+        Some(code) => PhaseOutcome::Fatal(format!("non-retryable sql error {code:?}")),
+        None => match spi_err {
+            Some(e) => PhaseOutcome::Fatal(format!("spi: {e}")),
+            None => PhaseOutcome::Fatal("write failed with no caught sqlstate".to_string()),
+        },
+    }
+}
 
-    match result {
-        Ok(true) => {
-            unsafe { pg_sys::ReleaseCurrentSubTransaction() };
-            Ok(())
+fn sqlstate_of(caught: &CaughtError) -> PgSqlErrorCode {
+    match caught {
+        CaughtError::PostgresError(e) | CaughtError::ErrorReport(e) => e.sql_error_code(),
+        CaughtError::RustPanic { ereport, .. } => ereport.sql_error_code(),
+    }
+}
+
+/// Exponential backoff for deadlock retries: 10 ms · 2^(attempt-1), capped at 1 s
+/// (attempt is 1-based).
+fn retry_backoff(attempt: u32) -> Duration {
+    let ms = 10u64.saturating_mul(1u64 << (attempt.saturating_sub(1)).min(20));
+    Duration::from_millis(ms.min(1000))
+}
+
+// ── Test-only injection sites (read unconditionally; only test_hooks SPIs
+//    ever arm them, §6.8 / §9.3) ──────────────────────────────────────
+
+/// Raise a synthetic 40P01 if the deadlock-injection counter is armed,
+/// decrementing it once. The RAISE longjmps to the caller's catch_others.
+fn maybe_inject_deadlock() {
+    let cq = COMMITTER_QUEUE.share();
+    // Claim one injection via CAS (saturating, never underflows below 0).
+    let counter = &cq.test_inject_committer_deadlock_count;
+    let mut cur = counter.load(Acquire);
+    loop {
+        if cur == 0 {
+            return;
         }
-        Ok(false) => {
-            unsafe { pg_sys::RollbackAndReleaseCurrentSubTransaction() };
-            Err("unique violation survived pre-flight dedup (caller race)".to_string())
+        match counter.compare_exchange_weak(cur, cur - 1, AcqRel, Acquire) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
         }
-        Err(e) => {
-            unsafe { pg_sys::RollbackAndReleaseCurrentSubTransaction() };
-            Err(format!("bulk-write: {e}"))
-        }
+    }
+    let _ = Spi::run(
+        "DO $$ BEGIN RAISE EXCEPTION 'injected deadlock (test_hooks)' \
+         USING ERRCODE = '40P01'; END $$",
+    );
+}
+
+/// Raise a synthetic non-retryable error (one-shot) if armed.
+fn maybe_inject_fatal() {
+    if COMMITTER_QUEUE
+        .share()
+        .test_inject_committer_fatal
+        .swap(0, AcqRel)
+        == 1
+    {
+        let _ = Spi::run(
+            "DO $$ BEGIN RAISE EXCEPTION 'injected fatal (test_hooks)' \
+             USING ERRCODE = '23514'; END $$",
+        );
+    }
+}
+
+/// Sleep for the injected stall (µs), holding pool_locks + the open subtx, so a
+/// recovery test has a window to act on the committer mid-flight (§9.3).
+fn maybe_stall() {
+    let stall_us = COMMITTER_QUEUE
+        .share()
+        .test_inject_committer_stall_us
+        .load(Acquire);
+    if stall_us > 0 {
+        COMMITTER_QUEUE
+            .share()
+            .test_committer_stall_hits
+            .fetch_add(1, Release);
+        std::thread::sleep(Duration::from_micros(stall_us as u64));
     }
 }
 

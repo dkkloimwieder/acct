@@ -418,3 +418,105 @@ pub async fn await_committer_drains(pool: &PgPool, base: i64, delta: i64) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+// ── Recovery + SQL-error-handling helpers (P3.4) ────────────────────
+
+/// Whether the postmaster-startup recovery sweep has signalled complete (§6.5).
+pub async fn recovery_complete(pool: &PgPool) -> bool {
+    sqlx::query_scalar("SELECT ledger_routed_c_recovery_complete()")
+        .fetch_one(pool)
+        .await
+        .expect("recovery_complete")
+}
+
+/// Poll until `recovery_complete` signals, returning whether it did within
+/// `timeout`.
+pub async fn await_recovery_complete(pool: &PgPool, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if recovery_complete(pool).await {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Invoke the router boot-recovery sweep synchronously (test_hooks). Returns the
+/// number of shmem slots reconciled.
+pub async fn run_router_recovery_sweep(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT ledger_routed_c_test_run_router_recovery_sweep()")
+        .fetch_one(pool)
+        .await
+        .expect("run_router_recovery_sweep (needs test_hooks build)")
+}
+
+/// Inject a synthetic orphaned CommitterQueueEntry (valid==2, dead owner). Returns
+/// the CQ index, or -1 if no free slot. Pause the BGWorkers first.
+pub async fn inject_orphan_cq(pool: &PgPool) -> i32 {
+    sqlx::query_scalar("SELECT ledger_routed_c_test_inject_orphan_cq()")
+        .fetch_one(pool)
+        .await
+        .expect("inject_orphan_cq (needs test_hooks build)")
+}
+
+/// Arm `n` synthetic deadlocks (SQLSTATE 40P01) for the committer write phase.
+pub async fn set_inject_deadlock_count(pool: &PgPool, n: i32) {
+    sqlx::query("SELECT ledger_routed_c_test_set_inject_deadlock_count($1)")
+        .bind(n)
+        .execute(pool)
+        .await
+        .expect("set_inject_deadlock_count (needs test_hooks build)");
+}
+
+/// Arm a one-shot non-retryable SQL error in the next committer write phase.
+pub async fn set_inject_fatal(pool: &PgPool, on: bool) {
+    sqlx::query("SELECT ledger_routed_c_test_set_inject_fatal($1)")
+        .bind(on)
+        .execute(pool)
+        .await
+        .expect("set_inject_fatal (needs test_hooks build)");
+}
+
+/// Pause both BGWorkers, stage `stage`, unpause ONLY the router, and wait until
+/// at least one commit_group is `ready` — leaving the committer paused so a test
+/// can arm an injection before the group drains. Returns once routing settled.
+pub async fn route_with_committer_paused<F, Fut>(pool: &PgPool, stage: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    set_committer_paused(pool, true).await;
+    set_router_paused(pool, true).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    stage().await;
+    set_router_paused(pool, false).await;
+    // Wait for the router to emit the commit_group (committer still parked).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if committer_queue_count(pool, "ready").await >= 1 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for a ready commit_group");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Poll until no commit_group sits at `ready` (the committer has claimed/drained
+/// them all), or panic on timeout.
+pub async fn await_no_ready_groups(pool: &PgPool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if committer_queue_count(pool, "ready").await == 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for ready commit_groups to drain");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

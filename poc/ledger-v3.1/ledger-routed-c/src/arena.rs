@@ -87,9 +87,27 @@ impl SpilloverArena {
             self.bump_offset.store(BLOCK_HEADER_BYTES, Relaxed);
         }
 
+        // A double-free upstream can splice the singly-linked freelist into a
+        // cycle (e.g. a node pointing at itself). Walking such a list for a block
+        // that doesn't fit would spin forever — and because this runs under
+        // `PgLwLock<SpilloverArena>` exclusive WITHOUT a CHECK_FOR_INTERRUPTS, the
+        // backend would also ignore SIGTERM (pg_terminate_backend can't reach it).
+        // Bound the walk by the maximum possible block count (every block is ≥
+        // header + min-alignment bytes); on overrun, abandon the corrupted
+        // freelist (leak its blocks) and fall through to bump-allocation so the
+        // request still succeeds and the backend stays interruptible. Defensive:
+        // the freelist should never cycle, but a wedged LWLock-holder is far worse
+        // than a one-time leak.
+        let max_steps = self.bytes.len() / (BLOCK_HEADER_BYTES as usize + ALLOC_ALIGN as usize) + 1;
+        let mut steps: usize = 0;
         let mut prev_header_offset: u32 = 0;
         let mut cur_header_offset = self.freelist_head_offset.load(Relaxed);
         while cur_header_offset != 0 {
+            steps += 1;
+            if steps > max_steps {
+                self.freelist_head_offset.store(0, Relaxed);
+                break;
+            }
             let cur = self.read_header(cur_header_offset);
             if cur.size >= size {
                 if prev_header_offset == 0 {
@@ -158,9 +176,16 @@ impl SpilloverArena {
     /// Count free blocks (walks the freelist). O(n) — tests +
     /// observability.
     pub fn freelist_count(&self) -> u32 {
+        // Bounded walk (mirrors `alloc`): a cycle from a double-free must not hang
+        // this observability call. On overrun, return the cap as a corruption
+        // signal rather than spinning.
+        let max_steps = self.bytes.len() / (BLOCK_HEADER_BYTES as usize + ALLOC_ALIGN as usize) + 1;
         let mut count: u32 = 0;
         let mut cur = self.freelist_head_offset.load(Relaxed);
         while cur != 0 {
+            if count as usize >= max_steps {
+                break;
+            }
             let hdr = self.read_header(cur);
             count += 1;
             cur = hdr.next_free;
@@ -308,6 +333,30 @@ mod tests {
         assert_eq!(reused, large);
         // 8-byte block remains on freelist.
         assert_eq!(a.freelist_count(), 1);
+    }
+
+    #[test]
+    fn alloc_terminates_on_corrupted_self_cycle_freelist() {
+        // A double-free can splice the freelist into a cycle. The bounded walk
+        // must terminate (abandon the corrupted list + bump-allocate) rather than
+        // spin forever holding the LWLock.
+        let mut a = fresh_arena();
+        let o = a.alloc(64).unwrap();
+        let hdr_off = o - BLOCK_HEADER_BYTES;
+        // Splice a self-cycle: this block's next_free points at itself, and it is
+        // the freelist head.
+        a.write_header(hdr_off, BlockHeader { size: 64, next_free: hdr_off });
+        a.freelist_head_offset.store(hdr_off, Relaxed);
+
+        // freelist_count must terminate (bounded), not hang.
+        let _ = a.freelist_count();
+
+        // A request LARGER than the cyclic block (64) would walk the cycle
+        // forever pre-guard; the guard breaks out and bump-allocates.
+        let o2 = a.alloc(128).expect("alloc must terminate via bump after a cycle");
+        assert_ne!(o2, o, "the larger request bump-allocates a fresh block");
+        // Corrupted freelist was abandoned (head reset to empty).
+        assert_eq!(a.freelist_count(), 0, "the cyclic freelist is abandoned");
     }
 
     #[test]

@@ -116,6 +116,19 @@ pub(crate) fn finalize_committer_queue_slot(committer_queue: &CommitterQueue, cq
     slot.committer_tx_id.store(0, Relaxed);
 }
 
+/// Move a CommitterQueueEntry to the terminal `poisoned` state (valid==4) and
+/// clear the identity / lease atomics (§6.8). Unlike `finalize_*`, the slot is
+/// NOT returned to empty: it is never re-claimed (claim only takes valid==1) and
+/// stays at 4 for observability / operator dead-letter inspection.
+pub(crate) fn mark_committer_queue_slot_poisoned(committer_queue: &CommitterQueue, cq_idx: u32) {
+    let slot = &committer_queue.entries[cq_idx as usize];
+    slot.valid.store(4, Release);
+    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+    slot.committer_bgw_generation.store(0, Relaxed);
+    slot.committer_acquired_at_ns.store(0, Relaxed);
+    slot.committer_tx_id.store(0, Relaxed);
+}
+
 /// Live wrapper: called by the committer after the commit_group's PG tx ends.
 /// For each staging entry: under STAGING_QUEUE.share(), CAS + (on success)
 /// broadcast the backpressure CV + capture arena offsets; drop the staging
@@ -151,6 +164,42 @@ pub(crate) fn cleanup_after_commit_group(
     {
         let committer_guard = COMMITTER_QUEUE.share();
         finalize_committer_queue_slot(&committer_guard, cq_idx);
+    }
+}
+
+/// Poison-path cleanup (§6.8): release the staging slots + free all arena blocks
+/// exactly as `cleanup_after_commit_group` does (the submissions are abandoned —
+/// lost, no trx), but mark the CQ entry `poisoned` (valid==4) instead of
+/// finalizing it to empty, so the dead-letter is visible to observability.
+pub(crate) fn cleanup_after_poison(
+    cq_idx: u32,
+    commit_group_id: u64,
+    staging_indices: &[u32],
+    staging_offsets_off: u32,
+    pool_keys_off: u32,
+) {
+    for &s_idx in staging_indices {
+        let offsets = {
+            let staging_guard = STAGING_QUEUE.share();
+            let offsets = try_release_staging_slot(&staging_guard, s_idx, commit_group_id);
+            if offsets.is_some() {
+                signal_staging_slot_freed(&staging_guard);
+            }
+            offsets
+        };
+        if let Some((payload_off, pool_keys_off_staging)) = offsets {
+            let mut arena_guard = SPILLOVER_ARENA.exclusive();
+            free_staging_arena_blocks(&mut arena_guard, payload_off, pool_keys_off_staging);
+        }
+    }
+
+    {
+        let mut arena_guard = SPILLOVER_ARENA.exclusive();
+        free_committer_queue_arena(&mut arena_guard, staging_offsets_off, pool_keys_off);
+    }
+    {
+        let committer_guard = COMMITTER_QUEUE.share();
+        mark_committer_queue_slot_poisoned(&committer_guard, cq_idx);
     }
 }
 
