@@ -528,7 +528,7 @@ Implementation: `committer.rs::wait_for_predecessor_pool_seqs` (acct-tm09). Repl
 
 ### 5.5 Recovery
 
-- **Router death**: shmem boot sweep on router restart. Staging entries at processing (valid=2) get inspected: if their CommitterQueueEntry doesn't exist or is at empty, revert to pending; clear superbatch_id before CAS to avoid stale-value resurrection.
+- **Router death**: shmem boot sweep on router restart. Staging entries at processing (valid=2) get inspected: if their CommitterQueueEntry doesn't exist or is at empty, revert to pending; clear commit_group_id before CAS to avoid stale-value resurrection.
 - **Committer death**: CommitterIdentityRegistry (extension-owned shmem array) tracks active committers via (slot, token). Liveness check is registry lookup. Dead committer's in-flight commit_group is reclaimed by next active committer via CAS on the queue entry. Whether the dead committer's PG tx committed is checked by looking up its xid in pg_xact:
   - Committed: the trx rows exist; the recovery committer doesn't reprocess; releases the shmem entries.
   - Aborted (or never started): the trx rows don't exist; the recovery committer reprocesses the commit_group normally.

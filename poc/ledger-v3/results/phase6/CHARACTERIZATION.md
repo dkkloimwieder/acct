@@ -77,7 +77,7 @@ complexity rises — Path B wins all complex cells we measured.
 
 - **Concentrated overlap, any concurrency**: s2 (Zipf at 200 callers) and
   s5 (single hot pool at 200 callers). Router packs `commit_group_avg ≈
-  7-25` envelopes per drain, amortizing pool_lock acquisition + fsync.
+  7-25` submissions per drain, amortizing pool_lock acquisition + fsync.
 - **Complex payloads, any overlap**: s3/s4. Even under the Phase 3
   workload-bug caveat, Path B's commit-group isolation protects against
   per-line failures cascading into per-tx aborts.
@@ -86,7 +86,7 @@ complexity rises — Path B wins all complex cells we measured.
 
 200 callers on a single pool: Path A serializes everyone behind FOR UPDATE
 on the same pool_lock row → 0.5 trx/s. Path B routes them all into 21-25
-envelopes per commit_group; one fsync per group → 1,055 trx/s. Same
+submissions per commit_group; one fsync per group → 1,055 trx/s. Same
 correctness contract, **2,110× throughput ratio**.
 
 This is the regime where a Postgres-native v0.2 design decisively beats a

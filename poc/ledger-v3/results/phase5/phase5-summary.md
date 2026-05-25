@@ -22,7 +22,7 @@ mode — no `WITH_TEST_HOOKS`).
 | s6       |     200 | Disjoint        | Simple     |            293.7 |       7495 |     162267 |      671612 |      936902 |   1.00 |      1 |       5,783,526 |   8950 |     13 |     0 |        31 |  590651 |         0 |
 
 (`Throughput` = trx materialized in the polling window / second.
-`CG avg`/`CG p99` = commit_group envelope count. `Drains` =
+`CG avg`/`CG p99` = commit_group submission count. `Drains` =
 committer pool commits across the run. `Defers` =
 `router_window_defers_total`. `Eject` = caller-tx ejects.
 `commits` is the system-wide `pg_stat_database.xact_commit` delta —
@@ -56,8 +56,8 @@ across `commit_group_avg = 21.20` submissions per PG transaction. Each
 caller still individually sees committed p99 = 818ms (the routing + drain
 queue depth is long), but throughput is 758× direct's.
 
-Pipeline ns avg = 217ms per drain × 547 drains × 21.2 envelopes
-≈ 11,591 envelopes processed — close to the 11,599 measured `attempts`.
+Pipeline ns avg = 217ms per drain × 547 drains × 21.2 submissions
+≈ 11,591 submissions processed — close to the 11,599 measured `attempts`.
 The committer pool keeps up; throughput ceiling is the per-drain PG work
 (bulk-write + commit), not the router or staging.
 
@@ -107,7 +107,7 @@ into a regime map.
 open long-running interactive txs (every `SELECT ledger_enqueue_trx(...)`
 returns immediately), so the §5.4 step-4 `pg_xact_status` eject path
 never triggers. `router_window_defers_total` likewise stays small
-(7-21 per scenario) — the router skipped tens of envelopes per scenario,
+(7-21 per scenario) — the router skipped tens of submissions per scenario,
 not thousands. The eject mechanism is wired and tested under
 `acct-6bp9` acceptance binaries; under measurement it stays passive.
 
