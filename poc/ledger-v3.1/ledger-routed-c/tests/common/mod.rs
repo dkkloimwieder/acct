@@ -110,3 +110,115 @@ pub async fn trx_count(pool: &PgPool) -> i64 {
         .await
         .expect("trx count")
 }
+
+// ── Router affinity-grouping helpers (P3.2) ─────────────────────────
+
+/// A single line touching `pool_id` (qty/cost are immaterial to routing —
+/// the router groups purely on the per-submission pool union).
+pub fn line_on(pool_id: i64) -> Value {
+    json!({
+        "pool_id": pool_id,
+        "line_type": "po_receipt_line",
+        "qty": 1,
+        "unit_cost": 1,
+        "debit_account": 1000,
+        "credit_account": 2000,
+    })
+}
+
+/// Enqueue one submission whose lines touch each of `pool_ids` (one line
+/// per pool). Enqueue does not validate pool existence, so arbitrary ids
+/// can be used to drive the affinity logic without seeding the DB.
+pub async fn enqueue_pools(
+    pool: &PgPool,
+    source_id: i64,
+    pool_ids: &[i64],
+) -> Result<i64, sqlx::Error> {
+    let lines: Vec<Value> = pool_ids.iter().map(|&p| line_on(p)).collect();
+    enqueue(pool, "po_receipt", source_id, lines).await
+}
+
+/// Flip the shmem pause flag so the router (and committer) skip ticking.
+/// Requires the `test_hooks` build (the runner installs it).
+pub async fn set_router_paused(pool: &PgPool, paused: bool) {
+    sqlx::query("SELECT ledger_routed_c_test_set_bgworker_paused($1)")
+        .bind(paused)
+        .execute(pool)
+        .await
+        .expect("set_bgworker_paused (needs test_hooks build)");
+}
+
+/// The live `batch_size_max` GUC (max submissions per commit_group).
+pub async fn batch_size_max(pool: &PgPool) -> i64 {
+    let s: String = sqlx::query_scalar("SHOW ledger_routed_c.batch_size_max")
+        .fetch_one(pool)
+        .await
+        .expect("show batch_size_max");
+    s.parse().expect("batch_size_max int")
+}
+
+/// Ready (valid==1) commit_groups whose pool_keys intersect `mine`,
+/// as (commit_group_id, submission_count, sorted pool_keys). Filtering by
+/// the caller's own pool_ids isolates the assertion from groups other
+/// tests left in the never-drained committer queue.
+pub async fn ready_groups_for(pool: &PgPool, mine: &[i64]) -> Vec<(i64, i64, Vec<i64>)> {
+    let rows: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT commit_group_id, submission_count, pool_keys \
+         FROM ledger_routed_c_ready_commit_groups()",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("ready_commit_groups");
+    let mine_set: std::collections::HashSet<i64> = mine.iter().copied().collect();
+    rows.into_iter()
+        .filter_map(|(cg, sc, keys)| {
+            let parsed: Vec<i64> = if keys.is_empty() {
+                Vec::new()
+            } else {
+                keys.split(',').map(|s| s.parse().unwrap()).collect()
+            };
+            parsed
+                .iter()
+                .any(|k| mine_set.contains(k))
+                .then_some((cg, sc, parsed))
+        })
+        .collect()
+}
+
+/// Poll until the total submission_count of ready groups touching `mine`
+/// reaches `expected` (router has flushed the batch), or panic on timeout.
+/// Returns the final ready groups for that pool set.
+pub async fn await_routed(
+    pool: &PgPool,
+    mine: &[i64],
+    expected: i64,
+) -> Vec<(i64, i64, Vec<i64>)> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let groups = ready_groups_for(pool, mine).await;
+        let total: i64 = groups.iter().map(|g| g.1).sum();
+        if total >= expected {
+            return groups;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {expected} routed submissions on pools {mine:?}; \
+                 got {total} across {} groups: {groups:?}",
+                groups.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Committer-queue state counts (empty/ready/in_flight/done). Used to
+/// confirm the P3.2 committer shell never advances a group past `ready`.
+pub async fn committer_queue_count(pool: &PgPool, state: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count FROM ledger_routed_c_committer_queue_state_counts() WHERE state = $1",
+    )
+    .bind(state)
+    .fetch_one(pool)
+    .await
+    .expect("committer_queue_state_counts")
+}

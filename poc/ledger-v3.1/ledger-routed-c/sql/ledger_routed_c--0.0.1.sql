@@ -66,12 +66,37 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_arena_total_frees_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:628
+-- ledger_routed_c::router::ledger_routed_c_committer_queue_state_counts
+CREATE  FUNCTION "ledger_routed_c_committer_queue_state_counts"() RETURNS TABLE (
+	"state" TEXT,  /* String */
+	"count" bigint  /* i64 */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_queue_state_counts_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- ledger-routed-c/src/lib.rs:308
 -- ledger_routed_c::ledger_routed_c_hello
 CREATE  FUNCTION "ledger_routed_c_hello"() RETURNS TEXT /* String */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_routed_c_hello_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:655
+-- ledger_routed_c::router::ledger_routed_c_ready_commit_groups
+CREATE  FUNCTION "ledger_routed_c_ready_commit_groups"() RETURNS TABLE (
+	"commit_group_id" bigint,  /* i64 */
+	"submission_count" bigint,  /* i64 */
+	"pool_keys" TEXT  /* String */
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_ready_commit_groups_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -93,5 +118,16 @@ CREATE  FUNCTION "ledger_routed_c_staging_state_counts"() RETURNS TABLE (
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_routed_c_staging_state_counts_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:719
+-- ledger_routed_c::router::ledger_routed_c_test_set_bgworker_paused
+CREATE  FUNCTION "ledger_routed_c_test_set_bgworker_paused"(
+	"paused" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_bgworker_paused_wrapper';
 /* </end connected objects> */
 

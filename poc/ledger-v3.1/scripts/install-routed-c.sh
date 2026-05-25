@@ -65,7 +65,6 @@ CURRENT_PRELOADS=$(docker exec "$CONTAINER" psql -U acct -d postgres -tA -c "SHO
 echo "==> current shared_preload_libraries: $CURRENT_PRELOADS"
 CURRENT_NORMALIZED=$(echo "$CURRENT_PRELOADS" | tr -d ' ')
 
-NEED_RESTART=0
 if echo ",$CURRENT_NORMALIZED," | grep -q ',ledger_routed_c,'; then
     echo "==> ledger_routed_c already preloaded; skipping ALTER SYSTEM"
 else
@@ -77,17 +76,23 @@ else
     echo "==> ALTER SYSTEM SET shared_preload_libraries = $NEW_PRELOADS_LIST"
     docker exec "$CONTAINER" psql -U acct -d postgres -c \
         "ALTER SYSTEM SET shared_preload_libraries = $NEW_PRELOADS_LIST"
-    NEED_RESTART=1
 fi
 
-if [ "$NEED_RESTART" = "1" ]; then
-    echo "==> restarting $CONTAINER to load ledger_routed_c"
-    docker restart "$CONTAINER" >/dev/null
-    until docker exec "$CONTAINER" pg_isready -U acct -d postgres >/dev/null 2>&1; do
-        sleep 1
-    done
-    echo "==> $CONTAINER is back up"
-fi
+# Always restart after copying the .so. ledger_routed_c is a *preloaded*
+# library: the postmaster loads its code + symbols at startup and every
+# backend inherits that image via fork. Overwriting the .so file does NOT
+# rebind a running cluster — the BGWorker bodies (router/committer) keep
+# executing the old code, and a fresh `CREATE EXTENSION` fails to resolve any
+# newly-added SQL symbols against the stale in-memory library ("could not find
+# function ... in file"). A restart re-execs the postmaster against the new
+# .so, picking up both the new worker code and the new symbols. (Cheap in dev;
+# the data volume persists.)
+echo "==> restarting $CONTAINER to load the freshly-built ledger_routed_c.so"
+docker restart "$CONTAINER" >/dev/null
+until docker exec "$CONTAINER" pg_isready -U acct -d postgres >/dev/null 2>&1; do
+    sleep 1
+done
+echo "==> $CONTAINER is back up"
 
 echo "==> verifying CREATE EXTENSION in $DB"
 docker exec "$CONTAINER" psql -U acct -d "$DB" -c \
