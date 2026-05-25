@@ -1,0 +1,35 @@
+[package]
+name = "ledger-routed-c"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "ledger-v3.1 Path C routed flavor: pgrx 0.18 extension with shmem staging queue + router BGWorker + committer BGWorker pool (no pristine-replay) + recovery (design-v3.1 §6)."
+
+[lib]
+name = "ledger_routed_c"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18"]
+pg_test = []
+# See ledger-direct-c/Cargo.toml; same gating pattern.
+test_hooks = []
+
+[dependencies]
+pgrx        = { workspace = true }
+ledger-core = { path = "../ledger-core" }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+chrono      = { workspace = true }
+libc        = { workspace = true }
+uuid        = { workspace = true, features = ["v4"] }
+sha2        = { workspace = true }
+
+[dev-dependencies]
+pgrx-tests  = { workspace = true }
+tokio       = { workspace = true }
+sqlx        = { workspace = true }
+rand        = { workspace = true }
+proptest    = { workspace = true }

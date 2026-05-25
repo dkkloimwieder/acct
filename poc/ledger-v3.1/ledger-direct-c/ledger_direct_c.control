@@ -1,0 +1,5 @@
+comment = 'ledger-v3.1 Path C direct flavor: synchronous in-tx ledger_submit_trx_c (design-v3.1 §5)'
+default_version = '0.0.1'
+module_pathname = '$libdir/ledger_direct_c'
+relocatable = false
+superuser = true

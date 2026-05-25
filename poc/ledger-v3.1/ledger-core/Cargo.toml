@@ -1,0 +1,19 @@
+[package]
+name = "ledger-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Pure-Rust cost-ledger transformation core for ledger-v3.1 (Path C). plan_apply / plan_apply_provisional over WAC/STD/specific (strict) and FIFO/LIFO (provisional). No pgrx; no DB. design-v3.1 §8."
+
+[lib]
+name = "ledger_core"
+
+[dependencies]
+serde      = { workspace = true }
+chrono     = { workspace = true }
+uuid       = { workspace = true, features = ["v4"] }
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+proptest   = { workspace = true }

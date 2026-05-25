@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS accounting_period;
+DROP TABLE IF EXISTS account;
+DROP TABLE IF EXISTS location;
+DROP TABLE IF EXISTS sku;
