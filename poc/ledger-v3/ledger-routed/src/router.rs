@@ -880,6 +880,19 @@ fn record_commit_group_stats(submission_count: u16) {
 /// Run one full router-orphan recovery sweep. Returns the number of
 /// shmem slots reconciled (re-stamped, reverted, or CQ-cleared).
 /// Idempotent.
+///
+/// Phase ordering is load-bearing: sweep_queue_phase MUST run before
+/// sweep_staging_phase. For a CQ entry at valid==1, the queue phase
+/// completes the router's interrupted data-before-flag stamp on the
+/// linked staging entries (try_restamp_staging_to_routed: staging
+/// valid 2→3, storing the queue's cg_id). The staging phase then
+/// reverts any staging entry still at valid==2 whose cg_id is not
+/// backed by a live CQ entry (try_revert_orphan_staging: valid 2→1,
+/// cg_id→0). A staging entry the queue phase is about to re-stamp
+/// carries cg_id==0 (the router crashed before the cg_id store), so
+/// it is never in active_cg_ids — running the staging phase first
+/// would revert it as an orphan, dropping a submission the queue
+/// phase was about to recover.
 pub(crate) fn try_recover_router_orphan() -> u64 {
     let mut recovered: u64 = 0;
     recovered += sweep_queue_phase();
