@@ -113,34 +113,14 @@ async fn run_one_case(pool: PgPool, method: &str, ops: Vec<Op>) -> Result<(), St
         }
     }
 
-    // I1 — no orphan trx.
-    let orphan: i64 = scalar(
-        &pool,
-        "SELECT count(*) FROM trx t \
-           WHERE NOT EXISTS (SELECT 1 FROM trx_line WHERE trx_id = t.id) \
-              OR NOT EXISTS (SELECT 1 FROM posting_line pl \
-                              JOIN trx_line tl ON tl.id = pl.trx_line_id \
-                             WHERE tl.trx_id = t.id)",
-    )
-    .await?;
-    if orphan != 0 {
-        return Err(format!("I1: {orphan} orphan trx (method={method})"));
-    }
+    // I1 / I2 / I4 / I5 / I7 — method-agnostic structural invariants (shared
+    // catch-net in common; acct-yojk.8).
+    assert_aggregate_method_invariants(&pool)
+        .await
+        .map_err(|e| format!("{e} (method={method})"))?;
 
-    // I2 — receipt/depletion amounts. Variance legs are excluded.
-    let bad_amount: i64 = scalar(
-        &pool,
-        "SELECT count(*) FROM posting_line pl \
-           JOIN trx_line tl ON tl.id = pl.trx_line_id \
-          WHERE pl.event_type IN ('inventory_receipt','inventory_depletion') \
-            AND pl.amount <> ABS(tl.qty) * tl.unit_cost",
-    )
-    .await?;
-    if bad_amount != 0 {
-        return Err(format!("I2: {bad_amount} posting rows amount != |qty|*unit_cost (method={method})"));
-    }
-
-    // I3 — aggregate qty == Σ signed trx_line qty.
+    // I3 — aggregate qty == Σ signed trx_line qty == expected on_hand. Workload-
+    // specific (needs the pool and the running expected), so it stays inline.
     let (agg, tl_sum): (i64, i64) = pair(
         &pool,
         "SELECT \
@@ -156,19 +136,6 @@ async fn run_one_case(pool: PgPool, method: &str, ops: Vec<Op>) -> Result<(), St
         return Err(format!("I3: aggregate {agg} != expected on_hand {on_hand} (method={method})"));
     }
 
-    // I4 — no materialized layers for aggregate methods.
-    let layers: i64 = scalar(&pool, "SELECT count(*) FROM pool_state WHERE layer_id > 0").await?;
-    if layers != 0 {
-        return Err(format!("I4: {layers} layer rows leaked onto the hot path (method={method})"));
-    }
-
-    // I5 — no source_trx_line_id linkage.
-    let linked: i64 =
-        scalar(&pool, "SELECT count(*) FROM trx_line WHERE source_trx_line_id IS NOT NULL").await?;
-    if linked != 0 {
-        return Err(format!("I5: {linked} trx_line rows carry source_trx_line_id (method={method})"));
-    }
-
     // I6 — pool_lock exists for the touched pool (when any work happened).
     let trx_n: i64 = scalar(&pool, "SELECT count(*) FROM trx").await?;
     if trx_n > 0 {
@@ -176,11 +143,6 @@ async fn run_one_case(pool: PgPool, method: &str, ops: Vec<Op>) -> Result<(), St
         if locks != 1 {
             return Err(format!("I6: expected 1 pool_lock for touched pool, got {locks}"));
         }
-    }
-
-    // I7 — aggregate qty never negative.
-    if agg < 0 {
-        return Err(format!("I7: negative aggregate qty {agg} (method={method})"));
     }
 
     Ok(())

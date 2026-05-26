@@ -249,3 +249,67 @@ pub async fn posting_lines(pool: &PgPool, trx_id: i64) -> Vec<(String, i64, i64,
     .await
     .expect("read posting_lines")
 }
+
+/// Shared structural-invariant catch-net for aggregate-method (fifo / lifo / wac
+/// / std) workloads — the I1-I7 subset that holds independent of which ops ran
+/// (acct-1cer). Property tests call this, then add their workload-specific
+/// assertions (aggregate qty == expected, pool_lock presence) inline. Returns
+/// Err(msg) on the first violation so it composes with the proptest closures.
+///
+///   I1 no orphan trx — every trx has >=1 trx_line and >=1 posting_line
+///   I2 receipt/depletion posting amount == |qty| * unit_cost (variance legs excluded)
+///   I4 zero materialized layers (layer_id > 0) — Path C never iterates layers
+///      for these methods (§3.5)
+///   I5 no trx_line carries source_trx_line_id (no specific-style layer linkage)
+///   I7 no aggregate (layer_id = 0) qty is negative (§3.6)
+///
+/// Scoped to the aggregate methods: I5 does NOT hold for the `specific` method
+/// (its depletions link the consumed layer), so do not call this on a specific
+/// workload.
+pub async fn assert_aggregate_method_invariants(pool: &PgPool) -> Result<(), String> {
+    async fn count(pool: &PgPool, sql: &str) -> Result<i64, String> {
+        sqlx::query_scalar(sql).fetch_one(pool).await.map_err(|e| e.to_string())
+    }
+
+    let orphan = count(
+        pool,
+        "SELECT count(*) FROM trx t \
+           WHERE NOT EXISTS (SELECT 1 FROM trx_line WHERE trx_id = t.id) \
+              OR NOT EXISTS (SELECT 1 FROM posting_line pl \
+                              JOIN trx_line tl ON tl.id = pl.trx_line_id \
+                             WHERE tl.trx_id = t.id)",
+    )
+    .await?;
+    if orphan != 0 {
+        return Err(format!("I1: {orphan} orphan trx (missing trx_line or posting_line)"));
+    }
+
+    let bad_amount = count(
+        pool,
+        "SELECT count(*) FROM posting_line pl \
+           JOIN trx_line tl ON tl.id = pl.trx_line_id \
+          WHERE pl.event_type IN ('inventory_receipt','inventory_depletion') \
+            AND pl.amount <> ABS(tl.qty) * tl.unit_cost",
+    )
+    .await?;
+    if bad_amount != 0 {
+        return Err(format!("I2: {bad_amount} posting rows where amount != |qty|*unit_cost"));
+    }
+
+    let layers = count(pool, "SELECT count(*) FROM pool_state WHERE layer_id > 0").await?;
+    if layers != 0 {
+        return Err(format!("I4: {layers} layer rows (layer_id>0) on the hot path"));
+    }
+
+    let linked = count(pool, "SELECT count(*) FROM trx_line WHERE source_trx_line_id IS NOT NULL").await?;
+    if linked != 0 {
+        return Err(format!("I5: {linked} trx_line rows carry source_trx_line_id"));
+    }
+
+    let negative = count(pool, "SELECT count(*) FROM pool_state WHERE layer_id = 0 AND qty < 0").await?;
+    if negative != 0 {
+        return Err(format!("I7: {negative} aggregate rows with negative qty"));
+    }
+
+    Ok(())
+}

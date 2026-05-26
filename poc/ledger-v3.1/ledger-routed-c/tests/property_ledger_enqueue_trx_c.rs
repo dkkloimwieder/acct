@@ -16,10 +16,13 @@
 //!       mismatch means a submission was dropped, duplicated, or misapplied.
 //!       (Aggregate unit_cost MAY diverge across flavors — running-average
 //!       provisional cost is order-sensitive — so it is NOT asserted, per §11.1.)
-//!   E2  no orphan trx (every trx has ≥1 trx_line and ≥1 posting_line).
-//!   E3  zero materialized layers (layer_id > 0) — Path C never iterates layers
-//!       on the hot path for these methods (the §3.5 architectural premise).
-//!   E4  aggregate qty never negative (no-negative-inventory, §3.6).
+//!
+//! E1 is the workload-specific check and stays inline. The method-agnostic
+//! structural invariants — no orphan trx, posting amount == |qty|*unit_cost, no
+//! materialized layers (§3.5), no source_trx_line_id, no negative aggregate
+//! (§3.6) — come from the shared `common::assert_aggregate_method_invariants`
+//! (the I1/I2/I4/I5/I7 catch-net, acct-yojk.8), so the direct and routed property
+//! tests share one definition of "structurally sound".
 //!
 //! Coverage of the routed-specific paths the §11.1 invariant must survive:
 //!   - **drop-and-continue**: each case may inject "poison" depletions whose qty
@@ -188,39 +191,23 @@ async fn run_one_case(pool: PgPool, case: Case) -> Result<(), String> {
     }
     await_quiescent(&pool, expected_trx).await?;
 
-    // ── E2 — no orphan trx. ──
-    let orphan: i64 = scalar(
-        &pool,
-        "SELECT count(*) FROM trx t \
-           WHERE NOT EXISTS (SELECT 1 FROM trx_line WHERE trx_id = t.id) \
-              OR NOT EXISTS (SELECT 1 FROM posting_line pl \
-                              JOIN trx_line tl ON tl.id = pl.trx_line_id \
-                             WHERE tl.trx_id = t.id)",
-    )
-    .await?;
-    if orphan != 0 {
-        return Err(format!("E2: {orphan} orphan trx (method={})", case.method));
-    }
+    // ── I1/I2/I4/I5/I7 — shared structural catch-net (acct-yojk.8). Subsumes
+    // this test's E2 (no orphan trx), E3 (no layers), and E4 (no negative
+    // aggregate). ──
+    assert_aggregate_method_invariants(&pool)
+        .await
+        .map_err(|e| format!("{e} (method={})", case.method))?;
 
-    // ── E3 — no materialized layers leaked onto the hot path. ──
-    let layers: i64 = scalar(&pool, "SELECT count(*) FROM pool_state WHERE layer_id > 0").await?;
-    if layers != 0 {
-        return Err(format!("E3: {layers} layer rows on the hot path (method={})", case.method));
-    }
-
-    // ── E1 — routed aggregate qty == model (== direct); E4 — never negative. ──
+    // ── E1 — routed aggregate qty == model (== what the direct flavor
+    // produces). Workload-specific (needs the per-pool expected), so inline. ──
     for p in 0..case.n_pools {
         let pool_id = (p + 1) as i64;
-        let agg = aggregate(&pool, pool_id).await;
-        let got = agg.map(|(q, _)| q).unwrap_or(0);
+        let got = aggregate(&pool, pool_id).await.map(|(q, _)| q).unwrap_or(0);
         if got != expected_qty[p] {
             return Err(format!(
                 "E1: pool {pool_id} routed qty {got} != model qty {} (method={})",
                 expected_qty[p], case.method
             ));
-        }
-        if got < 0 {
-            return Err(format!("E4: pool {pool_id} negative aggregate qty {got}"));
         }
     }
 
@@ -278,8 +265,4 @@ async fn staging_inflight(pool: &PgPool) -> i64 {
     .fetch_one(pool)
     .await
     .expect("staging inflight count")
-}
-
-async fn scalar(pool: &PgPool, q: &str) -> Result<i64, String> {
-    sqlx::query_scalar(q).fetch_one(pool).await.map_err(|e| e.to_string())
 }
