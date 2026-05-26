@@ -57,6 +57,20 @@ case "$cmd" in
         -e IGNORE_STARTUP_PARAMETERS="extra_float_digits,options" \
         "$IMAGE" >/dev/null
     fi
+    # PG18 stores the role verifier as scram-sha-256. The edoburu entrypoint
+    # md5-hashes DB_PASSWORD into userlist.txt, and pgbouncer cannot do SCRAM
+    # against the server from an md5 secret ("wrong password type"). Overwrite
+    # the userlist with the PLAINTEXT password (which pgbouncer CAN use to
+    # compute the SCRAM client proof) and reload. AUTH_TYPE=trust keeps clients
+    # password-free; this only fixes the pooler→server leg. Re-applied on every
+    # `up` because the entrypoint regenerates the md5 userlist on each start.
+    echo "==> installing plaintext userlist (server-side SCRAM) + reload"
+    for _ in 1 2 3 4 5; do
+      docker exec "$NAME" sh -c 'printf "\"acct\" \"acct_dev\"\n" > /etc/pgbouncer/userlist.txt' 2>/dev/null && break
+      sleep 1
+    done
+    docker kill --signal=HUP "$NAME" >/dev/null 2>&1 || true
+    sleep 1
     echo "==> pgbouncer up: postgres://acct:acct_dev@localhost:${HOST_PORT}/poc_v3_1 (pool_mode=$POOL_MODE, pool_size=$DEFAULT_POOL_SIZE)"
     ;;
   down)

@@ -2,4 +2,5 @@
 # Keep the directory; ignore the generated JSON / sampler dumps.
 *.json
 *.sampler.txt
+*.log
 !.gitignore

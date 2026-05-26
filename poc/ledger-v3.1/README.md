@@ -157,7 +157,7 @@ ledger-harness equivalence --scenario s7 --callers 8 --submissions-per-caller 50
 | P3.3  | `acct-2ttr.6` | committer pool (provisional dispatch, drop-and-continue) | ✓ |
 | P3.4  | `acct-2ttr.7` | recovery + committer SQL error handling | ✓ |
 | P4    | `acct-2ttr.8` | harness (3 submission modes + deep-pool seeding + lock-hold metric) | ✓ |
-| P5    | `acct-2ttr.9` | characterization & PoC report | |
+| P5    | `acct-2ttr.9` | characterization & PoC report ([`results/POC-REPORT.md`](results/POC-REPORT.md)) | ✓ |
 
 Stream label `stream:ledger-v3.1`; administrative pause gate `acct-1wyk` (`ledger-v3.1-PAUSE`).
 
