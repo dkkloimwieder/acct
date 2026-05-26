@@ -51,6 +51,10 @@ pub struct LineParam {
     pub unit_cost: i64,
     pub debit_account: i64,
     pub credit_account: i64,
+    /// Target for the STD variance leg (actual-vs-standard). Carried on every
+    /// line; non-STD methods ignore it. STD receipts at a cost != the seeded
+    /// standard need it, else `MissingVarianceAccount`.
+    pub variance_account: i64,
 }
 
 /// One workload spec. Holds a snapshot of the pool universe + shape axes.
@@ -111,6 +115,7 @@ impl Workload {
                         unit_cost: rng.random_range(1..=1000),
                         debit_account: self.universe.ap_account,
                         credit_account: self.universe.inv_account,
+                        variance_account: self.universe.variance_account,
                     }
                 } else {
                     LineParam {
@@ -121,6 +126,7 @@ impl Workload {
                         unit_cost: rng.random_range(1..=1000),
                         debit_account: self.universe.inv_account,
                         credit_account: self.universe.ap_account,
+                        variance_account: self.universe.variance_account,
                     }
                 }
             })
@@ -186,6 +192,7 @@ mod tests {
             pool_ids: ids(n),
             inv_account: 1000,
             ap_account: 2000,
+            variance_account: 3000,
         }
     }
 

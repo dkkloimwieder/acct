@@ -43,6 +43,7 @@ pub fn build_lines_json(lines: &[LineParam]) -> Value {
                 "unit_cost": l.unit_cost,
                 "debit_account": l.debit_account,
                 "credit_account": l.credit_account,
+                "variance_account": l.variance_account,
             })
         })
         .collect();
@@ -63,6 +64,7 @@ mod tests {
             unit_cost: 50,
             debit_account: 2000,
             credit_account: 1000,
+            variance_account: 3000,
         }];
         let v = build_lines_json(&lines);
         let arr = v.as_array().unwrap();
@@ -70,5 +72,6 @@ mod tests {
         assert_eq!(arr[0]["pool_id"], 7);
         assert_eq!(arr[0]["qty"], -4);
         assert_eq!(arr[0]["line_type"], "transfer_shipment_line");
+        assert_eq!(arr[0]["variance_account"], 3000);
     }
 }

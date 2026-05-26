@@ -138,7 +138,12 @@ mod tests {
     use super::*;
 
     fn small_universe(n: usize) -> PoolUniverse {
-        PoolUniverse { pool_ids: (1..=n as i64).collect(), inv_account: 1000, ap_account: 2000 }
+        PoolUniverse {
+            pool_ids: (1..=n as i64).collect(),
+            inv_account: 1000,
+            ap_account: 2000,
+            variance_account: 3000,
+        }
     }
 
     #[test]

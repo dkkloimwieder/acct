@@ -16,10 +16,19 @@ use sqlx::PgPool;
 
 use crate::cli::MethodMix;
 
-/// Inventory + AP account ids (fixed; the seeded chart). Workload generators
-/// reference these in their debit/credit fields.
+/// Inventory + AP + variance account ids (fixed; the seeded chart). Workload
+/// generators reference these in their debit/credit/variance fields. The variance
+/// account is the target for STD receipts whose actual cost differs from the
+/// seeded standard (every line carries it; non-STD methods ignore it).
 pub const INV_ACCOUNT: i64 = 1000;
 pub const AP_ACCOUNT: i64 = 2000;
+pub const VARIANCE_ACCOUNT: i64 = 3000;
+
+/// Standard cost seeded for every `std`-method pool's (sku, location) so STD
+/// receipts/depletions resolve a standard (no MissingStandardCost). The value is
+/// arbitrary — the harness measures throughput/locking, not variance magnitude;
+/// workload receipt costs (random 1..=1000) straddle it so the variance leg fires.
+pub const STD_UNIT_COST: i64 = 500;
 
 /// Drop all ledger data so a fresh universe can be seeded. Used by the
 /// equivalence harness and the `run --method-mix` reseed path. Table list is
@@ -41,6 +50,7 @@ pub struct PoolUniverse {
     pub pool_ids: Vec<i64>,
     pub inv_account: i64,
     pub ap_account: i64,
+    pub variance_account: i64,
 }
 
 /// Seed (or load) a pool universe.
@@ -85,6 +95,7 @@ pub async fn seed(
             pool_ids,
             inv_account: INV_ACCOUNT,
             ap_account: AP_ACCOUNT,
+            variance_account: VARIANCE_ACCOUNT,
         });
     }
 
@@ -92,10 +103,12 @@ pub async fn seed(
     sqlx::query(
         "INSERT INTO account (id, code, name, type) VALUES \
             ($1, '1000-inv', 'Inventory', 'asset'::account_type), \
-            ($2, '2000-ap',  'AP Unsettled', 'liability'::account_type)",
+            ($2, '2000-ap',  'AP Unsettled', 'liability'::account_type), \
+            ($3, '3000-var', 'Cost Variance', 'expense'::account_type)",
     )
     .bind(INV_ACCOUNT)
     .bind(AP_ACCOUNT)
+    .bind(VARIANCE_ACCOUNT)
     .execute(pool)
     .await?;
 
@@ -152,15 +165,46 @@ pub async fn seed(
     .execute(pool)
     .await?;
 
+    // ── standard_cost for std-method pools (acct-0z5m) ──
+    // STD receipts/depletions resolve a standard via (sku, location); without a
+    // row they abort with MissingStandardCost. Each pool maps to a unique
+    // (sku, location), so there are no duplicate PKs. Non-std pools need no row
+    // (hydration only reads standard_cost for pools whose method/basis wants it).
+    let std_skus: Vec<i64> = (0..count)
+        .filter(|&i| pool_method[i] == "std")
+        .map(|i| pool_sku[i])
+        .collect();
+    if !std_skus.is_empty() {
+        let std_locs: Vec<i64> = (0..count)
+            .filter(|&i| pool_method[i] == "std")
+            .map(|i| pool_loc[i])
+            .collect();
+        let std_costs: Vec<i64> = vec![STD_UNIT_COST; std_skus.len()];
+        sqlx::query(
+            "INSERT INTO standard_cost (sku_id, location_id, unit_cost) \
+             SELECT s, l, c FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[]) AS t(s, l, c)",
+        )
+        .bind(&std_skus)
+        .bind(&std_locs)
+        .bind(&std_costs)
+        .execute(pool)
+        .await?;
+    }
+
     eprintln!(
-        "seed-pools: {} pools, {} skus, {} locations, mix={:?} → seeded",
-        count, skus, locations, method_mix
+        "seed-pools: {} pools ({} std w/ standard_cost), {} skus, {} locations, mix={:?} → seeded",
+        count,
+        std_skus.len(),
+        skus,
+        locations,
+        method_mix
     );
 
     Ok(PoolUniverse {
         pool_ids: pool_ids_arg,
         inv_account: INV_ACCOUNT,
         ap_account: AP_ACCOUNT,
+        variance_account: VARIANCE_ACCOUNT,
     })
 }
 
@@ -177,6 +221,7 @@ pub async fn load(pool: &PgPool) -> Result<PoolUniverse, String> {
         pool_ids,
         inv_account: INV_ACCOUNT,
         ap_account: AP_ACCOUNT,
+        variance_account: VARIANCE_ACCOUNT,
     })
 }
 

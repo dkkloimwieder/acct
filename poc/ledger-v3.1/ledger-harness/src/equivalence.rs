@@ -67,6 +67,7 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
         pool_ids: (1..=EQUIV_POOLS as i64).collect(),
         inv_account: pool_universe::INV_ACCOUNT,
         ap_account: pool_universe::AP_ACCOUNT,
+        variance_account: pool_universe::VARIANCE_ACCOUNT,
     };
     let spec = scenarios::by_id(&opts.scenario, universe.clone())
         .ok_or_else(|| format!("unknown scenario '{}' (try s1..s8)", opts.scenario))?;
