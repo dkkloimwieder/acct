@@ -453,6 +453,11 @@ ledger_enqueue_trx_c(
 ) RETURNS BIGINT  -- submission_id (routed flavor; shmem-local, not trx.id)
 ```
 
+> **Implementation note (v3.1 PoC — AUDIT.md D1.1/D1.2).** The shipped SPIs take `lines` as
+> **JSONB** (an array of objects), not the SQL composite ARRAY sketched above — pgrx ergonomics;
+> behaviorally equivalent. Each line object also carries an optional **`variance_account`**
+> (absent from the tuple above) which STD receipts with actual ≠ standard require per §3.3.
+
 Both flavors are in PoC scope. Direct Path C demonstrates per-caller-tx provisional cost recording with reduced lock-hold time vs strict-mode paths. Routed Path C demonstrates the same provisional cost handling under batched-commit semantics — the combination that the hot-pool deep-FIFO regime needs. The two flavors map onto the same matrix that strict direct vs strict routed does (low/high concurrency × disjoint/overlapping pools); Path C's value at the architecturally-interesting cell (high concurrency, hot FIFO/LIFO pools) is fully realized only with routed.
 
 ## 5. Path C direct flavor (ledger_submit_trx_c)
@@ -1018,6 +1023,11 @@ If a query reads `pool_state` for a FIFO pool and finds layer_id=0 with unit_cos
 
 ### 14.2 Pristine-replay is not used
 
+> **Status (v3.1 PoC): SETTLED.** Implemented as drop-and-continue in
+> `ledger-routed-c/src/committer.rs::plan_and_write` — a per-submission trial snapshot clone,
+> discarded on `plan_apply_provisional` Err, no pristine-replay; submission_id-ascending order
+> and split-chunk order preservation hold as described below. (AUDIT-PASS2.md §4.4.)
+
 Path B (strict routed) in some architectures uses pristine-snapshot replay to handle failures in a commit_group where one trx's plan_apply fails and excluded trxs would have left stale intermediate state visible to other trxs. Path C has no cross-trx state dependency on the hot path — each trx updates only the aggregate row and produces only its own trx_line/posting_line rows. A trx that fails plan_apply_provisional (e.g., depletion exceeds aggregate qty) is simply dropped from the working snapshot; remaining trxs proceed unchanged.
 
 For direct flavor: the failed trx's user-tx aborts via RAISE EXCEPTION; nothing else is at stake.
@@ -1041,6 +1051,11 @@ What IS true about commutativity: for **receipts only** (no depletions), the WAC
 A depletion that would fail in the single-chunk world (because its qty exceeds the snapshot at its position in enqueue order) also fails in the split-chunk world (it's still at the same relative position; chunks committed before it still happened before; chunks committed after it still happen after). Determinism is preserved.
 
 ### 14.3 Choice of provisional cost basis
+
+> **Status (v3.1 PoC): SETTLED.** Both bases are implemented and dispatched in
+> `ledger-core/src/provisional.rs` (`running_avg` reads the aggregate unit_cost; `standard`
+> reads `standard_cost`). The two not-implemented bases (last-receipt, last-depletion) remain
+> out of scope.
 
 For FIFO/LIFO pools, the hot path needs to record SOME unit_cost for depletions, even though the true FIFO/LIFO cost is unknown at recording time. The PoC supports two bases, selectable per pool via `pool.provisional_basis`:
 
@@ -1085,3 +1100,32 @@ PostgreSQL identity columns (and BIGSERIAL) allocate ids monotonically via the u
 This does not affect Path C's hot path because the hot path doesn't observe any cross-trx ordering of trx_line ids. Each trx independently reads aggregate state, updates it, writes its own trx_line.
 
 When recalc/close is built (deferred), whoever builds it must account for this — a watermark-based "advance past max visible id" scheme is broken under BIGSERIAL-without-commit-ordering. Standard fixes include settled-state columns, full-recompute idempotency, or txid_snapshot-based safe-watermark patterns. This is a recalc/close design decision.
+
+## 15. Implementation divergences (v3.1 PoC)
+
+Recorded by the post-build coherence review (`poc/ledger-v3.1/AUDIT.md`, `AUDIT-PASS2.md`). The
+PoC faithfully realizes this spec; the deltas below are the known divergences. None is a
+correctness defect. Full per-finding detail (with file:line anchors and severities) lives in the
+AUDIT docs; this section is the spec-side pointer.
+
+- **SPI line shape** (§4, AUDIT D1.1/D1.2): `lines` is JSONB-array-of-objects, not a SQL
+  composite ARRAY; each object carries an optional `variance_account` (for §3.3 STD receipts).
+  Already annotated inline at §4.
+- **Aggregate-mutation coalescing** (§5.1 step 8 / §8, AUDIT D1.3): `ledger-core`'s
+  `PlanResult::coalesce_aggregates` collapses per-pool aggregate upserts to one (keep-last) so a
+  single submission touching a pool twice writes one `(pool_id, layer_id=0)` row (the direct
+  `ON CONFLICT DO UPDATE` batch cannot touch a row twice). The routed committer reaches the same
+  one-aggregate-per-pool shape via the §6.7 post-pass-snapshot reconstruction. (acct-036x.)
+- **Harness, distinct pools per submission** (§10.3, AUDIT D1.4): the workload generator emits
+  distinct pool_ids per submission (clean measurement; same root cause as the coalesce above).
+- **Harness seeds `standard_cost`** (§10.4, AUDIT D1.5): the pool seeder must populate
+  `standard_cost` for every std-method / standard-basis pool, else those pools abort with
+  MissingStandardCost and confound mixed-method scenarios. (acct-0z5m.)
+- **No `qty >= 0` CHECK on `pool_state`** (§2.2/§3.6, AUDIT D3.1): no-negative-inventory is a
+  `ledger-core` code invariant, not a schema constraint.
+
+Open follow-ups the review filed (cleanup, not spec changes): de-Path-B the routed crate (stale
+`design-v3`/Path B references + 13 dead `tm09`/stage/audit shmem counters + the dead
+`committer_lease_ms` GUC — AUDIT D4.1/D7.1/D8.1); extract a shared SPI-common crate for the
+triplicated `pool_lock`/`hydration`/`bulk_write` (AUDIT D5.1); add a routed-flavor property test
+(AUDIT D6.1).

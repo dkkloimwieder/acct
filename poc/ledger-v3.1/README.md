@@ -134,11 +134,15 @@ ledger-harness equivalence --scenario s7 --callers 8 --submissions-per-caller 50
   harness invocation is hard-`timeout`-wrapped. **The actual bake-off RESULTS +
   PoC report are P5 (`acct-2ttr.9`)**; P4 delivers the machinery.
 
-> Known limitation (filed separately): `ledger_submit_trx_c` (direct) emits one
-> aggregate UPSERT row per line, so a single submission must touch **distinct**
-> pools — listing the same pool twice fails the bulk UPSERT. The routed committer
-> coalesces per pool and is unaffected. The harness generates distinct pools per
-> submission accordingly (§5.1 "touched pool_ids … dedup").
+> Known limitation: `ledger_submit_trx_c` (direct) emits one aggregate UPSERT row
+> per line, so a single submission must touch **distinct** pools — listing the same
+> pool twice would fail the bulk `ON CONFLICT DO UPDATE`. `ledger-core` now coalesces
+> per-pool aggregate mutations (keep-last) so correctness holds either way
+> (`acct-036x`); the harness still generates distinct pools per submission for clean
+> measurement (§5.1 "touched pool_ids … dedup"). The pool seeder also populates
+> `standard_cost` for std/standard-basis pools so mixed-method scenarios don't abort
+> on MissingStandardCost (`acct-0z5m`). Both are recorded as divergences in AUDIT.md
+> (D1.3 / D1.5).
 
 ## Crates
 - `ledger-core` — pure Rust, no pgrx: per-method state transitions + provisional dispatch (§8). ✓
@@ -160,6 +164,22 @@ ledger-harness equivalence --scenario s7 --callers 8 --submissions-per-caller 50
 | P5    | `acct-2ttr.9` | characterization & PoC report ([`results/POC-REPORT.md`](results/POC-REPORT.md)) | ✓ |
 
 Stream label `stream:ledger-v3.1`; administrative pause gate `acct-1wyk` (`ledger-v3.1-PAUSE`).
+
+## Code review
+
+A post-build coherence + quality review lives in [`AUDIT.md`](AUDIT.md) (Pass 1: design-impl
+coherence + quality survey) and [`AUDIT-PASS2.md`](AUDIT-PASS2.md) (Pass 2: per-entry-point
+R1–R7 walk + the unsafe shmem/concurrency core). **Verdict: faithful Path C implementation,
+high-quality cost core, no P1 findings.** Overflow safety, locking (R4), idempotency (R6),
+audit-field provenance (R7), memory ordering on the shmem atomics, recovery, drop-and-continue
+(§14.2), the §6.7 collapse, and the arena allocator are all sound; R1/R3/R5 are vacuous for
+Path C's single-class pool model.
+
+The main blemish is copy-adapt residue in `ledger-routed-c` (stale "Path B / design-v3"
+references, 13 dead `tm09`/per-stage/audit shmem counters, the dead `committer_lease_ms` GUC).
+Follow-up cleanup issues filed (not yet done — assess-only review): de-Path-B the routed crate
+(AUDIT D4.1/D7.1/D8.1); extract a shared SPI-common crate for the triplicated
+`pool_lock`/`hydration`/`bulk_write` (D5.1); add a routed-flavor property test (D6.1).
 
 ## Deliberately omitted (design-v3.1 §13)
 Recalc/close (authoritative FIFO/LIFO reconciliation), negative inventory, multi-currency,

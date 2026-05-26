@@ -221,13 +221,19 @@ not a correctness defect. Authoritative cost reconciliation is deferred (§13).
 - **Host load** made absolute throughput directional; structural ratios (lock-hold floor, collapse
   ratio, exact equivalence) are the load-robust findings. A re-run on a quiet host would tighten
   the throughput numbers but is not expected to change any verdict.
-- **Mixed-method scenarios (S3/S4)** are confounded by the harness not seeding `standard_cost` for
-  std-method pools (→ MissingStandardCost aborts). Path C conclusions rest on the all-fifo (S5–S8)
-  and all-wac (S1/S2) universes, which ran clean. Seeding std costs is a harness follow-up.
-- **`acct-036x`** (open P2 bug): `ledger_submit_trx_c` (direct) emits one aggregate UPSERT per
-  line, so a single submission must touch *distinct* pools (the routed committer coalesces and is
-  unaffected). The harness already generates distinct pools per submission, so it did not affect
-  this run; noted for completeness.
+- **Mixed-method scenarios (S3/S4)** in *this run* are confounded by the harness not seeding
+  `standard_cost` for std-method pools (→ MissingStandardCost aborts). Path C conclusions rest on
+  the all-fifo (S5–S8) and all-wac (S1/S2) universes, which ran clean. **Resolved post-run by
+  `acct-0z5m`** (commit `9b6e6b5`): the seeder now populates `standard_cost` for std/standard-basis
+  pools, so a re-measurement of S3/S4 would be unconfounded — the numbers above are an accurate
+  *pre-fix* snapshot, not a Path C limitation. (Re-measurement not yet folded in.)
+- **`acct-036x`** (**closed**, commit `d4c2c5c`): `ledger_submit_trx_c` (direct) emits one aggregate
+  UPSERT per line, so a single submission must touch *distinct* pools; `ledger-core` now coalesces
+  per-pool aggregate mutations (the routed committer was always unaffected). The harness generates
+  distinct pools per submission, so it did not affect this run; noted for completeness.
+- **Code review**: a post-build coherence + quality audit (`../AUDIT.md`, `../AUDIT-PASS2.md`)
+  found no P1 issues; the open follow-ups are cleanup (de-Path-B the routed crate; shared SPI-common
+  crate; routed property test), none of which affect these measurements.
 - **Recalc/close, negative inventory, multi-currency, effective-dated standard costs, period close
   (§13)** remain deliberately out of scope. This PoC validates the *hot-path* claims only.
 
