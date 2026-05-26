@@ -167,6 +167,36 @@ async fn specific_receipt_then_depletion_materializes_and_links() {
 
 #[tokio::test]
 #[ignore = "needs running poc_v3_1 with ledger_direct_c installed"]
+async fn specific_second_receipt_rejected_while_stocked() {
+    // K=1 guard (§3.4): a specific pool holds at most one materialized unit. A
+    // second receipt while stocked must be rejected, not silently materialize a
+    // co-existing layer that breaks single-layer depletion.
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let f = seed_fixture(&pool, "specific", "running_avg").await;
+
+    submit(&pool, "po_receipt", 1, vec![receipt(&f, 1, 500)]).await.expect("first receipt");
+    assert_eq!(layer_count(&pool, f.pool_id).await, 1);
+
+    // Second receipt while the pool is stocked → RAISE, nothing materialized.
+    let err = submit(&pool, "po_receipt", 2, vec![receipt(&f, 1, 700)]).await;
+    assert!(err.is_err(), "second receipt to an occupied specific pool must RAISE");
+    assert!(
+        format!("{}", err.unwrap_err()).contains("already holds a unit"),
+        "error identifies the K=1 violation"
+    );
+    assert_eq!(layer_count(&pool, f.pool_id).await, 1, "no second layer materialized");
+    assert_eq!(aggregate(&pool, f.pool_id).await, Some((1, 500)), "aggregate unchanged");
+
+    // After depleting the unit, the slot may be re-stocked (qty back to 0).
+    submit(&pool, "transfer_shipment", 3, vec![depletion(&f, 1)]).await.expect("deplete");
+    assert_eq!(layer_count(&pool, f.pool_id).await, 0);
+    submit(&pool, "po_receipt", 4, vec![receipt(&f, 1, 700)]).await.expect("re-stock after depletion");
+    assert_eq!(aggregate(&pool, f.pool_id).await, Some((1, 700)), "re-stocked with the new unit");
+}
+
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_direct_c installed"]
 async fn fifo_standard_basis_depletes_at_standard_not_average() {
     let pool = connect_pool().await;
     reset_state(&pool).await;

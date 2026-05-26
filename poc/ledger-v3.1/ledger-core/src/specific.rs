@@ -42,6 +42,19 @@ fn receipt(
     posted_at: DateTime<Utc>,
 ) -> Result<(), LedgerError> {
     let (old_qty, _old_uc, _existed) = snapshot.read_aggregate(line.pool_id);
+    // K=1 (§3.4): a specific pool holds at most one materialized unit. A second
+    // receipt while the pool is stocked would push a co-existing layer that the
+    // single-layer `deplete` (lowest layer_id) cannot reason about. The aggregate
+    // qty mirrors layer presence here (specific supports full-layer consumption
+    // only, so qty is either 0 or the live layer's qty), making qty > 0 the
+    // signal that the pool is already stocked — for a hydrated prior receipt and
+    // for an earlier receipt within this same batch alike.
+    if old_qty > 0 {
+        return Err(LedgerError::SpecificPoolOccupied {
+            pool_id: line.pool_id,
+            existing_qty: old_qty,
+        });
+    }
     let new_qty = old_qty
         .checked_add(line.qty)
         .ok_or_else(|| overflow(format!("specific receipt qty on pool {}", line.pool_id)))?;

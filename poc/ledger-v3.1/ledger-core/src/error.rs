@@ -39,6 +39,14 @@ pub enum LedgerError {
     #[error("missing variance account for STD line on pool={pool_id}")]
     MissingVarianceAccount { pool_id: i64 },
 
+    /// A receipt targeted a specific-method pool that already holds a
+    /// materialized unit. The specific method is K=1 — one layer per pool
+    /// (§3.4) — so a second receipt while the pool is stocked would create a
+    /// co-existing layer that breaks single-layer depletion. Deplete the unit
+    /// first, or use a distinct identity_key (a separate pool).
+    #[error("specific pool {pool_id} already holds a unit (qty={existing_qty}); K=1 forbids a second receipt")]
+    SpecificPoolOccupied { pool_id: i64, existing_qty: i64 },
+
     #[error("arithmetic overflow: {detail}")]
     Overflow { detail: String },
 }

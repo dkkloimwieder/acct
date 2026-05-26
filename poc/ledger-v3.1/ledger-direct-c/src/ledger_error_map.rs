@@ -15,6 +15,8 @@
 //!     with no standard_cost row (§3.3).
 //!   MissingVarianceAccount → DATA_EXCEPTION (22000) — STD receipt with
 //!     actual != standard but no variance account supplied on the line (§3.3).
+//!   SpecificPoolOccupied   → INTEGRITY_CONSTRAINT_VIOLATION (23000) — a second
+//!     receipt to a specific pool that already holds a unit; K=1 (§3.4).
 //!   Overflow               → NUMERIC_VALUE_OUT_OF_RANGE (22003) — BIGINT
 //!     arithmetic overflowed during the running-average math (§3.0).
 //!
@@ -70,6 +72,15 @@ pub fn raise_ledger_error(err: LedgerError) {
                 msg,
                 "An STD receipt whose actual cost differs from standard needs a \
                  variance_account on the line to absorb the purchase-price variance."
+            );
+        }
+        LedgerError::SpecificPoolOccupied { .. } => {
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION,
+                msg,
+                "A specific-method pool is K=1 and already holds a unit. Deplete it \
+                 before re-stocking, or use a distinct identity_key (a separate pool)."
             );
         }
         LedgerError::Overflow { .. } => {
