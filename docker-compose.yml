@@ -7,6 +7,12 @@ services:
     container_name: acct-postgres
     security_opt:
       - seccomp:unconfined
+    # io_method=io_uring pre-allocates locked submission/completion queues per
+    # backend; the 8 MB Docker-default RLIMIT_MEMLOCK caps backend count well
+    # below max_connections=1100. Unlimited lets every backend lock its queues.
+    # Production memlock hardening is tracked as acct-hbp.
+    ulimits:
+      memlock: -1
     environment:
       POSTGRES_DB: acct
       POSTGRES_USER: acct
