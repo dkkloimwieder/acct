@@ -267,7 +267,15 @@ enum CallerTxStatus {
     Committed,
     InProgress,
     Aborted,
+    /// `pg_xact_status` returned NULL — the xid is older than the status horizon
+    /// (frozen), which means it must have committed. Safe to keep.
     Unknown,
+    /// `pg_xact_status` returned a non-null string we don't recognize — a wording
+    /// drift across PG versions. We can't confirm the caller committed, so this is
+    /// treated as not-yet-committed (never kept): a rename of the status text fails
+    /// loud (WARNING + caller timeouts) instead of silently committing work for a
+    /// possibly still-open tx.
+    Unrecognized,
 }
 
 fn process_commit_group(cq_idx: u32, _cg_id: u64) -> ProcessOutcome {
@@ -838,7 +846,9 @@ fn drop_prepared_already_in_trx(prepared: &mut Vec<Prepared>) -> Result<u64, Str
 /// Batched pg_xact_status lookup over the unique XIDs, then per-submission
 /// classification. In-progress callers are ejected (eject_count +
 /// last_eject_at_ns bumped, cg_id reset, staging CAS 3→1 so the router re-packs
-/// after cooldown); aborted callers are dropped silently. Returns the kept set.
+/// after cooldown); aborted callers are dropped silently; a NULL status (frozen
+/// xid = committed) is kept; an unrecognized non-null status (pg_xact_status
+/// wording drift) is logged and ejected, never kept. Returns the kept set.
 fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Error> {
     let mut unique_xids: HashSet<u64> = HashSet::new();
     for d in decoded {
@@ -868,7 +878,17 @@ fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Er
         .unwrap_or_default();
         for (x, s) in rows {
             let xid: u64 = x.parse().unwrap_or(0);
-            xid_status.insert(xid, parse_caller_status(s.as_deref()));
+            let status = parse_caller_status(s.as_deref());
+            if status == CallerTxStatus::Unrecognized {
+                // A pg_xact_status wording drift: surface it loudly. The submission
+                // is treated as not-yet-committed below (never kept), so this fails
+                // safe — it never commits work for a possibly still-open caller tx.
+                pgrx::warning!(
+                    "ledger_routed_c: unrecognized pg_xact_status {s:?} for caller xid {xid}; \
+                     treating as not-yet-committed (will not keep)"
+                );
+            }
+            xid_status.insert(xid, status);
         }
     }
 
@@ -888,7 +908,11 @@ fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Er
             CallerTxStatus::Aborted => {
                 // Drop silently — no trx will exist, which is the failure signal.
             }
-            CallerTxStatus::InProgress => {
+            // InProgress: caller's tx is still open — re-check after cooldown.
+            // Unrecognized: a status-wording drift; we can't confirm commit, so it
+            // rides the same not-yet-committed path (eject → retry → terminal-drop),
+            // never kept. A persistent drift thus fails loud (WARNING + timeouts).
+            CallerTxStatus::InProgress | CallerTxStatus::Unrecognized => {
                 let queue = STAGING_QUEUE.share();
                 let slot = &queue.entries[d.staging_idx as usize];
                 let prev = slot.eject_count.load(Acquire);
@@ -927,7 +951,10 @@ fn parse_caller_status(s: Option<&str>) -> CallerTxStatus {
         Some("committed") => CallerTxStatus::Committed,
         Some("aborted") => CallerTxStatus::Aborted,
         Some("in progress") => CallerTxStatus::InProgress,
-        Some(_) | None => CallerTxStatus::Unknown,
+        // NULL = frozen/too-old xid (committed long ago) → safe to keep. A non-null
+        // string we don't know = a pg_xact_status wording drift → must NOT be kept.
+        None => CallerTxStatus::Unknown,
+        Some(_) => CallerTxStatus::Unrecognized,
     }
 }
 
@@ -937,6 +964,7 @@ fn status_copy(s: &CallerTxStatus) -> CallerTxStatus {
         CallerTxStatus::InProgress => CallerTxStatus::InProgress,
         CallerTxStatus::Aborted => CallerTxStatus::Aborted,
         CallerTxStatus::Unknown => CallerTxStatus::Unknown,
+        CallerTxStatus::Unrecognized => CallerTxStatus::Unrecognized,
     }
 }
 
@@ -1068,8 +1096,18 @@ mod tests {
         assert_eq!(parse_caller_status(Some("committed")), CallerTxStatus::Committed);
         assert_eq!(parse_caller_status(Some("aborted")), CallerTxStatus::Aborted);
         assert_eq!(parse_caller_status(Some("in progress")), CallerTxStatus::InProgress);
+        // NULL = frozen/too-old xid → committed → keep.
         assert_eq!(parse_caller_status(None), CallerTxStatus::Unknown);
-        assert_eq!(parse_caller_status(Some("garbage")), CallerTxStatus::Unknown);
+    }
+
+    #[test]
+    fn parse_caller_status_unrecognized_is_distinct_from_null() {
+        // A non-null string we don't know (a pg_xact_status wording drift) must NOT
+        // collapse to Unknown-keep — it maps to Unrecognized (handled as
+        // not-yet-committed, never kept), so a future rename fails safe.
+        assert_eq!(parse_caller_status(Some("garbage")), CallerTxStatus::Unrecognized);
+        assert_eq!(parse_caller_status(Some("in-progress")), CallerTxStatus::Unrecognized);
+        assert_ne!(parse_caller_status(Some("running")), CallerTxStatus::Unknown);
     }
 
     #[test]
