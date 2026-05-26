@@ -697,8 +697,9 @@ The committer's PG tx can fail mid-flight from causes other than per-submission 
 
 Retry mechanics: the committer leaves the commit_group entry in shmem at `in_flight` with its own (slot, token), backs off (start 10ms, exponential up to 1s, max 5 retries), and resumes from §6.4 step 2 (open new PG tx, repeat pg_xact check, repeat dedup, etc.). Pre-flight dedup catches any work that other committers may have completed in the interim. After max retries with no progress, the commit_group is marked poisoned (see below).
 
+**Unique-violation that survives pre-flight dedup — re-drive the group minus the offender.** A 23505 on `trx(trx_type, source_id)` at INSERT time means a racing committer committed one of this group's keys between our pre-flight dedup and our write (two duplicate submissions that landed in different commit_groups — different pools — and so weren't caught by within-batch dedup). The offending key is now visible in `trx`, so the committer re-runs dedup against `trx`, drops the now-resolvable duplicate(s), and re-drives the rest of the group through the retry loop (a fresh hydrate + replan recomputes the aggregate without the offender). This avoids dead-lettering the group's innocent siblings alongside the one duplicate. If the re-dedup resolves no offender (a UNIQUE other than `(trx_type, source_id)`, or no duplicate is actually present), re-driving can't make progress and the group is poisoned as a genuine fatal. (Implemented: `committer.rs` `PhaseOutcome::DuplicateRace`; the re-drive count and the irresolvable-poison are both counted under `committer_duplicate_redrives_total`. acct-yojk.9.)
+
 **Fatal errors — poison the commit_group, do not retry.**
-- Constraint violation that survives pre-flight dedup (e.g., a caller-race wrote the trx between dedup and INSERT): this indicates a logic error in the caller, not a transient condition. Retrying won't help.
 - Type errors, NULL constraint violations on required columns: programming errors. Retrying won't help.
 - Disk full (SQLSTATE 53100): retrying is futile until operator intervenes.
 

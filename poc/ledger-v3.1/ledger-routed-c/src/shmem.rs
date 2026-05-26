@@ -203,13 +203,19 @@ pub struct CommitterQueue {
     /// raises a non-retryable SQL error (forces the §6.8 poison path), then
     /// clears the flag (swap-to-0). Production builds never set it nonzero.
     pub test_inject_committer_fatal: AtomicU8,
+    /// Test-only one-shot: when 1, the next committer write phase raises a raw
+    /// 23505 UNIQUE violation (no real duplicate behind it), then clears the flag
+    /// (swap-to-0). Exercises the §6.8 re-drive safety valve — a 23505 whose
+    /// duplicate is not resolvable in `trx` poisons rather than looping. Production
+    /// builds never set it nonzero.
+    pub test_inject_committer_unique: AtomicU8,
     /// Postmaster-startup recovery flag. 0 = recovery not yet
     /// complete; router + committer BGWorkers spin at startup until
     /// set. 1 = recovery sweep finished (Release stored by the
     /// recovery worker; router/committers Acquire-load before opening
     /// for traffic).
     pub recovery_complete: AtomicU8,
-    pub _pad_test: [u8; 1],
+    pub _pad_test: [u8; 0],
 
     // ── Committer pool counters ────────────────────────────────────
     pub committer_claim_count: AtomicU64,
@@ -241,6 +247,12 @@ pub struct CommitterQueue {
     /// Submissions dropped by drop-and-continue (per-submission
     /// plan_apply_provisional Err — e.g. insufficient inventory). §6.4 step 9.
     pub committer_dropped_submissions_total: AtomicU64,
+    /// Write-phase 23505 (UNIQUE survived pre-flight dedup) re-drives (§6.8): one
+    /// per caught unique violation. The racing duplicate is re-dedup'd out and the
+    /// rest of the group re-driven, so an innocent submission isn't dead-lettered
+    /// alongside the offender. Counts both the resolved re-drives and the safety-
+    /// valve poison (23505 with no resolvable duplicate).
+    pub committer_duplicate_redrives_total: AtomicU64,
 
     // ── Eject + pipeline observability ─────────────────────────────
     pub eject_total_count: AtomicU64,

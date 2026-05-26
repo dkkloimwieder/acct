@@ -315,3 +315,151 @@ async fn committed_group_reclaims_all_arena_blocks() {
         "every committed-and-dropped submission's arena blocks (incl. the lines blob) reclaimed"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn racing_duplicate_redrives_group_minus_offender() {
+    // acct-yojk.9: a 23505 that survives pre-flight dedup (a racer wrote one of the
+    // group's (trx_type, source_id) keys AFTER our dedup ran but before our INSERT)
+    // must NOT dead-letter the group's innocent siblings. The committer re-dedups
+    // the now-visible racer out and re-drives the rest.
+    //
+    // Determinism: stall the committer between pool_lock acquire and the write —
+    // a window past pre-flight dedup — then INSERT the racer trx on this connection.
+    // When the stall ends, the committer's own INSERT for that key hits 23505; the
+    // re-drive drops it and commits the innocent receipt.
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let f = seed_pool(&pool, 1, 1, 1, "fifo", "running_avg").await;
+    seed_aggregate(&pool, f.pool_id, 0, 0).await;
+
+    let base_redrives = committer_stat(&pool, "duplicate_redrives_total").await;
+    let base_skips = committer_stat(&pool, "dedup_skips_total").await;
+    let base_poisoned = committer_stat(&pool, "poisoned_total").await;
+    let base_dropped = committer_stat(&pool, "dropped_submissions_total").await;
+    let base_committed = committer_stat(&pool, "trx_committed_total").await;
+    let base_stall = committer_stall_hits(&pool).await;
+
+    // Long stall so the racer-insert lands comfortably inside the window.
+    set_committer_stall_us(&pool, 3_000_000).await;
+
+    // Innocent receipt 7001 + receipt 7002 (the one a racer will steal), one group.
+    paused(&pool, || async {
+        enqueue(&pool, "po_receipt", 7_001, vec![receipt_line_for(&f, 10, 100)])
+            .await
+            .expect("enqueue innocent receipt");
+        enqueue(&pool, "po_receipt", 7_002, vec![receipt_line_for(&f, 20, 100)])
+            .await
+            .expect("enqueue soon-to-race receipt");
+    })
+    .await;
+
+    // The committer has claimed the group, passed pre-flight dedup + locks, and is
+    // now parked in the stall. Clear the stall so the re-drive attempt won't stall
+    // again, then commit the racer's trx for 7002 on this connection.
+    await_stall_hit(&pool, base_stall).await;
+    set_committer_stall_us(&pool, 0).await;
+    sqlx::query("INSERT INTO trx (trx_type, source_id, posted_at) VALUES ('po_receipt'::trx_type, 7002, now())")
+        .execute(&pool)
+        .await
+        .expect("insert racing trx for 7002");
+
+    // After the stall ends: insert_trx(7002) → 23505 → re-drive drops 7002 →
+    // insert_trx(7001) commits. trx ends with 7001 (committer) + 7002 (racer) = 2.
+    await_trx_count(&pool, 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        trx_count_for_source(&pool, 7_001).await,
+        1,
+        "the innocent sibling committed — it was NOT dead-lettered with the offender"
+    );
+    assert_eq!(
+        trx_count_for_source(&pool, 7_002).await,
+        1,
+        "exactly one trx for the raced key (the racer's; the committer dropped its own)"
+    );
+    assert_eq!(
+        committer_stat(&pool, "trx_committed_total").await - base_committed,
+        1,
+        "the committer wrote exactly one trx (the innocent 7001), not the duplicate"
+    );
+    assert_eq!(
+        committer_stat(&pool, "duplicate_redrives_total").await - base_redrives,
+        1,
+        "exactly one re-drive for the surviving-UNIQUE 7002"
+    );
+    assert_eq!(
+        committer_stat(&pool, "dedup_skips_total").await - base_skips,
+        1,
+        "the raced 7002 was re-dedup'd out"
+    );
+    assert_eq!(
+        committer_stat(&pool, "poisoned_total").await - base_poisoned,
+        0,
+        "the group was NOT poisoned — only the offender dropped"
+    );
+    assert_eq!(
+        committer_stat(&pool, "dropped_submissions_total").await - base_dropped,
+        0,
+        "the offender is a dedup skip, not a drop-and-continue drop"
+    );
+    assert_eq!(
+        aggregate(&pool, f.pool_id).await,
+        Some((10, 100)),
+        "aggregate reflects only the innocent receipt (the raced 7002 wrote no lines)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn irresolvable_unique_poisons_group() {
+    // acct-yojk.9 safety valve: a 23505 with NO resolvable duplicate in trx (e.g. a
+    // UNIQUE other than (trx_type, source_id), modeled here by a synthetic injected
+    // 23505) can't make progress by re-driving — it must poison, not loop.
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let f = seed_pool(&pool, 1, 1, 1, "fifo", "running_avg").await;
+    seed_aggregate(&pool, f.pool_id, 0, 0).await;
+
+    let base_poisoned = committer_stat(&pool, "poisoned_total").await;
+    let base_redrives = committer_stat(&pool, "duplicate_redrives_total").await;
+
+    set_inject_unique(&pool, true).await;
+    paused(&pool, || async {
+        enqueue(&pool, "po_receipt", 8_001, vec![receipt_line_for(&f, 10, 100)])
+            .await
+            .expect("enqueue receipt");
+    })
+    .await;
+
+    // No trx will ever appear; poll the poison counter instead.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if committer_stat(&pool, "poisoned_total").await - base_poisoned >= 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for the irresolvable 23505 to poison the group");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        committer_stat(&pool, "duplicate_redrives_total").await - base_redrives,
+        1,
+        "the 23505 entered the re-drive arm once before poisoning"
+    );
+    assert_eq!(
+        committer_stat(&pool, "poisoned_total").await - base_poisoned,
+        1,
+        "an irresolvable 23505 poisons (does not loop)"
+    );
+    assert_eq!(trx_count_for_source(&pool, 8_001).await, 0, "no trx written for the poisoned group");
+    assert_eq!(
+        aggregate(&pool, f.pool_id).await,
+        Some((0, 0)),
+        "aggregate untouched by the poisoned group"
+    );
+}

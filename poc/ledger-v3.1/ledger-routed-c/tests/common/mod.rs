@@ -157,6 +157,50 @@ pub async fn set_committer_paused(pool: &PgPool, paused: bool) {
         .expect("set_committer_paused (needs test_hooks build)");
 }
 
+/// Set the committer stall (µs) honored between pool_lock acquire and the write —
+/// a window for a test to mutate `trx` mid-pipeline (after pre-flight dedup ran).
+/// Requires the `test_hooks` build.
+pub async fn set_committer_stall_us(pool: &PgPool, us: i32) {
+    sqlx::query("SELECT ledger_routed_c_test_set_committer_stall_us($1)")
+        .bind(us)
+        .execute(pool)
+        .await
+        .expect("set_committer_stall_us (needs test_hooks build)");
+}
+
+/// Times the committer entered its stall path (cumulative since load).
+pub async fn committer_stall_hits(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT ledger_routed_c_test_committer_stall_hits()")
+        .fetch_one(pool)
+        .await
+        .expect("committer_stall_hits (needs test_hooks build)")
+}
+
+/// Arm a one-shot raw 23505 in the next committer write phase (no real duplicate
+/// behind it). Drives the §6.8 re-drive safety valve. Requires the `test_hooks` build.
+pub async fn set_inject_unique(pool: &PgPool, on: bool) {
+    sqlx::query("SELECT ledger_routed_c_test_set_inject_unique($1)")
+        .bind(on)
+        .execute(pool)
+        .await
+        .expect("set_inject_unique (needs test_hooks build)");
+}
+
+/// Poll until `committer_stall_hits` advances past `base`, or panic on timeout —
+/// confirms the committer is parked in its stall (past pre-flight dedup + locks).
+pub async fn await_stall_hit(pool: &PgPool, base: i64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if committer_stall_hits(pool).await > base {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for committer to enter its stall");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The live `batch_size_max` GUC (max submissions per commit_group).
 pub async fn batch_size_max(pool: &PgPool) -> i64 {
     let s: String = sqlx::query_scalar("SHOW ledger_routed_c.batch_size_max")

@@ -75,7 +75,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_aggregate_upserts_total_wrapper
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:361
+-- ledger-routed-c/src/lib.rs:372
 -- ledger_routed_c::ledger_routed_c_committer_deadlock_retries_total
 CREATE  FUNCTION "ledger_routed_c_committer_deadlock_retries_total"() RETURNS bigint /* i64 */
 STRICT
@@ -111,7 +111,16 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_dropped_submissions_total_wrapp
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:354
+-- ledger-routed-c/src/lib.rs:349
+-- ledger_routed_c::ledger_routed_c_committer_duplicate_redrives_total
+CREATE  FUNCTION "ledger_routed_c_committer_duplicate_redrives_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_duplicate_redrives_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:365
 -- ledger_routed_c::ledger_routed_c_committer_poisoned_total
 CREATE  FUNCTION "ledger_routed_c_committer_poisoned_total"() RETURNS bigint /* i64 */
 STRICT
@@ -141,7 +150,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_queue_state_counts_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:371
+-- ledger-routed-c/src/lib.rs:382
 -- ledger_routed_c::ledger_routed_c_committer_takeover_count
 CREATE  FUNCTION "ledger_routed_c_committer_takeover_count"() RETURNS bigint /* i64 */
 STRICT
@@ -159,7 +168,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_trx_committed_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:346
+-- ledger-routed-c/src/lib.rs:357
 -- ledger_routed_c::ledger_routed_c_committer_tx_failures_total
 CREATE  FUNCTION "ledger_routed_c_committer_tx_failures_total"() RETURNS bigint /* i64 */
 STRICT
@@ -168,7 +177,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_tx_failures_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:386
+-- ledger-routed-c/src/lib.rs:397
 -- ledger_routed_c::ledger_routed_c_hello
 CREATE  FUNCTION "ledger_routed_c_hello"() RETURNS TEXT /* String */
 STRICT
@@ -190,7 +199,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_ready_commit_groups_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:378
+-- ledger-routed-c/src/lib.rs:389
 -- ledger_routed_c::ledger_routed_c_recovery_complete
 CREATE  FUNCTION "ledger_routed_c_recovery_complete"() RETURNS bool /* bool */
 STRICT
@@ -229,7 +238,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_committer_stall_hits_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:1022
+-- ledger-routed-c/src/router.rs:1034
 -- ledger_routed_c::router::ledger_routed_c_test_inject_orphan_cq
 CREATE  FUNCTION "ledger_routed_c_test_inject_orphan_cq"() RETURNS INT /* i32 */
 STRICT
@@ -247,7 +256,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_router_pid_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:1009
+-- ledger-routed-c/src/router.rs:1021
 -- ledger_routed_c::router::ledger_routed_c_test_run_router_recovery_sweep
 CREATE  FUNCTION "ledger_routed_c_test_run_router_recovery_sweep"() RETURNS bigint /* i64 */
 STRICT
@@ -308,5 +317,16 @@ CREATE  FUNCTION "ledger_routed_c_test_set_inject_fatal"(
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_inject_fatal_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1009
+-- ledger_routed_c::router::ledger_routed_c_test_set_inject_unique
+CREATE  FUNCTION "ledger_routed_c_test_set_inject_unique"(
+	"on" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_inject_unique_wrapper';
 /* </end connected objects> */
 

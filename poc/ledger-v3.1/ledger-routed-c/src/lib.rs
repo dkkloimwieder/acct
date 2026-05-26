@@ -343,6 +343,17 @@ fn ledger_routed_c_committer_dropped_submissions_total() -> i64 {
         .load(Relaxed) as i64
 }
 
+/// Write-phase 23505 re-drives (§6.8): one per UNIQUE violation that survived
+/// pre-flight dedup. The racer is re-dedup'd out and the rest of the group
+/// re-driven; an irresolvable 23505 increments this then poisons.
+#[pg_extern]
+fn ledger_routed_c_committer_duplicate_redrives_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .committer_duplicate_redrives_total
+        .load(Relaxed) as i64
+}
+
 #[pg_extern]
 fn ledger_routed_c_committer_tx_failures_total() -> i64 {
     COMMITTER_QUEUE.share().committer_tx_failures.load(Relaxed) as i64

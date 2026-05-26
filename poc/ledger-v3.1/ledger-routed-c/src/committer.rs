@@ -364,19 +364,19 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
         };
     }
 
-    let pool_ids: Vec<i64> = prepared
-        .iter()
-        .flat_map(|p| p.lines.iter().map(|l| l.pool_id))
-        .collect::<BTreeSet<i64>>()
-        .into_iter()
-        .collect();
+    let mut pool_ids = pool_ids_of(&prepared);
 
-    // Steps 7-10 with §6.8 retry-on-deadlock: the whole lock → hydrate → apply →
-    // write phase runs in a nested subtransaction. A transient SQLSTATE (40P01 /
-    // 40001) rolls the subtx back and re-attempts after backoff (the pre-flight
-    // dedup catches anything other committers finished meanwhile); a non-retryable
-    // SQLSTATE — or exhausting the retry budget — poisons the commit_group.
+    // Steps 7-10 with §6.8 retry-on-deadlock + re-drive-on-unique: the whole lock →
+    // hydrate → apply → write phase runs in a nested subtransaction. A transient
+    // SQLSTATE (40P01 / 40001) rolls the subtx back and re-attempts after backoff;
+    // a 23505 that survived pre-flight dedup (a racer wrote the key meanwhile) drops
+    // the now-visible offender and re-drives the rest of the group, so its innocent
+    // siblings aren't dead-lettered with it; any other non-retryable SQLSTATE — or
+    // exhausting a budget — poisons the commit_group. Each re-drive removes ≥1
+    // submission, so the bound is the (initial) submission count plus one.
     let mut attempt: u32 = 0;
+    let mut redrives: u32 = 0;
+    let max_redrives = prepared.len() as u32 + 1;
     loop {
         match attempt_commit_phase(&pool_ids, &prepared) {
             PhaseOutcome::Committed(summary) => {
@@ -411,6 +411,54 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
                     .fetch_add(1, Relaxed);
                 std::thread::sleep(retry_backoff(attempt));
             }
+            PhaseOutcome::DuplicateRace(msg) => {
+                redrives += 1;
+                COMMITTER_QUEUE
+                    .share()
+                    .committer_duplicate_redrives_total
+                    .fetch_add(1, Relaxed);
+                if redrives > max_redrives {
+                    return ProcessOutcome::Poisoned {
+                        message: format!("duplicate re-drives exhausted: {msg}"),
+                        staging_indices,
+                    };
+                }
+                // Re-dedup against trx: the racer that beat us to the UNIQUE is now
+                // committed and visible, so it (and any other newly-arrived
+                // duplicate) drops out, leaving the innocent rest to re-drive. A
+                // fresh hydrate + replan on the next attempt recomputes the
+                // aggregate without the offender.
+                let removed = match drop_prepared_already_in_trx(&mut prepared) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return ProcessOutcome::Poisoned {
+                            message: format!("re-drive dedup query failed: {e}"),
+                            staging_indices,
+                        };
+                    }
+                };
+                if removed == 0 {
+                    // 23505 with no resolvable duplicate in trx — re-driving can't
+                    // make progress (e.g. a non-(trx_type, source_id) UNIQUE, or a
+                    // synthetic injected 23505). This is a genuine fatal: poison.
+                    return ProcessOutcome::Poisoned {
+                        message: format!("unique violation with no resolvable duplicate: {msg}"),
+                        staging_indices,
+                    };
+                }
+                COMMITTER_QUEUE
+                    .share()
+                    .committer_dedup_skips_total
+                    .fetch_add(removed, Relaxed);
+                if prepared.is_empty() {
+                    // The racing duplicate(s) were the whole group — nothing to write.
+                    return ProcessOutcome::Committed {
+                        committed_count: 0,
+                        staging_indices,
+                    };
+                }
+                pool_ids = pool_ids_of(&prepared);
+            }
             PhaseOutcome::Fatal(msg) => {
                 return ProcessOutcome::Poisoned {
                     message: msg,
@@ -419,6 +467,18 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
             }
         }
     }
+}
+
+/// The sorted, deduped set of pool_ids a prepared batch touches — the lock +
+/// hydrate set. Recomputed after a re-drive drops a submission, so a now-untouched
+/// pool isn't needlessly locked.
+fn pool_ids_of(prepared: &[Prepared]) -> Vec<i64> {
+    prepared
+        .iter()
+        .flat_map(|p| p.lines.iter().map(|l| l.pool_id))
+        .collect::<BTreeSet<i64>>()
+        .into_iter()
+        .collect()
 }
 
 // ── Drop-and-continue apply + batch write (§6.4 steps 9-10, §6.8) ────
@@ -451,8 +511,14 @@ enum PhaseOutcome {
     /// Transient SQLSTATE (40P01 deadlock / 40001 serialization): the caller
     /// rolls back, backs off, and retries.
     Retryable(String),
-    /// Non-retryable SQLSTATE (UNIQUE survived dedup, check / not-null, disk-full,
-    /// …) or a Rust-level SPI error: the caller poisons the commit_group.
+    /// 23505 UNIQUE violation that survived pre-flight dedup — a racing committer
+    /// wrote one of this group's (trx_type, source_id) keys between our dedup and
+    /// our INSERT. The caller re-dedups (the racer is now visible in `trx`), drops
+    /// the offender, and re-drives the rest of the group; it does NOT poison the
+    /// innocent submissions alongside the offender.
+    DuplicateRace(String),
+    /// Non-retryable SQLSTATE (check / not-null, disk-full, …) or a Rust-level SPI
+    /// error: the caller poisons the commit_group.
     Fatal(String),
 }
 
@@ -475,6 +541,7 @@ fn attempt_commit_phase(pool_ids: &[i64], prepared: &[Prepared]) -> PhaseOutcome
         // Test-only injection sites (production builds Acquire-load 0 / skip).
         maybe_inject_deadlock();
         maybe_inject_fatal();
+        maybe_inject_unique();
         maybe_stall();
         let snapshot = hydration::hydrate_snapshot(pool_ids)?;
         let summary = plan_and_write(snapshot, prepared)?;
@@ -578,11 +645,12 @@ fn plan_and_write(
 
 // ── §6.8 SQL-error classification ───────────────────────────────────
 
-/// Map a caught error into the retry/poison decision. 40P01 (deadlock) and
-/// 40001 (serialization) are transient → Retryable; everything else, including a
-/// Rust-level SPI error with no caught SQLSTATE, is Fatal. PoC posture: this is
-/// the basic resilience measure (§6.8 final para); finer per-SQLSTATE handling is
-/// production hardening.
+/// Map a caught error into the retry/poison/re-drive decision. 40P01 (deadlock)
+/// and 40001 (serialization) are transient → Retryable; 23505 (UNIQUE survived
+/// dedup) → DuplicateRace (drop the racer, re-drive the rest); everything else,
+/// including a Rust-level SPI error with no caught SQLSTATE, is Fatal. PoC
+/// posture: this is the basic resilience measure (§6.8 final para); finer
+/// per-SQLSTATE handling is production hardening.
 fn classify_phase_error(
     caught: Option<PgSqlErrorCode>,
     spi_err: Option<pgrx::spi::Error>,
@@ -591,6 +659,9 @@ fn classify_phase_error(
         Some(PgSqlErrorCode::ERRCODE_T_R_DEADLOCK_DETECTED)
         | Some(PgSqlErrorCode::ERRCODE_T_R_SERIALIZATION_FAILURE) => {
             PhaseOutcome::Retryable(format!("{:?}", caught.unwrap()))
+        }
+        Some(PgSqlErrorCode::ERRCODE_UNIQUE_VIOLATION) => {
+            PhaseOutcome::DuplicateRace("23505 survived pre-flight dedup".to_string())
         }
         Some(code) => PhaseOutcome::Fatal(format!("non-retryable sql error {code:?}")),
         None => match spi_err {
@@ -654,6 +725,23 @@ fn maybe_inject_fatal() {
     }
 }
 
+/// Raise a synthetic raw 23505 (one-shot) with no real duplicate behind it, to
+/// exercise the re-drive safety valve: a UNIQUE violation whose offender is not
+/// resolvable in `trx` must poison (not loop). Production builds never arm it.
+fn maybe_inject_unique() {
+    if COMMITTER_QUEUE
+        .share()
+        .test_inject_committer_unique
+        .swap(0, AcqRel)
+        == 1
+    {
+        let _ = Spi::run(
+            "DO $$ BEGIN RAISE EXCEPTION 'injected unique (test_hooks)' \
+             USING ERRCODE = '23505'; END $$",
+        );
+    }
+}
+
 /// Sleep for the injected stall (µs), holding pool_locks + the open subtx, so a
 /// recovery test has a window to act on the committer mid-flight (§9.3).
 fn maybe_stall() {
@@ -682,28 +770,7 @@ fn dedup_against_trx(kept: Vec<Decoded>) -> Result<(Vec<Decoded>, u64), String> 
 
     let trx_types: Vec<String> = kept.iter().map(|d| d.submission.trx_type.clone()).collect();
     let source_ids: Vec<i64> = kept.iter().map(|d| d.submission.source_id).collect();
-
-    let existing: HashSet<(String, i64)> =
-        Spi::connect(|client| -> Result<HashSet<(String, i64)>, pgrx::spi::Error> {
-            let mut set = HashSet::new();
-            // Compare the existing enum rendered as text against the input text
-            // so an unknown trx_type can't fail an enum cast on the input side.
-            let mut t = client.select(
-                "SELECT trx.trx_type::text, trx.source_id \
-                   FROM trx \
-                   JOIN UNNEST($1::text[], $2::bigint[]) AS u(tt, sid) \
-                     ON trx.trx_type::text = u.tt AND trx.source_id = u.sid",
-                None,
-                &[trx_types.into(), source_ids.into()],
-            )?;
-            while let Some(row) = t.next() {
-                let tt: String = row.get::<String>(1)?.unwrap_or_default();
-                let sid: i64 = row.get::<i64>(2)?.unwrap_or(0);
-                set.insert((tt, sid));
-            }
-            Ok(set)
-        })
-        .map_err(|e| format!("trx dedup query: {e}"))?;
+    let existing = existing_trx_keys(trx_types, source_ids)?;
 
     let mut seen: HashSet<(String, i64)> = HashSet::new();
     let mut out: Vec<Decoded> = Vec::with_capacity(kept.len());
@@ -718,6 +785,52 @@ fn dedup_against_trx(kept: Vec<Decoded>) -> Result<(Vec<Decoded>, u64), String> 
         }
     }
     Ok((out, skipped))
+}
+
+/// Query `trx` for which of the given (trx_type, source_id) keys already exist.
+/// The stored enum is rendered as text and compared against the input text so an
+/// unknown trx_type can't fail an enum cast on the input side. Shared by
+/// pre-flight dedup and the re-drive re-dedup.
+fn existing_trx_keys(
+    trx_types: Vec<String>,
+    source_ids: Vec<i64>,
+) -> Result<HashSet<(String, i64)>, String> {
+    Spi::connect(|client| -> Result<HashSet<(String, i64)>, pgrx::spi::Error> {
+        let mut set = HashSet::new();
+        let mut t = client.select(
+            "SELECT trx.trx_type::text, trx.source_id \
+               FROM trx \
+               JOIN UNNEST($1::text[], $2::bigint[]) AS u(tt, sid) \
+                 ON trx.trx_type::text = u.tt AND trx.source_id = u.sid",
+            None,
+            &[trx_types.into(), source_ids.into()],
+        )?;
+        while let Some(row) = t.next() {
+            let tt: String = row.get::<String>(1)?.unwrap_or_default();
+            let sid: i64 = row.get::<i64>(2)?.unwrap_or(0);
+            set.insert((tt, sid));
+        }
+        Ok(set)
+    })
+    .map_err(|e| format!("trx dedup query: {e}"))
+}
+
+/// Re-drive re-dedup (§6.8): after a 23505 that survived pre-flight dedup, a racing
+/// committer has now committed one (or more) of this group's (trx_type, source_id)
+/// keys. Re-query `trx` and drop every `prepared` submission whose key is now
+/// present, leaving the innocent rest to be re-driven. Returns how many were
+/// removed — 0 means the UNIQUE fired with no resolvable duplicate, so the caller
+/// poisons (re-driving can't make progress).
+fn drop_prepared_already_in_trx(prepared: &mut Vec<Prepared>) -> Result<u64, String> {
+    if prepared.is_empty() {
+        return Ok(0);
+    }
+    let trx_types: Vec<String> = prepared.iter().map(|p| p.trx_type.clone()).collect();
+    let source_ids: Vec<i64> = prepared.iter().map(|p| p.source_id).collect();
+    let existing = existing_trx_keys(trx_types, source_ids)?;
+    let before = prepared.len();
+    prepared.retain(|p| !existing.contains(&(p.trx_type.clone(), p.source_id)));
+    Ok((before - prepared.len()) as u64)
 }
 
 // ── Caller user-tx classification + eject ───────────────────────────
