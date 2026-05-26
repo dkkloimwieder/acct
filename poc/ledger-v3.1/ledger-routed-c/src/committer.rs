@@ -28,8 +28,9 @@
 //!  11. Implicit COMMIT on `BackgroundWorker::transaction` scope exit.
 //!  12. `cleanup::cleanup_after_commit_group` outside the tx scope.
 //!
-//! Path C deltas vs the v3 strict committer: no tm09 per-pool predecessor wait
-//! (no PoolSeqTable), and pristine-replay is replaced by drop-and-continue.
+//! Path C deltas vs a strict committer: no per-pool predecessor wait
+//! (no per-pool sequence table), and pristine-replay is replaced by
+//! drop-and-continue (§6.4 / §14.2).
 //!
 //! §6.8 SQL error handling: the whole lock → hydrate → apply → write phase runs
 //! in a nested subtransaction. A transient SQLSTATE (40P01 deadlock / 40001

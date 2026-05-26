@@ -51,7 +51,6 @@ static STAGING_QUEUE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(16384);
 static COMMITTER_QUEUE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(2048);
 static SPILLOVER_ARENA_MB: GucSetting<i32> = GucSetting::<i32>::new(128);
 static QUEUE_FULL_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
-static COMMITTER_LEASE_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
 static ROUTER_WINDOW_SIZE: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static BATCH_SIZE_MAX: GucSetting<i32> = GucSetting::<i32>::new(50);
 static BATCH_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
@@ -74,10 +73,6 @@ pub(crate) fn target_database_str() -> String {
 #[allow(dead_code)]
 pub(crate) fn queue_full_timeout_ms_now() -> i32 {
     QUEUE_FULL_TIMEOUT_MS.get()
-}
-#[allow(dead_code)]
-pub(crate) fn committer_lease_ms_now() -> i32 {
-    COMMITTER_LEASE_MS.get()
 }
 #[allow(dead_code)]
 pub(crate) fn router_window_size_now() -> i32 {
@@ -153,16 +148,6 @@ pub extern "C-unwind" fn _PG_init() {
         &QUEUE_FULL_TIMEOUT_MS,
         100,
         60_000,
-        GucContext::Sighup,
-        GucFlags::empty(),
-    );
-    GucRegistry::define_int_guc(
-        c"ledger_routed_c.committer_lease_ms",
-        c"Committer lease duration (orphan-recovery threshold)",
-        c"A committer's CAS-acquired lease stays valid for this long before a contender may attempt takeover (after pid_alive verification).",
-        &COMMITTER_LEASE_MS,
-        10,
-        10_000,
         GucContext::Sighup,
         GucFlags::empty(),
     );

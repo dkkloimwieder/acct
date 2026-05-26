@@ -1,21 +1,21 @@
-//! Recovery BGWorker for ledger-routed (Path B).
+//! Recovery BGWorker for ledger-routed-c (Path C, design-v3.1 §6.5).
 //!
 //! Postmaster-startup recovery worker. Runs ONCE at postmaster start
 //! (set_restart_time None on registration), Release-stores
 //! `COMMITTER_QUEUE.recovery_complete = 1` so router + committers can
 //! open for traffic, exits.
 //!
-//! ## Why this is trivial for v3
+//! ## Why this is trivial for Path C
 //!
-//! Per design-v3 §5.5 / §10.5, in-flight submissions at postmaster
+//! Per design-v3.1 §6.5 / §14.2, in-flight submissions at postmaster
 //! restart EVAPORATE cleanly:
 //!   - Shmem (StagingQueue + CommitterQueue + SpilloverArena) is
 //!     wiped to zero on PG startup — no orphan staging or CQ entries
 //!     to sweep.
-//!   - There is NO submission_status table to classify (v3's "trx
-//!     exists iff committed" semantics make per-submission DB state
+//!   - There is NO submission_status table to classify ("trx exists
+//!     iff committed" semantics make per-submission DB state
 //!     unnecessary).
-//!   - There is NO persistent_staging durable path (v3 spec doesn't
+//!   - There is NO persistent_staging durable path (the design doesn't
 //!     include it).
 //!
 //! The recovery worker therefore exists only to be the official

@@ -28,9 +28,9 @@
 //!
 //! ## Path C delta
 //!
-//! There is no `pool_seqs` arena block (no PoolSeqTable, §6.2), so the
-//! committer-queue cleanup frees two blocks (staging_indices + pool_keys), not
-//! three.
+//! There is no `pool_seqs` arena block (no per-pool sequence table, §6.2), so
+//! the committer-queue cleanup frees two blocks (staging_indices + pool_keys),
+//! not three.
 //!
 //! ## Lock ordering
 //!

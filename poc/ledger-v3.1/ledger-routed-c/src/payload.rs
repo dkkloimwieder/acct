@@ -1,4 +1,4 @@
-//! Arena payload encoding for ledger-routed (Path B).
+//! Arena payload encoding for ledger-routed-c (Path C, design-v3.1 §6.2).
 //!
 //! Each enqueued submission lives in TWO arena allocations:
 //!
@@ -11,8 +11,8 @@
 //!      allocated).
 //!
 //! The split lets each block be freed independently by the
-//! committer's cleanup step. JSON encoding per locked design plan §E:
-//! "rev to repr(C) only if measurement shows arena pressure."
+//! committer's cleanup step. JSON encoding per design-v3.1 §6.2:
+//! rev to repr(C) only if measurement shows arena pressure.
 //!
 //! Length tracking: the submission block's length is carried by
 //! `StagingEntry.payload_length` (passed back to `decode_submission`).

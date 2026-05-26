@@ -1,4 +1,4 @@
-//! Path B SPI entry point: `ledger_enqueue_trx_c` (design-v3 §5.1, §5.4 step 0).
+//! Routed SPI entry point: `ledger_enqueue_trx_c` (design-v3.1 §6.1, §6.4 step 0).
 //!
 //! Caller invokes inside their own user-tx. The function:
 //!

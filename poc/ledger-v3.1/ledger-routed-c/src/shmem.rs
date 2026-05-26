@@ -1,9 +1,8 @@
-//! Shmem layout for ledger-routed (Path B).
+//! Shmem layout for ledger-routed-c (Path C, design-v3.1 §6.2).
 //!
-//! StagingEntry/Queue + CommitterEntry/Queue + SpilloverArena +
-//! PoolSeqTable carry the load-bearing atomics, CV plumbing, identity
-//! slots, observability counters, and BGWorker rendezvous fields.
-//! Single `pool_id` namespace per design-v3 §1.
+//! StagingEntry/Queue + CommitterEntry/Queue + SpilloverArena carry the
+//! load-bearing atomics, CV plumbing, identity slots, observability
+//! counters, and BGWorker rendezvous fields. Single `pool_id` namespace.
 //!
 //! The PgLwLock statics + their wiring live in `lib.rs::_PG_init`.
 
@@ -28,11 +27,11 @@ pub const LEDGER_V3_SPILLOVER_ARENA_BYTES: usize =
 pub const LEDGER_V3_COMMITTER_IDENTITY_SLOTS: usize = 64;
 
 // design-v3.1 §6.2 has no per-pool sequence table: Path C drops the strict
-// cross-window FIFO ordering (the v3 "tm09" mechanism) the strict path needed.
-// Routed Path C preserves order within a commit_group via enqueue order and
-// serializes cross-group hot-pool contention at the pool_lock; provisional
-// unit_costs are allowed to differ across orderings (§9.4, §14.2). So no
-// PoolSeqTable region exists here.
+// cross-window FIFO ordering the strict path needed. Routed Path C preserves
+// order within a commit_group via enqueue order and serializes cross-group
+// hot-pool contention at the pool_lock; provisional unit_costs are allowed to
+// differ across orderings (§9.4, §14.2). So no per-pool sequence region exists
+// here.
 
 // ── StagingEntry / StagingQueue ─────────────────────────────────────
 
@@ -47,7 +46,7 @@ pub struct StagingEntry {
     /// Index into a per-extension trx-type table the caller maps the
     /// SQL `trx_type` enum into at enqueue time. The shmem layer is
     /// enum-agnostic; the dispatch per-trx-type lives in the committer
-    /// (Path B) / SPI surface (Path A).
+    /// (routed) / SPI surface (direct).
     pub trx_type_id: u16,
     pub _pad_trx: [u8; 2],
     pub payload_offset: u32,
@@ -68,7 +67,7 @@ pub struct StagingEntry {
     /// Release). Read by the router's `collect_candidates`
     /// cooldown filter (Acquire-load); paired against
     /// `eject_cooldown_ms` to skip recently-ejected slots
-    /// (design-v3 §5.3 step 2). 0 = never ejected.
+    /// (§6.3 router collect_candidates). 0 = never ejected.
     pub last_eject_at_ns: AtomicU64,
 }
 
@@ -149,11 +148,6 @@ pub struct CommitterQueue {
     // ── Router stats ───────────────────────────────────────────────
     pub router_commit_group_count: AtomicU64,
     pub router_total_submissions: AtomicU64,
-    /// Number of commit_groups emitted without applying the
-    /// `batch_size_max` chunking step because at least one pool in the
-    /// group is order-sensitive (fifo / lifo / specific). Read by
-    /// `ledger_routed_router_order_sensitive_groups_total`. See acct-aywu.
-    pub router_order_sensitive_groups_total: AtomicU64,
     pub router_ticks_total: AtomicU64,
     pub router_entries_scanned_total: AtomicU64,
     pub committer_drains_total: AtomicU64,
@@ -175,7 +169,7 @@ pub struct CommitterQueue {
     /// across feature variants. Tests set this via
     /// `ledger_routed_test_set_committer_stall_us` to force the
     /// committer to remain in flight long enough for pg_terminate_backend
-    /// to land mid-pipeline (acct-p0d8 orphan_recovery).
+    /// to land mid-pipeline (acct-2ttr.7 orphan recovery).
     pub test_inject_committer_stall_us: AtomicU32,
     /// Test-only: number of synthetic deadlocks (SQLSTATE 40P01) the committer
     /// write phase should raise before letting the write proceed. Decremented
@@ -210,12 +204,6 @@ pub struct CommitterQueue {
     /// for traffic).
     pub recovery_complete: AtomicU8,
     pub _pad_test: [u8; 1],
-
-    // ── Slot-leak audit counters ───────────────────────────────────
-    pub audit_reclaims_count: AtomicU64,
-    pub audit_orphans_recovered_count: AtomicU64,
-    pub audit_lost_submissions_count: AtomicU64,
-    pub audit_last_run_at_ns: AtomicU64,
 
     // ── Committer pool counters ────────────────────────────────────
     pub committer_claim_count: AtomicU64,
@@ -252,35 +240,6 @@ pub struct CommitterQueue {
     pub eject_total_count: AtomicU64,
     pub committer_pipeline_ns_total: AtomicU64,
     pub committer_pipeline_count: AtomicU64,
-    /// Per-stage cumulative ns across all committer workers since
-    /// extension load. Stages map to the 8-step pipeline
-    /// (design-v3 §5.4):
-    ///   parse_ns        — Step 3 deserialize submissions from arena
-    ///   pre_apply_ns    — Steps 4-7 eject loop + lock acquire +
-    ///                     snapshot hydrate
-    ///   apply_ns        — Step 8 per-submission `plan_apply` with
-    ///                     pristine-replay loop
-    ///   bulk_insert_ns  — Step 9 bulk-write (trx + trx_line +
-    ///                     pool_state + posting_line)
-    ///   post_ns         — Step 10 COMMIT + Step 11 cleanup
-    pub committer_stage_parse_ns: AtomicU64,
-    pub committer_stage_pre_apply_ns: AtomicU64,
-    pub committer_stage_apply_ns: AtomicU64,
-    pub committer_stage_bulk_insert_ns: AtomicU64,
-    pub committer_stage_post_ns: AtomicU64,
-
-    // ── tm09 predecessor-wait observability ────────────────────────
-    /// Number of order-sensitive pool waits the committer entered
-    /// (incremented per (commit_group, pool) that needed any wait).
-    pub committer_tm09_waits_total: AtomicU64,
-    /// Number of times the predecessor wait hit the committer_lease_ms
-    /// deadline. Indicates upstream commit_groups are not making
-    /// progress (router emit failure that didn't roll-forward seqs,
-    /// dead committer awaiting takeover, etc).
-    pub committer_tm09_wait_timeouts_total: AtomicU64,
-    /// Cumulative nanoseconds spent in the tm09 predecessor wait loop
-    /// across all committers since extension load.
-    pub committer_tm09_wait_ns_total: AtomicU64,
 
     // ── Committer identity slots ───────────────────────────────────
     pub identity_slots: [CommitterIdentitySlot; LEDGER_V3_COMMITTER_IDENTITY_SLOTS],
@@ -317,7 +276,7 @@ pub struct CommitterIdentitySlot {
 /// Flat byte buffer indexed by u32 offsets stored in
 /// `StagingEntry.payload_offset / pool_keys_offset` and
 /// `CommitterQueueEntry.staging_entry_offsets / pool_keys_offset`.
-/// Allocator (bump + LIFO freelist) lands in `arena.rs` (acct-17p5);
+/// Allocator (bump + LIFO freelist) lands in `arena.rs` (acct-2ttr.4);
 /// this struct only holds the byte region + the allocator's anchor
 /// atomics + observability counters.
 #[repr(C, align(64))]

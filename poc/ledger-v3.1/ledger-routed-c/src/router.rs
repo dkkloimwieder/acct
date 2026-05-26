@@ -26,10 +26,10 @@
 //!           entry with Release BEFORE CAS staging valid 2→3 with
 //!           Release.
 //!
-//! ## Path C delta vs the v3 strict path (§6.2, §9.4, §14.2)
+//! ## Path C delta vs a strict path (§6.2, §9.4, §14.2)
 //!
-//! There is no PoolSeqTable / per-pool sequence assignment (the v3
-//! "tm09" cross-window FIFO ordering): Path C records provisional
+//! There is no per-pool sequence table / per-pool sequence assignment
+//! (strict cross-window FIFO ordering): Path C records provisional
 //! aggregate updates, so any component may be split across
 //! commit_groups and provisional unit_costs are allowed to differ
 //! across orderings. The chunker therefore treats every component
@@ -531,7 +531,7 @@ fn hydrate_candidates(metas: &[CandidateMeta]) -> Vec<Candidate> {
 /// Block 1: staging_indices (submission_count × u32 LE)
 /// Block 2: pool_keys (pool_keys_count × i64 LE, sorted, deduplicated)
 ///
-/// Path C has no third pool_seqs block (no PoolSeqTable, §6.2).
+/// Path C has no third pool_seqs block (no per-pool sequence table, §6.2).
 fn allocate_commit_group_arena(
     submission_count: u16,
     packed: &[Candidate],
@@ -725,8 +725,8 @@ fn ledger_routed_c_ready_commit_groups() -> TableIterator<
 // the new router runs this sweep before entering the tick loop. Also
 // invoked on demand by the test_hooks SPI.
 //
-// Two-phase shape (Path C has no PoolSeqTable, so the v3 "tm09" seq
-// rollforward is absent; otherwise this mirrors the v3 sweep):
+// Two-phase shape (Path C has no per-pool sequence table, so strict
+// per-pool seq rollforward is absent; otherwise this mirrors the strict sweep):
 //
 //   Phase 1 (queue-driven re-stamp): for each CommitterQueueEntry at
 //     valid==1 (ready, no committer claim yet), iterate linked staging
