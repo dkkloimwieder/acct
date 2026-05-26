@@ -159,6 +159,54 @@ fn all_provisional_depletions_have_null_source_link() {
 }
 
 #[test]
+fn two_lines_same_pool_coalesce_to_one_aggregate_mutation() {
+    // acct-036x: a single submission with two lines on the same pool must emit
+    // exactly ONE aggregate mutation (keep-last, cumulative), so the direct bulk
+    // ON CONFLICT (pool_id, layer_id=0) UPSERT does not see a row twice.
+    let mut s = Snapshot::default();
+    fifo_pool(&mut s, 1, ProvisionalBasis::RunningAvg);
+    // 10 @ 100 then 10 @ 200 -> running avg 150, total qty 20.
+    let r = plan_apply_provisional(&mut s, &[receipt(1, 10, 100), receipt(1, 10, 200)], ts())
+        .unwrap();
+    // Both lines still produce their own trx_line (audit), but the aggregate
+    // mutations collapse to one carrying the cumulative state.
+    assert_eq!(r.trx_lines.len(), 2);
+    assert_eq!(
+        r.pool_state_mutations,
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 20, unit_cost: 150 }]
+    );
+}
+
+#[test]
+fn coalesce_keeps_one_aggregate_per_pool_across_mixed_pools() {
+    // Distinct pools keep their own aggregate; only same-pool duplicates collapse.
+    let mut s = Snapshot::default();
+    fifo_pool(&mut s, 1, ProvisionalBasis::RunningAvg);
+    fifo_pool(&mut s, 2, ProvisionalBasis::RunningAvg);
+    seed_aggregate(&mut s, 1, 100, 50);
+    seed_aggregate(&mut s, 2, 100, 70);
+    // pool 1 touched twice (deplete, deplete), pool 2 once.
+    let r = plan_apply_provisional(
+        &mut s,
+        &[deplete(1, 10), deplete(2, 5), deplete(1, 20)],
+        ts(),
+    )
+    .unwrap();
+    assert_eq!(r.trx_lines.len(), 3);
+    // One aggregate per touched pool: pool 1 at 100-10-20=70, pool 2 at 95.
+    let mut aggs: Vec<_> = r
+        .pool_state_mutations
+        .iter()
+        .map(|m| match m {
+            PoolStateMutation::UpsertAggregate { pool_id, qty, .. } => (*pool_id, *qty),
+            _ => panic!("unexpected layer mutation"),
+        })
+        .collect();
+    aggs.sort();
+    assert_eq!(aggs, vec![(1, 70), (2, 95)]);
+}
+
+#[test]
 fn provisional_dispatches_wac_std_specific_to_strict() {
     // A WAC pool routed through the Path C entry point still runs strict WAC.
     let mut s = Snapshot::default();

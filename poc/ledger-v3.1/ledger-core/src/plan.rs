@@ -150,3 +150,52 @@ pub struct PlanResult {
     pub pool_state_mutations: Vec<PoolStateMutation>,
     pub posting_lines: Vec<PostingLineRequest>,
 }
+
+impl PlanResult {
+    /// Collapse `UpsertAggregate` mutations to at most one per pool, keeping the
+    /// LAST. Each `UpsertAggregate` carries the full post-line aggregate state
+    /// (`wac::aggregate_receipt` / `aggregate_deplete` push the new total qty and
+    /// running-average cost, not a delta), and lines mutate the snapshot in place,
+    /// so the last mutation for a pool already reflects every earlier line on it.
+    /// `InsertLayer` / `DeleteLayer` (specific, `layer_id != 0`) are kept in order.
+    ///
+    /// Without this, a single submission with two lines on the same pool emits
+    /// duplicate `(pool_id, layer_id = 0)` rows, and the direct bulk
+    /// `INSERT ... ON CONFLICT (pool_id, layer_id) DO UPDATE` rejects the batch
+    /// ("ON CONFLICT DO UPDATE command cannot affect row a second time"). The
+    /// routed committer is unaffected (it reconstructs one aggregate per touched
+    /// pool from the post-pass snapshot); coalescing here makes both paths emit
+    /// one aggregate mutation per pool.
+    pub fn coalesce_aggregates(&mut self) {
+        use std::collections::HashMap;
+        let mut last_idx: HashMap<i64, usize> = HashMap::new();
+        for (i, m) in self.pool_state_mutations.iter().enumerate() {
+            if let PoolStateMutation::UpsertAggregate { pool_id, .. } = m {
+                last_idx.insert(*pool_id, i);
+            }
+        }
+        if last_idx.len() == self.pool_state_mutations.len()
+            && self
+                .pool_state_mutations
+                .iter()
+                .all(|m| matches!(m, PoolStateMutation::UpsertAggregate { .. }))
+        {
+            return; // already one aggregate per pool, no layer ops — nothing to do
+        }
+        let mut kept = Vec::with_capacity(self.pool_state_mutations.len());
+        for (i, m) in std::mem::take(&mut self.pool_state_mutations)
+            .into_iter()
+            .enumerate()
+        {
+            match &m {
+                PoolStateMutation::UpsertAggregate { pool_id, .. } => {
+                    if last_idx.get(pool_id) == Some(&i) {
+                        kept.push(m);
+                    }
+                }
+                _ => kept.push(m),
+            }
+        }
+        self.pool_state_mutations = kept;
+    }
+}

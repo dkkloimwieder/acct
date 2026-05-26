@@ -34,6 +34,41 @@ where
 
 #[tokio::test]
 #[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn two_lines_same_pool_one_submission_agrees_with_direct() {
+    // acct-036x: the routed path must handle a single submission with two lines on
+    // the same pool and land the same coalesced aggregate the (now-fixed) direct
+    // path does — (20, 150) for 10@100 + 10@200. Routed reconstructs one aggregate
+    // per touched pool from the post-pass snapshot, so it was never affected by the
+    // direct duplicate-UPSERT crash; this locks the two paths' agreement.
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let f = seed_pool(&pool, 1, 1, 1, "fifo", "running_avg").await;
+
+    let base_drains = committer_stat(&pool, "drains_total").await;
+    paused(&pool, || async {
+        enqueue(
+            &pool,
+            "po_receipt",
+            1,
+            vec![receipt_line_for(&f, 10, 100), receipt_line_for(&f, 10, 200)],
+        )
+        .await
+        .expect("enqueue two-line same-pool submission");
+    })
+    .await;
+
+    await_trx_count(&pool, 1).await;
+    await_committer_drains(&pool, base_drains, 1).await;
+
+    assert_eq!(
+        aggregate(&pool, f.pool_id).await,
+        Some((20, 150)),
+        "routed aggregate matches the direct coalesced result (acct-036x)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
 async fn hot_pool_collapses_to_one_commit_group_one_lock_one_aggregate_update() {
     let pool = connect_pool().await;
     reset_state(&pool).await;

@@ -44,6 +44,10 @@ pub fn plan_apply_provisional(
             }
         }
     }
+    // Multiple lines on the same pool each push a full-state aggregate upsert;
+    // collapse to one per pool (keep-last) so a single submission touching a pool
+    // twice writes one (pool_id, layer_id = 0) row. See PlanResult::coalesce_aggregates.
+    result.coalesce_aggregates();
     Ok(result)
 }
 

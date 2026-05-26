@@ -47,6 +47,29 @@ async fn fifo_receipts_running_average_then_provisional_depletion() {
 
 #[tokio::test]
 #[ignore = "needs running poc_v3_1 with ledger_direct_c installed"]
+async fn two_lines_same_pool_one_submission_succeeds_and_coalesces() {
+    // acct-036x regression: a single submission with two lines on the same pool
+    // used to crash the direct bulk aggregate UPSERT ("ON CONFLICT DO UPDATE
+    // command cannot affect row a second time"). ledger-core now coalesces the
+    // per-line aggregate mutations to one per pool, so it must succeed with the
+    // aggregate reflecting both lines (matching what the routed path produces).
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let f = seed_fixture(&pool, "fifo", "running_avg").await;
+
+    // Two receipts on the SAME pool in ONE submission: 10 @ 100 + 10 @ 200.
+    let trx = submit(&pool, "po_receipt", 1, vec![receipt(&f, 10, 100), receipt(&f, 10, 200)])
+        .await
+        .expect("two-line same-pool submission must succeed (acct-036x)");
+
+    // Both lines are recorded for audit; the aggregate is collapsed and cumulative.
+    assert_eq!(trx_lines(&pool, trx).await.len(), 2);
+    assert_eq!(aggregate(&pool, f.pool_id).await, Some((20, 150)));
+    assert_eq!(layer_count(&pool, f.pool_id).await, 0, "Path C FIFO materializes no layers");
+}
+
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_direct_c installed"]
 async fn wac_matches_fifo_provisional() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
