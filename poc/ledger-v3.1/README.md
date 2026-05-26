@@ -88,11 +88,63 @@ and `ledger_routed_c_committer_queue_state_counts()` (now incl. `poisoned`) /
 > workers needs headroom: the dev container's `max_worker_processes` was raised to 32 so the full
 > 4-committer pool starts (see `acct-8cn2`).
 
+## Harness (P4) — measurement binary
+
+A plain `sqlx` + `tokio` client (not pgrx) that drives the installed extensions
+and emits JSON reports. Build with `cargo build --release -p ledger-harness`.
+
+```bash
+# 1. Seed a pool universe, optionally deep-seeding layer rows (§10.5). Path C's
+#    hot path never makes FIFO/LIFO layers, so deep pools come from direct SQL.
+ledger-harness seed-pools --count 10000 --method-mix all-fifo --depth 1000
+
+# 2. Drive a scenario in one of the three §10.0 submission modes.
+ledger-harness run --scenario s7 --mode direct-per-call --duration 30s
+ledger-harness run --scenario s7 --mode direct-batched --batch-size 50 --duration 30s
+ledger-harness run --scenario s7 --mode routed --duration 30s
+
+# 3. Cross-flavor equivalence: identical input → identical aggregate qty (§11.1).
+ledger-harness equivalence --scenario s7 --callers 8 --submissions-per-caller 50
+```
+
+- **Three submission modes** (§10.0): `direct-per-call` (one user-tx per
+  `ledger_submit_trx_c`), `direct-batched` (N calls in one user-tx, §5.5
+  commit/lock amortization), `routed` (`ledger_enqueue_trx_c` → committer pool,
+  §6 cross-caller aggregation).
+- **Scenarios S1–S8** (§10.6): S1–S4 shallow receipt workloads (baseline,
+  routing amortization, complexity); S5/S6 1000-caller shallow FIFO (hot-pool vs
+  disjoint); **S7/S8 deep-pool FIFO depletions — Path C's home field** (§11.2).
+- **Headline metric**: per-trx ack latency captured per seeded `--depth`. The
+  in-function critical section is dominated by pool_lock hold time and depth is
+  the only thing varying across a seed sweep, so flat latency across depths
+  10→1000 confirms the constant-lock-hold premise. `bench/run-lockhold-sweep.sh`
+  runs that sweep.
+- **Routed observability**: the JSON `routed` block carries the
+  `ledger_routed_c_committer_*` deltas — `commit_group_size_avg` and the ratio
+  of trx committed to pool_lock acquisitions / aggregate upserts quantify the
+  §6.7 batching win — plus the P3.4 `poisoned` / `deadlock_retries` / `takeover`
+  counts.
+- **1000-caller scenarios (S5/S7/S8)** are driven through a pgbouncer
+  transaction pool (`bench/setup-pgbouncer.sh up`) because the dev container's
+  io_uring memlock ceiling can't hold 1000 direct backends (`acct-8cn2`); the
+  bench runners point `--dsn` at the pooler for those scenarios. `--max-callers`
+  caps concurrency for pooler-less smoke runs (the cap is recorded in the report).
+- `bench/`: `run-lockhold-sweep.sh` (§11.2), `run-crossover.sh` (§11.4 mode ×
+  scenario matrix), `run-equivalence.sh` (§11.1), `setup-pgbouncer.sh`. Every
+  harness invocation is hard-`timeout`-wrapped. **The actual bake-off RESULTS +
+  PoC report are P5 (`acct-2ttr.9`)**; P4 delivers the machinery.
+
+> Known limitation (filed separately): `ledger_submit_trx_c` (direct) emits one
+> aggregate UPSERT row per line, so a single submission must touch **distinct**
+> pools — listing the same pool twice fails the bulk UPSERT. The routed committer
+> coalesces per pool and is unaffected. The harness generates distinct pools per
+> submission accordingly (§5.1 "touched pool_ids … dedup").
+
 ## Crates
 - `ledger-core` — pure Rust, no pgrx: per-method state transitions + provisional dispatch (§8). ✓
 - `ledger-direct-c` — pgrx extension: `ledger_submit_trx_c` (§5). ✓
 - `ledger-routed-c` — pgrx extension: `ledger_enqueue_trx_c` + shmem (§6.1/§6.2) + router (§6.3) + committer (§6.4) + recovery (§6.5) + SQL error handling (§6.8). ✓ (P3.4)
-- `ledger-harness` — multi-session measurement binary (§10).
+- `ledger-harness` — multi-session measurement binary (§10). ✓ (P4)
 
 ## Phases — epic `acct-2ttr`
 | Phase | bd issue      | Goal | Status |
@@ -104,7 +156,7 @@ and `ledger_routed_c_committer_queue_state_counts()` (now incl. `poisoned`) /
 | P3.2  | `acct-2ttr.5` | router BGWorker (window scan + union-find affinity) | ✓ |
 | P3.3  | `acct-2ttr.6` | committer pool (provisional dispatch, drop-and-continue) | ✓ |
 | P3.4  | `acct-2ttr.7` | recovery + committer SQL error handling | ✓ |
-| P4    | `acct-2ttr.8` | harness (3 submission modes + deep-pool seeding + lock-hold metric) | |
+| P4    | `acct-2ttr.8` | harness (3 submission modes + deep-pool seeding + lock-hold metric) | ✓ |
 | P5    | `acct-2ttr.9` | characterization & PoC report | |
 
 Stream label `stream:ledger-v3.1`; administrative pause gate `acct-1wyk` (`ledger-v3.1-PAUSE`).

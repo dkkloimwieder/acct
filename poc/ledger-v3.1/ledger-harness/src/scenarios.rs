@@ -1,0 +1,196 @@
+//! Scenarios S1-S8 per design-v3.1 §10.6 (P4 acct-2ttr.8).
+//!
+//! Each `sN(PoolUniverse) -> ScenarioSpec` fills the workload axes + caller
+//! count + the pool depth the universe is EXPECTED to have been seeded to
+//! (`depth_hint`). `run` resolves --scenario sN here, then drives the spec.
+//!
+//! | id | callers | overlap          | complexity | method | deplete | depth
+//! |----|---------|------------------|------------|--------|---------|------
+//! | s1 | 10      | Uniform          | Simple     | WAC    | 0       | 0
+//! | s2 | 200     | Zipf(1.5)        | Simple     | WAC    | 0       | 0
+//! | s3 | 10      | Uniform          | Complex    | Mixed  | 0       | 0
+//! | s4 | 200     | Zipf(1.2)        | Complex    | Mixed  | 0       | 0
+//! | s5 | 1000    | single hot pool  | Simple     | FIFO   | 100     | 10
+//! | s6 | 1000    | Disjoint stripes | Simple     | FIFO   | 100     | 10
+//! | s7 | 1000    | Zipf(1.2)        | Simple     | FIFO   | 100     | 1000  ← deep
+//! | s8 | 1000    | Zipf(1.2)        | Complex    | FIFO   | 50      | 1000  ← deep
+//!
+//! v3.1 adds S7/S8 (deep pools — Path C's home field, §11.2) over ledger-v3's
+//! S1-S6. S5-S8 deplete and therefore require pre-seeded aggregates
+//! (`seed-pools --depth`); S1-S4 are receipt-only and self-seed.
+
+use crate::cli::MethodMix;
+use crate::pool_universe::PoolUniverse;
+use crate::workload::{Complexity, OverlapMode, Workload};
+
+#[derive(Debug, Clone)]
+pub struct ScenarioSpec {
+    pub id: &'static str,
+    pub description: &'static str,
+    pub callers: usize,
+    pub workload: Workload,
+    /// Method mix the universe is expected to have been seeded with (a label;
+    /// the workload is method-agnostic — per-pool method comes from seed-pools).
+    #[allow(dead_code)]
+    pub expected_method_mix: MethodMix,
+    /// Pool depth the universe should be seeded to before driving this scenario
+    /// (`seed-pools --depth`). 0 = shallow/receipt-only. Recorded in the report.
+    pub depth_hint: usize,
+}
+
+/// Resolve an "sN" id to the matching builder. Returns None on unknown.
+pub fn by_id(id: &str, universe: PoolUniverse) -> Option<ScenarioSpec> {
+    let f: fn(PoolUniverse) -> ScenarioSpec = match id {
+        "s1" => s1,
+        "s2" => s2,
+        "s3" => s3,
+        "s4" => s4,
+        "s5" => s5,
+        "s6" => s6,
+        "s7" => s7,
+        "s8" => s8,
+        _ => return None,
+    };
+    Some(f(universe))
+}
+
+fn spec(
+    id: &'static str,
+    description: &'static str,
+    callers: usize,
+    universe: PoolUniverse,
+    overlap: OverlapMode,
+    complexity: Complexity,
+    deplete_pct: u8,
+    method: MethodMix,
+    depth_hint: usize,
+) -> ScenarioSpec {
+    ScenarioSpec {
+        id,
+        description,
+        callers,
+        workload: Workload {
+            universe,
+            overlap,
+            complexity,
+            deplete_pct,
+            caller_count: callers,
+        },
+        expected_method_mix: method,
+        depth_hint,
+    }
+}
+
+pub fn s1(u: PoolUniverse) -> ScenarioSpec {
+    spec("s1", "baseline — 10 callers, uniform, simple receipts, all-wac, shallow",
+        10, u, OverlapMode::Uniform, Complexity::Simple, 0, MethodMix::AllWac, 0)
+}
+
+pub fn s2(u: PoolUniverse) -> ScenarioSpec {
+    spec("s2", "routing lock-amortization — 200 callers, zipf(1.5), simple receipts, all-wac, shallow",
+        200, u, OverlapMode::Zipf { exponent: 1.5 }, Complexity::Simple, 0, MethodMix::AllWac, 0)
+}
+
+pub fn s3(u: PoolUniverse) -> ScenarioSpec {
+    spec("s3", "per-trx work intensity — 10 callers, uniform, complex receipts, mixed, shallow",
+        10, u, OverlapMode::Uniform, Complexity::Complex, 0, MethodMix::Mixed, 0)
+}
+
+pub fn s4(u: PoolUniverse) -> ScenarioSpec {
+    spec("s4", "production-like stress — 200 callers, zipf(1.2), complex receipts, mixed, shallow",
+        200, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 0, MethodMix::Mixed, 0)
+}
+
+/// S5 — pathological hot pool for direct (every caller depletes one pool).
+/// `Zipf{exponent: 100}` concentrates >99% of picks on pool_ids[0]; depth 10
+/// shallow seed gives the hot pool depletion headroom.
+pub fn s5(u: PoolUniverse) -> ScenarioSpec {
+    spec("s5", "pathological for direct — 1000 callers, single hot pool, simple fifo depletions, shallow",
+        1000, u, OverlapMode::Zipf { exponent: 100.0 }, Complexity::Simple, 100, MethodMix::AllFifo, 10)
+}
+
+/// S6 — pathological for routed (no router benefit when pool sets are fully
+/// disjoint). stripe_size = universe / callers, floored at 1.
+pub fn s6(u: PoolUniverse) -> ScenarioSpec {
+    let stripe_size = u.pool_ids.len().checked_div(1000).unwrap_or(1).max(1);
+    spec("s6", "pathological for routed — 1000 callers, disjoint stripes, simple fifo depletions, shallow",
+        1000, u, OverlapMode::Disjoint { stripe_size }, Complexity::Simple, 100, MethodMix::AllFifo, 10)
+}
+
+/// S7 — **Path C's home field** (§11.2). 1000 callers, Zipfian overlap, simple
+/// FIFO depletions against DEEP pools (1000 layers). Direct Path C holds the
+/// lock for aggregate-only work independent of depth; routed collapses the
+/// concurrent depletions into one commit_group.
+pub fn s7(u: PoolUniverse) -> ScenarioSpec {
+    spec("s7", "deep-pool home field — 1000 callers, zipf(1.2), simple fifo depletions, DEEP (1000 layers)",
+        1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Simple, 100, MethodMix::AllFifo, 1000)
+}
+
+/// S8 — production-realistic FIFO stress: 1000 callers, Zipfian, complex
+/// multi-line trxs mixing receipts and depletions, against deep pools.
+pub fn s8(u: PoolUniverse) -> ScenarioSpec {
+    spec("s8", "deep-pool complex — 1000 callers, zipf(1.2), complex multi-line fifo, DEEP (1000 layers)",
+        1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 50, MethodMix::AllFifo, 1000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn small_universe(n: usize) -> PoolUniverse {
+        PoolUniverse { pool_ids: (1..=n as i64).collect(), inv_account: 1000, ap_account: 2000 }
+    }
+
+    #[test]
+    fn by_id_resolves_all_eight() {
+        for id in ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"] {
+            let s = by_id(id, small_universe(10_000)).expect("resolves");
+            assert_eq!(s.id, id);
+            assert!(s.callers > 0);
+        }
+    }
+
+    #[test]
+    fn by_id_unknown_returns_none() {
+        assert!(by_id("s99", small_universe(10)).is_none());
+        assert!(by_id("", small_universe(10)).is_none());
+    }
+
+    #[test]
+    fn caller_counts_match_matrix() {
+        let u = small_universe(10_000);
+        assert_eq!(s1(u.clone()).callers, 10);
+        assert_eq!(s2(u.clone()).callers, 200);
+        assert_eq!(s3(u.clone()).callers, 10);
+        assert_eq!(s4(u.clone()).callers, 200);
+        assert_eq!(s5(u.clone()).callers, 1000);
+        assert_eq!(s6(u.clone()).callers, 1000);
+        assert_eq!(s7(u.clone()).callers, 1000);
+        assert_eq!(s8(u).callers, 1000);
+    }
+
+    #[test]
+    fn deep_scenarios_advertise_depth_1000() {
+        let u = small_universe(10_000);
+        assert_eq!(s7(u.clone()).depth_hint, 1000);
+        assert_eq!(s8(u).depth_hint, 1000);
+    }
+
+    #[test]
+    fn depletion_scenarios_set_deplete_pct() {
+        let u = small_universe(10_000);
+        assert_eq!(s1(u.clone()).workload.deplete_pct, 0);
+        assert_eq!(s5(u.clone()).workload.deplete_pct, 100);
+        assert_eq!(s8(u).workload.deplete_pct, 50);
+    }
+
+    #[test]
+    fn s6_stripe_partitions_universe() {
+        let s = s6(small_universe(10_000));
+        if let OverlapMode::Disjoint { stripe_size } = s.workload.overlap {
+            assert_eq!(stripe_size, 10);
+        } else {
+            panic!("s6 should use Disjoint overlap");
+        }
+    }
+}

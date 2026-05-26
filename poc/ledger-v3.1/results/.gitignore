@@ -1,0 +1,5 @@
+# Generated harness reports (design-v3.1 §11). The P5 bake-off populates this.
+# Keep the directory; ignore the generated JSON / sampler dumps.
+*.json
+*.sampler.txt
+!.gitignore
