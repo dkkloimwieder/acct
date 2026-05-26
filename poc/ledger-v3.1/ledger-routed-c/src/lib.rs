@@ -28,14 +28,11 @@ use std::sync::atomic::Ordering::Relaxed;
 ::pgrx::pg_module_magic!();
 
 pub(crate) mod arena;
-pub(crate) mod bulk_write;
 pub(crate) mod cleanup;
 pub(crate) mod committer;
 pub(crate) mod enqueue;
-pub(crate) mod hydration;
 pub(crate) mod identity;
 pub(crate) mod payload;
-pub(crate) mod pool_lock;
 pub(crate) mod recovery;
 pub(crate) mod router;
 pub(crate) mod shmem;

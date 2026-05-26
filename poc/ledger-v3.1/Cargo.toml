@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "ledger-core",
+    "ledger-spi-common",
     "ledger-direct-c",
     "ledger-routed-c",
     "ledger-harness",

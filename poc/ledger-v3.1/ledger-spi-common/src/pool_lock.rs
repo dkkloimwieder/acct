@@ -1,17 +1,15 @@
-//! Per-pool row lock acquisition (design-v3.1 §6.4 step 7).
+//! Per-pool row lock acquisition (direct §5.1 step 2 / routed §6.4 step 7).
 //!
-//! Shared shape with ledger-direct-c §5.1 step 2 — the same optimistic FOR
-//! UPDATE pattern, here keyed across the whole commit_group's deduped pool set
-//! (one acquisition for the batch, vs direct flavor's one per submission).
-//!
-//! Each submission touches a set of pools; before reading pool_state we acquire
-//! `pool_lock` FOR UPDATE on every touched pool. We use the spec's **optimistic**
-//! pattern: in the steady state (the pool_lock row already exists, which is the
-//! case after a pool's first-ever touch) acquisition is one SPI —
-//! `SELECT 1 FROM pool_lock WHERE pool_id = $1 FOR UPDATE`. Only on a pool's very
-//! first touch does the SELECT find no row; then we lazy-create
-//! (`INSERT ... ON CONFLICT DO NOTHING`) and re-SELECT FOR UPDATE (+2 SPI, once
-//! per pool over its lifetime).
+//! Each submission (direct) or commit_group (routed) touches a set of pools;
+//! before reading pool_state we acquire `pool_lock` FOR UPDATE on every touched
+//! pool. We use the spec's **optimistic** pattern: in the steady state (the
+//! pool_lock row already exists, which is the case after a pool's first-ever
+//! touch) acquisition is one SPI — `SELECT 1 FROM pool_lock WHERE pool_id = $1
+//! FOR UPDATE`. Only on a pool's very first touch does the SELECT find no row;
+//! then we lazy-create (`INSERT ... ON CONFLICT DO NOTHING`) and re-SELECT FOR
+//! UPDATE (+2 SPI, once per pool over its lifetime). The routed flavor acquires
+//! across the whole commit_group's deduped pool set (one acquisition for the
+//! batch, vs direct's one per submission).
 //!
 //! Deadlock avoidance: locks are always taken in ascending `pool_id` order, so
 //! two callers touching overlapping pool sets agree on lock order and serialize

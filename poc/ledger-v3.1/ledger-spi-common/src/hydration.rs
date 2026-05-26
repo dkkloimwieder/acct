@@ -1,4 +1,4 @@
-//! Snapshot hydration (design-v3.1 §5.1 steps 3-5).
+//! Snapshot hydration (direct §5.1 steps 3-5 / routed §6.4 step 8).
 //!
 //! Reads, for the touched pool set, everything ledger-core needs:
 //!   1. pool routing — `method`, `provisional_basis`, `(sku_id, location_id)`.

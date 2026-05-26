@@ -12,14 +12,13 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
-use ledger_core::{plan_apply_provisional, LineType, TrxLineRequest};
+use ledger_core::{plan_apply_provisional, TrxLineRequest};
 use pgrx::prelude::*;
 use serde::Deserialize;
 
-use crate::bulk_write;
-use crate::hydration;
 use crate::ledger_error_map;
-use crate::pool_lock;
+use ledger_spi_common::line_type::decode_line_type;
+use ledger_spi_common::{bulk_write, hydration, pool_lock};
 
 /// JSONB element shape for `lines[]`. Mirror of `TrxLineRequest` with a
 /// stringly-typed line_type — the caller sends the SQL enum text and we decode
@@ -37,21 +36,6 @@ struct LineJson {
     credit_account: i64,
     #[serde(default)]
     variance_account: Option<i64>,
-}
-
-fn decode_line_type(s: &str) -> Option<LineType> {
-    match s {
-        "po_receipt_line" => Some(LineType::PoReceiptLine),
-        "wo_output" => Some(LineType::WoOutput),
-        "wo_backflush" => Some(LineType::WoBackflush),
-        "wo_scrap" => Some(LineType::WoScrap),
-        "inv_adjustment_line" => Some(LineType::InvAdjustmentLine),
-        "transfer_shipment_line" => Some(LineType::TransferShipmentLine),
-        "transfer_receipt_line" => Some(LineType::TransferReceiptLine),
-        "manual_adjustment_line" => Some(LineType::ManualAdjustmentLine),
-        "revaluation_line" => Some(LineType::RevaluationLine),
-        _ => None,
-    }
 }
 
 /// Caller-facing SPI: submit one transaction (Path C direct flavor).

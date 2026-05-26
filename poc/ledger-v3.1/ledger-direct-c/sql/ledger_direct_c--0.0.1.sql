@@ -7,7 +7,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-direct-c/src/lib.rs:44
+-- ledger-direct-c/src/lib.rs:41
 -- ledger_direct_c::ledger_direct_c_hello
 CREATE  FUNCTION "ledger_direct_c_hello"() RETURNS TEXT /* String */
 STRICT
@@ -16,7 +16,7 @@ AS 'MODULE_PATHNAME', 'ledger_direct_c_hello_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-direct-c/src/submit.rs:65
+-- ledger-direct-c/src/submit.rs:49
 -- ledger_direct_c::submit::ledger_submit_trx_c
 CREATE  FUNCTION "ledger_submit_trx_c"(
 	"trx_type" TEXT, /* & str */

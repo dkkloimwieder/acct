@@ -1,31 +1,25 @@
-//! Bulk-write helpers (design-v3.1 §6.4 step 10; shared shape with direct-c
-//! §5.1 step 8).
+//! Bulk-write helpers (direct §5.1 step 8 / routed §6.4 step 10).
 //!
-//! The routed committer reuses the per-primitive helpers but orchestrates them
-//! differently from direct flavor: it calls `insert_trx` / `insert_trx_lines` /
-//! `insert_posting_lines` once per submission, applies only each submission's
-//! *layer* mutations (specific pools) inline, and writes the *aggregate* row
-//! once per pool from the final working snapshot — that collapse is how a whole
-//! commit_group's depletions become one aggregate UPDATE (§6.7). The
-//! `apply_plan_result` convenience wrapper (per-submission everything) is the
-//! direct-flavor shape and is unused on the routed path.
-//!
-//! Called in FK order (direct flavor by `submit::ledger_submit_trx_c`; routed
-//! flavor by `committer::write_commit_group`):
+//! The four primitives, in FK order:
 //!   1. `insert_trx`                  — RETURNING trx.id (1 row)
 //!   2. `insert_trx_lines`            — UNNEST INSERT RETURNING trx_line.ids (input order)
 //!   3. `apply_pool_state_mutations`  — aggregate UPSERT / layer INSERT / layer DELETE
 //!   4. `insert_posting_lines`        — UNNEST INSERT
 //!
-//! v3.1 deltas vs the strict (Path A/B) bulk_write: pool_state carries no
-//! `value_sum` / `last_trx_line_id` and trx_line has no `trx_seq`. Mutations are
+//! Direct flavor (`submit::ledger_submit_trx_c`) calls `apply_plan_result`, the
+//! per-submission convenience wrapper that runs all four in order. The routed
+//! committer (`committer::write_commit_group`) drives the primitives itself: it
+//! calls `insert_trx` / `insert_trx_lines` / `insert_posting_lines` once per
+//! submission, applies only each submission's *layer* mutations (specific pools)
+//! inline, and writes the *aggregate* row once per pool from the final working
+//! snapshot — that collapse is how a whole commit_group's depletions become one
+//! aggregate UPSERT (§6.7), so it does not use `apply_plan_result`.
+//!
+//! v3.1 deltas vs the strict bulk_write: pool_state carries no `value_sum` /
+//! `last_trx_line_id` and trx_line has no `trx_seq`. Mutations are
 //! `UpsertAggregate` (layer_id = 0), `InsertLayer` (layer_id = the receipt
 //! trx_line.id, resolved from RETURNING), and `DeleteLayer`. There is no
 //! provisional-posting side table (that is recalc/close, out of scope §13).
-
-// `apply_plan_result` is the direct-flavor convenience wrapper; the routed
-// committer drives the primitives directly, so it goes unused here.
-#![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
 use ledger_core::{PlanResult, PoolStateMutation, PostingLineRequest, TrxLineOutput};
@@ -234,7 +228,8 @@ pub fn insert_posting_lines(
     Ok(())
 }
 
-/// Run the full §5.1 step 8 sequence and return the new trx.id.
+/// Run the full §5.1 step 8 sequence and return the new trx.id. The direct-flavor
+/// convenience wrapper; the routed committer drives the primitives directly.
 pub fn apply_plan_result(
     trx_type: &str,
     source_id: i64,
