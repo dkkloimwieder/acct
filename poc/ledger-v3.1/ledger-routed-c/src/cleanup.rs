@@ -56,10 +56,11 @@ pub(crate) fn try_release_staging_slot(
     staging_queue: &StagingQueue,
     s_idx: u32,
     commit_group_id: u64,
-) -> Option<(u32, u32)> {
+) -> Option<(u32, u32, u32)> {
     let slot = &staging_queue.entries[s_idx as usize];
     let payload_off = slot.payload_offset;
     let pool_keys_off = slot.pool_keys_offset;
+    let line_off = slot.line_offset;
     let observed_cg = slot.commit_group_id.load(Acquire);
     let observed_eject = slot.eject_count.load(Acquire);
     let cas_ok = (observed_cg == commit_group_id
@@ -67,21 +68,27 @@ pub(crate) fn try_release_staging_slot(
         || (observed_eject == 0
             && slot.valid.compare_exchange(2, 0, Release, Relaxed).is_ok());
     if cas_ok {
-        Some((payload_off, pool_keys_off))
+        Some((payload_off, pool_keys_off, line_off))
     } else {
         None
     }
 }
 
-/// Free the two arena blocks owned by a staging entry's payload (lines blob +
-/// submission blob). Either offset may be 0 (sentinel for "no block").
+/// Free the three arena blocks owned by a staging entry: the submission blob
+/// (`payload_off`), the lines blob (`line_off`, `encode_submission`'s first
+/// alloc), and the per-submission pool-keys block (`pool_keys_off`). Any offset
+/// may be 0 (sentinel for "no block").
 pub(crate) fn free_staging_arena_blocks(
     arena: &mut SpilloverArena,
     payload_off: u32,
     pool_keys_off: u32,
+    line_off: u32,
 ) {
     if payload_off != 0 {
         arena.free(payload_off);
+    }
+    if line_off != 0 {
+        arena.free(line_off);
     }
     if pool_keys_off != 0 {
         arena.free(pool_keys_off);
@@ -151,9 +158,9 @@ pub(crate) fn cleanup_after_commit_group(
             }
             offsets
         };
-        if let Some((payload_off, pool_keys_off_staging)) = offsets {
+        if let Some((payload_off, pool_keys_off_staging, line_off)) = offsets {
             let mut arena_guard = SPILLOVER_ARENA.exclusive();
-            free_staging_arena_blocks(&mut arena_guard, payload_off, pool_keys_off_staging);
+            free_staging_arena_blocks(&mut arena_guard, payload_off, pool_keys_off_staging, line_off);
         }
     }
 
@@ -187,9 +194,9 @@ pub(crate) fn cleanup_after_poison(
             }
             offsets
         };
-        if let Some((payload_off, pool_keys_off_staging)) = offsets {
+        if let Some((payload_off, pool_keys_off_staging, line_off)) = offsets {
             let mut arena_guard = SPILLOVER_ARENA.exclusive();
-            free_staging_arena_blocks(&mut arena_guard, payload_off, pool_keys_off_staging);
+            free_staging_arena_blocks(&mut arena_guard, payload_off, pool_keys_off_staging, line_off);
         }
     }
 
@@ -229,8 +236,9 @@ mod tests {
         valid: u8,
         cg_id: u64,
         eject_count: u32,
-    ) -> (u32, u32) {
+    ) -> (u32, u32, u32) {
         let payload_off = arena.alloc(64).expect("alloc payload");
+        let line_off = arena.alloc(32).expect("alloc lines");
         let pool_keys_off = arena.alloc(16).expect("alloc pool_keys");
         let slot = &mut staging_queue.entries[s_idx as usize];
         slot.valid = AtomicU8::new(valid);
@@ -238,9 +246,10 @@ mod tests {
         slot.eject_count = AtomicU32::new(eject_count);
         slot.payload_offset = payload_off;
         slot.payload_length = 64;
+        slot.line_offset = line_off;
         slot.pool_keys_offset = pool_keys_off;
         slot.pool_count = 2;
-        (payload_off, pool_keys_off)
+        (payload_off, pool_keys_off, line_off)
     }
 
     #[test]
@@ -249,16 +258,16 @@ mod tests {
         let mut arena = fresh_arena();
         let cg_id: u64 = 42;
         populate_slot(&mut staging, &mut arena, 7, 3, cg_id, 0);
-        assert_eq!(arena.outstanding_allocs(), 2);
+        assert_eq!(arena.outstanding_allocs(), 3);
 
         let released = try_release_staging_slot(&staging, 7, cg_id);
-        let (p, pk) = released.expect("CAS 3→0 should succeed on matching cg_id");
+        let (p, pk, ln) = released.expect("CAS 3→0 should succeed on matching cg_id");
 
         assert_eq!(staging.entries[7].valid.load(Relaxed), 0);
-        assert_eq!(arena.outstanding_allocs(), 2, "release does not free arena");
+        assert_eq!(arena.outstanding_allocs(), 3, "release does not free arena");
 
-        free_staging_arena_blocks(&mut arena, p, pk);
-        assert_eq!(arena.outstanding_allocs(), 0, "caller-side arena free");
+        free_staging_arena_blocks(&mut arena, p, pk, ln);
+        assert_eq!(arena.outstanding_allocs(), 0, "caller-side arena free (all three blocks)");
     }
 
     #[test]
@@ -266,15 +275,16 @@ mod tests {
         let mut staging = fresh_staging_queue();
         let mut arena = fresh_arena();
         let cg_id: u64 = 42;
-        let (p, pk) = populate_slot(&mut staging, &mut arena, 5, 1, 0, 1);
+        let (p, pk, ln) = populate_slot(&mut staging, &mut arena, 5, 1, 0, 1);
 
         let released = try_release_staging_slot(&staging, 5, cg_id);
 
         assert!(released.is_none(), "ejected entry should not release");
         assert_eq!(staging.entries[5].valid.load(Relaxed), 1, "stays pending");
-        assert_eq!(arena.outstanding_allocs(), 2, "arena belongs to next pack");
+        assert_eq!(arena.outstanding_allocs(), 3, "arena belongs to next pack");
         assert_eq!(staging.entries[5].payload_offset, p);
         assert_eq!(staging.entries[5].pool_keys_offset, pk);
+        assert_eq!(staging.entries[5].line_offset, ln);
     }
 
     #[test]
@@ -284,10 +294,10 @@ mod tests {
         populate_slot(&mut staging, &mut arena, 9, 2, 0, 0);
 
         let released = try_release_staging_slot(&staging, 9, 42);
-        let (p, pk) = released.expect("CAS 2→0 fallback should succeed");
+        let (p, pk, ln) = released.expect("CAS 2→0 fallback should succeed");
 
         assert_eq!(staging.entries[9].valid.load(Relaxed), 0);
-        free_staging_arena_blocks(&mut arena, p, pk);
+        free_staging_arena_blocks(&mut arena, p, pk, ln);
         assert_eq!(arena.outstanding_allocs(), 0);
     }
 
@@ -301,7 +311,7 @@ mod tests {
 
         assert!(released.is_none(), "in-flight eject must block 2→0 fallback");
         assert_eq!(staging.entries[3].valid.load(Relaxed), 2);
-        assert_eq!(arena.outstanding_allocs(), 2);
+        assert_eq!(arena.outstanding_allocs(), 3);
     }
 
     #[test]
@@ -314,7 +324,7 @@ mod tests {
 
         assert!(released.is_none(), "stale cleanup must not free a re-routed slot");
         assert_eq!(staging.entries[1].valid.load(Relaxed), 3);
-        assert_eq!(arena.outstanding_allocs(), 2);
+        assert_eq!(arena.outstanding_allocs(), 3);
     }
 
     #[test]

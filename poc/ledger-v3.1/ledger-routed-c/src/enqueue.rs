@@ -147,6 +147,7 @@ fn ledger_enqueue_trx_c(
                 &mut queue_guard,
                 payload_offset,
                 payload_length,
+                sub_shell.line_offset,
                 pool_count,
                 pool_keys_offset,
                 trx_type_id,
@@ -269,6 +270,7 @@ fn push_entry_into_queue(
     queue: &mut StagingQueue,
     payload_offset: u32,
     payload_length: u32,
+    line_offset: u32,
     pool_count: u16,
     pool_keys_offset: u32,
     trx_type_id: u16,
@@ -292,6 +294,7 @@ fn push_entry_into_queue(
         slot.trx_type_id = trx_type_id;
         slot.payload_offset = payload_offset;
         slot.payload_length = payload_length;
+        slot.line_offset = line_offset;
         slot.pool_count = pool_count;
         slot.pool_keys_offset = pool_keys_offset;
         slot.enqueued_at_micros = enqueued_at_micros;

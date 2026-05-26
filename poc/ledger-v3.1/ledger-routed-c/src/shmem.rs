@@ -51,6 +51,12 @@ pub struct StagingEntry {
     pub _pad_trx: [u8; 2],
     pub payload_offset: u32,
     pub payload_length: u32,
+    /// Arena offset of the lines blob — `encode_submission`'s first
+    /// allocation (the submission blob, at `payload_offset`, records the
+    /// same value as its `line_offset`). Stored on the slot so the
+    /// committer cleanup path can free it without decoding the submission.
+    /// 0 = no block.
+    pub line_offset: u32,
     /// Number of pool_ids this submission touches.
     pub pool_count: u16,
     pub _pad_pool: [u8; 2],

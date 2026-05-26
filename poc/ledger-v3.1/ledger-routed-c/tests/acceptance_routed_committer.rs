@@ -275,3 +275,43 @@ async fn duplicate_source_caught_by_preflight_dedup() {
         "only one receipt applied to the aggregate"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn committed_group_reclaims_all_arena_blocks() {
+    // Regression for the arena leak (acct-yojk.15): each submission allocates a
+    // lines blob + submission blob + pool-keys block, and the router adds the
+    // commit_group's two blocks. Cleanup must free ALL of them — the lines blob
+    // was previously leaked (1 block/submission). After a full drain (committed
+    // AND drop-and-continue paths), arena_outstanding must return to baseline.
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let f = seed_pool(&pool, 1, 1, 1, "fifo", "running_avg").await;
+    seed_aggregate(&pool, f.pool_id, 1_000, 100).await;
+
+    let base = arena_outstanding(&pool).await;
+
+    paused(&pool, || async {
+        for i in 0..5i64 {
+            enqueue(&pool, "po_receipt", 5_000 + i, vec![receipt_line_for(&f, 10, 100)])
+                .await
+                .expect("enqueue receipt");
+        }
+        // An over-depletion the committer drops via drop-and-continue — its arena
+        // blocks must be reclaimed too, not just the committed submissions'.
+        enqueue(&pool, "transfer_shipment", 5_100, vec![depletion_line(&f, 999_999)])
+            .await
+            .expect("enqueue over-depletion");
+    })
+    .await;
+
+    await_trx_count(&pool, 5).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(trx_count(&pool).await, 5, "5 receipts committed; the over-depletion dropped");
+    assert_eq!(
+        arena_outstanding(&pool).await,
+        base,
+        "every committed-and-dropped submission's arena blocks (incl. the lines blob) reclaimed"
+    );
+}

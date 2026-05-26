@@ -248,11 +248,9 @@ fn receipt_line(f: &Fixture, qty: i64, cost: i64, method: &str) -> Value {
 /// case starts clean — the cluster-per-binary runner does NOT reset shmem between
 /// cases within a binary, and reset_state's TRUNCATE only touches DB tables.
 ///
-/// Note we deliberately do NOT gate on `arena_outstanding`: committed groups
-/// release their staging slots but the arena payload blocks are not reclaimed
-/// promptly (a separate soak concern), so the arena gauge never returns to zero
-/// here. Staging-drained + committed-count are the reliable quiescence signals,
-/// and the 128 MB arena has ample headroom for a property run's worth of allocs.
+/// Committed-count + staging-drained are the direct quiescence signals: they tell
+/// us every submission has been applied (or dropped) and no slot is still in
+/// flight, independent of arena reclaim timing.
 async fn await_quiescent(pool: &PgPool, expected_trx: i64) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

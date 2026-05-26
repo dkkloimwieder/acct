@@ -199,7 +199,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_recovery_complete_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/enqueue.rs:218
+-- ledger-routed-c/src/enqueue.rs:219
 -- ledger_routed_c::enqueue::ledger_routed_c_staging_request_seq_max
 CREATE  FUNCTION "ledger_routed_c_staging_request_seq_max"() RETURNS bigint /* i64 */
 STRICT
@@ -208,7 +208,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_staging_request_seq_max_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/enqueue.rs:194
+-- ledger-routed-c/src/enqueue.rs:195
 -- ledger_routed_c::enqueue::ledger_routed_c_staging_state_counts
 CREATE  FUNCTION "ledger_routed_c_staging_state_counts"() RETURNS TABLE (
 	"state" TEXT,  /* String */
