@@ -1158,7 +1158,9 @@ dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
 `poc/ledger-v3.1/README.md`.
 
 - **SPI line shape** (§4): `lines` is a JSONB array-of-objects, not a SQL composite ARRAY; each
-  object carries an optional `variance_account` (for §3.3 STD receipts). Annotated inline at §4.
+  object carries `(line_type, source_id?, pool_id, qty, unit_cost)`. Posting accounts (debit /
+  credit, and the variance account for §3.3 STD receipts) are NOT on the wire — they are resolved
+  ledger-side from `posting_account_map` per §3.7. Annotated inline at §4.
 - **Aggregate-mutation coalescing** (§5.1 step 8 / §8): `ledger-core`'s
   `PlanResult::coalesce_aggregates` collapses per-pool aggregate upserts to one (keep-last) so a
   single submission touching a pool twice writes one `(pool_id, layer_id=0)` row (the direct
