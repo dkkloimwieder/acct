@@ -31,6 +31,8 @@ pub fn cap_callers(spec: &mut ScenarioSpec, max_callers: Option<usize>) {
 }
 
 /// JSONB array shape expected by `ledger_submit_trx_c` / `ledger_enqueue_trx_c`.
+/// Posting accounts are resolved ledger-side from posting_account_map (§3.7), so
+/// the line carries only pool/qty/cost, not debit/credit/variance.
 pub fn build_lines_json(lines: &[LineParam]) -> Value {
     let arr: Vec<Value> = lines
         .iter()
@@ -41,9 +43,6 @@ pub fn build_lines_json(lines: &[LineParam]) -> Value {
                 "source_id": l.source_id,
                 "qty": l.qty,
                 "unit_cost": l.unit_cost,
-                "debit_account": l.debit_account,
-                "credit_account": l.credit_account,
-                "variance_account": l.variance_account,
             })
         })
         .collect();
@@ -62,9 +61,6 @@ mod tests {
             source_id: Some(11),
             qty: -4,
             unit_cost: 50,
-            debit_account: 2000,
-            credit_account: 1000,
-            variance_account: 3000,
         }];
         let v = build_lines_json(&lines);
         let arr = v.as_array().unwrap();
@@ -72,6 +68,8 @@ mod tests {
         assert_eq!(arr[0]["pool_id"], 7);
         assert_eq!(arr[0]["qty"], -4);
         assert_eq!(arr[0]["line_type"], "transfer_shipment_line");
-        assert_eq!(arr[0]["variance_account"], 3000);
+        assert_eq!(arr[0]["unit_cost"], 50);
+        // No posting-account fields on the wire (§3.7).
+        assert!(arr[0].get("debit_account").is_none());
     }
 }

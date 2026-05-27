@@ -44,7 +44,8 @@ use crate::shmem::{
 /// `trx_type` is the SQL `trx_type` enum text (po_receipt, wo_completion, ...).
 /// `posted_at` is RFC3339 text (e.g. `'2026-05-21T12:00:00+00:00'`).
 /// `lines` is a JSONB array of `{line_type, source_id?, pool_id, qty,
-/// unit_cost, debit_account, credit_account}` objects.
+/// unit_cost}` objects. Posting accounts are resolved ledger-side from
+/// posting_account_map (§3.7), not supplied per line.
 ///
 /// Returns the shmem `request_seq` of the published staging slot.
 #[pg_extern]
@@ -68,7 +69,7 @@ fn ledger_enqueue_trx_c(
         Err(e) => ereport_invalid_arg(
             PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
             format!("ledger_enqueue_trx_c: lines JSONB decode failed: {e}"),
-            "Expected an array of {line_type, source_id?, pool_id, qty, unit_cost, debit_account, credit_account, variance_account?}.",
+            "Expected an array of {line_type, source_id?, pool_id, qty, unit_cost}.",
         ),
     };
     if line_vec.is_empty() {
@@ -376,9 +377,6 @@ mod tests {
             pool_id,
             qty: 1,
             unit_cost: 1,
-            debit_account: 1,
-            credit_account: 2,
-            variance_account: None,
         }
     }
 

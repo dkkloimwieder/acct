@@ -17,7 +17,7 @@
 //! Caller must already hold `pool_lock` FOR UPDATE on every pool_id — otherwise
 //! reads can race a concurrent committer and produce a stale snapshot.
 
-use ledger_core::{PoolMethod, PoolStateRow, ProvisionalBasis, Snapshot};
+use ledger_core::{PoolMethod, PoolStateRow, PostingAccounts, ProvisionalBasis, Snapshot};
 use pgrx::prelude::*;
 
 /// Hydrate a [`Snapshot`] for the given pool_ids.
@@ -163,6 +163,47 @@ pub fn hydrate_snapshot(pool_ids: &[i64]) -> Result<Snapshot, pgrx::spi::Error> 
             Ok(())
         })?;
     }
+
+    // ── 5. posting accounts — every touched pool (§3.7) ────────────
+    // Joined on the pool's (sku_id, location_id), like standard_cost. Needed for
+    // every pool: each line posts a journal row. A pool with no posting_account_map
+    // row simply gets no entry here; ledger-core raises MissingPostingAccounts when
+    // it processes the line (fail-loud).
+    Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
+        let mut t = client.select(
+            "SELECT p.id, \
+                    m.receipt_debit, m.receipt_credit, \
+                    m.transfer_debit, m.transfer_credit, \
+                    m.build_debit, m.build_credit, \
+                    m.scrap_debit, m.scrap_credit, \
+                    m.adjustment_debit, m.adjustment_credit, \
+                    m.revaluation_debit, m.revaluation_credit, \
+                    m.variance_acct \
+               FROM pool p \
+               JOIN posting_account_map m \
+                 ON m.sku_id = p.sku_id AND m.location_id = p.location_id \
+              WHERE p.id = ANY($1::bigint[])",
+            None,
+            &[ids.clone().into()],
+        )?;
+        while let Some(row) = t.next() {
+            let pid: i64 = row.get::<i64>(1)?.unwrap_or(0);
+            let g = |c: usize| -> i64 { row.get::<i64>(c).ok().flatten().unwrap_or(0) };
+            snapshot.posting_accounts_of.insert(
+                pid,
+                PostingAccounts {
+                    receipt: (g(2), g(3)),
+                    transfer: (g(4), g(5)),
+                    build: (g(6), g(7)),
+                    scrap: (g(8), g(9)),
+                    adjustment: (g(10), g(11)),
+                    revaluation: (g(12), g(13)),
+                    variance: row.get::<i64>(14)?,
+                },
+            );
+        }
+        Ok(())
+    })?;
 
     Ok(snapshot)
 }

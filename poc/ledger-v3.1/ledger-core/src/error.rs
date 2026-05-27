@@ -33,10 +33,18 @@ pub enum LedgerError {
     #[error("missing standard cost: sku={sku_id} location={location_id}")]
     MissingStandardCost { sku_id: i64, location_id: i64 },
 
-    /// An STD receipt with actual != standard cost was submitted without a
-    /// variance account to absorb the purchase-price variance (§3.3). Resolves
-    /// the §4-SPI-tuple gap: STD lines must carry `variance_account`.
-    #[error("missing variance account for STD line on pool={pool_id}")]
+    /// A line was submitted for a pool whose (sku_id, location_id) has no
+    /// `posting_account_map` row. The ledger resolves debit/credit (and the STD
+    /// variance account) from that table (§3.7); a missing row is a configuration
+    /// error. Every line posts a journal row, so this surfaces for any touched
+    /// pool that lacks config — fail loud.
+    #[error("missing posting accounts: sku={sku_id} location={location_id}")]
+    MissingPostingAccounts { sku_id: i64, location_id: i64 },
+
+    /// An STD receipt's actual cost differs from standard, but the pool's
+    /// `posting_account_map.variance_acct` is NULL — no account to absorb the
+    /// purchase-price variance (§3.3). Configuration error; fail loud.
+    #[error("missing variance account for STD pool={pool_id} (posting_account_map.variance_acct is NULL)")]
     MissingVarianceAccount { pool_id: i64 },
 
     /// A receipt targeted a specific-method pool that already holds a

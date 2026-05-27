@@ -37,7 +37,7 @@ pub async fn connect_pool() -> PgPool {
 pub async fn reset_state(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE TABLE posting_line_dimension, posting_line, trx_line, trx, \
-                       pool_state, pool_lock, pool, standard_cost, \
+                       pool_state, pool_lock, pool, standard_cost, posting_account_map, \
                        sku, location, account, accounting_period \
                        RESTART IDENTITY CASCADE",
     )
@@ -113,6 +113,29 @@ pub async fn seed_pool(
     .await
     .expect("insert pool");
 
+    // Posting accounts for this (sku, location), resolved ledger-side (§3.7). All
+    // operation pairs stored receipt-direction (debit inv, credit ap); depletions
+    // swap, recovering (debit ap, credit inv) on shipments. ON CONFLICT lets two
+    // specific pools share a (sku, location) without a PK collision.
+    sqlx::query(
+        "INSERT INTO posting_account_map ( \
+            sku_id, location_id, \
+            receipt_debit, receipt_credit, transfer_debit, transfer_credit, \
+            build_debit, build_credit, scrap_debit, scrap_credit, \
+            adjustment_debit, adjustment_credit, revaluation_debit, revaluation_credit, \
+            variance_acct) \
+         VALUES ($1, $2, $3,$4, $3,$4, $3,$4, $3,$4, $3,$4, $3,$4, $5) \
+         ON CONFLICT (sku_id, location_id) DO NOTHING",
+    )
+    .bind(sku_id)
+    .bind(loc_id)
+    .bind(inv_acct)
+    .bind(ap_acct)
+    .bind(var_acct)
+    .execute(pool)
+    .await
+    .expect("insert posting_account_map");
+
     Fixture { sku_id, loc_id, pool_id, inv_acct, ap_acct, var_acct }
 }
 
@@ -146,42 +169,33 @@ pub async fn seed_standard_cost(pool: &PgPool, sku_id: i64, loc_id: i64, unit_co
 
 // ── line builders ──────────────────────────────────────────────────
 
-/// A receipt line (positive qty). debit inv / credit ap.
+/// A receipt line (positive qty). Posting accounts (debit inv / credit ap) are
+/// resolved ledger-side from posting_account_map (§3.7), not on the line.
 pub fn receipt(f: &Fixture, qty: i64, unit_cost: i64) -> Value {
     json!({
         "pool_id": f.pool_id,
         "line_type": "po_receipt_line",
         "qty": qty,
         "unit_cost": unit_cost,
-        "debit_account": f.inv_acct,
-        "credit_account": f.ap_acct,
     })
 }
 
-/// An STD receipt line carrying a variance account for the PPV leg (§3.3).
+/// An STD receipt line. The PPV variance account is resolved from
+/// posting_account_map.variance_acct (§3.3); identical wire shape to `receipt`
+/// now that accounts are ledger-resolved — kept as a named alias for intent.
 pub fn receipt_std(f: &Fixture, qty: i64, unit_cost: i64) -> Value {
-    json!({
-        "pool_id": f.pool_id,
-        "line_type": "po_receipt_line",
-        "qty": qty,
-        "unit_cost": unit_cost,
-        "debit_account": f.inv_acct,
-        "credit_account": f.ap_acct,
-        "variance_account": f.var_acct,
-    })
+    receipt(f, qty, unit_cost)
 }
 
-/// A depletion line (negative qty). debit ap / credit inv. `unit_cost` is the
-/// caller's asserted cost; Path C overrides the recorded cost with the
-/// provisional (running avg or standard).
+/// A depletion line (negative qty). Posting accounts (debit ap / credit inv) are
+/// resolved ledger-side (§3.7). `unit_cost` is the caller's asserted cost; Path C
+/// overrides the recorded cost with the provisional (running avg or standard).
 pub fn depletion(f: &Fixture, qty: i64) -> Value {
     json!({
         "pool_id": f.pool_id,
         "line_type": "transfer_shipment_line",
         "qty": -qty,
         "unit_cost": 0,
-        "debit_account": f.ap_acct,
-        "credit_account": f.inv_acct,
     })
 }
 

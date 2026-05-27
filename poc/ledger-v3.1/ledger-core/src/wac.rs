@@ -64,6 +64,10 @@ pub(crate) fn aggregate_receipt(
     result: &mut PlanResult,
     posted_at: DateTime<Utc>,
 ) -> Result<(), LedgerError> {
+    // Receipt direction: debit inventory, credit contra — the stored pair as-is.
+    let (debit_account, credit_account) =
+        snapshot.resolve_posting_accounts(line.pool_id)?.pair_for(line.line_type);
+
     let (old_qty, old_unit_cost, old_value_sum, _existed) = snapshot.read_aggregate(line.pool_id);
 
     let new_qty = old_qty
@@ -110,8 +114,8 @@ pub(crate) fn aggregate_receipt(
         trx_line_idx,
         event_type: PostingEventType::InventoryReceipt,
         amount,
-        debit_account: line.debit_account,
-        credit_account: line.credit_account,
+        debit_account,
+        credit_account,
         posted_at,
     });
     Ok(())
@@ -128,6 +132,12 @@ pub(crate) fn aggregate_deplete(
     posted_at: DateTime<Utc>,
     applied_unit_cost: i64,
 ) -> Result<(), LedgerError> {
+    // Depletion direction: swap the receipt-direction pair (debit contra, credit
+    // inventory).
+    let (rcv_debit, rcv_credit) =
+        snapshot.resolve_posting_accounts(line.pool_id)?.pair_for(line.line_type);
+    let (debit_account, credit_account) = (rcv_credit, rcv_debit);
+
     let qty_to_deplete = line
         .qty
         .checked_abs()
@@ -178,8 +188,8 @@ pub(crate) fn aggregate_deplete(
         trx_line_idx,
         event_type: PostingEventType::InventoryDepletion,
         amount,
-        debit_account: line.debit_account,
-        credit_account: line.credit_account,
+        debit_account,
+        credit_account,
         posted_at,
     });
     Ok(())

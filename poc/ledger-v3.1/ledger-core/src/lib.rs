@@ -50,4 +50,4 @@ pub use plan::{
     TrxLineRequest,
 };
 pub use provisional::plan_apply_provisional;
-pub use snapshot::{PoolStateRow, Snapshot};
+pub use snapshot::{PoolStateRow, PostingAccounts, Snapshot};

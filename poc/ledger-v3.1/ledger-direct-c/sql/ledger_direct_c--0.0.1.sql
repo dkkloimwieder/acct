@@ -16,7 +16,7 @@ AS 'MODULE_PATHNAME', 'ledger_direct_c_hello_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-direct-c/src/submit.rs:49
+-- ledger-direct-c/src/submit.rs:46
 -- ledger_direct_c::submit::ledger_submit_trx_c
 CREATE  FUNCTION "ledger_submit_trx_c"(
 	"trx_type" TEXT, /* & str */

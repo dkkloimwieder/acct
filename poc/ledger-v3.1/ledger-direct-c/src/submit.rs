@@ -22,8 +22,9 @@ use ledger_spi_common::{bulk_write, hydration, pool_lock};
 
 /// JSONB element shape for `lines[]`. Mirror of `TrxLineRequest` with a
 /// stringly-typed line_type — the caller sends the SQL enum text and we decode
-/// it here. `variance_account` is optional (only STD receipts with a non-zero
-/// purchase-price variance require it, §3.3).
+/// it here. Posting accounts are NOT on the line: the ledger resolves debit/credit
+/// (and the STD variance account) from `posting_account_map` keyed on the pool's
+/// (sku_id, location_id), hydrated at lock time (§3.7).
 #[derive(Deserialize)]
 struct LineJson {
     pool_id: i64,
@@ -32,10 +33,6 @@ struct LineJson {
     source_id: Option<i64>,
     qty: i64,
     unit_cost: i64,
-    debit_account: i64,
-    credit_account: i64,
-    #[serde(default)]
-    variance_account: Option<i64>,
 }
 
 /// Caller-facing SPI: submit one transaction (Path C direct flavor).
@@ -67,8 +64,7 @@ fn ledger_submit_trx_c(
         Err(e) => ereport_invalid_arg(
             PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
             format!("ledger_submit_trx_c: lines JSONB decode failed: {e}"),
-            "Expected an array of {pool_id, line_type, source_id?, qty, unit_cost, \
-             debit_account, credit_account, variance_account?}.",
+            "Expected an array of {pool_id, line_type, source_id?, qty, unit_cost}.",
         ),
     };
 
@@ -89,9 +85,6 @@ fn ledger_submit_trx_c(
                 source_id: l.source_id,
                 qty: l.qty,
                 unit_cost: l.unit_cost,
-                debit_account: l.debit_account,
-                credit_account: l.credit_account,
-                variance_account: l.variance_account,
             }
         })
         .collect();

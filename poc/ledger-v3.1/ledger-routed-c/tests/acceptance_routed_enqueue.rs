@@ -5,7 +5,6 @@
 //!   - the payload is staged to the spillover arena (outstanding allocs grow);
 //!   - a staging slot transitions to `pending`;
 //!   - NO DB row is written at enqueue (the trx row is the committer's job, P3.3);
-//!   - the optional STD `variance_account` field is accepted;
 //!   - empty / malformed submissions are rejected.
 //!
 //! Counts are measured as deltas because the staging queue + arena live in shmem
@@ -33,18 +32,13 @@ async fn enqueue_stages_to_shmem_without_db_write() {
     // Let any in-progress tick finish so both workers are parked on their flags.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    // One plain line, one carrying the optional variance account.
+    // Two single-line submissions.
     let s1 = enqueue(&pool, "po_receipt", 1, vec![receipt_line(1, 10, 50)])
         .await
         .expect("enqueue 1");
-    let s2 = enqueue(
-        &pool,
-        "po_receipt",
-        2,
-        vec![receipt_line_with_variance(2, 1, 1)],
-    )
-    .await
-    .expect("enqueue 2 (with variance_account)");
+    let s2 = enqueue(&pool, "po_receipt", 2, vec![receipt_line(2, 1, 1)])
+        .await
+        .expect("enqueue 2");
 
     // Capture the staged-state readings while paused.
     let trx_after = trx_count(&pool).await;

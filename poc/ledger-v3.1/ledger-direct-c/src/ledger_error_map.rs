@@ -13,8 +13,10 @@
 //!     that wasn't hydrated.
 //!   MissingStandardCost    → DATA_EXCEPTION (22000) — STD / 'standard'-basis pool
 //!     with no standard_cost row (§3.3).
+//!   MissingPostingAccounts → DATA_EXCEPTION (22000) — touched pool's (sku_id,
+//!     location_id) has no posting_account_map row (§3.7).
 //!   MissingVarianceAccount → DATA_EXCEPTION (22000) — STD receipt with
-//!     actual != standard but no variance account supplied on the line (§3.3).
+//!     actual != standard but the pool's posting_account_map.variance_acct is NULL (§3.3).
 //!   SpecificPoolOccupied   → INTEGRITY_CONSTRAINT_VIOLATION (23000) — a second
 //!     receipt to a specific pool that already holds a unit; K=1 (§3.4).
 //!   Overflow               → NUMERIC_VALUE_OUT_OF_RANGE (22003) — BIGINT
@@ -65,13 +67,22 @@ pub fn raise_ledger_error(err: LedgerError) {
                  (sku_id, location_id). Insert one and retry."
             );
         }
+        LedgerError::MissingPostingAccounts { .. } => {
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_DATA_EXCEPTION,
+                msg,
+                "Every pool's (sku_id, location_id) needs a posting_account_map row \
+                 resolving debit/credit (and the STD variance) accounts. Insert one and retry."
+            );
+        }
         LedgerError::MissingVarianceAccount { .. } => {
             ereport!(
                 ERROR,
                 PgSqlErrorCode::ERRCODE_DATA_EXCEPTION,
                 msg,
-                "An STD receipt whose actual cost differs from standard needs a \
-                 variance_account on the line to absorb the purchase-price variance."
+                "An STD receipt whose actual cost differs from standard needs \
+                 posting_account_map.variance_acct set for the pool's (sku_id, location_id)."
             );
         }
         LedgerError::SpecificPoolOccupied { .. } => {

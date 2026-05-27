@@ -376,6 +376,8 @@ No layer rows. Standard costs live in the `standard_cost` table (§2.2), keyed b
 - INSERT trx_line with unit_cost = C_std.
 - INSERT posting_lines per the depletion's debit/credit accounts at Q × C_std.
 
+The inventory / source / variance accounts named here are resolved from `posting_account_map`, not supplied per line (v3.2 — see §3.7). The variance leg uses that table's `variance_acct`.
+
 STD pools MUST maintain an aggregate row at layer_id = 0 (same structure as WAC: qty + unit_cost), so the no-negative-inventory invariant (§3.6) can be enforced uniformly. On every receipt: UPSERT pool_state (qty += Q; unit_cost = C_std mirrored from standard_cost). On every depletion: SELECT pool_state.qty FOR UPDATE; if qty < Q, RAISE EXCEPTION InsufficientInventory (matches §3.1 depletion semantics); otherwise UPDATE pool_state SET qty = qty - Q. unit_cost on the aggregate row mirrors standard_cost.unit_cost; it's redundant with the standard_cost table but kept for query consistency (queries against pool_state get a complete picture without joining standard_cost).
 
 When standard_cost is revised, the new value applies to future trx_lines. Already-recorded trx_lines retain their C_std as recorded. The aggregate row's unit_cost is updated to the new standard at the next receipt or depletion (it's just a mirror; not a per-trx-history value).
@@ -433,6 +435,35 @@ This is a deliberate scope cut. Real-world inventory systems often need to recor
 
 **Decision deferred to production design.** v3.1's PoC validates Path C's hot-path performance under the no-negative invariant. The choice of (a) which gating mechanism, (b) how to handle zero-crossing GL postings, and (c) how recalc/close reconciles negative-aggregate states is left to whichever future phase implements negative-inventory support.
 
+### 3.7 Posting-account resolution (v3.2)
+
+In the v3.1 PoC each SPI line carried `debit_account`, `credit_account` (and an optional `variance_account`), supplied verbatim by the caller and copied straight into `posting_line`. That pushed GL chart-of-accounts knowledge to every caller. v3.2 moves account resolution into the ledger: callers send only inventory facts (`pool_id, line_type, qty, unit_cost`), and the ledger looks the accounts up from a config table — mirroring how `standard_cost` is already resolved.
+
+**Config table.** `posting_account_map` holds one full account set per `(sku_id, location_id)`:
+
+```sql
+posting_account_map(
+  sku_id, location_id,                          -- PRIMARY KEY (no FK, like standard_cost)
+  receipt_debit, receipt_credit,                -- po_receipt_line
+  transfer_debit, transfer_credit,              -- transfer_shipment_line / transfer_receipt_line
+  build_debit, build_credit,                    -- wo_output / wo_backflush
+  scrap_debit, scrap_credit,                    -- wo_scrap
+  adjustment_debit, adjustment_credit,          -- inv_adjustment_line / manual_adjustment_line
+  revaluation_debit, revaluation_credit,        -- revaluation_line
+  variance_acct                                 -- STD purchase-price variance; NULL if never STD
+)                                               -- account columns FK account(id)
+```
+
+**Direction.** Each operation's pair is stored in the **receipt (inventory-increase) direction**: `debit` = the pool's inventory side, `credit` = the contra. The cost engine uses the pair as-is for receipts (`qty > 0`) and **swaps it** (debit ↔ credit) for depletions (`qty < 0`). One uniform rule covers every operation — a `transfer_shipment_line` depletion swaps the transfer pair to `(debit contra, credit inventory)`; an `inv_adjustment_line` loss swaps the adjustment pair. The engine owns direction; the config stores it once.
+
+**line_type → operation.** A fixed code-level map selects which column pair applies: `po_receipt_line → receipt`; `transfer_{shipment,receipt}_line → transfer`; `wo_output`/`wo_backflush → build`; `wo_scrap → scrap`; `inv_adjustment_line`/`manual_adjustment_line → adjustment`; `revaluation_line → revaluation`. Adding a fundamentally new operation is an `ALTER TABLE` adding a column pair — appropriate when the transaction taxonomy itself changes, not per SKU.
+
+**STD variance leg (§3.3).** For an STD receipt whose actual cost differs from standard, the variance leg flips between `variance_acct` and the receipt-direction `credit` (the contra/source), favorable vs unfavorable. If `variance_acct` is NULL for that pool, RAISE EXCEPTION (`MissingVarianceAccount`).
+
+**Hydration + fail-loud.** `posting_account_map` is joined on the pool's `(sku_id, location_id)` and hydrated into the snapshot for every touched pool (every line posts a journal row), alongside `standard_cost` under the same `pool_lock`. A touched pool whose `(sku_id, location_id)` has no row fails loud: RAISE EXCEPTION (`MissingPostingAccounts`) — same posture as a missing `standard_cost`. There is no caller-supplied fallback.
+
+This is GL-routing configuration off the hot-path locking critical section; it does not change the lock-hold or aggregate-update profile the PoC measures (one extra constant-time index seek per touched pool at hydration, like the `standard_cost` join).
+
 ## 4. SPI surface
 
 Path C exposes two flavors of hot-path entry, corresponding to direct and routed shapes:
@@ -442,21 +473,29 @@ ledger_submit_trx_c(
     trx_type: trx_type,
     source_id: BIGINT,
     posted_at: TIMESTAMPTZ,
-    lines: ARRAY of (line_type, source_id, pool_id, qty, unit_cost, debit_account, credit_account)
+    lines: ARRAY of (line_type, source_id, pool_id, qty, unit_cost)
 ) RETURNS BIGINT  -- trx.id (direct flavor)
 
 ledger_enqueue_trx_c(
     trx_type: trx_type,
     source_id: BIGINT,
     posted_at: TIMESTAMPTZ,
-    lines: ARRAY of (line_type, source_id, pool_id, qty, unit_cost, debit_account, credit_account)
+    lines: ARRAY of (line_type, source_id, pool_id, qty, unit_cost)
 ) RETURNS BIGINT  -- submission_id (routed flavor; shmem-local, not trx.id)
 ```
 
 > **Implementation note (v3.1 PoC — AUDIT.md D1.1/D1.2).** The shipped SPIs take `lines` as
 > **JSONB** (an array of objects), not the SQL composite ARRAY sketched above — pgrx ergonomics;
-> behaviorally equivalent. Each line object also carries an optional **`variance_account`**
-> (absent from the tuple above) which STD receipts with actual ≠ standard require per §3.3.
+> behaviorally equivalent.
+
+> **v3.2 — posting accounts are resolved ledger-side (§3.7), not on the line.** The original
+> v3.1 line tuple carried `debit_account`, `credit_account` (and an optional `variance_account`)
+> supplied verbatim by the caller. v3.2 drops all three: the ledger resolves debit/credit (and the
+> STD variance account) from `posting_account_map` keyed on the touched pool's `(sku_id,
+> location_id)`, hydrated at lock time like `standard_cost`. Callers no longer need to know the GL
+> chart of accounts. A touched pool with no `posting_account_map` row fails loud (§3.7). This
+> changes the SPI wire contract (the tuple above is the v3.2 shape) but not what the v3.1 PoC
+> measured — it is GL-routing config, off the hot-path-locking critical section.
 
 Both flavors are in PoC scope. Direct Path C demonstrates per-caller-tx provisional cost recording with reduced lock-hold time vs strict-mode paths. Routed Path C demonstrates the same provisional cost handling under batched-commit semantics — the combination that the hot-pool deep-FIFO regime needs. The two flavors map onto the same matrix that strict direct vs strict routed does (low/high concurrency × disjoint/overlapping pools); Path C's value at the architecturally-interesting cell (high concurrency, hot FIFO/LIFO pools) is fully realized only with routed.
 

@@ -47,9 +47,9 @@ pub struct PocV3Submission {
 /// ledger-core side; the SPI shim does the enum mapping between
 /// `line_type` text and the SQL `line_type` enum at decode time.
 ///
-/// `variance_account` carries the STD purchase-price-variance account
-/// (design-v3.1 §3.3); `None` for non-STD lines. Defaulted on decode so
-/// callers that omit it (the common case) deserialize cleanly.
+/// Posting accounts are NOT on the line: the ledger resolves debit/credit
+/// (and the STD variance account) from `posting_account_map` keyed on the
+/// pool's (sku_id, location_id), hydrated at lock time (design-v3.1 §3.7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PocV3Line {
     pub line_type: String,
@@ -57,10 +57,6 @@ pub struct PocV3Line {
     pub pool_id: i64,
     pub qty: i64,
     pub unit_cost: i64,
-    pub debit_account: i64,
-    pub credit_account: i64,
-    #[serde(default)]
-    pub variance_account: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,9 +264,6 @@ mod tests {
                 pool_id: 7,
                 qty: 10,
                 unit_cost: 50,
-                debit_account: 1,
-                credit_account: 2,
-                variance_account: None,
             },
             PocV3Line {
                 line_type: "po_receipt_line".into(),
@@ -278,9 +271,6 @@ mod tests {
                 pool_id: 8,
                 qty: 5,
                 unit_cost: 100,
-                debit_account: 1,
-                credit_account: 2,
-                variance_account: Some(3),
             },
         ];
         (submission, lines)
@@ -374,24 +364,14 @@ mod tests {
             1i64..=10_000,
             -100_000i64..=100_000,
             1i64..=1_000_000,
-            1i64..=64,
-            1i64..=64,
-            prop::option::of(1i64..=64),
         )
-            .prop_map(
-                |(line_type, source_id, pool_id, qty, unit_cost, debit, credit, variance)| {
-                    PocV3Line {
-                        line_type,
-                        source_id,
-                        pool_id,
-                        qty,
-                        unit_cost,
-                        debit_account: debit,
-                        credit_account: credit,
-                        variance_account: variance,
-                    }
-                },
-            )
+            .prop_map(|(line_type, source_id, pool_id, qty, unit_cost)| PocV3Line {
+                line_type,
+                source_id,
+                pool_id,
+                qty,
+                unit_cost,
+            })
     }
 
     fn arb_submission_and_lines() -> impl Strategy<Value = (String, i64, i64, Vec<PocV3Line>)>

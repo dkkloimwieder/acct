@@ -30,7 +30,7 @@ pub async fn connect_pool() -> PgPool {
 pub async fn reset_state(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE TABLE posting_line_dimension, posting_line, trx_line, trx, \
-                       pool_state, pool_lock, pool, standard_cost, \
+                       pool_state, pool_lock, pool, standard_cost, posting_account_map, \
                        sku, location, account, accounting_period \
                        RESTART IDENTITY CASCADE",
     )
@@ -39,30 +39,22 @@ pub async fn reset_state(pool: &PgPool) {
     .expect("reset_state TRUNCATE");
 }
 
-/// A single po_receipt line (no variance account).
+/// A single po_receipt line. Posting accounts are resolved ledger-side from
+/// posting_account_map (§3.7), not carried on the line.
 pub fn receipt_line(pool_id: i64, qty: i64, unit_cost: i64) -> Value {
     json!({
         "pool_id": pool_id,
         "line_type": "po_receipt_line",
         "qty": qty,
         "unit_cost": unit_cost,
-        "debit_account": 1000,
-        "credit_account": 2000,
     })
 }
 
-/// A line carrying the optional STD variance account (exercises the v3.1 payload
-/// delta end-to-end through JSON → arena → (future) committer).
+/// Same wire shape as `receipt_line` now that the STD variance account is
+/// ledger-resolved (§3.7) rather than carried per line. Kept as a named alias
+/// for the enqueue acceptance test's intent.
 pub fn receipt_line_with_variance(pool_id: i64, qty: i64, unit_cost: i64) -> Value {
-    json!({
-        "pool_id": pool_id,
-        "line_type": "po_receipt_line",
-        "qty": qty,
-        "unit_cost": unit_cost,
-        "debit_account": 1000,
-        "credit_account": 2000,
-        "variance_account": 3000,
-    })
+    receipt_line(pool_id, qty, unit_cost)
 }
 
 /// Call `ledger_enqueue_trx_c`, returning the shmem submission_id (or SQL error).
@@ -121,8 +113,6 @@ pub fn line_on(pool_id: i64) -> Value {
         "line_type": "po_receipt_line",
         "qty": 1,
         "unit_cost": 1,
-        "debit_account": 1000,
-        "credit_account": 2000,
     })
 }
 
@@ -349,6 +339,28 @@ pub async fn seed_pool(
     .await
     .expect("insert pool");
 
+    // Posting accounts for this (sku, location), resolved ledger-side (§3.7). All
+    // operation pairs stored receipt-direction (debit inv, credit ap); depletions
+    // swap, recovering (debit ap, credit inv) on shipments.
+    sqlx::query(
+        "INSERT INTO posting_account_map ( \
+            sku_id, location_id, \
+            receipt_debit, receipt_credit, transfer_debit, transfer_credit, \
+            build_debit, build_credit, scrap_debit, scrap_credit, \
+            adjustment_debit, adjustment_credit, revaluation_debit, revaluation_credit, \
+            variance_acct) \
+         VALUES ($1, $2, $3,$4, $3,$4, $3,$4, $3,$4, $3,$4, $3,$4, $5) \
+         ON CONFLICT (sku_id, location_id) DO NOTHING",
+    )
+    .bind(sku_id)
+    .bind(loc_id)
+    .bind(inv_acct)
+    .bind(ap_acct)
+    .bind(var_acct)
+    .execute(pool)
+    .await
+    .expect("insert posting_account_map");
+
     Fixture { sku_id, loc_id, pool_id, inv_acct, ap_acct, var_acct }
 }
 
@@ -390,8 +402,6 @@ pub fn depletion_line(f: &Fixture, qty: i64) -> Value {
         "line_type": "transfer_shipment_line",
         "qty": -qty,
         "unit_cost": 0,
-        "debit_account": f.ap_acct,
-        "credit_account": f.inv_acct,
     })
 }
 
@@ -402,8 +412,6 @@ pub fn receipt_line_for(f: &Fixture, qty: i64, unit_cost: i64) -> Value {
         "line_type": "po_receipt_line",
         "qty": qty,
         "unit_cost": unit_cost,
-        "debit_account": f.inv_acct,
-        "credit_account": f.ap_acct,
     })
 }
 

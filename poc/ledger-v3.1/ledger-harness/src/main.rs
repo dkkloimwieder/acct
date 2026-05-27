@@ -58,10 +58,11 @@ async fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::from(1);
             }
             println!(
-                "{{\"pools\":{},\"inv_account\":{},\"ap_account\":{},\"depth\":{}}}",
+                "{{\"pools\":{},\"inv_account\":{},\"ap_account\":{},\"variance_account\":{},\"depth\":{}}}",
                 universe.pool_ids.len(),
                 universe.inv_account,
                 universe.ap_account,
+                universe.variance_account,
                 depth
             );
             std::process::ExitCode::SUCCESS

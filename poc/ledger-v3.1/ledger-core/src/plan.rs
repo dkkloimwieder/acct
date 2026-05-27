@@ -67,6 +67,11 @@ impl PostingEventType {
 }
 
 /// One line from a caller's submission. Input to a plan_apply entry point.
+///
+/// Posting accounts (debit/credit, and the STD variance account) are NOT on the
+/// line — the ledger resolves them from `posting_account_map` keyed on the pool's
+/// `(sku_id, location_id)`, hydrated into `Snapshot::posting_accounts_of` (§3.7).
+/// `line_type` selects which operation's account pair applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrxLineRequest {
     pub pool_id: i64,
@@ -78,13 +83,6 @@ pub struct TrxLineRequest {
     /// For WAC/provisional depletions plan_apply overrides the recorded cost with
     /// the running average (or standard); for STD it uses the standard cost.
     pub unit_cost: i64,
-    pub debit_account: i64,
-    pub credit_account: i64,
-    /// Purchase-price-variance account for STD receipts (§3.3). Required when an
-    /// STD receipt's actual cost differs from standard. None for non-STD lines.
-    /// (Resolves the gap between §3.3, which needs a variance account, and the
-    /// §4 SPI line tuple, which omits one; ledger-direct-c/routed-c supply it.)
-    pub variance_account: Option<i64>,
 }
 
 /// One row to INSERT into trx_line.

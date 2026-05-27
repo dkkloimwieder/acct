@@ -63,6 +63,11 @@ fn receipt(
     c_std: i64,
     old_qty: i64,
 ) -> Result<(), LedgerError> {
+    // Receipt direction: debit inventory, credit contra. The variance leg flips
+    // between the contra (credit_account) and the configured variance account.
+    let accounts = snapshot.resolve_posting_accounts(line.pool_id)?;
+    let (debit_account, credit_account) = accounts.pair_for(line.line_type);
+
     let q = line.qty; // > 0
     let c_actual = line.unit_cost;
     let new_qty = old_qty
@@ -101,24 +106,24 @@ fn receipt(
         trx_line_idx,
         event_type: PostingEventType::InventoryReceipt,
         amount: std_value,
-        debit_account: line.debit_account,
-        credit_account: line.credit_account,
+        debit_account,
+        credit_account,
         posted_at,
     });
 
     // Variance leg: Q*(C_actual - C_std). Source's net credit becomes Q*C_actual.
     let delta_unit = (c_actual as i128) - (c_std as i128);
     if delta_unit != 0 {
-        let variance_account = line
-            .variance_account
+        let variance_account = accounts
+            .variance
             .ok_or(LedgerError::MissingVarianceAccount { pool_id: line.pool_id })?;
         let variance: i128 = (q as i128) * delta_unit;
         // delta > 0 (paid more than standard, unfavorable): debit variance,
-        // credit source. delta < 0 (favorable): debit source, credit variance.
-        let (debit_account, credit_account, amount) = if variance > 0 {
-            (variance_account, line.credit_account, variance)
+        // credit source (the contra). delta < 0 (favorable): debit source, credit variance.
+        let (var_debit, var_credit, amount) = if variance > 0 {
+            (variance_account, credit_account, variance)
         } else {
-            (line.credit_account, variance_account, -variance)
+            (credit_account, variance_account, -variance)
         };
         let amount: i64 = amount
             .try_into()
@@ -127,8 +132,8 @@ fn receipt(
             trx_line_idx,
             event_type: PostingEventType::Variance,
             amount,
-            debit_account,
-            credit_account,
+            debit_account: var_debit,
+            credit_account: var_credit,
             posted_at,
         });
     }
@@ -143,6 +148,12 @@ fn deplete(
     c_std: i64,
     old_qty: i64,
 ) -> Result<(), LedgerError> {
+    // Depletion direction: swap the receipt-direction pair (debit contra, credit
+    // inventory).
+    let (rcv_debit, rcv_credit) =
+        snapshot.resolve_posting_accounts(line.pool_id)?.pair_for(line.line_type);
+    let (debit_account, credit_account) = (rcv_credit, rcv_debit);
+
     let qty_to_deplete = line
         .qty
         .checked_abs()
@@ -184,8 +195,8 @@ fn deplete(
         trx_line_idx,
         event_type: PostingEventType::InventoryDepletion,
         amount,
-        debit_account: line.debit_account,
-        credit_account: line.credit_account,
+        debit_account,
+        credit_account,
         posted_at,
     });
     Ok(())

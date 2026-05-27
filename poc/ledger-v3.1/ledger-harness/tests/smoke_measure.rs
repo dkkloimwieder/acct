@@ -57,6 +57,19 @@ async fn collector_captures_nonzero_deltas() {
     .execute(&pool)
     .await
     .unwrap();
+    // Posting accounts for (sku=1, loc=1) — resolved ledger-side (§3.7). All pairs
+    // (debit inv 1000, credit ap 2000); no STD here so variance_acct stays NULL.
+    sqlx::query(
+        "INSERT INTO posting_account_map ( \
+            sku_id, location_id, \
+            receipt_debit, receipt_credit, transfer_debit, transfer_credit, \
+            build_debit, build_credit, scrap_debit, scrap_credit, \
+            adjustment_debit, adjustment_credit, revaluation_debit, revaluation_credit) \
+         VALUES (1, 1, 1000,2000, 1000,2000, 1000,2000, 1000,2000, 1000,2000, 1000,2000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let collector = MeasureCollector::spawn(pool.clone(), 200);
     let start = take_snapshot(&pool).await.expect("start snapshot");
@@ -64,7 +77,7 @@ async fn collector_captures_nonzero_deltas() {
     for src in 1..=50 {
         let lines = serde_json::json!([{
             "pool_id": 1, "line_type": "po_receipt_line", "source_id": src,
-            "qty": 1, "unit_cost": 10, "debit_account": 1000, "credit_account": 2000
+            "qty": 1, "unit_cost": 10
         }]);
         sqlx::query("SELECT ledger_submit_trx_c('po_receipt', $1, '2026-05-25T12:00:00+00:00', $2::jsonb)")
             .bind(src as i64)

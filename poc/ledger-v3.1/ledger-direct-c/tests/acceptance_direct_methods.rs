@@ -135,6 +135,30 @@ async fn std_without_standard_cost_raises() {
 
 #[tokio::test]
 #[ignore = "needs running poc_v3_1 with ledger_direct_c installed"]
+async fn missing_posting_account_map_raises() {
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let f = seed_fixture(&pool, "fifo", "running_avg").await;
+    // Remove the posting-account config for this pool's (sku, location). The
+    // ledger resolves debit/credit from posting_account_map (§3.7), so a receipt
+    // must now fail loud rather than fall back to caller-supplied accounts.
+    sqlx::query("DELETE FROM posting_account_map WHERE sku_id = $1 AND location_id = $2")
+        .bind(f.sku_id)
+        .bind(f.loc_id)
+        .execute(&pool)
+        .await
+        .expect("delete posting_account_map");
+
+    let err = submit(&pool, "po_receipt", 1, vec![receipt(&f, 10, 100)]).await;
+    assert!(err.is_err(), "receipt without posting_account_map must RAISE");
+    let msg = format!("{}", err.unwrap_err());
+    assert!(msg.contains("missing posting accounts"), "unexpected error: {msg}");
+    // Fail-loud aborts the tx — nothing landed.
+    assert_eq!(aggregate(&pool, f.pool_id).await, None);
+}
+
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_direct_c installed"]
 async fn specific_receipt_then_depletion_materializes_and_links() {
     let pool = connect_pool().await;
     reset_state(&pool).await;

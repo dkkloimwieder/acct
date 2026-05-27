@@ -7,17 +7,33 @@
 use chrono::{DateTime, TimeZone, Utc};
 use ledger_core::{
     plan_apply_provisional, LedgerError, LineType, PlanResult, PoolMethod, PoolStateMutation,
-    PoolStateRow, ProvisionalBasis, Snapshot, TrxLineRequest,
+    PoolStateRow, PostingAccounts, ProvisionalBasis, Snapshot, TrxLineRequest,
 };
 
 fn ts() -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000, 0).unwrap()
 }
 
+/// Posting accounts hydrated for every test pool (§3.7). Pairs are stored in
+/// receipt direction; depletions swap. PoReceiptLine -> receipt (100,200);
+/// TransferShipmentLine -> transfer (100,400) swapped to (400,100) on depletion.
+fn posting_accounts() -> PostingAccounts {
+    PostingAccounts {
+        receipt: (100, 200),
+        transfer: (100, 400),
+        build: (100, 500),
+        scrap: (100, 700),
+        adjustment: (100, 800),
+        revaluation: (100, 900),
+        variance: Some(300),
+    }
+}
+
 fn fifo_pool(s: &mut Snapshot, id: i64, basis: ProvisionalBasis) {
     s.method_of.insert(id, PoolMethod::Fifo);
     s.provisional_basis_of.insert(id, basis);
     s.sku_location_of.insert(id, (id * 10, id * 10 + 1));
+    s.posting_accounts_of.insert(id, posting_accounts());
 }
 
 fn seed_aggregate(s: &mut Snapshot, id: i64, qty: i64, unit_cost: i64) {
@@ -34,9 +50,6 @@ fn receipt(pool_id: i64, qty: i64, cost: i64) -> TrxLineRequest {
         source_id: Some(1),
         qty,
         unit_cost: cost,
-        debit_account: 100,
-        credit_account: 200,
-        variance_account: None,
     }
 }
 
@@ -47,9 +60,6 @@ fn deplete(pool_id: i64, qty: i64) -> TrxLineRequest {
         source_id: Some(2),
         qty: -qty,
         unit_cost: 0,
-        debit_account: 400,
-        credit_account: 100,
-        variance_account: None,
     }
 }
 
@@ -126,6 +136,7 @@ fn lifo_behaves_identically_under_provisional() {
     s.method_of.insert(1, PoolMethod::Lifo);
     s.provisional_basis_of.insert(1, ProvisionalBasis::RunningAvg);
     s.sku_location_of.insert(1, (10, 11));
+    s.posting_accounts_of.insert(1, posting_accounts());
     let r = plan_apply_provisional(&mut s, &[receipt(1, 10, 100), deplete(1, 4)], ts()).unwrap();
     assert!(no_layer_mutations(&r));
     assert_eq!(r.trx_lines[1].unit_cost, 100);
@@ -215,6 +226,7 @@ fn provisional_dispatches_wac_std_specific_to_strict() {
     let mut s = Snapshot::default();
     s.method_of.insert(5, PoolMethod::Wac);
     s.sku_location_of.insert(5, (50, 51));
+    s.posting_accounts_of.insert(5, posting_accounts());
     seed_aggregate(&mut s, 5, 10, 100);
     let r = plan_apply_provisional(&mut s, &[deplete(5, 4)], ts()).unwrap();
     assert_eq!(r.trx_lines[0].unit_cost, 100);

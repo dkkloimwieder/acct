@@ -4,16 +4,33 @@
 use chrono::{DateTime, TimeZone, Utc};
 use ledger_core::{
     plan_apply, LedgerError, LineType, PoolMethod, PoolStateMutation, PoolStateRow,
-    PostingEventType, Snapshot, TrxLineRequest,
+    PostingAccounts, PostingEventType, Snapshot, TrxLineRequest,
 };
 
 fn ts() -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000, 0).unwrap()
 }
 
+/// Posting accounts hydrated for every test pool (§3.7). PoReceiptLine -> receipt
+/// (debit inventory 100, credit contra 200); the STD variance leg flips between
+/// the contra (200) and variance (300). InvAdjustmentLine depletions use the
+/// adjustment pair swapped (debit 400, credit 100).
+fn posting_accounts() -> PostingAccounts {
+    PostingAccounts {
+        receipt: (100, 200),
+        transfer: (100, 400),
+        build: (100, 500),
+        scrap: (100, 700),
+        adjustment: (100, 400),
+        revaluation: (100, 900),
+        variance: Some(300),
+    }
+}
+
 fn pool(s: &mut Snapshot, id: i64, m: PoolMethod) {
     s.method_of.insert(id, m);
     s.sku_location_of.insert(id, (id * 10, id * 10 + 1));
+    s.posting_accounts_of.insert(id, posting_accounts());
 }
 
 fn seed_aggregate(s: &mut Snapshot, id: i64, qty: i64, unit_cost: i64) {
@@ -30,9 +47,6 @@ fn receipt(pool_id: i64, qty: i64, cost: i64) -> TrxLineRequest {
         source_id: Some(1),
         qty,
         unit_cost: cost,
-        debit_account: 100,
-        credit_account: 200,
-        variance_account: Some(300),
     }
 }
 
@@ -43,9 +57,6 @@ fn deplete(pool_id: i64, qty: i64) -> TrxLineRequest {
         source_id: Some(2),
         qty: -qty,
         unit_cost: 0,
-        debit_account: 400,
-        credit_account: 100,
-        variance_account: None,
     }
 }
 

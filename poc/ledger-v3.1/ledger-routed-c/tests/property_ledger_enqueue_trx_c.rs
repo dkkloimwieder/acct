@@ -223,20 +223,16 @@ async fn run_one_case(pool: PgPool, case: Case) -> Result<(), String> {
     Ok(())
 }
 
-/// A po_receipt line; STD pools carry the variance account for the PPV leg (§3.3).
-fn receipt_line(f: &Fixture, qty: i64, cost: i64, method: &str) -> Value {
-    let mut v = json!({
+/// A po_receipt line. Posting accounts (including the STD PPV variance account)
+/// are resolved ledger-side from posting_account_map (§3.7), not on the line, so
+/// the wire shape no longer varies by method.
+fn receipt_line(f: &Fixture, qty: i64, cost: i64, _method: &str) -> Value {
+    json!({
         "pool_id": f.pool_id,
         "line_type": "po_receipt_line",
         "qty": qty,
         "unit_cost": cost,
-        "debit_account": f.inv_acct,
-        "credit_account": f.ap_acct,
-    });
-    if method == "std" {
-        v["variance_account"] = json!(f.var_acct);
-    }
-    v
+    })
 }
 
 /// Poll until the committer has materialized every non-dropped submission AND the

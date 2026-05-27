@@ -41,6 +41,10 @@ fn receipt(
     result: &mut PlanResult,
     posted_at: DateTime<Utc>,
 ) -> Result<(), LedgerError> {
+    // Receipt direction: debit inventory, credit contra — the stored pair as-is.
+    let (debit_account, credit_account) =
+        snapshot.resolve_posting_accounts(line.pool_id)?.pair_for(line.line_type);
+
     let (old_qty, _old_uc, _old_vs, _existed) = snapshot.read_aggregate(line.pool_id);
     // K=1 (§3.4): a specific pool holds at most one materialized unit. A second
     // receipt while the pool is stocked would push a co-existing layer that the
@@ -101,8 +105,8 @@ fn receipt(
         trx_line_idx,
         event_type: PostingEventType::InventoryReceipt,
         amount,
-        debit_account: line.debit_account,
-        credit_account: line.credit_account,
+        debit_account,
+        credit_account,
         posted_at,
     });
     Ok(())
@@ -114,6 +118,12 @@ fn deplete(
     result: &mut PlanResult,
     posted_at: DateTime<Utc>,
 ) -> Result<(), LedgerError> {
+    // Depletion direction: swap the receipt-direction pair (debit contra, credit
+    // inventory).
+    let (rcv_debit, rcv_credit) =
+        snapshot.resolve_posting_accounts(line.pool_id)?.pair_for(line.line_type);
+    let (debit_account, credit_account) = (rcv_credit, rcv_debit);
+
     let qty_to_deplete = line
         .qty
         .checked_abs()
@@ -182,8 +192,8 @@ fn deplete(
         trx_line_idx,
         event_type: PostingEventType::InventoryDepletion,
         amount,
-        debit_account: line.debit_account,
-        credit_account: line.credit_account,
+        debit_account,
+        credit_account,
         posted_at,
     });
     Ok(())

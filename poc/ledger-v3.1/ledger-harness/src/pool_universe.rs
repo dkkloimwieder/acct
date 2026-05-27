@@ -16,10 +16,10 @@ use sqlx::PgPool;
 
 use crate::cli::MethodMix;
 
-/// Inventory + AP + variance account ids (fixed; the seeded chart). Workload
-/// generators reference these in their debit/credit/variance fields. The variance
-/// account is the target for STD receipts whose actual cost differs from the
-/// seeded standard (every line carries it; non-STD methods ignore it).
+/// Inventory + AP + variance account ids (fixed; the seeded chart). Seeded into
+/// `posting_account_map` so the ledger resolves debit/credit/variance per line
+/// (§3.7). The variance account is the target for STD receipts whose actual cost
+/// differs from the seeded standard.
 pub const INV_ACCOUNT: i64 = 1000;
 pub const AP_ACCOUNT: i64 = 2000;
 pub const VARIANCE_ACCOUNT: i64 = 3000;
@@ -37,7 +37,8 @@ pub async fn reset_ledger_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "TRUNCATE TABLE posting_line_dimension, posting_line, \
                        trx_line, trx, pool_state, pool_lock, pool, \
-                       standard_cost, sku, location, account, accounting_period \
+                       standard_cost, posting_account_map, sku, location, account, \
+                       accounting_period \
                        RESTART IDENTITY CASCADE",
     )
     .execute(pool)
@@ -162,6 +163,30 @@ pub async fn seed(
     .bind(&pool_sku)
     .bind(&pool_loc)
     .bind(&pool_method)
+    .execute(pool)
+    .await?;
+
+    // ── posting_account_map for every pool's (sku, location) (§3.7) ──
+    // Posting accounts are resolved ledger-side now (acct-y08r), so every touched
+    // pool's (sku, location) needs a row or post raises MissingPostingAccounts.
+    // Pools are 1:1 with (sku, location), so pool_sku/pool_loc are distinct keys.
+    // Each operation's pair is stored receipt-direction (debit inv, credit ap);
+    // depletions swap, recovering the old (debit ap, credit inv) on shipments.
+    sqlx::query(
+        "INSERT INTO posting_account_map ( \
+            sku_id, location_id, \
+            receipt_debit, receipt_credit, transfer_debit, transfer_credit, \
+            build_debit, build_credit, scrap_debit, scrap_credit, \
+            adjustment_debit, adjustment_credit, revaluation_debit, revaluation_credit, \
+            variance_acct) \
+         SELECT s, l, $3,$4, $3,$4, $3,$4, $3,$4, $3,$4, $3,$4, $5 \
+           FROM UNNEST($1::bigint[], $2::bigint[]) AS t(s, l)",
+    )
+    .bind(&pool_sku)
+    .bind(&pool_loc)
+    .bind(INV_ACCOUNT)
+    .bind(AP_ACCOUNT)
+    .bind(VARIANCE_ACCOUNT)
     .execute(pool)
     .await?;
 

@@ -1047,9 +1047,6 @@ fn decode_lines(lines: &[PocV3Line]) -> Result<Vec<TrxLineRequest>, String> {
             source_id: l.source_id,
             qty: l.qty,
             unit_cost: l.unit_cost,
-            debit_account: l.debit_account,
-            credit_account: l.credit_account,
-            variance_account: l.variance_account,
         });
     }
     Ok(out)
@@ -1063,7 +1060,7 @@ mod tests {
     use ledger_core::LineType;
 
     #[test]
-    fn decode_lines_carries_variance_account() {
+    fn decode_lines_maps_line_type_and_fields() {
         let lines = vec![
             PocV3Line {
                 line_type: "po_receipt_line".into(),
@@ -1071,9 +1068,6 @@ mod tests {
                 pool_id: 7,
                 qty: 10,
                 unit_cost: 50,
-                debit_account: 1,
-                credit_account: 2,
-                variance_account: Some(3),
             },
             PocV3Line {
                 line_type: "inv_adjustment_line".into(),
@@ -1081,18 +1075,15 @@ mod tests {
                 pool_id: 8,
                 qty: -3,
                 unit_cost: 100,
-                debit_account: 1,
-                credit_account: 2,
-                variance_account: None,
             },
         ];
         let req = decode_lines(&lines).expect("decode ok");
         assert_eq!(req.len(), 2);
         assert_eq!(req[0].pool_id, 7);
         assert_eq!(req[0].line_type, LineType::PoReceiptLine);
-        assert_eq!(req[0].variance_account, Some(3));
+        assert_eq!(req[0].source_id, Some(42));
         assert_eq!(req[1].qty, -3);
-        assert_eq!(req[1].variance_account, None);
+        assert_eq!(req[1].line_type, LineType::InvAdjustmentLine);
     }
 
     #[test]
@@ -1103,9 +1094,6 @@ mod tests {
             pool_id: 1,
             qty: 1,
             unit_cost: 1,
-            debit_account: 1,
-            credit_account: 2,
-            variance_account: None,
         }];
         assert!(decode_lines(&lines).is_err());
     }

@@ -90,12 +90,10 @@ async fn concurrent_depletions_serialize_without_lost_updates() {
     for i in 0..50i64 {
         let p = Arc::clone(&pool);
         let pool_id = f.pool_id;
-        let inv = f.inv_acct;
-        let ap = f.ap_acct;
         handles.push(tokio::spawn(async move {
             let line = serde_json::json!({
                 "pool_id": pool_id, "line_type": "transfer_shipment_line",
-                "qty": -10, "unit_cost": 0, "debit_account": ap, "credit_account": inv,
+                "qty": -10, "unit_cost": 0,
             });
             sqlx::query_scalar::<_, i64>("SELECT ledger_submit_trx_c($1,$2,$3,$4::jsonb)")
                 .bind("transfer_shipment")
