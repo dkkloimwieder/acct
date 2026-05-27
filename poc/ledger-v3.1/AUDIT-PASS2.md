@@ -4,6 +4,13 @@ Pass 2 to `AUDIT.md` (Pass 1). Full per-entry-point R1–R7 walk, cross-crate pa
 recovery-flow walk, and a body-level read of the unsafe shmem core (`router.rs`,
 `committer.rs`, `shmem.rs`, `arena.rs`) with a memory-ordering verdict per primitive.
 
+> **Status (acct-gd3g reconciliation).** Assess-only, point-in-time. All six P2.x findings and the
+> §2 triplication are resolved under epic `acct-yojk` (15/15) — see the **Resolution** column and
+> reconciliation note in the findings index. Two behavioral notes in §0 below (the whole-group
+> poison and the per-submission clone) describe the as-assessed state; the poison granularity was
+> changed by acct-yojk.9 (re-drive) and the clone was measured and kept (acct-yojk.12). Prose is
+> not corrected in place.
+
 Severity as in Pass 1. New findings here are numbered `P2.x`; Pass-1 findings are referenced
 by their `Dx.y` id.
 
@@ -330,18 +337,31 @@ PoC-scope change.
 
 ## Findings index (Pass 2)
 
-| ID | Sev | Verdict | Title | Anchor |
-|----|-----|---------|-------|--------|
-| §1 | — | clean | R1–R7 walk: R4/R6/R7 satisfied, R1/R3/R5 vacuous-by-construction | all entry points |
-| §2 | (D5.1) | divergence | pool_lock/hydration/bulk_write triplication | both `-c` crates |
-| §3 | — | clean | cleanup 3-CAS, orphan-sweep phase order, identity liveness | cleanup.rs / router.rs / identity.rs |
-| §4 | — | clean | memory ordering on every shmem atomic (data-before-flag) | enqueue/router/committer/shmem |
-| P2.1 | P3 | divergence | UNIQUE-survivor poisons whole commit_group | committer.rs:38,491 |
-| P2.2 | P3 | divergence | parse_caller_status PG-string coupling | committer.rs:812 |
-| P2.3 | P3 | divergence | test-injection reads on production path | committer.rs:622 / router.rs:306 |
-| P2.4 | P3 | divergence | per-submission snapshot.clone() | committer.rs:519 |
-| §5 | — | clean | arena allocator safety (offset-0 sentinel + bounded-walk cycle guard) | arena.rs:86,90 |
-| §6.1 | — | clean | payload.rs arena codec (bounds, sentinel, error-path cleanup) | payload.rs:122,232 |
-| §6.2 | — | clean | harness body-read: equivalence keystone + authoritative trx count + honest depth seeding | ledger-harness/src/* |
-| P2.5 | P3 | quality | equivalence drain-wait quiescence heuristic (fails safe) | equivalence.rs:209 |
-| P2.6 | P3 | coverage | lifo/specific absent from load + equivalence scenarios | scenarios.rs:84 |
+| ID | Sev | Verdict | Title | Resolution (epic `acct-yojk`) |
+|----|-----|---------|-------|-------------------------------|
+| §1 | — | clean | R1–R7 walk: R4/R6/R7 satisfied, R1/R3/R5 vacuous-by-construction | no action |
+| §2 | (D5.1) | divergence | pool_lock/hydration/bulk_write triplication | **fixed** acct-yojk.2 (`9e6cbc0`): `ledger-spi-common` rlib |
+| §3 | — | clean | cleanup 3-CAS, orphan-sweep phase order, identity liveness | no action |
+| §4 | — | clean | memory ordering on every shmem atomic (data-before-flag) | no action |
+| P2.1 | P3 | divergence | UNIQUE-survivor poisons whole commit_group | **fixed** acct-yojk.9 (`6fe3979`): `PhaseOutcome::DuplicateRace` re-drives the group minus the offender; poisons only if the re-dedup resolves no offender |
+| P2.2 | P3 | divergence | parse_caller_status PG-string coupling | **fixed** acct-yojk.10 (`e9eb7eb`): `CallerTxStatus::Unrecognized` (WARN + eject, never keep) so a PG wording drift fails loud |
+| P2.3 | P3 | divergence | test-injection reads on production path | **fixed** acct-yojk.11 (`f14b779`): reads/calls `#[cfg(feature = "test_hooks")]`-gated, compiled out of production |
+| P2.4 | P3 | divergence | per-submission snapshot.clone() | **assessed → won't-fix** acct-yojk.12 (`cc28d11`): measured ~96–180 ns/clone vs ~19 µs/submission SPI ≈ 0.5–1%; kept; bench `ledger-core/examples/clone_bench.rs` |
+| §5 | — | clean | arena allocator safety (offset-0 sentinel + bounded-walk cycle guard) | no action |
+| §6.1 | — | clean | payload.rs arena codec (bounds, sentinel, error-path cleanup) | header de-Path-B'd in acct-yojk.1; **arena-leak bug** found in this body-read **fixed** acct-yojk.15 (`49cc894`) — see note below |
+| §6.2 | — | clean | harness body-read: equivalence keystone + authoritative trx count + honest depth seeding | no action |
+| P2.5 | P3 | quality | equivalence drain-wait quiescence heuristic (fails safe) | **fixed** acct-yojk.13 (`38339a8`): asserts trx baseline-delta == submissions before diffing (partial drain → distinct "drain incomplete" error) |
+| P2.6 | P3 | coverage | lifo/specific absent from load + equivalence scenarios | **fixed** acct-yojk.14 (`fcd2d6f`): method-coverage caveat in `results/POC-REPORT.md` |
+
+**Arena-leak follow-on (acct-yojk.15, `49cc894`).** The §6.1 codec body-read concluded "clean,"
+but the deeper acct-yojk.5/.15 trace found the committer's cleanup freed only the submission block,
+not the lines block — leaking ~1 arena block per committed submission (outstanding count never
+returned to 0). Fixed by freeing the lines blob and tracking its offset on `StagingEntry`
+(`line_offset`). This is the one correctness bug the audit's interface-level §6.1 read missed and
+the body-read caught — recorded here so the index isn't read as "§6.1 had no issues."
+
+**Reconciliation (acct-gd3g, post-follow-up):** all six P2.x and the §2 triplication are resolved
+under epic `acct-yojk` (15/15 closed). One newly-found divergence — two stale `committer.rs`
+comments (module header + `Poisoned` variant doc) still list "UNIQUE survived dedup" as a *direct*
+poison cause, contradicting the acct-yojk.9 re-drive — is filed as a follow-up (code-comment edit,
+not patched inline per the gd3g docs-only constraint).

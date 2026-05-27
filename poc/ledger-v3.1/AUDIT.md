@@ -4,6 +4,12 @@ Pass 1: design-vs-impl coherence + a quality survey across the four crates.
 Pass 2 (deep correctness walk on the routed/direct hot paths + R1–R7 + the unsafe
 shmem core) lives in `AUDIT-PASS2.md`.
 
+> **Status (acct-gd3g reconciliation).** This is the assess-only, point-in-time review (4 crates
+> at the time; a 5th, `ledger-spi-common`, was extracted by the D5.1 fix). Every fix-needed finding
+> has since been resolved under epic `acct-yojk` (15/15 closed) — see the per-finding **Resolution**
+> column in the findings index. The prose below is preserved as the as-assessed state; it is not
+> corrected in place.
+
 Scope: `poc/ledger-v3.1/` — `ledger-core` (~1.3k LOC), `ledger-direct-c` (~0.8k),
 `ledger-routed-c` (~5.5k), `ledger-harness` (~3.0k). Spec: `poc/design_research/design-v3.1.md`
 (worktree copy, authoritative). Severity: **P1** correctness/blocking · **P2** real but
@@ -292,23 +298,30 @@ per-submission `snapshot.clone()` allocation note).
 
 ## Findings index
 
-| ID | Sev | Verdict | Title | Anchor |
-|----|-----|---------|-------|--------|
-| D1.1 | P3 | divergence | SPI JSONB vs §4 ARRAY-of-composite | submit.rs:66 / enqueue.rs:51 |
-| D1.2 | P3 | divergence | `variance_account` added to line tuple | plan.rs:87 |
-| D1.3 | P3 | divergence | `coalesce_aggregates` unspec'd (acct-036x) | plan.rs:169 |
-| D1.4 | P3 | divergence | harness distinct-pool-per-submission limitation | workload.rs:79 |
-| D1.5 | P3 | divergence | harness `standard_cost` seeding (acct-0z5m) | pool_universe.rs |
-| D3.1 | P3 | divergence | no `qty>=0` CHECK on pool_state (code invariant) | 0003_ledger_tables.up.sql:27 |
-| D3.2 | P3 | divergence | specific K=1 not schema-enforced | specific.rs:10 |
-| D4.1 | P2 | dead/hygiene | stale Path B / design-v3 / PoolSeqTable / tm09 refs | shmem.rs / recovery.rs / enqueue.rs |
-| D4.2 | P3 | clean | greenfield-comment + time-estimate scrub passed | — |
-| D5.1 | P2 | divergence | triplicated pool_lock/hydration/bulk_write copies | both `-c` crates |
-| D5.2 | P3 | clean | v3.1 naming otherwise consistent | — |
-| D6.1 | P2 | fix-needed | no property test for `ledger_enqueue_trx_c` | ledger-routed-c/tests/ |
-| D6.2 | P3 | divergence | no shared `assert_invariants_hold` harness | tests/common/mod.rs |
-| D7.1 | P3 | dead | `committer_lease_ms` GUC + getter unused | lib.rs:54,79 |
-| D8.1 | P2 | dead | 13 dead shmem counter fields (tm09 / stage / audit / order-sensitive) | shmem.rs:156,215-218,266-283 |
+| ID | Sev | Verdict | Title | Resolution (epic `acct-yojk`) |
+|----|-----|---------|-------|-------------------------------|
+| D1.1 | P3 | divergence | SPI JSONB vs §4 ARRAY-of-composite | doc-patched §4 + §15 (audit commit `6ee51c0`); JSONB is the chosen wire shape, no code change |
+| D1.2 | P3 | divergence | `variance_account` added to line tuple | doc-patched §4 + §15 (`6ee51c0`); correct gap-fill, kept |
+| D1.3 | P3 | divergence | `coalesce_aggregates` unspec'd (acct-036x) | doc-patched §5.1/§8/§15 (`6ee51c0`); behavior already in code (acct-036x) |
+| D1.4 | P3 | divergence | harness distinct-pool-per-submission limitation | doc-patched README + §15 (`6ee51c0`); harness convention, no code change |
+| D1.5 | P3 | divergence | harness `standard_cost` seeding (acct-0z5m) | doc-patched §15 (`6ee51c0`); behavior already in code (acct-0z5m) |
+| D3.1 | P3 | divergence | no `qty>=0` CHECK on pool_state (code invariant) | **fixed** acct-yojk.6 (`69d5595`): `CHECK (layer_id <> 0 OR qty >= 0)` on pool_state (migration `0006`); §15 updated |
+| D3.2 | P3 | divergence | specific K=1 not schema-enforced | **fixed** acct-yojk.7 (`239e141`): `LedgerError::SpecificPoolOccupied` rejects a 2nd receipt to a specific pool |
+| D4.1 | P2 | dead/hygiene | stale Path B / design-v3 / PoolSeqTable / tm09 refs | **fixed** acct-yojk.1 (`d891a9a`): de-Path-B'd the routed crate (headers + scattered refs → design-v3.1 / §6.x / acct-2ttr.*) |
+| D4.2 | P3 | clean | greenfield-comment + time-estimate scrub passed | no action |
+| D5.1 | P2 | divergence | triplicated pool_lock/hydration/bulk_write copies | **fixed** acct-yojk.2 (`9e6cbc0`): extracted `ledger-spi-common` rlib (pool_lock + hydration + bulk_write + line_type), depended on by both `-c` crates |
+| D5.2 | P3 | clean | v3.1 naming otherwise consistent | no action |
+| D6.1 | P2 | fix-needed | no property test for `ledger_enqueue_trx_c` | **fixed** acct-yojk.3 (`19fe35a`): `property_ledger_enqueue_trx_c.rs` (random multi-caller workloads vs §11.1 equivalence) |
+| D6.2 | P3 | divergence | no shared `assert_invariants_hold` harness | **fixed** acct-yojk.8 (`2ae2473`): shared `assert_aggregate_method_invariants` (I1/I2/I4/I5/I7) |
+| D7.1 | P3 | dead | `committer_lease_ms` GUC + getter unused | **fixed** acct-yojk.1 (`d891a9a`): GUC + getter removed (de-Path-B) |
+| D8.1 | P2 | dead | 13 dead shmem counter fields (tm09 / stage / audit / order-sensitive) | **fixed** acct-yojk.1 (`d891a9a`): the 13 fields + stale-comment blocks deleted (de-Path-B) |
 
-P1 = 0 · P2 = 4 (D4.1, D5.1, D6.1, D8.1) · P3 = 11. D4.1 + D7.1 + D8.1 share one root cause
-(copy-adapt from Path B) and one fix ("de-Path-B the routed crate").
+P1 = 0 · P2 = 4 (D4.1, D5.1, D6.1, D8.1) · P3 = 11. D4.1 + D7.1 + D8.1 shared one root cause
+(copy-adapt from Path B) and one fix — closed together as "de-Path-B the routed crate"
+(acct-yojk.1).
+
+**Reconciliation (acct-gd3g, post-follow-up):** every fix-needed finding above is resolved — the
+four P2s and D3.1/D3.2/D6.2 fixed in code under epic `acct-yojk` (15/15 closed), the five P3 D1.x
+divergences folded into the docs by the audit commit itself. The Pass-2 findings (P2.1–P2.6) and
+the arena-leak bug found during the acct-yojk.5 body-read (fixed in acct-yojk.15, `49cc894`) are
+reconciled in `AUDIT-PASS2.md`. No finding left stale.

@@ -236,8 +236,10 @@ not a correctness defect. Authoritative cost reconciliation is deferred (§13).
   per-pool aggregate mutations (the routed committer was always unaffected). The harness generates
   distinct pools per submission, so it did not affect this run; noted for completeness.
 - **Code review**: a post-build coherence + quality audit (`../AUDIT.md`, `../AUDIT-PASS2.md`)
-  found no P1 issues; the open follow-ups are cleanup (de-Path-B the routed crate; shared SPI-common
-  crate; routed property test), none of which affect these measurements.
+  found no P1 issues. Its follow-ups have since shipped under epic `acct-yojk` (15/15): de-Path-B
+  the routed crate, the shared `ledger-spi-common` crate, a routed property test, a `pool_state`
+  `qty >= 0` CHECK, the specific-K=1 guard, Pass-2 hardening, and an arena-leak fix — none of which
+  affect these measurements (the harness path was already correct).
 - **Recalc/close, negative inventory, multi-currency, effective-dated standard costs, period close
   (§13)** remain deliberately out of scope. This PoC validates the *hot-path* claims only.
 

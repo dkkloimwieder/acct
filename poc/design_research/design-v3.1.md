@@ -630,7 +630,9 @@ Pool of BGWorkers (default 4). Each:
 4. Check pg_xact_status for each submission's caller user_tx_xid. `pg_xact_status(xid)` is a PG system function that returns `'committed'`, `'aborted'`, or `'in progress'` for a given transaction id; it reads from PG's clog (transaction commit log, persistent and always available — independent of `track_commit_timestamp`):
    - 'committed': keep.
    - 'aborted': drop the submission from the batch (no trx will be created for it).
-   - 'in_progress': eject (CAS staging entry back to `pending`, increment eject_count, store last_eject_at_ns, exclude). The cooldown prevents tight cycling.
+   - 'in progress': eject (CAS staging entry back to `pending`, increment eject_count, store last_eject_at_ns, exclude). The cooldown prevents tight cycling.
+   - *no status returned* (NULL — e.g. the xid predates clog truncation): treat as Unknown and keep (optimistic, bounded by the caller-tx eject timeout).
+   - *any other, unrecognized status string*: treat as not-yet-committed — emit a WARNING and eject (never keep). This defends against a future PG wording change silently reclassifying an in-progress caller as keep-able. (acct-yojk.10: `CallerTxStatus::Unrecognized`, distinct from the NULL → Unknown case.)
 
 5. **Pre-flight dedup against trx.** Bulk-read existing trx rows matching the batch's (trx_type, source_id) pairs:
    ```sql
@@ -1122,11 +1124,17 @@ AUDIT docs; this section is the spec-side pointer.
 - **Harness seeds `standard_cost`** (§10.4, AUDIT D1.5): the pool seeder must populate
   `standard_cost` for every std-method / standard-basis pool, else those pools abort with
   MissingStandardCost and confound mixed-method scenarios. (acct-0z5m.)
-- **No `qty >= 0` CHECK on `pool_state`** (§2.2/§3.6, AUDIT D3.1): no-negative-inventory is a
-  `ledger-core` code invariant, not a schema constraint.
+- **`qty >= 0` CHECK on `pool_state`** (§2.2/§3.6, AUDIT D3.1): no-negative-inventory began as a
+  `ledger-core`-only code invariant; migration `0006` (acct-yojk.6) added
+  `CHECK (layer_id <> 0 OR qty >= 0)` as a schema-level defense-in-depth backstop on the aggregate
+  row (the constraint is scoped to `layer_id = 0` so it never constrains strict-method layer rows,
+  which Path C does not materialize on the hot path).
 
-Open follow-ups the review filed (cleanup, not spec changes): de-Path-B the routed crate (stale
-`design-v3`/Path B references + 13 dead `tm09`/stage/audit shmem counters + the dead
-`committer_lease_ms` GUC — AUDIT D4.1/D7.1/D8.1); extract a shared SPI-common crate for the
-triplicated `pool_lock`/`hydration`/`bulk_write` (AUDIT D5.1); add a routed-flavor property test
-(AUDIT D6.1).
+Follow-ups the review filed have all shipped under epic `acct-yojk` (assess-only review → fix
+phase): de-Path-B the routed crate (removed the stale `design-v3`/Path B references, the 13 dead
+`tm09`/stage/audit shmem counters, and the dead `committer_lease_ms` GUC — AUDIT D4.1/D7.1/D8.1,
+acct-yojk.1); extracted the shared `ledger-spi-common` crate for the previously-triplicated
+`pool_lock`/`hydration`/`bulk_write` (AUDIT D5.1, acct-yojk.2); added a routed-flavor property test
+(AUDIT D6.1, acct-yojk.3); guarded specific K=1 (AUDIT D3.2, acct-yojk.7); plus the Pass-2 hardening
+(re-drive on a UNIQUE that survives dedup — §6.8, acct-yojk.9; the `Unrecognized` caller-tx status —
+§6.4, acct-yojk.10) and an arena-leak fix found during the deep body-read (acct-yojk.15).

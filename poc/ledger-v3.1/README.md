@@ -146,6 +146,7 @@ ledger-harness equivalence --scenario s7 --callers 8 --submissions-per-caller 50
 
 ## Crates
 - `ledger-core` — pure Rust, no pgrx: per-method state transitions + provisional dispatch (§8). ✓
+- `ledger-spi-common` — pure-rlib shared SPI primitives (`pool_lock` / `hydration` / `bulk_write` / `line_type`) compiled into both `-c` extensions, so a lock-ordering / hydration / `pool_state`-column change lands in both flavors at once (extracted by `acct-yojk.2`). ✓
 - `ledger-direct-c` — pgrx extension: `ledger_submit_trx_c` (§5). ✓
 - `ledger-routed-c` — pgrx extension: `ledger_enqueue_trx_c` + shmem (§6.1/§6.2) + router (§6.3) + committer (§6.4) + recovery (§6.5) + SQL error handling (§6.8). ✓ (P3.4)
 - `ledger-harness` — multi-session measurement binary (§10). ✓ (P4)
@@ -175,11 +176,17 @@ audit-field provenance (R7), memory ordering on the shmem atomics, recovery, dro
 (§14.2), the §6.7 collapse, and the arena allocator are all sound; R1/R3/R5 are vacuous for
 Path C's single-class pool model.
 
-The main blemish is copy-adapt residue in `ledger-routed-c` (stale "Path B / design-v3"
-references, 13 dead `tm09`/per-stage/audit shmem counters, the dead `committer_lease_ms` GUC).
-Follow-up cleanup issues filed (not yet done — assess-only review): de-Path-B the routed crate
-(AUDIT D4.1/D7.1/D8.1); extract a shared SPI-common crate for the triplicated
-`pool_lock`/`hydration`/`bulk_write` (D5.1); add a routed-flavor property test (D6.1).
+The main blemish the review flagged was copy-adapt residue in `ledger-routed-c` (stale "Path B /
+design-v3" references, 13 dead `tm09`/per-stage/audit shmem counters, the dead `committer_lease_ms`
+GUC). **All follow-ups have since shipped under epic `acct-yojk` (15/15 closed):** de-Path-B'd the
+routed crate (AUDIT D4.1/D7.1/D8.1); extracted the shared `ledger-spi-common` crate for the
+triplicated `pool_lock`/`hydration`/`bulk_write` (D5.1); added `property_ledger_enqueue_trx_c.rs`
+(D6.1); added a `CHECK (layer_id <> 0 OR qty >= 0)` on `pool_state` (D3.1, migration `0006`); guarded
+specific K=1 (D3.2); plus Pass-2 hardening — re-drive on a UNIQUE that survives dedup (P2.1),
+defensive `Unrecognized` caller-tx handling (P2.2), `#[cfg(feature = "test_hooks")]`-gating of the
+test-injection reads (P2.3) — and a fix for an arena leak (~1 block/committed submission) found
+during the deep body-read (acct-yojk.15). The AUDIT.md / AUDIT-PASS2.md findings indexes carry the
+per-finding resolution (reconciled under `acct-gd3g`).
 
 ## Deliberately omitted (design-v3.1 §13)
 Recalc/close (authoritative FIFO/LIFO reconciliation), negative inventory, multi-currency,
