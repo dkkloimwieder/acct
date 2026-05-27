@@ -36,12 +36,16 @@
 //! in a nested subtransaction. A transient SQLSTATE (40P01 deadlock / 40001
 //! serialization) rolls the subtx back and retries with exponential backoff (up
 //! to MAX_DEADLOCK_RETRIES) — the pre-flight dedup catches anything other
-//! committers finished meanwhile. A non-retryable SQLSTATE (UNIQUE survived
-//! dedup, check / not-null, …), or exhausting the retry budget, POISONs the
-//! commit_group: its CQ entry moves to the terminal valid==4 dead-letter state
-//! and its submissions are lost. Committer-death recovery itself is the router
-//! boot sweep's job (router.rs §6.5 Phase 2); this committer's pre-flight dedup
-//! is the recovery source of truth when a reclaimed group is reprocessed.
+//! committers finished meanwhile. A 23505 that survived pre-flight dedup (a racer
+//! committed one of this group's keys between our dedup and our write) re-runs
+//! dedup against `trx`, drops the now-visible offender, and re-drives the rest of
+//! the group. A non-retryable SQLSTATE (check / not-null / disk-full, …),
+//! exhausting the retry budget, or a UNIQUE re-drive that resolves no offender
+//! POISONs the commit_group: its CQ entry moves to the terminal valid==4
+//! dead-letter state and its submissions are lost. Committer-death recovery itself
+//! is the router boot sweep's job (router.rs §6.5 Phase 2); this committer's
+//! pre-flight dedup is the recovery source of truth when a reclaimed group is
+//! reprocessed.
 
 #![allow(dead_code)]
 
@@ -249,9 +253,11 @@ pub(crate) enum ProcessOutcome {
         message: String,
         staging_indices: Vec<u32>,
     },
-    /// Terminal: a non-retryable SQL error (UNIQUE survived dedup, NOT-NULL,
-    /// check, disk-full, …) or a deadlock that exhausted MAX_DEADLOCK_RETRIES.
-    /// The CQ entry is moved to valid==4 (dead-letter); submissions are lost.
+    /// Terminal: a non-retryable SQL error (NOT-NULL, check, disk-full, …), a
+    /// deadlock that exhausted MAX_DEADLOCK_RETRIES, or a UNIQUE that survived
+    /// dedup with no resolvable offender to re-drive without (a resolvable one is
+    /// `DuplicateRace`, not terminal). The CQ entry is moved to valid==4
+    /// (dead-letter); submissions are lost.
     Poisoned {
         message: String,
         staging_indices: Vec<u32>,
