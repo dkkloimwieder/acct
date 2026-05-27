@@ -227,6 +227,10 @@ not a correctness defect. Authoritative cost reconciliation is deferred (§13).
   `acct-0z5m`** (commit `9b6e6b5`): the seeder now populates `standard_cost` for std/standard-basis
   pools, so a re-measurement of S3/S4 would be unconfounded — the numbers above are an accurate
   *pre-fix* snapshot, not a Path C limitation. (Re-measurement not yet folded in.)
+- **Method coverage**: scenarios S1–S8 and `MethodMix::Mixed` (50/30/20 fifo/wac/std) drive only
+  **fifo, wac, and std** as primary methods (faithful to §10.6); **lifo and specific are not exercised
+  by any load or equivalence run** here — they are covered only by `ledger-core` unit/property tests.
+  The `--method-mix all-lifo` / `all-specific` CLI variants exist but are outside the canonical set.
 - **`acct-036x`** (**closed**, commit `d4c2c5c`): `ledger_submit_trx_c` (direct) emits one aggregate
   UPSERT per line, so a single submission must touch *distinct* pools; `ledger-core` now coalesces
   per-pool aggregate mutations (the routed committer was always unaffected). The harness generates
