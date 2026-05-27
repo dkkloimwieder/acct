@@ -68,6 +68,14 @@ const STD_COST: i64 = 50;
 /// A depletion larger than any reachable balance → always dropped, in any order,
 /// by any committer. Exercises drop-and-continue without making qty order-sensitive.
 const POISON_QTY: i64 = 2_000_000;
+/// Replays per case for the determinism property. A fixed enqueue sequence,
+/// re-run from a clean DB, must land byte-identical pool_state AND trx_line
+/// content every time. This is the property that would break if the committer
+/// ever processed a pool's submissions in any order other than submission_id
+/// (e.g. pool-ascending to optimize lock acquisition): the order-independent
+/// aggregate qty would still match, but the running-average-derived provisional
+/// unit_costs on trx_line would silently change.
+const REPLAYS: usize = 3;
 
 #[derive(Clone, Debug)]
 enum Op {
@@ -265,4 +273,182 @@ async fn staging_inflight(pool: &PgPool) -> i64 {
     .fetch_one(pool)
     .await
     .expect("staging inflight count")
+}
+
+// ── Replay-determinism (acct-j7so) ──────────────────────────────────
+//
+// E1 (above) proves the *qty* is order-independent. This proves the rest of the
+// final state is *replay*-deterministic: a fixed mixed receipt+depletion enqueue
+// sequence, drained from a clean DB N times, lands identical pool_state AND
+// trx_line content (per-line provisional unit_cost) every run. Where the qty
+// check is blind — running-average unit_cost is order-sensitive by construction
+// (§11.1; tracked for the value_sum fix as acct-0qps) — replay determinism still
+// holds, because the committer processes each commit_group in submission_id order
+// and a fixed sequence reproduces the same fold. A regression that reordered
+// processing (or let batching boundaries leak into the fold) would pass E1 and
+// fail here.
+
+/// The full provisional-cost content after a drain, in a deterministic order.
+/// Equality across replays IS the determinism assertion.
+#[derive(PartialEq, Eq, Debug)]
+struct LedgerSnapshot {
+    /// (pool_id, qty, unit_cost) for each seeded pool.
+    aggregates: Vec<(i64, i64, i64)>,
+    /// (source_id, pool_id, qty, unit_cost) for every recorded trx_line.
+    trx_lines: Vec<(i64, i64, i64, i64)>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn routed_mixed_sequence_replay_deterministic() {
+    // REPLAYS drains + a content read per case → run fewer cases than the qty
+    // test so total drain work stays in the property-test wall-time band.
+    let cases: u32 = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let replay_cases = (cases / REPLAYS as u32).max(8);
+
+    let pool = connect_pool().await;
+    let mut runner = TestRunner::new(Config { cases: replay_cases, ..Default::default() });
+
+    runner
+        .run(&case_strategy(), |case| {
+            let pool = pool.clone();
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(run_replay_case(pool, case.clone()))
+            });
+            result.map_err(TestCaseError::fail)
+        })
+        .expect("routed replay-determinism property failed");
+}
+
+async fn run_replay_case(pool: PgPool, case: Case) -> Result<(), String> {
+    // Build the enqueue sequence ONCE (fixtures are deterministic: pool_id i+1,
+    // accounts 1000/2000/3000 — matching seed_pool), then replay it.
+    let fixtures = synthetic_fixtures(case.n_pools);
+    let (stream, expected_trx) = build_stream(&case, &fixtures);
+
+    let mut snapshots: Vec<LedgerSnapshot> = Vec::with_capacity(REPLAYS);
+    for r in 0..REPLAYS {
+        let snap = run_and_capture(&pool, &case, &stream, expected_trx)
+            .await
+            .map_err(|e| format!("replay {r}: {e} (method={})", case.method))?;
+        snapshots.push(snap);
+    }
+
+    for (r, snap) in snapshots.iter().enumerate().skip(1) {
+        if *snap != snapshots[0] {
+            return Err(format!(
+                "replay {r} diverged from replay 0 (method={}, n_pools={}):\n  r0={:?}\n  r{r}={:?}",
+                case.method, case.n_pools, snapshots[0], snap
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fixtures matching what `seed_pool` produces (deterministic ids + constant
+/// accounts), so the enqueue stream can be built without a DB round-trip.
+fn synthetic_fixtures(n_pools: usize) -> Vec<Fixture> {
+    (1..=n_pools as i64)
+        .map(|id| Fixture {
+            sku_id: id,
+            loc_id: id,
+            pool_id: id,
+            inv_acct: 1000,
+            ap_acct: 2000,
+            var_acct: 3000,
+        })
+        .collect()
+}
+
+/// Interleave callers round-robin into one enqueue stream (same shape as
+/// `run_one_case`) and return it with the count of non-poison submissions
+/// (== expected trx rows; poison depletions are dropped at commit).
+fn build_stream(case: &Case, fixtures: &[Fixture]) -> (Vec<(&'static str, i64, Value)>, i64) {
+    let max_len = case.callers.iter().map(Vec::len).max().unwrap_or(0);
+    let mut stream = Vec::new();
+    let mut next_source = 1i64;
+    let mut expected_trx = 0i64;
+    for tick in 0..max_len {
+        for caller in &case.callers {
+            let Some(op) = caller.get(tick) else { continue };
+            let source_id = next_source;
+            next_source += 1;
+            match *op {
+                Op::Receipt { pool: pi, qty, cost } => {
+                    expected_trx += 1;
+                    stream.push((
+                        "po_receipt",
+                        source_id,
+                        receipt_line(&fixtures[pi], qty, cost, case.method),
+                    ));
+                }
+                Op::Deplete { pool: pi, qty } => {
+                    expected_trx += 1;
+                    stream.push((
+                        "transfer_shipment",
+                        source_id,
+                        depletion_line(&fixtures[pi], qty),
+                    ));
+                }
+                Op::Poison { pool: pi } => {
+                    stream.push((
+                        "transfer_shipment",
+                        source_id,
+                        depletion_line(&fixtures[pi], POISON_QTY),
+                    ));
+                }
+            }
+        }
+    }
+    (stream, expected_trx)
+}
+
+/// Reset + reseed + enqueue the stream + drain, then capture the full ledger
+/// content for cross-replay comparison.
+async fn run_and_capture(
+    pool: &PgPool,
+    case: &Case,
+    stream: &[(&'static str, i64, Value)],
+    expected_trx: i64,
+) -> Result<LedgerSnapshot, String> {
+    reset_state(pool).await;
+    for p in 0..case.n_pools {
+        let id = (p + 1) as i64;
+        let f = seed_pool(pool, id, id, id, case.method, "running_avg").await;
+        if case.method == "std" {
+            seed_standard_cost(pool, f.sku_id, f.loc_id, STD_COST).await;
+        }
+        seed_aggregate(pool, f.pool_id, SEED_QTY, SEED_COST).await;
+    }
+    for (trx_type, source_id, line) in stream {
+        enqueue(pool, trx_type, *source_id, vec![line.clone()])
+            .await
+            .map_err(|e| format!("enqueue source_id={source_id}: {e}"))?;
+    }
+    await_quiescent(pool, expected_trx).await?;
+
+    let mut aggregates = Vec::with_capacity(case.n_pools);
+    for p in 0..case.n_pools {
+        let pid = (p + 1) as i64;
+        let (q, u) = aggregate(pool, pid).await.unwrap_or((0, 0));
+        aggregates.push((pid, q, u));
+    }
+    let trx_lines = read_trx_line_content(pool).await;
+    Ok(LedgerSnapshot { aggregates, trx_lines })
+}
+
+/// Every trx_line's (source_id, pool_id, qty, unit_cost) in a deterministic
+/// order — the per-line provisional costs whose determinism we assert.
+async fn read_trx_line_content(pool: &PgPool) -> Vec<(i64, i64, i64, i64)> {
+    sqlx::query_as(
+        "SELECT t.source_id, tl.pool_id, tl.qty, tl.unit_cost \
+           FROM trx_line tl JOIN trx t ON t.id = tl.trx_id \
+          ORDER BY t.source_id, tl.pool_id, tl.qty, tl.unit_cost",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read trx_line content")
 }
