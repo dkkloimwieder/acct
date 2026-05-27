@@ -20,7 +20,9 @@ use sqlx::PgPool;
 use tokio::sync::Barrier;
 
 use crate::cli::Mode;
-use crate::driver_common::{build_lines_json, cap_callers, run_prefix};
+use crate::driver_common::{
+    apply_multi_touch, build_lines_json, cap_callers, multi_touch_report, run_prefix,
+};
 use crate::measure::{take_snapshot, LatencyHistogram, MeasureCollector};
 use crate::pool_universe;
 use crate::report::{self, RunReport};
@@ -37,6 +39,9 @@ pub struct RunOptions {
     pub output: Option<PathBuf>,
     pub no_sampler: bool,
     pub max_callers: Option<usize>,
+    /// Multi-touch overlay (acct-34ce); None leaves the scenario's own setting.
+    pub multi_touch_pct: Option<u8>,
+    pub touch_dist: Option<crate::workload::TouchDistribution>,
 }
 
 const POSTED_AT: &str = "2026-05-25T12:00:00+00:00";
@@ -57,6 +62,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let mut spec = scenarios::by_id(&opts.scenario, universe)
         .ok_or_else(|| format!("unknown scenario '{}' (try s1..s8)", opts.scenario))?;
     cap_callers(&mut spec, opts.max_callers);
+    apply_multi_touch(&mut spec, opts.multi_touch_pct, opts.touch_dist);
     eprintln!(
         "scenario {} [{}]: {} (callers={}, batch_size={}, duration={:?})",
         spec.id, mode_label, spec.description, spec.callers,
@@ -150,7 +156,8 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         &sampler_report,
         sampler_dump_path,
         started_at,
-    );
+    )
+    .with_multi_touch(multi_touch_report(&spec.workload));
 
     report::write_to_path(&report, &output_path).map_err(|e| format!("write report: {e}"))?;
     println!(

@@ -4,6 +4,8 @@
 //!   OverlapMode  — how callers' submissions overlap on pool_ids (§10.2)
 //!   Complexity   — lines-per-submission size (§10.3)
 //!   deplete_pct  — fraction of lines that are depletions vs receipts
+//!   multi_touch  — fraction of submissions that touch the same pool more than
+//!                  once, shaped by a weighted TouchDistribution (acct-34ce)
 //!
 //! A depletion is a negative-qty line (ledger-core dispatches receipt/depletion
 //! on the SIGN of qty, not line_type — see provisional.rs / wac.rs). Depletions
@@ -51,6 +53,100 @@ pub struct LineParam {
     pub unit_cost: i64,
 }
 
+/// Weighted distribution over per-pool touch counts (acct-34ce).
+///
+/// A multi-touch submission is built by repeatedly opening a fresh distinct
+/// pool and drawing how many of its lines land on THAT pool from this
+/// distribution. `(touches, weight)` buckets: `touches` is the group size (1 =
+/// the pool appears once, 2 = twice, …); `weight` is its relative frequency.
+/// A realistic WO-completion mix puts most mass on 1 with a tail at 2–3 (the
+/// backflush + scrap + output shape), not a single synthetic worst-case.
+///
+/// `distinct()` (the default) is `[(1, 1)]` — every pool touched exactly once,
+/// reproducing the lock-hold-measurement distinct-pool generation.
+#[derive(Debug, Clone)]
+pub struct TouchDistribution {
+    /// `(touches >= 1, weight)`; at least one bucket with weight > 0.
+    buckets: Vec<(u32, u32)>,
+    total_weight: u64,
+}
+
+impl TouchDistribution {
+    /// The distinct-pool default: every pool touched exactly once.
+    pub fn distinct() -> Self {
+        Self { buckets: vec![(1, 1)], total_weight: 1 }
+    }
+
+    /// Build from `(touches, weight)` buckets. Errors if empty, if any
+    /// `touches < 1`, or if the total weight is 0.
+    pub fn weighted(buckets: Vec<(u32, u32)>) -> Result<Self, String> {
+        if buckets.is_empty() {
+            return Err("touch distribution must have at least one bucket".into());
+        }
+        if buckets.iter().any(|&(t, _)| t < 1) {
+            return Err("touch count must be >= 1".into());
+        }
+        let total_weight: u64 = buckets.iter().map(|&(_, w)| w as u64).sum();
+        if total_weight == 0 {
+            return Err("touch distribution total weight must be > 0".into());
+        }
+        Ok(Self { buckets, total_weight })
+    }
+
+    /// Parse the CLI form `"1:60,2:30,3:10"` (touches:weight, comma-separated).
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut buckets = Vec::new();
+        for tok in spec.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            let (t, w) = tok
+                .split_once(':')
+                .ok_or_else(|| format!("touch-dist token '{tok}' is not 'touches:weight'"))?;
+            let touches: u32 = t
+                .trim()
+                .parse()
+                .map_err(|_| format!("touch-dist touches '{t}' is not a number"))?;
+            let weight: u32 = w
+                .trim()
+                .parse()
+                .map_err(|_| format!("touch-dist weight '{w}' is not a number"))?;
+            buckets.push((touches, weight));
+        }
+        Self::weighted(buckets)
+    }
+
+    /// Draw a touch count, weighted by the bucket weights.
+    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> u32 {
+        let mut r = rng.random_range(0..self.total_weight);
+        for &(touches, weight) in &self.buckets {
+            let w = weight as u64;
+            if r < w {
+                return touches;
+            }
+            r -= w;
+        }
+        // total_weight > 0 guarantees the loop returns; fall back to the last.
+        self.buckets.last().map(|&(t, _)| t).unwrap_or(1)
+    }
+
+    /// Largest touch count any bucket can yield.
+    #[allow(dead_code)]
+    pub fn max_touches(&self) -> u32 {
+        self.buckets.iter().map(|&(t, _)| t).max().unwrap_or(1)
+    }
+
+    /// Render back to the `"touches:weight,…"` spec for report labeling.
+    pub fn spec_string(&self) -> String {
+        self.buckets
+            .iter()
+            .map(|&(t, w)| format!("{t}:{w}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 /// One workload spec. Holds a snapshot of the pool universe + shape axes.
 #[derive(Debug, Clone)]
 pub struct Workload {
@@ -61,6 +157,16 @@ pub struct Workload {
     /// 100 = all depletions). FIFO/LIFO depletion is the depth-sensitive
     /// operation Path C makes constant-time.
     pub deplete_pct: u8,
+    /// Percent of submissions eligible to touch the same pool more than once
+    /// (acct-34ce). 0 = every submission is distinct-pool (the lock-hold
+    /// measurement default); 100 = every submission draws its per-pool group
+    /// sizes from `touch_dist`. Exercises PlanResult::coalesce_aggregates under
+    /// load — the same-pool-twice path the distinct-pool generator never hits.
+    pub multi_touch_pct: u8,
+    /// Per-pool group-size distribution for multi-touch submissions. Only
+    /// consulted when a submission rolls multi-touch; `distinct()` (all mass on
+    /// 1) is a no-op even at `multi_touch_pct = 100`.
+    pub touch_dist: TouchDistribution,
     /// Informational — the scenario's advertised caller count.
     #[allow(dead_code)]
     pub caller_count: usize,
@@ -69,33 +175,29 @@ pub struct Workload {
 impl Workload {
     /// Generate one submission's worth of lines for `caller_id`.
     ///
-    /// Pools are DISTINCT within a submission: the SPI bulk-UPSERTs aggregate
-    /// rows keyed by (pool_id, layer_id=0), so listing the same pool twice in
-    /// one direct submission would make the UPSERT "affect a row a second time".
-    /// This matches §5.1 ("touched pool_ids ... dedup") and §10.3's "multiple
-    /// pools" framing. When the overlap mode can't surface enough distinct pools
-    /// (single-hot-pool Zipf, stripe_size=1), the submission shrinks to what's
-    /// available — Simple scenarios (1 line) are unaffected.
+    /// By default pools are DISTINCT within a submission: the SPI bulk-UPSERTs
+    /// aggregate rows keyed by (pool_id, layer_id=0), so listing the same pool
+    /// twice would make a naive UPSERT "affect a row a second time". This is the
+    /// §5.1 / §10.3 lock-hold-measurement shape. When `multi_touch_pct > 0` a
+    /// fraction of submissions instead repeat pools (group sizes drawn from
+    /// `touch_dist`), exercising PlanResult::coalesce_aggregates under load.
+    /// When the overlap mode can't surface enough distinct pools to open new
+    /// groups (single-hot-pool Zipf, stripe_size=1), the submission shrinks to
+    /// what's available — Simple scenarios (1 line) are always single-touch.
     pub fn next_lines<R: Rng + ?Sized>(&self, rng: &mut R, caller_id: usize) -> Vec<LineParam> {
         let n_lines = match self.complexity {
             Complexity::Simple => 1,
             Complexity::Medium => rng.random_range(2..=5),
             Complexity::Complex => rng.random_range(10..=20),
         };
-        let target = n_lines.min(self.universe.pool_ids.len());
 
-        let mut chosen: Vec<i64> = Vec::with_capacity(target);
-        let attempt_cap = target.saturating_mul(20).max(target);
-        let mut attempts = 0;
-        while chosen.len() < target && attempts < attempt_cap {
-            let pid = self.pick_pool(rng, caller_id);
-            if !chosen.contains(&pid) {
-                chosen.push(pid);
-            }
-            attempts += 1;
-        }
+        // multi_touch_pct gates eligibility; touch_dist shapes the repeats. The
+        // `&&` short-circuit means the default (pct=0) path draws no extra RNG,
+        // so distinct-pool generation is identical to a single-touch build.
+        let multi_touch =
+            self.multi_touch_pct > 0 && (rng.random_range(0..100) as u8) < self.multi_touch_pct;
 
-        chosen
+        self.pool_sequence(rng, caller_id, n_lines, multi_touch)
             .into_iter()
             .map(|pool_id| {
                 let deplete = (rng.random_range(0..100) as u8) < self.deplete_pct;
@@ -119,6 +221,45 @@ impl Workload {
                 }
             })
             .collect()
+    }
+
+    /// Build this submission's per-line pool sequence (one entry per line).
+    ///
+    /// Each group opens a FRESH distinct pool (via `pick_pool` + a not-yet-seen
+    /// check, so repetition is orthogonal to which pools the OverlapMode picks),
+    /// then places `touches` lines on it. Without multi-touch every group is a
+    /// single line, reproducing the distinct-pool set. With multi-touch the
+    /// group size is drawn from `touch_dist` and clamped to the lines still
+    /// needed, so the same pool legitimately appears 2–3× — the coalesce path.
+    fn pool_sequence<R: Rng + ?Sized>(
+        &self,
+        rng: &mut R,
+        caller_id: usize,
+        n_lines: usize,
+        multi_touch: bool,
+    ) -> Vec<i64> {
+        let mut started: Vec<i64> = Vec::new();
+        let mut seq: Vec<i64> = Vec::with_capacity(n_lines);
+        let attempt_cap = n_lines.saturating_mul(20).max(n_lines);
+        let mut attempts = 0;
+        while seq.len() < n_lines && attempts < attempt_cap {
+            attempts += 1;
+            let pid = self.pick_pool(rng, caller_id);
+            if started.contains(&pid) {
+                continue; // a fresh distinct pool opens each group
+            }
+            started.push(pid);
+            let remaining = n_lines - seq.len();
+            let touches = if multi_touch {
+                (self.touch_dist.sample(rng) as usize).clamp(1, remaining)
+            } else {
+                1
+            };
+            for _ in 0..touches {
+                seq.push(pid);
+            }
+        }
+        seq
     }
 
     fn pick_pool<R: Rng + ?Sized>(&self, rng: &mut R, caller_id: usize) -> i64 {
@@ -244,6 +385,8 @@ mod tests {
             overlap: OverlapMode::Uniform,
             complexity: Complexity::Complex,
             deplete_pct: 0,
+            multi_touch_pct: 0,
+            touch_dist: TouchDistribution::distinct(),
             caller_count: 4,
         };
         let mut rng = StdRng::seed_from_u64(3);
@@ -262,6 +405,8 @@ mod tests {
             overlap: OverlapMode::Uniform,
             complexity: Complexity::Simple,
             deplete_pct: 100,
+            multi_touch_pct: 0,
+            touch_dist: TouchDistribution::distinct(),
             caller_count: 4,
         };
         let mut rng = StdRng::seed_from_u64(4);
@@ -280,6 +425,8 @@ mod tests {
             overlap: OverlapMode::Zipf { exponent: 1.2 },
             complexity: Complexity::Complex,
             deplete_pct: 50,
+            multi_touch_pct: 0,
+            touch_dist: TouchDistribution::distinct(),
             caller_count: 4,
         };
         let mut rng = StdRng::seed_from_u64(9);
@@ -300,12 +447,114 @@ mod tests {
             overlap: OverlapMode::Uniform,
             complexity: Complexity::Complex,
             deplete_pct: 50,
+            multi_touch_pct: 0,
+            touch_dist: TouchDistribution::distinct(),
             caller_count: 4,
         };
         let mut rng = StdRng::seed_from_u64(5);
         for _ in 0..20 {
             let n = w.next_lines(&mut rng, 0).len();
             assert!((10..=20).contains(&n), "complex lines.len() = {n} outside [10,20]");
+        }
+    }
+
+    fn multi_touch_workload(n: usize, pct: u8, dist: TouchDistribution) -> Workload {
+        Workload {
+            universe: universe(n),
+            overlap: OverlapMode::Uniform,
+            complexity: Complexity::Complex,
+            deplete_pct: 0,
+            multi_touch_pct: pct,
+            touch_dist: dist,
+            caller_count: 4,
+        }
+    }
+
+    fn max_pool_multiplicity(lines: &[LineParam]) -> usize {
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for l in lines {
+            *counts.entry(l.pool_id).or_default() += 1;
+        }
+        counts.values().copied().max().unwrap_or(0)
+    }
+
+    #[test]
+    fn multi_touch_repeats_a_pool() {
+        // pct=100 + "always 2 touches" => every opened pool is hit twice.
+        let w = multi_touch_workload(50, 100, TouchDistribution::parse("2:1").unwrap());
+        let mut rng = StdRng::seed_from_u64(11);
+        for _ in 0..100 {
+            let lines = w.next_lines(&mut rng, 0);
+            assert!(
+                max_pool_multiplicity(&lines) >= 2,
+                "multi-touch submission must repeat a pool: {lines:?}"
+            );
+            // Complexity::Complex still bounds the total line count; the large
+            // universe leaves room to open every group as a fresh pool.
+            assert!((10..=20).contains(&lines.len()), "lines.len()={}", lines.len());
+        }
+    }
+
+    #[test]
+    fn multi_touch_zero_pct_stays_distinct() {
+        // Even with a repeat-heavy distribution, pct=0 gates multi-touch off.
+        let w = multi_touch_workload(50, 0, TouchDistribution::parse("2:1,3:1").unwrap());
+        let mut rng = StdRng::seed_from_u64(12);
+        for _ in 0..100 {
+            let lines = w.next_lines(&mut rng, 0);
+            assert_eq!(max_pool_multiplicity(&lines), 1, "pct=0 must stay distinct");
+        }
+    }
+
+    #[test]
+    fn multi_touch_mix_yields_both_distinct_and_repeated_pools() {
+        // A realistic mix (mostly 1, tail at 2-3) produces some single-touch and
+        // some repeated pools across a run — not a uniform worst case.
+        let w = multi_touch_workload(200, 100, TouchDistribution::parse("1:60,2:30,3:10").unwrap());
+        let mut rng = StdRng::seed_from_u64(13);
+        let mut saw_distinct_group = false;
+        let mut saw_repeat = false;
+        for _ in 0..200 {
+            let lines = w.next_lines(&mut rng, 0);
+            let mut counts: HashMap<i64, usize> = HashMap::new();
+            for l in &lines {
+                *counts.entry(l.pool_id).or_default() += 1;
+            }
+            if counts.values().any(|&c| c == 1) {
+                saw_distinct_group = true;
+            }
+            if counts.values().any(|&c| c >= 2) {
+                saw_repeat = true;
+            }
+        }
+        assert!(saw_distinct_group, "expected some single-touch groups");
+        assert!(saw_repeat, "expected some repeated pools");
+    }
+
+    #[test]
+    fn touch_distribution_parse_round_trips() {
+        let d = TouchDistribution::parse("1:60,2:30,3:10").unwrap();
+        assert_eq!(d.spec_string(), "1:60,2:30,3:10");
+        assert_eq!(d.max_touches(), 3);
+    }
+
+    #[test]
+    fn touch_distribution_parse_rejects_malformed() {
+        assert!(TouchDistribution::parse("").is_err()); // no buckets
+        assert!(TouchDistribution::parse("0:5").is_err()); // touches < 1
+        assert!(TouchDistribution::parse("1:0").is_err()); // total weight 0
+        assert!(TouchDistribution::parse("2").is_err()); // missing ':'
+        assert!(TouchDistribution::parse("x:1").is_err()); // non-numeric touches
+    }
+
+    #[test]
+    fn touch_distribution_sample_respects_weights() {
+        let mut rng = StdRng::seed_from_u64(14);
+        let always_two = TouchDistribution::parse("2:1").unwrap();
+        let distinct = TouchDistribution::distinct();
+        for _ in 0..1_000 {
+            assert_eq!(always_two.sample(&mut rng), 2);
+            assert_eq!(distinct.sample(&mut rng), 1);
         }
     }
 }

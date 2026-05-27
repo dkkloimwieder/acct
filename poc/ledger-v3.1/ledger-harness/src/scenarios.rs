@@ -1,27 +1,31 @@
-//! Scenarios S1-S8 per design-v3.1 §10.6 (P4 acct-2ttr.8).
+//! Scenarios S1-S9 per design-v3.1 §10.6 (P4 acct-2ttr.8; S9 acct-34ce).
 //!
 //! Each `sN(PoolUniverse) -> ScenarioSpec` fills the workload axes + caller
 //! count + the pool depth the universe is EXPECTED to have been seeded to
 //! (`depth_hint`). `run` resolves --scenario sN here, then drives the spec.
 //!
-//! | id | callers | overlap          | complexity | method | deplete | depth
-//! |----|---------|------------------|------------|--------|---------|------
-//! | s1 | 10      | Uniform          | Simple     | WAC    | 0       | 0
-//! | s2 | 200     | Zipf(1.5)        | Simple     | WAC    | 0       | 0
-//! | s3 | 10      | Uniform          | Complex    | Mixed  | 0       | 0
-//! | s4 | 200     | Zipf(1.2)        | Complex    | Mixed  | 0       | 0
-//! | s5 | 1000    | single hot pool  | Simple     | FIFO   | 100     | 10
-//! | s6 | 1000    | Disjoint stripes | Simple     | FIFO   | 100     | 10
-//! | s7 | 1000    | Zipf(1.2)        | Simple     | FIFO   | 100     | 1000  ← deep
-//! | s8 | 1000    | Zipf(1.2)        | Complex    | FIFO   | 50      | 1000  ← deep
+//! | id | callers | overlap          | complexity | method | deplete | depth | multi-touch
+//! |----|---------|------------------|------------|--------|---------|-------|------------
+//! | s1 | 10      | Uniform          | Simple     | WAC    | 0       | 0     | —
+//! | s2 | 200     | Zipf(1.5)        | Simple     | WAC    | 0       | 0     | —
+//! | s3 | 10      | Uniform          | Complex    | Mixed  | 0       | 0     | —
+//! | s4 | 200     | Zipf(1.2)        | Complex    | Mixed  | 0       | 0     | —
+//! | s5 | 1000    | single hot pool  | Simple     | FIFO   | 100     | 10    | —
+//! | s6 | 1000    | Disjoint stripes | Simple     | FIFO   | 100     | 10    | —
+//! | s7 | 1000    | Zipf(1.2)        | Simple     | FIFO   | 100     | 1000  | — ← deep
+//! | s8 | 1000    | Zipf(1.2)        | Complex    | FIFO   | 50      | 1000  | — ← deep
+//! | s9 | 1000    | Zipf(1.2)        | Complex    | FIFO   | 50      | 1000  | 40% / 1:60,2:30,3:10 ← deep
 //!
 //! v3.1 adds S7/S8 (deep pools — Path C's home field, §11.2) over ledger-v3's
-//! S1-S6. S5-S8 deplete and therefore require pre-seeded aggregates
-//! (`seed-pools --depth`); S1-S4 are receipt-only and self-seed.
+//! S1-S6. S5-S9 deplete and therefore require pre-seeded aggregates
+//! (`seed-pools --depth`); S1-S4 are receipt-only and self-seed. S9 is S8 +
+//! multi-touch (acct-34ce): a head-to-head for the coalesce-under-load path.
+//! Any scenario can be made multi-touch ad hoc via `run --multi-touch-pct` +
+//! `--touch-dist`.
 
 use crate::cli::MethodMix;
 use crate::pool_universe::PoolUniverse;
-use crate::workload::{Complexity, OverlapMode, Workload};
+use crate::workload::{Complexity, OverlapMode, TouchDistribution, Workload};
 
 #[derive(Debug, Clone)]
 pub struct ScenarioSpec {
@@ -49,6 +53,7 @@ pub fn by_id(id: &str, universe: PoolUniverse) -> Option<ScenarioSpec> {
         "s6" => s6,
         "s7" => s7,
         "s8" => s8,
+        "s9" => s9,
         _ => return None,
     };
     Some(f(universe))
@@ -74,6 +79,8 @@ fn spec(
             overlap,
             complexity,
             deplete_pct,
+            multi_touch_pct: 0,
+            touch_dist: TouchDistribution::distinct(),
             caller_count: callers,
         },
         expected_method_mix: method,
@@ -133,6 +140,24 @@ pub fn s8(u: PoolUniverse) -> ScenarioSpec {
         1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 50, MethodMix::AllFifo, 1000)
 }
 
+/// S9 — WO-completion multi-touch mix (acct-34ce). S8's shape (1000 callers,
+/// zipf(1.2), complex deep-pool FIFO) with multi-touch ENABLED, so it is a
+/// head-to-head against s8: same axes, but ~40% of submissions touch one pool
+/// 2–3× (the backflush + scrap + output shape). Exercises
+/// PlanResult::coalesce_aggregates under load. A realistic mix, not a worst
+/// case — most groups stay single-touch (touch-dist 1:60,2:30,3:10).
+pub fn s9(u: PoolUniverse) -> ScenarioSpec {
+    let mut s = spec(
+        "s9",
+        "WO-completion multi-touch — s8 shape + ~40% same-pool 2-3x (coalesce under load), DEEP",
+        1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 50, MethodMix::AllFifo, 1000,
+    );
+    s.workload.multi_touch_pct = 40;
+    s.workload.touch_dist =
+        TouchDistribution::parse("1:60,2:30,3:10").expect("valid s9 touch distribution");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,8 +172,8 @@ mod tests {
     }
 
     #[test]
-    fn by_id_resolves_all_eight() {
-        for id in ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"] {
+    fn by_id_resolves_all_nine() {
+        for id in ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"] {
             let s = by_id(id, small_universe(10_000)).expect("resolves");
             assert_eq!(s.id, id);
             assert!(s.callers > 0);
@@ -171,7 +196,21 @@ mod tests {
         assert_eq!(s5(u.clone()).callers, 1000);
         assert_eq!(s6(u.clone()).callers, 1000);
         assert_eq!(s7(u.clone()).callers, 1000);
-        assert_eq!(s8(u).callers, 1000);
+        assert_eq!(s8(u.clone()).callers, 1000);
+        assert_eq!(s9(u).callers, 1000);
+    }
+
+    #[test]
+    fn s9_enables_multi_touch_and_s8_does_not() {
+        let u = small_universe(10_000);
+        // s8 (and every other canned scenario) is distinct-pool by default.
+        assert_eq!(s8(u.clone()).workload.multi_touch_pct, 0);
+        // s9 turns it on with a realistic mix (tail at 2-3, not worst case).
+        let s9 = s9(u);
+        assert_eq!(s9.workload.multi_touch_pct, 40);
+        assert_eq!(s9.workload.touch_dist.spec_string(), "1:60,2:30,3:10");
+        assert_eq!(s9.workload.touch_dist.max_touches(), 3);
+        assert_eq!(s9.depth_hint, 1000);
     }
 
     #[test]

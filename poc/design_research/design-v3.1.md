@@ -926,6 +926,9 @@ For the bake-off: cross-product of caller concurrency × overlap × complexity �
 - **S6**: Pathological — 1000 callers, fully disjoint FIFO pools, simple trxs, shallow pools. Direct-c should win (no contention, lower overhead than router round-trip).
 - **S7**: Heavy concurrency, Zipfian overlap, simple FIFO trxs, **deep pools**. **Path C's home field.** A strict-mode implementation in this regime would bottleneck on layer iteration (this is the architectural motivation for Path C; not directly measured in v3.1 since strict-mode implementation lives in v3). Direct Path C reduces lock-hold time per trx to aggregate-row work (each caller serializes through a microsecond-per-trx critical section, independent of pool depth). Routed Path C reduces serialization itself (1000 concurrent submissions become one commit_group with one aggregate update). Routed-c should overtake direct-c at high concurrency on overlapping pools.
 - **S8**: Heavy concurrency, Zipfian overlap, complex FIFO trxs (multi-line), deep pools. Production-realistic FIFO stress. Same hot-path properties as S7 with more complex per-trx work.
+- **S9**: S8's shape (1000 callers, Zipfian, complex deep-pool FIFO) with **multi-touch enabled** — a head-to-head against S8. ~40% of submissions touch one pool 2–3× (the WO-completion shape: backflush + scrap + output on one SKU/location), drawn from a weighted touch distribution (`1:60,2:30,3:10`) so the mix is realistic rather than a single synthetic worst case. Exercises `PlanResult::coalesce_aggregates` (§5.1, the keep-last collapse of same-pool aggregate mutations) under load, which S1–S8's distinct-pool generation never reaches.
+
+**Multi-touch generation (acct-34ce).** By default a submission's lines land on DISTINCT pools, keeping per-submission pool count unconfounded for lock-hold measurement (§5.1). Two orthogonal knobs relax this: `multi_touch_pct` (fraction of submissions eligible to repeat a pool) gates eligibility, and a weighted per-pool **touch distribution** (`touches:weight,…`) shapes the repeats. The generator opens a fresh distinct pool per group (so repetition is orthogonal to which pools the overlap mode picks) and places that group's drawn touch-count of lines on it. Both are parameterizable per run via `run --multi-touch-pct` / `--touch-dist`, overlaying any scenario; S9 is the canned realistic preset. The default (`multi_touch_pct = 0`) path is byte-identical to distinct-pool generation.
 
 (Recalc/close-saturation scenarios are deferred along with recalc/close, §13.)
 
@@ -1022,7 +1025,7 @@ Deliverable: routed flavor operational. 1000 concurrent ledger_enqueue_trx_c sub
 - Configurable concurrency, overlap distribution, complexity, method mix, pool depth (§10).
 - Pre-seeding harness for deep pools (direct SQL bulk insert into pool_state and trx_line per §10.5).
 - **Three submission modes** (§10.0): direct per-call, direct batched-per-caller (configurable batch size), and routed.
-- Drives all three modes through scenarios S1-S8.
+- Drives all three modes through scenarios S1-S9.
 - Records throughput, per-trx lock-hold time as a function of pool depth, fsync rate, WAL volume, committed trxs/sec.
 - Direct vs routed crossover measurement.
 
@@ -1161,9 +1164,12 @@ dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
   single submission touching a pool twice writes one `(pool_id, layer_id=0)` row (the direct
   `ON CONFLICT DO UPDATE` batch cannot touch a row twice). The routed committer reaches the same
   one-aggregate-per-pool shape via the §6.7 post-pass-snapshot reconstruction.
-- **Harness, distinct pools per submission** (§10.3): the workload generator emits distinct
-  pool_ids per submission for clean lock-hold measurement (same root cause as the coalesce above);
-  the coalesce path itself is covered by ledger-core / direct / routed correctness tests.
+- **Harness, distinct pools per submission** (§10.3, §10.6): the workload generator emits distinct
+  pool_ids per submission by default for clean lock-hold measurement (same root cause as the coalesce
+  above). The coalesce path's correctness is covered by ledger-core / direct / routed tests; an
+  **opt-in multi-touch mode** (acct-34ce — `run --multi-touch-pct` / `--touch-dist`, and the canned
+  S9 preset) additionally drives same-pool-twice submissions through both flavors under load. Default
+  stays distinct-pool.
 - **Harness seeds `standard_cost`** (§10.4): the pool seeder must populate `standard_cost` for
   every std-method / standard-basis pool, else those pools abort with MissingStandardCost and
   confound mixed-method scenarios.

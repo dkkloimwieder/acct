@@ -82,7 +82,21 @@ async fn main() -> std::process::ExitCode {
             seed_skus,
             seed_locations,
             seed_depth,
+            multi_touch_pct,
+            touch_dist,
         } => {
+            // Parse the multi-touch distribution overlay up front so a bad spec
+            // fails before any reseed/load work (acct-34ce).
+            let touch_dist = match touch_dist {
+                Some(s) => match workload::TouchDistribution::parse(&s) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        eprintln!("--touch-dist parse failed: {e}");
+                        return std::process::ExitCode::from(1);
+                    }
+                },
+                None => None,
+            };
             if let Some(mix) = method_mix {
                 let pool = match connect(&args.dsn, 8).await {
                     Ok(p) => p,
@@ -122,6 +136,8 @@ async fn main() -> std::process::ExitCode {
                         output,
                         no_sampler,
                         max_callers,
+                        multi_touch_pct,
+                        touch_dist,
                     })
                     .await
                 }
@@ -135,6 +151,8 @@ async fn main() -> std::process::ExitCode {
                         no_sampler,
                         max_callers,
                         drain_deadline: Duration::from_secs(30),
+                        multi_touch_pct,
+                        touch_dist,
                     })
                     .await
                 }

@@ -3,8 +3,9 @@
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
+use crate::report::MultiTouchReport;
 use crate::scenarios::ScenarioSpec;
-use crate::workload::LineParam;
+use crate::workload::{LineParam, TouchDistribution, Workload};
 
 /// Per-run, per-caller source_id namespace base. `run_prefix + caller_id*1e6 +
 /// tick` keeps the trx UNIQUE (trx_type, source_id) constraint from colliding
@@ -28,6 +29,41 @@ pub fn cap_callers(spec: &mut ScenarioSpec, max_callers: Option<usize>) {
             spec.workload.caller_count = capped;
         }
     }
+}
+
+/// Overlay the optional `run --multi-touch-pct` / `--touch-dist` knobs onto a
+/// resolved scenario's workload (acct-34ce). Either overrides the scenario's
+/// own value (the touch distribution is pre-parsed by the caller); logging when
+/// an override changes the scenario's setting. With both unset the workload is
+/// untouched — the scenario's default (distinct-pool for s1-s8, the preset mix
+/// for s9) stands.
+pub fn apply_multi_touch(
+    spec: &mut ScenarioSpec,
+    multi_touch_pct: Option<u8>,
+    touch_dist: Option<TouchDistribution>,
+) {
+    if let Some(pct) = multi_touch_pct {
+        if pct != spec.workload.multi_touch_pct {
+            eprintln!(
+                "scenario {}: multi_touch_pct {} -> {} via --multi-touch-pct",
+                spec.id, spec.workload.multi_touch_pct, pct
+            );
+        }
+        spec.workload.multi_touch_pct = pct;
+    }
+    if let Some(dist) = touch_dist {
+        eprintln!("scenario {}: touch_dist -> {} via --touch-dist", spec.id, dist.spec_string());
+        spec.workload.touch_dist = dist;
+    }
+}
+
+/// Build the report's multi-touch block from a resolved workload — Some only
+/// when multi-touch is active, so distinct-pool runs record `multi_touch: null`.
+pub fn multi_touch_report(w: &Workload) -> Option<MultiTouchReport> {
+    (w.multi_touch_pct > 0).then(|| MultiTouchReport {
+        pct: w.multi_touch_pct,
+        touch_dist: w.touch_dist.spec_string(),
+    })
 }
 
 /// JSONB array shape expected by `ledger_submit_trx_c` / `ledger_enqueue_trx_c`.

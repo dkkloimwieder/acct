@@ -55,7 +55,7 @@ pub enum Cmd {
     },
     /// Drive a scenario in one submission mode and collect measurements.
     Run {
-        /// Scenario id (s1..s8 per §10.6).
+        /// Scenario id (s1..s9 per §10.6; s9 is the canned multi-touch mix).
         #[arg(long)]
         scenario: String,
         /// Submission mode (§10.0).
@@ -101,6 +101,18 @@ pub enum Cmd {
         /// Deep-seed depth applied during a --method-mix reseed.
         #[arg(long, default_value_t = 0)]
         seed_depth: usize,
+        /// Overlay multi-touch (same-pool-twice) generation onto ANY scenario
+        /// (acct-34ce): the percent of submissions eligible to touch one pool
+        /// more than once. Overrides the scenario's own value (s9 presets 40).
+        /// 0/unset keeps distinct-pool generation. Only multi-line (Medium/
+        /// Complex) submissions can repeat — Simple is always single-touch.
+        #[arg(long)]
+        multi_touch_pct: Option<u8>,
+        /// Overlay the per-pool group-size distribution for multi-touch
+        /// submissions, as `touches:weight,…` (e.g. `1:60,2:30,3:10`). Only
+        /// consulted when multi-touch is active. Overrides the scenario's value.
+        #[arg(long)]
+        touch_dist: Option<String>,
     },
     /// Drive direct-c and routed-c against an identical input sequence and diff
     /// the resulting pool_state aggregate qty (§11.1). Aggregate qty must match

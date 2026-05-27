@@ -80,6 +80,17 @@ pub struct RoutedReport {
     pub takeover_count: u64,
 }
 
+/// Multi-touch overlay parameters in effect for the run (acct-34ce). Null when
+/// the workload was distinct-pool (multi_touch_pct = 0), so every report
+/// self-documents whether it exercised the coalesce-under-load path.
+#[derive(Debug, Serialize)]
+pub struct MultiTouchReport {
+    /// Percent of submissions eligible to repeat a pool.
+    pub pct: u8,
+    /// Per-pool group-size distribution, `touches:weight,…`.
+    pub touch_dist: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RunReport {
     pub scenario: String,
@@ -87,6 +98,8 @@ pub struct RunReport {
     pub mode: String,
     /// Pool depth the universe was seeded to (§10.5); None if unspecified.
     pub pool_depth: Option<usize>,
+    /// Multi-touch overlay (acct-34ce); None for distinct-pool runs.
+    pub multi_touch: Option<MultiTouchReport>,
     pub duration_secs: f64,
     pub callers: usize,
     pub throughput_trx_per_sec: f64,
@@ -125,6 +138,7 @@ impl RunReport {
             scenario: scenario.into(),
             mode: mode.into(),
             pool_depth,
+            multi_touch: None,
             duration_secs,
             callers,
             throughput_trx_per_sec: if duration_secs > 0.0 {
@@ -169,6 +183,7 @@ impl RunReport {
             scenario: scenario.into(),
             mode: "routed".into(),
             pool_depth,
+            multi_touch: None,
             duration_secs,
             callers,
             throughput_trx_per_sec: if duration_secs > 0.0 {
@@ -188,6 +203,13 @@ impl RunReport {
             sampler_report_path,
             started_at,
         }
+    }
+
+    /// Attach the multi-touch overlay parameters (acct-34ce). Pass None for a
+    /// distinct-pool run.
+    pub fn with_multi_touch(mut self, mt: Option<MultiTouchReport>) -> Self {
+        self.multi_touch = mt;
+        self
     }
 }
 

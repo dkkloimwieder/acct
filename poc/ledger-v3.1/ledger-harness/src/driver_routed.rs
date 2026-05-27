@@ -26,7 +26,9 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Barrier;
 
-use crate::driver_common::{build_lines_json, cap_callers, run_prefix};
+use crate::driver_common::{
+    apply_multi_touch, build_lines_json, cap_callers, multi_touch_report, run_prefix,
+};
 use crate::measure::{take_snapshot, LatencyHistogram, MeasureCollector};
 use crate::report::{self, RoutedReport, RunReport};
 use crate::sampler::{print_sampler_enabled, PgLocksSampler};
@@ -42,6 +44,9 @@ pub struct RunOptions {
     pub max_callers: Option<usize>,
     /// Hard cap on the post-callers observer + drain wait.
     pub drain_deadline: Duration,
+    /// Multi-touch overlay (acct-34ce); None leaves the scenario's own setting.
+    pub multi_touch_pct: Option<u8>,
+    pub touch_dist: Option<crate::workload::TouchDistribution>,
 }
 
 type SubmissionMark = (i64, Instant);
@@ -63,6 +68,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let mut spec = scenarios::by_id(&opts.scenario, universe)
         .ok_or_else(|| format!("unknown scenario '{}' (try s1..s8)", opts.scenario))?;
     cap_callers(&mut spec, opts.max_callers);
+    apply_multi_touch(&mut spec, opts.multi_touch_pct, opts.touch_dist);
     eprintln!(
         "scenario {} [routed]: {} (callers={}, duration={:?})",
         spec.id, spec.description, spec.callers, opts.duration
@@ -209,7 +215,8 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         sampler_dump_path,
         started_at,
         routed_report,
-    );
+    )
+    .with_multi_touch(multi_touch_report(&spec.workload));
 
     report::write_to_path(&report, &output_path).map_err(|e| format!("write report: {e}"))?;
     let routed = report.routed.as_ref().expect("routed block populated");
