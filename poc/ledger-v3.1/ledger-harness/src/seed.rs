@@ -83,8 +83,8 @@ pub async fn deepen(pool: &PgPool, pool_ids: &[i64], depth: usize) -> Result<(),
                   FROM generate_series(1, $5::int) \
                 RETURNING id \
              ) \
-             INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost) \
-             SELECT $2, id, $3, $4 FROM ins",
+             INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) \
+             SELECT $2, id, $3, $4, $3 * $4 FROM ins",
         )
         .bind(trx_id)
         .bind(pool_id)
@@ -95,10 +95,10 @@ pub async fn deepen(pool: &PgPool, pool_ids: &[i64], depth: usize) -> Result<(),
         .await?;
 
         sqlx::query(
-            "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost) \
-             VALUES ($1, 0, $2, $3) \
+            "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) \
+             VALUES ($1, 0, $2, $3, $2 * $3) \
              ON CONFLICT (pool_id, layer_id) \
-             DO UPDATE SET qty = EXCLUDED.qty, unit_cost = EXCLUDED.unit_cost",
+             DO UPDATE SET qty = EXCLUDED.qty, unit_cost = EXCLUDED.unit_cost, value_sum = EXCLUDED.value_sum",
         )
         .bind(pool_id)
         .bind(agg_qty)

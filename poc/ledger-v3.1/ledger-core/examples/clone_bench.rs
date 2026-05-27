@@ -18,7 +18,7 @@ use ledger_core::snapshot::{PoolStateRow, Snapshot};
 fn build_snapshot(n_pools: i64) -> Snapshot {
     let mut s = Snapshot::default();
     for p in 1..=n_pools {
-        s.pools.insert(p, vec![PoolStateRow { layer_id: 0, qty: 1_000, unit_cost: 50 }]);
+        s.pools.insert(p, vec![PoolStateRow { layer_id: 0, qty: 1_000, unit_cost: 50, value_sum: 50_000 }]);
         s.method_of.insert(p, PoolMethod::Fifo);
         s.provisional_basis_of.insert(p, ProvisionalBasis::RunningAvg);
         s.sku_location_of.insert(p, (p, p));

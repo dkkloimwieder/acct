@@ -48,14 +48,14 @@ async fn deep_pool_depletion_touches_only_aggregate() {
     // Seed a deep pool directly: aggregate plus 1000 stale layer rows. A strict
     // FIFO impl would iterate these on depletion; Path C must not — it reads and
     // writes only layer_id = 0.
-    sqlx::query("INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost) VALUES ($1, 0, 5000, 100)")
+    sqlx::query("INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) VALUES ($1, 0, 5000, 100, 500000)")
         .bind(f.pool_id)
         .execute(&pool)
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost) \
-         SELECT $1, g, 5, 100 FROM generate_series(1, 1000) AS g",
+        "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) \
+         SELECT $1, g, 5, 100, 500 FROM generate_series(1, 1000) AS g",
     )
     .bind(f.pool_id)
     .execute(&pool)

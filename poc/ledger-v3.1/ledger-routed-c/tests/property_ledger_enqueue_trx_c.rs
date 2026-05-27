@@ -54,6 +54,7 @@
 mod common;
 
 use common::*;
+use ledger_core::banker_div;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use serde_json::{json, Value};
@@ -451,4 +452,121 @@ async fn read_trx_line_content(pool: &PgPool) -> Vec<(i64, i64, i64, i64)> {
     .fetch_all(pool)
     .await
     .expect("read trx_line content")
+}
+
+// ── Receipts-only value-weighted average (acct-0qps) ────────────────
+//
+// With value_sum storage, a receipts-only pool's final aggregate unit_cost is
+// EXACTLY banker_div(Σ qty*cost, Σ qty) — derived once from the exact accumulated
+// book value, never re-rounded incrementally off the prior average — and so it
+// is ORDER-INDEPENDENT across any interleaving of the receipts. This is the
+// property the design team's review asked for (and that the pre-value_sum
+// incremental running average could not satisfy). STD is excluded: it records
+// the standard, not the value-weighted average of actual costs. (Mixed
+// receipt+depletion sequences stay order-sensitive — covered by replay
+// determinism above, not here.)
+
+#[derive(Clone, Debug)]
+struct ReceiptCase {
+    method: &'static str,
+    n_pools: usize,
+    /// Per caller, a stream of (pool_idx, qty, cost) receipts.
+    callers: Vec<Vec<(usize, i64, i64)>>,
+}
+
+fn receipt_case_strategy() -> impl Strategy<Value = ReceiptCase> {
+    // Running-average methods only.
+    let method = prop_oneof![Just("fifo"), Just("lifo"), Just("wac")];
+    (method, 1usize..=3)
+        .prop_flat_map(|(method, n_pools)| {
+            let one = (0..n_pools, 1i64..=50, 1i64..=200);
+            let callers = prop::collection::vec(prop::collection::vec(one, 1..=5), 2..=3);
+            (Just(method), Just(n_pools), callers)
+        })
+        .prop_map(|(method, n_pools, callers)| ReceiptCase { method, n_pools, callers })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn routed_receipts_only_unit_cost_is_value_weighted() {
+    let cases: u32 = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+
+    let pool = connect_pool().await;
+    let mut runner = TestRunner::new(Config { cases, ..Default::default() });
+
+    runner
+        .run(&receipt_case_strategy(), |case| {
+            let pool = pool.clone();
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(run_receipt_case(pool, case.clone()))
+            });
+            result.map_err(TestCaseError::fail)
+        })
+        .expect("routed receipts-only value-weighted property failed");
+}
+
+async fn run_receipt_case(pool: PgPool, case: ReceiptCase) -> Result<(), String> {
+    reset_state(&pool).await;
+
+    // Seed each pool deep; the seed contributes SEED_QTY*SEED_COST to the exact
+    // expected book value. exp_value is i128 — the Σ qty*cost can exceed i64
+    // intermediate range only in pathological inputs, but i128 keeps the model
+    // honest regardless.
+    let mut fixtures = Vec::with_capacity(case.n_pools);
+    let mut exp_value: Vec<i128> = vec![(SEED_QTY as i128) * (SEED_COST as i128); case.n_pools];
+    let mut exp_qty: Vec<i64> = vec![SEED_QTY; case.n_pools];
+    for p in 0..case.n_pools {
+        let id = (p + 1) as i64;
+        let f = seed_pool(&pool, id, id, id, case.method, "running_avg").await;
+        seed_aggregate(&pool, f.pool_id, SEED_QTY, SEED_COST).await;
+        fixtures.push(f);
+    }
+
+    // Interleave callers round-robin into one enqueue stream; accumulate the
+    // exact (order-independent) expected book value + qty per pool as we go.
+    let max_len = case.callers.iter().map(Vec::len).max().unwrap_or(0);
+    let mut stream: Vec<(i64, Value)> = Vec::new();
+    let mut next_source = 1i64;
+    let mut expected_trx = 0i64;
+    for tick in 0..max_len {
+        for caller in &case.callers {
+            let Some(&(pi, qty, cost)) = caller.get(tick) else { continue };
+            exp_value[pi] += (qty as i128) * (cost as i128);
+            exp_qty[pi] += qty;
+            expected_trx += 1;
+            stream.push((next_source, receipt_line(&fixtures[pi], qty, cost, case.method)));
+            next_source += 1;
+        }
+    }
+
+    for (source_id, line) in &stream {
+        enqueue(&pool, "po_receipt", *source_id, vec![line.clone()])
+            .await
+            .map_err(|e| format!("enqueue source_id={source_id}: {e}"))?;
+    }
+    await_quiescent(&pool, expected_trx).await?;
+
+    for p in 0..case.n_pools {
+        let pool_id = (p + 1) as i64;
+        let (qty, unit_cost) = aggregate(&pool, pool_id).await.unwrap_or((0, 0));
+        let want_qty = exp_qty[p];
+        let want_uc = banker_div(exp_value[p], want_qty);
+        if qty != want_qty {
+            return Err(format!(
+                "pool {pool_id} qty {qty} != model {want_qty} (method={})",
+                case.method
+            ));
+        }
+        if unit_cost != want_uc {
+            return Err(format!(
+                "pool {pool_id} unit_cost {unit_cost} != value-weighted {want_uc} \
+                 (value_sum {}, qty {want_qty}, method={})",
+                exp_value[p], case.method
+            ));
+        }
+    }
+    Ok(())
 }

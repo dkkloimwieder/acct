@@ -32,7 +32,7 @@ pub(crate) fn apply_wac(
         std::cmp::Ordering::Greater => aggregate_receipt(snapshot, line, result, posted_at),
         std::cmp::Ordering::Less => {
             // WAC depletes at the running average (the current aggregate unit_cost).
-            let (_, applied_unit_cost, _) = snapshot.read_aggregate(line.pool_id);
+            let (_, applied_unit_cost, _, _) = snapshot.read_aggregate(line.pool_id);
             aggregate_deplete(snapshot, line, result, posted_at, applied_unit_cost)
         }
     }
@@ -64,23 +64,26 @@ pub(crate) fn aggregate_receipt(
     result: &mut PlanResult,
     posted_at: DateTime<Utc>,
 ) -> Result<(), LedgerError> {
-    let (old_qty, old_unit_cost, _existed) = snapshot.read_aggregate(line.pool_id);
+    let (old_qty, old_unit_cost, old_value_sum, _existed) = snapshot.read_aggregate(line.pool_id);
 
     let new_qty = old_qty
         .checked_add(line.qty)
         .ok_or_else(|| overflow(format!("receipt qty on pool {}", line.pool_id)))?;
 
-    // new_unit_cost: weighted average with banker's rounding (§3.0). The i128
-    // cast on the numerator's operands is mandatory — i64*i64 overflows here.
+    // value_sum accumulates the EXACT book value (§3.0): old book value plus this
+    // receipt's qty*cost. The i128 cast is mandatory — i64*i64 overflows here. The
+    // running-average unit_cost is then DERIVED from the exact value_sum, never
+    // re-rounded off the prior (already-rounded) average — so a receipts-only pool
+    // lands unit_cost == banker_div(Σ qty*cost, Σ qty), exact and order-independent.
+    let new_value_sum_i128: i128 =
+        (old_value_sum as i128) + (line.qty as i128) * (line.unit_cost as i128);
+    let new_value_sum: i64 = new_value_sum_i128
+        .try_into()
+        .map_err(|_| overflow(format!("receipt value_sum on pool {}", line.pool_id)))?;
     // new_qty == 0 guard: defensive against a degenerate qty=0 receipt against an
     // empty pool, which would divide by zero (§3.1). Preserve old_unit_cost.
-    let new_unit_cost = if new_qty > 0 {
-        let numerator: i128 = (old_qty as i128) * (old_unit_cost as i128)
-            + (line.qty as i128) * (line.unit_cost as i128);
-        banker_div(numerator, new_qty)
-    } else {
-        old_unit_cost
-    };
+    let new_unit_cost =
+        if new_qty > 0 { banker_div(new_value_sum_i128, new_qty) } else { old_unit_cost };
 
     let trx_line_idx = result.trx_lines.len();
     result.trx_lines.push(TrxLineOutput {
@@ -96,8 +99,9 @@ pub(crate) fn aggregate_receipt(
         pool_id: line.pool_id,
         qty: new_qty,
         unit_cost: new_unit_cost,
+        value_sum: new_value_sum,
     });
-    snapshot.put_aggregate(line.pool_id, new_qty, new_unit_cost);
+    snapshot.put_aggregate(line.pool_id, new_qty, new_unit_cost, new_value_sum);
 
     let amount = (line.qty as i128 * line.unit_cost as i128)
         .try_into()
@@ -129,7 +133,8 @@ pub(crate) fn aggregate_deplete(
         .checked_abs()
         .ok_or_else(|| overflow(format!("deplete qty.abs() on pool {}", line.pool_id)))?;
 
-    let (current_qty, current_unit_cost, _existed) = snapshot.read_aggregate(line.pool_id);
+    let (current_qty, current_unit_cost, current_value_sum, _existed) =
+        snapshot.read_aggregate(line.pool_id);
     if current_qty < qty_to_deplete {
         return Err(LedgerError::InsufficientInventory {
             pool_id: line.pool_id,
@@ -149,16 +154,26 @@ pub(crate) fn aggregate_deplete(
         source_id: line.source_id,
     });
 
+    // Depletion posts qty*applied_unit_cost; value_sum drops by exactly that
+    // amount so it stays == net posted book value (GL-reconcilable). The average
+    // is re-derived from the reduced value_sum (preserved up to rounding). When
+    // the pool empties, force value_sum = 0 to clear the rounding residual and
+    // avoid a stranded value with zero qty (acct-0qps).
+    let amount: i64 = (qty_to_deplete as i128 * applied_unit_cost as i128)
+        .try_into()
+        .map_err(|_| overflow(format!("deplete amount on pool {}", line.pool_id)))?;
+    let new_value_sum = if new_qty == 0 { 0 } else { current_value_sum - amount };
+    let new_unit_cost =
+        if new_qty > 0 { banker_div(new_value_sum as i128, new_qty) } else { current_unit_cost };
+
     result.pool_state_mutations.push(PoolStateMutation::UpsertAggregate {
         pool_id: line.pool_id,
         qty: new_qty,
-        unit_cost: current_unit_cost, // unchanged on depletion
+        unit_cost: new_unit_cost,
+        value_sum: new_value_sum,
     });
-    snapshot.put_aggregate(line.pool_id, new_qty, current_unit_cost);
+    snapshot.put_aggregate(line.pool_id, new_qty, new_unit_cost, new_value_sum);
 
-    let amount = (qty_to_deplete as i128 * applied_unit_cost as i128)
-        .try_into()
-        .map_err(|_| overflow(format!("deplete amount on pool {}", line.pool_id)))?;
     result.posting_lines.push(PostingLineRequest {
         trx_line_idx,
         event_type: PostingEventType::InventoryDepletion,

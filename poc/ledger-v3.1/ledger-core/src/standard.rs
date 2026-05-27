@@ -46,7 +46,7 @@ pub(crate) fn apply_std(
         return Ok(());
     }
     let c_std = resolve_standard_cost(snapshot, line.pool_id)?;
-    let (old_qty, _old_uc, _existed) = snapshot.read_aggregate(line.pool_id);
+    let (old_qty, _old_uc, _old_vs, _existed) = snapshot.read_aggregate(line.pool_id);
 
     if line.qty > 0 {
         receipt(snapshot, line, result, posted_at, c_std, old_qty)
@@ -79,12 +79,19 @@ fn receipt(
         source_id: line.source_id,
     });
 
+    // STD's book value mirrors the standard: value_sum = qty*C_std, so the
+    // derived unit_cost stays exactly C_std and value_sum tracks the posted std
+    // value (Q*C_std main leg).
+    let value_sum: i64 = (new_qty as i128 * c_std as i128)
+        .try_into()
+        .map_err(|_| overflow(format!("std receipt value_sum on pool {}", line.pool_id)))?;
     result.pool_state_mutations.push(PoolStateMutation::UpsertAggregate {
         pool_id: line.pool_id,
         qty: new_qty,
         unit_cost: c_std, // aggregate mirrors the standard
+        value_sum,
     });
-    snapshot.put_aggregate(line.pool_id, new_qty, c_std);
+    snapshot.put_aggregate(line.pool_id, new_qty, c_std, value_sum);
 
     // Main leg: inventory (debit) <- source (credit) at standard value Q*C_std.
     let std_value: i64 = (q as i128 * c_std as i128)
@@ -159,12 +166,16 @@ fn deplete(
         source_id: line.source_id,
     });
 
+    let value_sum: i64 = (new_qty as i128 * c_std as i128)
+        .try_into()
+        .map_err(|_| overflow(format!("std deplete value_sum on pool {}", line.pool_id)))?;
     result.pool_state_mutations.push(PoolStateMutation::UpsertAggregate {
         pool_id: line.pool_id,
         qty: new_qty,
         unit_cost: c_std,
+        value_sum,
     });
-    snapshot.put_aggregate(line.pool_id, new_qty, c_std);
+    snapshot.put_aggregate(line.pool_id, new_qty, c_std, value_sum);
 
     let amount: i64 = (qty_to_deplete as i128 * c_std as i128)
         .try_into()

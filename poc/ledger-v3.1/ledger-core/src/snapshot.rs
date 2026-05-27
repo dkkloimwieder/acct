@@ -9,18 +9,22 @@ use std::collections::HashMap;
 
 use crate::method::{PoolMethod, ProvisionalBasis};
 
-/// One row from `pool_state`. v3.1 stores running state directly (no cumulative
-/// value_sum, no last_trx_line_id — see design-v3.1 §2.2):
-///  - `layer_id = 0` aggregate: `qty` = total on-hand, `unit_cost` = running
-///    average (WAC and the Path C provisional basis for FIFO/LIFO).
+/// One row from `pool_state` (design-v3.1 §2.2 / §3.0):
+///  - `layer_id = 0` aggregate: `qty` = total on-hand, `value_sum` = cumulative
+///    book value, `unit_cost` = the derived running average `value_sum/qty`
+///    (banker-rounded). WAC and the Path C provisional basis for FIFO/LIFO.
 ///  - `layer_id > 0` materialized layer (specific pools only): `qty` = layer qty
-///    (1 for specific), `unit_cost` = the layer's immutable per-unit cost.
-///    `layer_id` equals the receipt trx_line.id that created the layer.
+///    (1 for specific), `unit_cost` = the layer's immutable per-unit cost,
+///    `value_sum` = `qty*unit_cost`. `layer_id` equals the receipt trx_line.id
+///    that created the layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolStateRow {
     pub layer_id: i64,
     pub qty: i64,
     pub unit_cost: i64,
+    /// Cumulative book value. `unit_cost == banker_div(value_sum, qty)` for the
+    /// aggregate; `qty*unit_cost` for layer rows (acct-0qps).
+    pub value_sum: i64,
 }
 
 /// Snapshot of the pools touched by a submission.
@@ -63,24 +67,25 @@ impl Snapshot {
             .and_then(|rows| rows.iter().find(|r| r.layer_id == 0))
     }
 
-    /// `(qty, unit_cost, existed)` for the aggregate row; `(0, 0, false)` when
-    /// the pool has no aggregate yet (first receipt).
-    pub(crate) fn read_aggregate(&self, pool_id: i64) -> (i64, i64, bool) {
+    /// `(qty, unit_cost, value_sum, existed)` for the aggregate row;
+    /// `(0, 0, 0, false)` when the pool has no aggregate yet (first receipt).
+    pub(crate) fn read_aggregate(&self, pool_id: i64) -> (i64, i64, i64, bool) {
         match self.aggregate(pool_id) {
-            Some(r) => (r.qty, r.unit_cost, true),
-            None => (0, 0, false),
+            Some(r) => (r.qty, r.unit_cost, r.value_sum, true),
+            None => (0, 0, 0, false),
         }
     }
 
     /// Insert-or-update the in-memory aggregate row so later lines in the same
     /// submission observe the new state.
-    pub(crate) fn put_aggregate(&mut self, pool_id: i64, qty: i64, unit_cost: i64) {
+    pub(crate) fn put_aggregate(&mut self, pool_id: i64, qty: i64, unit_cost: i64, value_sum: i64) {
         let rows = self.pools.entry(pool_id).or_default();
         if let Some(r) = rows.iter_mut().find(|r| r.layer_id == 0) {
             r.qty = qty;
             r.unit_cost = unit_cost;
+            r.value_sum = value_sum;
         } else {
-            rows.push(PoolStateRow { layer_id: 0, qty, unit_cost });
+            rows.push(PoolStateRow { layer_id: 0, qty, unit_cost, value_sum });
         }
     }
 }

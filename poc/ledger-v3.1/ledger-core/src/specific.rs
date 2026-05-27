@@ -41,7 +41,7 @@ fn receipt(
     result: &mut PlanResult,
     posted_at: DateTime<Utc>,
 ) -> Result<(), LedgerError> {
-    let (old_qty, _old_uc, _existed) = snapshot.read_aggregate(line.pool_id);
+    let (old_qty, _old_uc, _old_vs, _existed) = snapshot.read_aggregate(line.pool_id);
     // K=1 (§3.4): a specific pool holds at most one materialized unit. A second
     // receipt while the pool is stocked would push a co-existing layer that the
     // single-layer `deplete` (lowest layer_id) cannot reason about. The aggregate
@@ -71,19 +71,28 @@ fn receipt(
 
     // Materialize the layer. layer_id = this receipt's trx_line.id, resolved by
     // the caller from INSERT ... RETURNING (the idx points at trx_lines).
+    let layer_value_sum: i64 = (line.qty as i128 * line.unit_cost as i128)
+        .try_into()
+        .map_err(|_| overflow(format!("specific layer value_sum on pool {}", line.pool_id)))?;
     result.pool_state_mutations.push(PoolStateMutation::InsertLayer {
         pool_id: line.pool_id,
         layer_trx_line_idx: trx_line_idx,
         qty: line.qty,
         unit_cost: line.unit_cost,
+        value_sum: layer_value_sum,
     });
-    // Aggregate qty tracking (unit_cost mirror is informational for specific).
+    // Aggregate qty tracking (unit_cost + value_sum mirror are informational for
+    // specific: book value = qty * the single layer's cost).
+    let value_sum: i64 = (new_qty as i128 * line.unit_cost as i128)
+        .try_into()
+        .map_err(|_| overflow(format!("specific receipt value_sum on pool {}", line.pool_id)))?;
     result.pool_state_mutations.push(PoolStateMutation::UpsertAggregate {
         pool_id: line.pool_id,
         qty: new_qty,
         unit_cost: line.unit_cost,
+        value_sum,
     });
-    snapshot.put_aggregate(line.pool_id, new_qty, line.unit_cost);
+    snapshot.put_aggregate(line.pool_id, new_qty, line.unit_cost, value_sum);
 
     let amount: i64 = (line.qty as i128 * line.unit_cost as i128)
         .try_into()
@@ -146,12 +155,17 @@ fn deplete(
     });
     // Aggregate qty decrement (cannot go below zero — guarded by the check above
     // plus the aggregate invariant).
-    let (agg_qty, agg_uc, _) = snapshot.read_aggregate(line.pool_id);
+    let (agg_qty, agg_uc, _agg_vs, _) = snapshot.read_aggregate(line.pool_id);
     let new_agg_qty = (agg_qty - qty_to_deplete).max(0);
+    // K=1 full consumption empties the pool: book value follows qty to 0.
+    let new_value_sum: i64 = (new_agg_qty as i128 * agg_uc as i128)
+        .try_into()
+        .map_err(|_| overflow(format!("specific deplete value_sum on pool {}", line.pool_id)))?;
     result.pool_state_mutations.push(PoolStateMutation::UpsertAggregate {
         pool_id: line.pool_id,
         qty: new_agg_qty,
         unit_cost: agg_uc,
+        value_sum: new_value_sum,
     });
 
     // In-memory: remove the consumed layer, update aggregate, so a second
@@ -159,7 +173,7 @@ fn deplete(
     if let Some(rows) = snapshot.pools.get_mut(&line.pool_id) {
         rows.retain(|r| r.layer_id != layer.layer_id);
     }
-    snapshot.put_aggregate(line.pool_id, new_agg_qty, agg_uc);
+    snapshot.put_aggregate(line.pool_id, new_agg_qty, agg_uc, new_value_sum);
 
     let amount: i64 = (qty_to_deplete as i128 * layer.unit_cost as i128)
         .try_into()

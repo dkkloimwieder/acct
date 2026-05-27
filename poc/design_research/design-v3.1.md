@@ -264,9 +264,11 @@ Each pool_method determines how trx_line rows interact with pool_state. Path C r
 
 Production deployments wanting exact decimal arithmetic at arbitrary precision should swap BIGINT for PG's `NUMERIC(precision, scale)` type. Schema-change-and-recompile; the ledger-core arithmetic logic stays the same shape.
 
-**Division and rounding.** Path C's WAC formula on aggregate updates produces non-integer intermediate values that must be coerced back to BIGINT. The division site:
+**Aggregate book value (`value_sum`).** Each `pool_state` row carries a `value_sum` BIGINT alongside `qty` and `unit_cost`. For the aggregate row (`layer_id = 0`) it is the cumulative book value of the pool, and `unit_cost` is **derived** from it as `banker_div(value_sum, qty)` — a rounded view, not an independent accumulator. Receipts add `Q × C` exactly; depletions subtract the posted depletion amount (`Q × applied_unit_cost`), so `value_sum` stays equal to the net of the pool's posting_line amounts (GL-reconcilable). For layer rows (`layer_id > 0`, specific) `value_sum = qty × unit_cost`. Storing the exact book value — rather than re-deriving the average incrementally off the *previously-rounded* average — is what makes a receipts-only pool's final `unit_cost` exactly `banker_div(Σ Q×C, Σ Q)` and independent of receipt order. (Mixed receipt+depletion sequences stay order-sensitive: depletion-at-rounded-average is lossy. §3.1, §11.1, §14.2.)
 
-- WAC weighted-average formula (§3.1): `new_unit_cost = (old_qty × old_unit_cost + Q × C) / new_qty`. Used both by strict WAC mode and by Path C's provisional mode (which maintains the running average on the aggregate row for FIFO/LIFO pools).
+**Division and rounding.** Deriving the running-average `unit_cost` from `value_sum` produces a non-integer ratio that must be coerced back to BIGINT. The division site:
+
+- Running-average derivation (§3.1): `unit_cost = value_sum / qty`, where `value_sum` is the exact accumulated book value. Used both by strict WAC mode and by Path C's provisional mode (which maintains the aggregate book value on the aggregate row for FIFO/LIFO pools).
 
 ledger-core uses **banker's rounding** (round-half-to-even) for this division. Rationale: under sustained workloads with many small fractional remainders, biased rounding (always-truncate, always-round-up) accumulates a systematic drift in the pool's recorded value. Banker's rounding is symmetric — half-way cases round to the nearest even integer, which over a sufficiently random distribution of remainders cancels out to net-zero drift.
 
@@ -312,16 +314,15 @@ pub fn banker_div(numerator: i128, denominator: i64) -> i64 {
 }
 ```
 
-**Why i128 numerator?** The WAC formula's numerator is `old_qty × old_unit_cost + Q × C`. Each product is up to `i64 × i64`, which can overflow i64 well before the values themselves are unreasonable. At the PoC's 1e-6 precision, a pool with qty = 10^8 units and unit_cost = $10,000 (= 10^10 BIGINT-units) already produces `qty × unit_cost = 10^18`, right at i64's limit (~9.2 × 10^18). Adding a second receipt overflows. Callers must promote to i128 before multiplying:
+**Why i128 numerator?** Two places need i128. (1) Accumulating `value_sum += Q × C`: each `Q × C` is up to `i64 × i64`, which overflows i64 well before the values are unreasonable, so the product is formed in i128 before adding. (2) The derivation `banker_div(value_sum, qty)` takes `value_sum` as an i128 numerator. At the PoC's 1e-6 precision, a pool with qty = 10^8 units and unit_cost = $10,000 (= 10^10 BIGINT-units) already has `value_sum ≈ 10^18`, near i64's limit (~9.2 × 10^18). Callers must promote to i128 before multiplying:
 
 ```rust
 // Correct:
-let numerator: i128 = (old_qty as i128) * (old_unit_cost as i128)
-                    + (q as i128)       * (c as i128);
-let new_unit_cost = banker_div(numerator, new_qty);
+let new_value_sum: i128 = (old_value_sum as i128) + (q as i128) * (c as i128);
+let new_unit_cost = banker_div(new_value_sum, new_qty);
 
-// Wrong (silent overflow at i64 level before banker_div is called):
-let bad_numerator: i64 = old_qty * old_unit_cost + q * c;  // overflows
+// Wrong (silent overflow at i64 level before the i128 widening):
+let bad: i64 = old_value_sum + q * c;  // q*c overflows
 ```
 
 The function signature enforces this discipline — passing an i64 expression to banker_div requires an explicit `as i128` cast, which is exactly where the caller should be doing the multiplication anyway.
@@ -332,24 +333,23 @@ The function signature enforces this discipline — passing an i64 expression to
 
 ### 3.1 WAC
 
-pool_state has exactly one row per pool, at layer_id = 0 (the aggregate row). It carries the pool's total qty and the running average unit_cost.
+pool_state has exactly one row per pool, at layer_id = 0 (the aggregate row). It carries the pool's total qty, the cumulative book value value_sum, and the derived running-average unit_cost (= `banker_div(value_sum, qty)`).
 
 **Receipt** of qty Q at unit_cost C:
 - INSERT trx_line (qty=Q, unit_cost=C). trx_line.id auto-assigned.
-- UPSERT pool_state at layer_id=0:
-  - If row doesn't exist: insert with qty=Q, unit_cost=C.
-  - Otherwise: new_qty = old_qty + Q.
-    - If new_qty > 0: new_unit_cost = banker_div((old_qty as i128) × (old_unit_cost as i128) + (Q as i128) × (C as i128), new_qty). Standard weighted-average formula. The i128 cast on the numerator's operands is mandatory — see §3.0 for why and what overflows without it. Banker's rounding per §3.0.
-    - If new_qty == 0: preserve old_unit_cost. (Defensive guard against the degenerate case where old_qty == 0 AND Q == 0 — both must be zero given Q > 0 is required for receipts and old_qty ≥ 0 is invariant. Reachable only on programming errors; the guard prevents a division-by-zero panic.)
-- The new_qty == 0 guard is defensive but load-bearing — without it, a degenerate receipt could panic the ledger-core. Production callers should reject zero-qty receipts at the SPI layer; the guard exists as defense-in-depth.
+- UPSERT pool_state at layer_id=0 (old_qty = old_value_sum = 0 if the row does not exist yet):
+  - new_qty = old_qty + Q.
+  - new_value_sum = old_value_sum + (Q as i128) × (C as i128), stored as BIGINT. **Exact — no rounding.** The i128 product is mandatory (§3.0).
+  - new_unit_cost = banker_div(new_value_sum, new_qty) if new_qty > 0; else preserve old_unit_cost (defensive guard against a degenerate qty=0 receipt against an empty pool, which would divide by zero). Banker's rounding per §3.0.
+- The new_qty == 0 guard is defensive but load-bearing — without it, a degenerate receipt could panic ledger-core. Production callers should reject zero-qty receipts at the SPI layer; the guard exists as defense-in-depth.
 
-Under the PoC's no-negative-inventory invariant (depletions raise InsufficientInventory rather than driving qty below zero, see below), old_qty is always ≥ 0 going into a receipt. For Q > 0, new_qty = old_qty + Q > 0, so the formula branch is taken. The new_qty < 0 case is unreachable. Negative-qty handling is a deferred extension; see §3.6.
+Because value_sum accumulates exactly, a receipts-only pool's final unit_cost is `banker_div(Σ Q×C, Σ Q)` regardless of the order the receipts arrived — see §14.2. Under the PoC's no-negative-inventory invariant (depletions raise InsufficientInventory rather than driving qty below zero, see below), old_qty is always ≥ 0 going into a receipt. For Q > 0, new_qty > 0, so the formula branch is taken. Negative-qty handling is a deferred extension; see §3.6.
 
 **Depletion** of qty Q:
 - Read pool_state at layer_id=0. If qty < Q, RAISE EXCEPTION InsufficientInventory. The PoC does not allow depletions that would drive aggregate qty below zero.
-- applied_unit_cost = current pool_state.unit_cost.
+- applied_unit_cost = current pool_state.unit_cost (the running average).
 - INSERT trx_line (qty=-Q, unit_cost=applied_unit_cost).
-- UPDATE pool_state at layer_id=0: new_qty = qty - Q. unit_cost unchanged (avg only changes on receipts).
+- UPDATE pool_state at layer_id=0: new_qty = qty - Q. **value_sum -= Q × applied_unit_cost** (the posted depletion amount), so value_sum stays equal to the net of posted amounts; if new_qty == 0, value_sum := 0 to clear the rounding residual. new_unit_cost = banker_div(value_sum, new_qty) if new_qty > 0, else preserve. The average is preserved up to rounding — it is the exact book value, divided by remaining qty, that is authoritative, not a byte-stable average held across the depletion.
 
 Path C's hot path runs this exact strict logic for WAC pools.
 
@@ -896,7 +896,7 @@ For the bake-off: cross-product of caller concurrency × overlap × complexity �
 
 Path C records what it claims to record: trx_lines with provisional unit_costs, NULL source_trx_line_id for FIFO/LIFO depletions, aggregate-only pool_state mutations for FIFO/LIFO. Verified by integration tests (§9).
 
-Cross-flavor equivalence: direct-c and routed-c, given identical input sequences, produce identical pool_state.aggregate.qty values. Provisional unit_costs may differ because of within-batch order-of-processing (a deliberate consequence of routed flavor's batching, not a bug). Recalc/close (deferred) would converge both flavors to identical authoritative costs.
+Cross-flavor equivalence: direct-c and routed-c, given identical input sequences, produce identical pool_state.aggregate.qty values. For **receipts-only** pools they also produce identical unit_cost — value_sum accumulates exactly, so the running average is `banker_div(Σ Q×C, Σ Q)` regardless of processing order (§3.0/§3.1). For pools with **depletions**, unit_cost may still differ across flavors because of within-batch order-of-processing: depletion-at-rounded-average is lossy, so once a depletion intervenes the running average is order-sensitive (a deliberate consequence of routed flavor's batching, not a bug). Recalc/close (deferred) would converge both flavors to identical authoritative costs.
 
 ### 11.2 Direct flavor demonstration
 
@@ -1047,9 +1047,9 @@ Determinism: for a fixed enqueue order, the committer's behavior is deterministi
 
 Pristine-replay (Path B's mechanism for restarting from a clean snapshot when an intermediate trx fails) is genuinely not needed here. Drop-and-continue suffices because there's no cross-trx state visible-but-uncommitted on the hot path that needs unwinding — each submission's contribution to the working snapshot is independent of every other submission's. The committer doesn't need to back out a failed submission's earlier writes (there were none to back out).
 
-What IS true about commutativity: for **receipts only** (no depletions), the WAC running-average formula on the aggregate is order-sensitive in unit_cost output but produces a deterministic final state given the multiset of receipts. Mixed batches (receipts + depletions) are order-sensitive in both qty and unit_cost, as described above.
+What IS true about commutativity: for **receipts only** (no depletions), the running average is **fully order-independent**. value_sum accumulates the exact book value (Σ Q×C) and unit_cost is derived as `banker_div(value_sum, Σ Q)`, so any permutation of the same multiset of receipts yields byte-identical final qty AND unit_cost (§3.0/§3.1) — this is the value_sum storage model's payoff over an incrementally-re-rounded average. Mixed batches (receipts + depletions) remain order-sensitive: a depletion subtracts the posted `Q × applied_unit_cost` (a rounded amount), so once a depletion intervenes the running average is path-dependent — and, when a depletion would oversell, drop-and-continue makes even qty order-sensitive (the A/B example above).
 
-**Why there is no read-modify-write race on the running average.** The running average is never the target of two concurrent SQL read-modify-write cycles, so the determinism above does not rest on luck. Routing affinity (§6.3) places every submission touching a given pool into the *same* commit_group, claimed by exactly *one* committer, which folds that pool's receipts into the running average **in-memory** (working snapshot, submission_id order) and emits a single coalesced aggregate UPSERT (§6.7) — there is no per-receipt `UPDATE ... SET unit_cost = f(unit_cost)` round-trip to race on. When a connected component is split across commit_groups by `batch_size_max`, the committer holds `pool_lock FOR UPDATE` while it hydrates and writes, so a later chunk's hydrate blocks until the earlier chunk commits and then reads the post-commit aggregate. In both cases the per-pool fold is serialized, and the receipts-only final average — Σ(qtyᵢ·costᵢ)/Σqtyᵢ — is computed exactly once over the full multiset regardless of arrival concurrency. (The §9 property test asserts the final-state qty determinism directly; a receipts-only final-`unit_cost` assertion is a tracked property-test extension.)
+**Why there is no read-modify-write race on the running average.** The running average is never the target of two concurrent SQL read-modify-write cycles, so the determinism above does not rest on luck. Routing affinity (§6.3) places every submission touching a given pool into the *same* commit_group, claimed by exactly *one* committer, which folds that pool's receipts into the running average **in-memory** (working snapshot, submission_id order) and emits a single coalesced aggregate UPSERT (§6.7) — there is no per-receipt `UPDATE ... SET unit_cost = f(unit_cost)` round-trip to race on. When a connected component is split across commit_groups by `batch_size_max`, the committer holds `pool_lock FOR UPDATE` while it hydrates and writes, so a later chunk's hydrate blocks until the earlier chunk commits and then reads the post-commit aggregate. In both cases the per-pool fold is serialized, and because value_sum is exact the receipts-only final average — `banker_div(Σ qtyᵢ·costᵢ, Σ qtyᵢ)` — is the same no matter how the receipts interleave. (The §9 property test asserts both the final-state qty determinism for any sequence, and, for receipts-only pools, that the final unit_cost equals this value-weighted average.)
 
 **Split-chunk ordering across commit_groups.** When a connected component exceeds `batch_size_max` (default 50, §6.3), the router splits it into multiple commit_groups. Total enqueue order is preserved across the split: chunk 1 holds submissions with submission_ids 1..50, chunk 2 holds 51..100, etc. The committer processes chunks in queue order (chunk 1 fully commits before chunk 2 begins), and within each chunk processes submissions in submission_id order. As a result, the global processing order for any pool's submissions across split chunks is identical to what a hypothetical single-chunk-with-no-cap committer would produce. No semantic violation occurs because of splitting — splitting is purely a batching-size optimization that does not reorder.
 

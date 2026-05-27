@@ -15,8 +15,9 @@
 //! snapshot — that collapse is how a whole commit_group's depletions become one
 //! aggregate UPSERT (§6.7), so it does not use `apply_plan_result`.
 //!
-//! v3.1 deltas vs the strict bulk_write: pool_state carries no `value_sum` /
-//! `last_trx_line_id` and trx_line has no `trx_seq`. Mutations are
+//! v3.1 deltas vs the strict bulk_write: pool_state carries `value_sum` (the
+//! cumulative book value behind the running average, acct-0qps) but no
+//! `last_trx_line_id`, and trx_line has no `trx_seq`. Mutations are
 //! `UpsertAggregate` (layer_id = 0), `InsertLayer` (layer_id = the receipt
 //! trx_line.id, resolved from RETURNING), and `DeleteLayer`. There is no
 //! provisional-posting side table (that is recalc/close, out of scope §13).
@@ -123,12 +124,14 @@ pub fn apply_pool_state_mutations(
     let mut up_pid = Vec::new();
     let mut up_qty = Vec::new();
     let mut up_uc = Vec::new();
+    let mut up_vs = Vec::new();
 
     // Materialized layer inserts (specific receipts).
     let mut ins_pid = Vec::new();
     let mut ins_lid = Vec::new();
     let mut ins_qty = Vec::new();
     let mut ins_uc = Vec::new();
+    let mut ins_vs = Vec::new();
 
     // Materialized layer deletes (specific depletions).
     let mut del_pid = Vec::new();
@@ -136,21 +139,24 @@ pub fn apply_pool_state_mutations(
 
     for m in mutations {
         match *m {
-            PoolStateMutation::UpsertAggregate { pool_id, qty, unit_cost } => {
+            PoolStateMutation::UpsertAggregate { pool_id, qty, unit_cost, value_sum } => {
                 up_pid.push(pool_id);
                 up_qty.push(qty);
                 up_uc.push(unit_cost);
+                up_vs.push(value_sum);
             }
             PoolStateMutation::InsertLayer {
                 pool_id,
                 layer_trx_line_idx,
                 qty,
                 unit_cost,
+                value_sum,
             } => {
                 ins_pid.push(pool_id);
                 ins_lid.push(trx_line_ids[layer_trx_line_idx]);
                 ins_qty.push(qty);
                 ins_uc.push(unit_cost);
+                ins_vs.push(value_sum);
             }
             PoolStateMutation::DeleteLayer { pool_id, layer_id } => {
                 del_pid.push(pool_id);
@@ -161,22 +167,24 @@ pub fn apply_pool_state_mutations(
 
     if !up_pid.is_empty() {
         Spi::run_with_args(
-            "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost) \
-             SELECT pid, 0, q, uc \
-               FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[]) AS t(pid, q, uc) \
+            "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) \
+             SELECT pid, 0, q, uc, vs \
+               FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[]) \
+                    AS t(pid, q, uc, vs) \
              ON CONFLICT (pool_id, layer_id) DO UPDATE \
-                SET qty = EXCLUDED.qty, unit_cost = EXCLUDED.unit_cost",
-            &[up_pid.into(), up_qty.into(), up_uc.into()],
+                SET qty = EXCLUDED.qty, unit_cost = EXCLUDED.unit_cost, \
+                    value_sum = EXCLUDED.value_sum",
+            &[up_pid.into(), up_qty.into(), up_uc.into(), up_vs.into()],
         )?;
     }
 
     if !ins_pid.is_empty() {
         Spi::run_with_args(
-            "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost) \
-             SELECT pid, lid, q, uc \
-               FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[]) \
-                    AS t(pid, lid, q, uc)",
-            &[ins_pid.into(), ins_lid.into(), ins_qty.into(), ins_uc.into()],
+            "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) \
+             SELECT pid, lid, q, uc, vs \
+               FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[]) \
+                    AS t(pid, lid, q, uc, vs)",
+            &[ins_pid.into(), ins_lid.into(), ins_qty.into(), ins_uc.into(), ins_vs.into()],
         )?;
     }
 

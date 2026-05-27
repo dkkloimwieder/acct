@@ -651,6 +651,7 @@ fn plan_and_write(
                 pool_id: pid,
                 qty: r.qty,
                 unit_cost: r.unit_cost,
+                value_sum: r.value_sum,
             })
         })
         .collect();

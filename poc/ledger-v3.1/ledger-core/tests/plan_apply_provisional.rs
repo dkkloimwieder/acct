@@ -24,7 +24,7 @@ fn seed_aggregate(s: &mut Snapshot, id: i64, qty: i64, unit_cost: i64) {
     s.pools
         .entry(id)
         .or_default()
-        .push(PoolStateRow { layer_id: 0, qty, unit_cost });
+        .push(PoolStateRow { layer_id: 0, qty, unit_cost, value_sum: qty * unit_cost });
 }
 
 fn receipt(pool_id: i64, qty: i64, cost: i64) -> TrxLineRequest {
@@ -71,7 +71,8 @@ fn fifo_receipts_maintain_running_average() {
     assert!(no_layer_mutations(&r));
     assert_eq!(
         *r.pool_state_mutations.last().unwrap(),
-        PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 20, unit_cost: 150 }
+        // value_sum = 10*100 + 10*200 = 3000; unit_cost = 3000/20 = 150.
+        PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 20, unit_cost: 150, value_sum: 3000 }
     );
     // Receipt trx_lines record the actual asserted cost, not the average.
     assert_eq!(r.trx_lines[0].unit_cost, 100);
@@ -89,7 +90,8 @@ fn fifo_running_avg_depletion_uses_aggregate_cost() {
     assert!(no_layer_mutations(&r));
     assert_eq!(
         r.pool_state_mutations,
-        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 15, unit_cost: 150 }]
+        // seed value_sum 20*150=3000; deplete 5 at avg 150 removes 750 -> 2250; 2250/15 = 150.
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 15, unit_cost: 150, value_sum: 2250 }]
     );
     assert_eq!(r.posting_lines[0].amount, 750);
 }
@@ -173,7 +175,8 @@ fn two_lines_same_pool_coalesce_to_one_aggregate_mutation() {
     assert_eq!(r.trx_lines.len(), 2);
     assert_eq!(
         r.pool_state_mutations,
-        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 20, unit_cost: 150 }]
+        // value_sum = 10*100 + 10*200 = 3000; unit_cost = 3000/20 = 150.
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 20, unit_cost: 150, value_sum: 3000 }]
     );
 }
 

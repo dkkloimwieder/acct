@@ -74,7 +74,7 @@ pub fn hydrate_snapshot(pool_ids: &[i64]) -> Result<Snapshot, pgrx::spi::Error> 
     // ── 2. aggregate row (layer_id = 0) for every pool ─────────────
     Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
         let mut t = client.select(
-            "SELECT pool_id, qty, unit_cost \
+            "SELECT pool_id, qty, unit_cost, value_sum \
                FROM pool_state \
               WHERE pool_id = ANY($1::bigint[]) AND layer_id = 0",
             None,
@@ -84,11 +84,12 @@ pub fn hydrate_snapshot(pool_ids: &[i64]) -> Result<Snapshot, pgrx::spi::Error> 
             let pid: i64 = row.get::<i64>(1)?.unwrap_or(0);
             let qty: i64 = row.get::<i64>(2)?.unwrap_or(0);
             let unit_cost: i64 = row.get::<i64>(3)?.unwrap_or(0);
+            let value_sum: i64 = row.get::<i64>(4)?.unwrap_or(0);
             snapshot
                 .pools
                 .entry(pid)
                 .or_default()
-                .push(PoolStateRow { layer_id: 0, qty, unit_cost });
+                .push(PoolStateRow { layer_id: 0, qty, unit_cost, value_sum });
         }
         Ok(())
     })?;
@@ -103,7 +104,7 @@ pub fn hydrate_snapshot(pool_ids: &[i64]) -> Result<Snapshot, pgrx::spi::Error> 
     if !specific.is_empty() {
         Spi::connect(|client| -> Result<(), pgrx::spi::Error> {
             let mut t = client.select(
-                "SELECT pool_id, layer_id, qty, unit_cost \
+                "SELECT pool_id, layer_id, qty, unit_cost, value_sum \
                    FROM pool_state \
                   WHERE pool_id = ANY($1::bigint[]) AND layer_id > 0 \
                   ORDER BY pool_id, layer_id",
@@ -115,11 +116,12 @@ pub fn hydrate_snapshot(pool_ids: &[i64]) -> Result<Snapshot, pgrx::spi::Error> 
                 let layer_id: i64 = row.get::<i64>(2)?.unwrap_or(0);
                 let qty: i64 = row.get::<i64>(3)?.unwrap_or(0);
                 let unit_cost: i64 = row.get::<i64>(4)?.unwrap_or(0);
+                let value_sum: i64 = row.get::<i64>(5)?.unwrap_or(0);
                 snapshot
                     .pools
                     .entry(pid)
                     .or_default()
-                    .push(PoolStateRow { layer_id, qty, unit_cost });
+                    .push(PoolStateRow { layer_id, qty, unit_cost, value_sum });
             }
             Ok(())
         })?;

@@ -20,7 +20,7 @@ fn seed_aggregate(s: &mut Snapshot, id: i64, qty: i64, unit_cost: i64) {
     s.pools
         .entry(id)
         .or_default()
-        .push(PoolStateRow { layer_id: 0, qty, unit_cost });
+        .push(PoolStateRow { layer_id: 0, qty, unit_cost, value_sum: qty * unit_cost });
 }
 
 fn receipt(pool_id: i64, qty: i64, cost: i64) -> TrxLineRequest {
@@ -67,7 +67,8 @@ fn wac_single_receipt_sets_aggregate() {
     assert_eq!(r.trx_lines[0].source_trx_line_id, None);
     assert_eq!(
         r.pool_state_mutations,
-        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 10, unit_cost: 100 }]
+        // value_sum = 10*100 = 1000; unit_cost = 1000/10 = 100.
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 10, unit_cost: 100, value_sum: 1000 }]
     );
     assert_eq!(r.posting_lines[0].event_type, PostingEventType::InventoryReceipt);
     assert_eq!(r.posting_lines[0].amount, 1000);
@@ -80,7 +81,11 @@ fn wac_mixed_cost_receipts_average_with_banker_rounding() {
     // 3 @ 100 then 1 @ 150 -> (300 + 150) / 4 = 112.5 -> 112 (round-half-to-even).
     let r = plan_apply(&mut s, &[receipt(1, 3, 100), receipt(1, 1, 150)], ts()).unwrap();
     let last = r.pool_state_mutations.last().unwrap();
-    assert_eq!(*last, PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 4, unit_cost: 112 });
+    // value_sum = 3*100 + 1*150 = 450; unit_cost = 450/4 = 112.5 -> 112 (banker).
+    assert_eq!(
+        *last,
+        PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 4, unit_cost: 112, value_sum: 450 }
+    );
 }
 
 #[test]
@@ -94,7 +99,8 @@ fn wac_depletion_uses_running_average_unchanged_cost() {
     assert_eq!(r.trx_lines[0].source_trx_line_id, None);
     assert_eq!(
         r.pool_state_mutations,
-        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 15, unit_cost: 150 }]
+        // seed value_sum 20*150=3000; deplete 5 at avg 150 removes 750 -> 2250; 2250/15 = 150.
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 15, unit_cost: 150, value_sum: 2250 }]
     );
     assert_eq!(r.posting_lines[0].amount, 750);
     assert_eq!(r.posting_lines[0].event_type, PostingEventType::InventoryDepletion);
@@ -142,7 +148,8 @@ fn std_receipt_emits_variance_posting() {
     assert_eq!(var.credit_account, 200); // source
     assert_eq!(
         r.pool_state_mutations,
-        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 10, unit_cost: 100 }]
+        // STD: value_sum = qty*C_std = 10*100 = 1000.
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 10, unit_cost: 100, value_sum: 1000 }]
     );
 }
 
@@ -180,7 +187,8 @@ fn std_depletion_at_standard_cost() {
     assert_eq!(r.posting_lines[0].amount, 400);
     assert_eq!(
         r.pool_state_mutations,
-        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 6, unit_cost: 100 }]
+        // STD deplete 4 of 10: new qty 6, value_sum = 6*100 = 600.
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 6, unit_cost: 100, value_sum: 600 }]
     );
 }
 
@@ -202,7 +210,7 @@ fn specific_receipt_materializes_layer() {
     assert_eq!(r.trx_lines[0].qty, 1);
     assert!(matches!(
         r.pool_state_mutations[0],
-        PoolStateMutation::InsertLayer { pool_id: 1, layer_trx_line_idx: 0, qty: 1, unit_cost: 500 }
+        PoolStateMutation::InsertLayer { pool_id: 1, layer_trx_line_idx: 0, qty: 1, unit_cost: 500, value_sum: 500 }
     ));
     assert!(matches!(
         r.pool_state_mutations[1],
@@ -216,7 +224,7 @@ fn specific_depletion_consumes_layer_and_links_source() {
     pool(&mut s, 1, PoolMethod::Specific);
     // Simulate a committed receipt: layer_id = 42 (the receipt's trx_line.id).
     seed_aggregate(&mut s, 1, 1, 500);
-    s.pools.get_mut(&1).unwrap().push(PoolStateRow { layer_id: 42, qty: 1, unit_cost: 500 });
+    s.pools.get_mut(&1).unwrap().push(PoolStateRow { layer_id: 42, qty: 1, unit_cost: 500, value_sum: 500 });
 
     let r = plan_apply(&mut s, &[deplete(1, 1)], ts()).unwrap();
     assert_eq!(r.trx_lines[0].unit_cost, 500);
@@ -232,7 +240,7 @@ fn specific_second_depletion_raises_insufficient() {
     let mut s = Snapshot::default();
     pool(&mut s, 1, PoolMethod::Specific);
     seed_aggregate(&mut s, 1, 1, 500);
-    s.pools.get_mut(&1).unwrap().push(PoolStateRow { layer_id: 42, qty: 1, unit_cost: 500 });
+    s.pools.get_mut(&1).unwrap().push(PoolStateRow { layer_id: 42, qty: 1, unit_cost: 500, value_sum: 500 });
     // Two depletions in one submission: first consumes the layer, second finds none.
     let err = plan_apply(&mut s, &[deplete(1, 1), deplete(1, 1)], ts()).unwrap_err();
     assert_eq!(

@@ -108,20 +108,26 @@ pub struct TrxLineOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoolStateMutation {
     /// Aggregate row (`layer_id = 0`): WAC, STD, and provisional FIFO/LIFO.
-    /// `INSERT ... ON CONFLICT (pool_id, layer_id) DO UPDATE SET qty, unit_cost`.
+    /// `INSERT ... ON CONFLICT (pool_id, layer_id) DO UPDATE SET qty, unit_cost,
+    /// value_sum`. `unit_cost` is the derived running average `value_sum/qty`;
+    /// `value_sum` is the authoritative cumulative book value (acct-0qps).
     UpsertAggregate {
         pool_id: i64,
         qty: i64,
         unit_cost: i64,
+        value_sum: i64,
     },
     /// New materialized layer (specific receipt). The layer's `layer_id` is the
     /// receipt's trx_line.id, unknown until INSERT — `layer_trx_line_idx` indexes
     /// into `PlanResult.trx_lines`; the caller resolves it from RETURNING.
+    /// `value_sum` is the layer's book value (`qty*unit_cost`), stored so every
+    /// pool_state row carries a non-null value_sum (acct-0qps).
     InsertLayer {
         pool_id: i64,
         layer_trx_line_idx: usize,
         qty: i64,
         unit_cost: i64,
+        value_sum: i64,
     },
     /// Materialized layer fully consumed (specific depletion): `DELETE` the row.
     DeleteLayer {

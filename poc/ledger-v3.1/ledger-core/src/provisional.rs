@@ -72,7 +72,7 @@ fn apply_provisional(
                 .unwrap_or_default();
             let applied_unit_cost = match basis {
                 ProvisionalBasis::RunningAvg => {
-                    let (_, unit_cost, _) = snapshot.read_aggregate(line.pool_id);
+                    let (_, unit_cost, _, _) = snapshot.read_aggregate(line.pool_id);
                     unit_cost
                 }
                 ProvisionalBasis::Standard => {

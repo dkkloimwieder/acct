@@ -370,8 +370,9 @@ pub async fn seed_standard_cost(pool: &PgPool, sku_id: i64, loc_id: i64, unit_co
 /// starting balance to draw down.
 pub async fn seed_aggregate(pool: &PgPool, pool_id: i64, qty: i64, unit_cost: i64) {
     sqlx::query(
-        "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost) VALUES ($1, 0, $2, $3) \
-         ON CONFLICT (pool_id, layer_id) DO UPDATE SET qty = EXCLUDED.qty, unit_cost = EXCLUDED.unit_cost",
+        "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) VALUES ($1, 0, $2, $3, $2 * $3) \
+         ON CONFLICT (pool_id, layer_id) DO UPDATE \
+            SET qty = EXCLUDED.qty, unit_cost = EXCLUDED.unit_cost, value_sum = EXCLUDED.value_sum",
     )
     .bind(pool_id)
     .bind(qty)
