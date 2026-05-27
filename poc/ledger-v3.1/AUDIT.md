@@ -82,15 +82,25 @@ routed committer reaches the same one-aggregate-per-pool shape differently (the 
 reconstruction from the post-pass snapshot in `committer::plan_and_write`). **Proposed spec
 patch:** note in §5.1 step 8 / §8 that ledger-core coalesces aggregate mutations per pool.
 
-#### D1.4 [P3] Harness enforces distinct pools per submission — `divergence` (harness limitation)
+#### D1.4 [P3] Harness enforces distinct pools per submission — `divergence` (harness measurement choice)
 `workload.rs` / `pool_universe.rs` generate submissions with DISTINCT pool_ids per
-submission. §10.3 frames multi-pool submissions generically. The distinctness is an
-implementation constraint that follows directly from D1.3's root cause: the direct
-`bulk_write` `ON CONFLICT (pool_id, layer_id) DO UPDATE` cannot touch the same aggregate row
-twice in one statement, so the *generator* avoids producing same-pool-twice submissions rather
-than relying solely on the coalesce. (Coalesce handles it for correctness; the harness avoids
-it for clean measurement.) Documented in `workload.rs:79-84`. **Proposed action:** note the
-limitation in README + §10.3; no code change.
+submission. §10.3 frames multi-pool submissions generically. The distinctness is a deliberate
+measurement choice that follows directly from D1.3's root cause: the direct `bulk_write`
+`ON CONFLICT (pool_id, layer_id) DO UPDATE` cannot touch the same aggregate row twice in one
+statement, so the *generator* avoids producing same-pool-twice submissions rather than relying
+solely on the coalesce — keeping per-submission pool-count unconfounded for lock-hold measurement.
+Documented in `workload.rs:79-84`.
+
+**The coalesce path IS exercised — for correctness, not under load.** The same-pool-twice
+(multi-touch) case `coalesce_aggregates` exists to handle is covered by three tests:
+`ledger-core/tests/plan_apply_provisional.rs::two_lines_same_pool_coalesce_to_one_aggregate_mutation`,
+`ledger-direct-c/tests/acceptance_direct_methods.rs::two_lines_same_pool_one_submission_succeeds_and_coalesces`,
+and `ledger-routed-c/tests/acceptance_routed_committer.rs::two_lines_same_pool_one_submission_agrees_with_direct`.
+What the distinct-pool generator does NOT do is drive multi-touch submissions *under load*, so the
+PoC has no perf characterization of the coalesce path. That residual gap — an opt-in multi-touch
+load scenario — is filed as a follow-up (default workload stays distinct-pool). **Proposed
+action:** none beyond this note (round-2 post-build review); correctness is covered, the load
+scenario is a separate enhancement.
 
 #### D1.5 [P3] `standard_cost` seeding lives in the harness — `divergence` (build-time, acct-0z5m)
 `pool_universe::seed` inserts `standard_cost` rows for std-method pools (`acct-0z5m`, commit
@@ -303,7 +313,7 @@ per-submission `snapshot.clone()` allocation note).
 | D1.1 | P3 | divergence | SPI JSONB vs §4 ARRAY-of-composite | doc-patched §4 + §15 (audit commit `6ee51c0`); JSONB is the chosen wire shape, no code change |
 | D1.2 | P3 | divergence | `variance_account` added to line tuple | doc-patched §4 + §15 (`6ee51c0`); correct gap-fill, kept |
 | D1.3 | P3 | divergence | `coalesce_aggregates` unspec'd (acct-036x) | doc-patched §5.1/§8/§15 (`6ee51c0`); behavior already in code (acct-036x) |
-| D1.4 | P3 | divergence | harness distinct-pool-per-submission limitation | doc-patched README + §15 (`6ee51c0`); harness convention, no code change |
+| D1.4 | P3 | divergence | harness distinct-pool-per-submission limitation | doc-patched README + §15 (`6ee51c0`); round-2 review reframed it as a measurement choice and cited the 3 coalesce correctness tests; multi-touch load scenario filed as `acct-34ce` |
 | D1.5 | P3 | divergence | harness `standard_cost` seeding (acct-0z5m) | doc-patched §15 (`6ee51c0`); behavior already in code (acct-0z5m) |
 | D3.1 | P3 | divergence | no `qty>=0` CHECK on pool_state (code invariant) | **fixed** acct-yojk.6 (`69d5595`): `CHECK (layer_id <> 0 OR qty >= 0)` on pool_state (migration `0006`); §15 updated |
 | D3.2 | P3 | divergence | specific K=1 not schema-enforced | **fixed** acct-yojk.7 (`239e141`): `LedgerError::SpecificPoolOccupied` rejects a 2nd receipt to a specific pool |

@@ -521,7 +521,7 @@ Caller's user-tx commits. One fsync.
 
 For FIFO/LIFO pools under provisional mode, lock-hold time per trx is bounded by aggregate-row work only — no layer iteration. For a hot SKU under FIFO with hundreds of historical layers, Path C holds the lock for the same duration as a WAC update — orders of magnitude less than a strict-mode implementation would. This is what the PoC measures.
 
-For WAC, STD, and specific pools, Path C's lock-hold characteristics match a strict-mode implementation's (specific has K=1 so iteration cost is constant; WAC has no layers; STD has no pool_state mutation at all).
+For WAC, STD, and specific pools, Path C's lock-hold characteristics match a strict-mode implementation's (specific has K=1 so iteration cost is constant; WAC has no layers; STD has no *layer-row* mutation — it UPSERTs the aggregate `(pool_id, layer_id=0)` row on every receipt and depletion, exactly like WAC, per §3.3).
 
 ### 5.3 Per-trx SPI count
 
@@ -646,7 +646,7 @@ Pool of BGWorkers (default 4). Each:
    2. **Recovery committer re-processing an aborted commit_group.** If the original committer claimed the commit_group and partially processed it (e.g., wrote some trx rows but died before COMMIT), PG rolled the partial work back — so trx rows for that commit_group don't exist and the recovery committer processes fresh. But if the original committer DID commit successfully and died after, the trx rows DO exist; recovery reads them via this dedup and skips.
    3. **Caller-side double-submission bug.** Application code submits the same (trx_type, source_id) twice. The dedup catches the second one cleanly; without dedup, the second would hit the UNIQUE constraint at INSERT time and abort the entire commit_group (per §6.8 error handling).
 
-   **What this dedup does NOT defend against.** Two committers processing the SAME (trx_type, source_id) submission concurrently is not a scenario this dedup needs to handle, because the routing architecture prevents it: each staging entry is claimed by exactly one committer via CAS on the entry's state, and the router places each submission in exactly one commit_group. Two committers can process different commit_groups concurrently, but those commit_groups by construction contain disjoint sets of submissions. The only path to "same (trx_type, source_id) in two simultaneous committer txs" is recovery after committer death — and the dedup handles that case as described in scenario 2 above.
+   **What this dedup does NOT fully defend against — the cross-commit-group same-key race.** A *single* submission is never processed by two committers concurrently: each staging entry is claimed by exactly one committer via CAS on the entry's state, and the router places each submission in exactly one commit_group. But two *distinct* submissions that happen to carry the same (trx_type, source_id) — the caller-side double-submission of scenario 3 — are not guaranteed to land in the same commit_group. Commit_groups are formed by pool overlap (§6.3), not by (trx_type, source_id); so if the two submissions touch disjoint pools they route to *different* commit_groups, and the within-batch dedup above never compares them. Two committers can then process those commit_groups concurrently and both reach INSERT with the same key — one wins, the other gets a 23505. That race (and the recovery-after-committer-death case) is caught by §6.8's re-drive-on-UNIQUE, not by this pre-flight dedup. The pre-flight dedup is the steady-state fast path; the §6.8 re-drive is the race backstop.
 
 6. Compute the union of pool_ids across included submissions (after dedup). Sort ascending, dedup.
 7. Acquire pool_lock FOR UPDATE in singleton-loop order using the same optimistic pattern as §5.1 step 2: `SELECT 1 FROM pool_lock WHERE pool_id = $1 FOR UPDATE` per pool, with a lazy-create retry path (`INSERT INTO pool_lock (pool_id) VALUES ($1) ON CONFLICT DO NOTHING` followed by re-SELECT) only if the pool's lock row doesn't yet exist.
@@ -1049,6 +1049,8 @@ Pristine-replay (Path B's mechanism for restarting from a clean snapshot when an
 
 What IS true about commutativity: for **receipts only** (no depletions), the WAC running-average formula on the aggregate is order-sensitive in unit_cost output but produces a deterministic final state given the multiset of receipts. Mixed batches (receipts + depletions) are order-sensitive in both qty and unit_cost, as described above.
 
+**Why there is no read-modify-write race on the running average.** The running average is never the target of two concurrent SQL read-modify-write cycles, so the determinism above does not rest on luck. Routing affinity (§6.3) places every submission touching a given pool into the *same* commit_group, claimed by exactly *one* committer, which folds that pool's receipts into the running average **in-memory** (working snapshot, submission_id order) and emits a single coalesced aggregate UPSERT (§6.7) — there is no per-receipt `UPDATE ... SET unit_cost = f(unit_cost)` round-trip to race on. When a connected component is split across commit_groups by `batch_size_max`, the committer holds `pool_lock FOR UPDATE` while it hydrates and writes, so a later chunk's hydrate blocks until the earlier chunk commits and then reads the post-commit aggregate. In both cases the per-pool fold is serialized, and the receipts-only final average — Σ(qtyᵢ·costᵢ)/Σqtyᵢ — is computed exactly once over the full multiset regardless of arrival concurrency. (The §9 property test asserts the final-state qty determinism directly; a receipts-only final-`unit_cost` assertion is a tracked property-test extension.)
+
 **Split-chunk ordering across commit_groups.** When a connected component exceeds `batch_size_max` (default 50, §6.3), the router splits it into multiple commit_groups. Total enqueue order is preserved across the split: chunk 1 holds submissions with submission_ids 1..50, chunk 2 holds 51..100, etc. The committer processes chunks in queue order (chunk 1 fully commits before chunk 2 begins), and within each chunk processes submissions in submission_id order. As a result, the global processing order for any pool's submissions across split chunks is identical to what a hypothetical single-chunk-with-no-cap committer would produce. No semantic violation occurs because of splitting — splitting is purely a batching-size optimization that does not reorder.
 
 A depletion that would fail in the single-chunk world (because its qty exceeds the snapshot at its position in enqueue order) also fails in the split-chunk world (it's still at the same relative position; chunks committed before it still happened before; chunks committed after it still happen after). Determinism is preserved.
@@ -1108,33 +1110,25 @@ When recalc/close is built (deferred), whoever builds it must account for this �
 
 Recorded by the post-build coherence review (`poc/ledger-v3.1/AUDIT.md`, `AUDIT-PASS2.md`). The
 PoC faithfully realizes this spec; the deltas below are the known divergences. None is a
-correctness defect. Full per-finding detail (with file:line anchors and severities) lives in the
-AUDIT docs; this section is the spec-side pointer.
+correctness defect. This section lists only **spec-relevant** divergences; per-finding detail
+(file:line anchors, severities) and the code-side follow-ups the review shipped (crate extraction,
+dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
+`poc/ledger-v3.1/README.md`.
 
-- **SPI line shape** (§4, AUDIT D1.1/D1.2): `lines` is JSONB-array-of-objects, not a SQL
-  composite ARRAY; each object carries an optional `variance_account` (for §3.3 STD receipts).
-  Already annotated inline at §4.
-- **Aggregate-mutation coalescing** (§5.1 step 8 / §8, AUDIT D1.3): `ledger-core`'s
+- **SPI line shape** (§4): `lines` is a JSONB array-of-objects, not a SQL composite ARRAY; each
+  object carries an optional `variance_account` (for §3.3 STD receipts). Annotated inline at §4.
+- **Aggregate-mutation coalescing** (§5.1 step 8 / §8): `ledger-core`'s
   `PlanResult::coalesce_aggregates` collapses per-pool aggregate upserts to one (keep-last) so a
   single submission touching a pool twice writes one `(pool_id, layer_id=0)` row (the direct
   `ON CONFLICT DO UPDATE` batch cannot touch a row twice). The routed committer reaches the same
-  one-aggregate-per-pool shape via the §6.7 post-pass-snapshot reconstruction. (acct-036x.)
-- **Harness, distinct pools per submission** (§10.3, AUDIT D1.4): the workload generator emits
-  distinct pool_ids per submission (clean measurement; same root cause as the coalesce above).
-- **Harness seeds `standard_cost`** (§10.4, AUDIT D1.5): the pool seeder must populate
-  `standard_cost` for every std-method / standard-basis pool, else those pools abort with
-  MissingStandardCost and confound mixed-method scenarios. (acct-0z5m.)
-- **`qty >= 0` CHECK on `pool_state`** (§2.2/§3.6, AUDIT D3.1): no-negative-inventory began as a
-  `ledger-core`-only code invariant; migration `0006` (acct-yojk.6) added
-  `CHECK (layer_id <> 0 OR qty >= 0)` as a schema-level defense-in-depth backstop on the aggregate
-  row (the constraint is scoped to `layer_id = 0` so it never constrains strict-method layer rows,
-  which Path C does not materialize on the hot path).
-
-Follow-ups the review filed have all shipped under epic `acct-yojk` (assess-only review → fix
-phase): de-Path-B the routed crate (removed the stale `design-v3`/Path B references, the 13 dead
-`tm09`/stage/audit shmem counters, and the dead `committer_lease_ms` GUC — AUDIT D4.1/D7.1/D8.1,
-acct-yojk.1); extracted the shared `ledger-spi-common` crate for the previously-triplicated
-`pool_lock`/`hydration`/`bulk_write` (AUDIT D5.1, acct-yojk.2); added a routed-flavor property test
-(AUDIT D6.1, acct-yojk.3); guarded specific K=1 (AUDIT D3.2, acct-yojk.7); plus the Pass-2 hardening
-(re-drive on a UNIQUE that survives dedup — §6.8, acct-yojk.9; the `Unrecognized` caller-tx status —
-§6.4, acct-yojk.10) and an arena-leak fix found during the deep body-read (acct-yojk.15).
+  one-aggregate-per-pool shape via the §6.7 post-pass-snapshot reconstruction.
+- **Harness, distinct pools per submission** (§10.3): the workload generator emits distinct
+  pool_ids per submission for clean lock-hold measurement (same root cause as the coalesce above);
+  the coalesce path itself is covered by ledger-core / direct / routed correctness tests.
+- **Harness seeds `standard_cost`** (§10.4): the pool seeder must populate `standard_cost` for
+  every std-method / standard-basis pool, else those pools abort with MissingStandardCost and
+  confound mixed-method scenarios.
+- **`qty >= 0` CHECK on `pool_state`** (§2.2/§3.6): no-negative-inventory began as a
+  `ledger-core`-only code invariant; migration `0006` added `CHECK (layer_id <> 0 OR qty >= 0)` as a
+  schema-level defense-in-depth backstop on the aggregate row (scoped to `layer_id = 0` so it never
+  constrains strict-method layer rows, which Path C does not materialize on the hot path).
