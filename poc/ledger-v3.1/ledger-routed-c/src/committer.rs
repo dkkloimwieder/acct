@@ -116,6 +116,9 @@ pub extern "C-unwind" fn ledger_routed_c_committer_main(_arg: pg_sys::Datum) {
                 pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
             }
         }
+        // Test-only pause hook: only test_hooks builds can arm it, and the read is
+        // compiled out of production entirely (acct-yojk.11).
+        #[cfg(feature = "test_hooks")]
         if COMMITTER_QUEUE.share().test_committer_paused.load(Acquire) == 1 {
             continue;
         }
@@ -546,11 +549,15 @@ fn attempt_commit_phase(pool_ids: &[i64], prepared: &[Prepared]) -> PhaseOutcome
     // RefUnwindSafe bound. Err = a Rust-level SPI error short-circuited a `?`.
     let result: Result<PhaseStep, pgrx::spi::Error> = PgTryBuilder::new(AssertUnwindSafe(|| {
         pool_lock::acquire_pool_locks(pool_ids)?;
-        // Test-only injection sites (production builds Acquire-load 0 / skip).
-        maybe_inject_deadlock();
-        maybe_inject_fatal();
-        maybe_inject_unique();
-        maybe_stall();
+        // Test-only injection sites — compiled out of production builds entirely
+        // (acct-yojk.11); only test_hooks builds carry them and can arm them.
+        #[cfg(feature = "test_hooks")]
+        {
+            maybe_inject_deadlock();
+            maybe_inject_fatal();
+            maybe_inject_unique();
+            maybe_stall();
+        }
         let snapshot = hydration::hydrate_snapshot(pool_ids)?;
         let summary = plan_and_write(snapshot, prepared)?;
         Ok(PhaseStep::Wrote(summary))
@@ -693,11 +700,13 @@ fn retry_backoff(attempt: u32) -> Duration {
     Duration::from_millis(ms.min(1000))
 }
 
-// ── Test-only injection sites (read unconditionally; only test_hooks SPIs
-//    ever arm them, §6.8 / §9.3) ──────────────────────────────────────
+// ── Test-only injection sites (test_hooks builds only — both the call sites in
+//    the commit phase and these bodies are #[cfg]'d out of production, acct-yojk.11;
+//    only test_hooks SPIs ever arm them, §6.8 / §9.3) ───────────────────
 
 /// Raise a synthetic 40P01 if the deadlock-injection counter is armed,
 /// decrementing it once. The RAISE longjmps to the caller's catch_others.
+#[cfg(feature = "test_hooks")]
 fn maybe_inject_deadlock() {
     let cq = COMMITTER_QUEUE.share();
     // Claim one injection via CAS (saturating, never underflows below 0).
@@ -719,6 +728,7 @@ fn maybe_inject_deadlock() {
 }
 
 /// Raise a synthetic non-retryable error (one-shot) if armed.
+#[cfg(feature = "test_hooks")]
 fn maybe_inject_fatal() {
     if COMMITTER_QUEUE
         .share()
@@ -736,6 +746,7 @@ fn maybe_inject_fatal() {
 /// Raise a synthetic raw 23505 (one-shot) with no real duplicate behind it, to
 /// exercise the re-drive safety valve: a UNIQUE violation whose offender is not
 /// resolvable in `trx` must poison (not loop). Production builds never arm it.
+#[cfg(feature = "test_hooks")]
 fn maybe_inject_unique() {
     if COMMITTER_QUEUE
         .share()
@@ -752,6 +763,7 @@ fn maybe_inject_unique() {
 
 /// Sleep for the injected stall (µs), holding pool_locks + the open subtx, so a
 /// recovery test has a window to act on the committer mid-flight (§9.3).
+#[cfg(feature = "test_hooks")]
 fn maybe_stall() {
     let stall_us = COMMITTER_QUEUE
         .share()

@@ -138,7 +138,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pool_lock_acquisitions_total_wr
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:639
+-- ledger-routed-c/src/router.rs:653
 -- ledger_routed_c::router::ledger_routed_c_committer_queue_state_counts
 CREATE  FUNCTION "ledger_routed_c_committer_queue_state_counts"() RETURNS TABLE (
 	"state" TEXT,  /* String */
@@ -186,7 +186,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_hello_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:666
+-- ledger-routed-c/src/router.rs:680
 -- ledger_routed_c::router::ledger_routed_c_ready_commit_groups
 CREATE  FUNCTION "ledger_routed_c_ready_commit_groups"() RETURNS TABLE (
 	"commit_group_id" bigint,  /* i64 */
@@ -229,7 +229,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_staging_state_counts_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:977
+-- ledger-routed-c/src/router.rs:991
 -- ledger_routed_c::router::ledger_routed_c_test_committer_stall_hits
 CREATE  FUNCTION "ledger_routed_c_test_committer_stall_hits"() RETURNS bigint /* i64 */
 STRICT
@@ -238,7 +238,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_committer_stall_hits_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:1034
+-- ledger-routed-c/src/router.rs:1048
 -- ledger_routed_c::router::ledger_routed_c_test_inject_orphan_cq
 CREATE  FUNCTION "ledger_routed_c_test_inject_orphan_cq"() RETURNS INT /* i32 */
 STRICT
@@ -247,7 +247,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_inject_orphan_cq_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:957
+-- ledger-routed-c/src/router.rs:971
 -- ledger_routed_c::router::ledger_routed_c_test_router_pid
 CREATE  FUNCTION "ledger_routed_c_test_router_pid"() RETURNS INT /* i32 */
 STRICT
@@ -256,7 +256,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_router_pid_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:1021
+-- ledger-routed-c/src/router.rs:1035
 -- ledger_routed_c::router::ledger_routed_c_test_run_router_recovery_sweep
 CREATE  FUNCTION "ledger_routed_c_test_run_router_recovery_sweep"() RETURNS bigint /* i64 */
 STRICT
@@ -265,7 +265,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_run_router_recovery_sweep_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:934
+-- ledger-routed-c/src/router.rs:948
 -- ledger_routed_c::router::ledger_routed_c_test_set_bgworker_paused
 CREATE  FUNCTION "ledger_routed_c_test_set_bgworker_paused"(
 	"paused" bool /* bool */
@@ -276,7 +276,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_bgworker_paused_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:946
+-- ledger-routed-c/src/router.rs:960
 -- ledger_routed_c::router::ledger_routed_c_test_set_committer_paused
 CREATE  FUNCTION "ledger_routed_c_test_set_committer_paused"(
 	"paused" bool /* bool */
@@ -287,7 +287,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_committer_paused_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:966
+-- ledger-routed-c/src/router.rs:980
 -- ledger_routed_c::router::ledger_routed_c_test_set_committer_stall_us
 CREATE  FUNCTION "ledger_routed_c_test_set_committer_stall_us"(
 	"us" INT /* i32 */
@@ -298,7 +298,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_committer_stall_us_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:985
+-- ledger-routed-c/src/router.rs:999
 -- ledger_routed_c::router::ledger_routed_c_test_set_inject_deadlock_count
 CREATE  FUNCTION "ledger_routed_c_test_set_inject_deadlock_count"(
 	"n" INT /* i32 */
@@ -309,7 +309,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_inject_deadlock_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:997
+-- ledger-routed-c/src/router.rs:1011
 -- ledger_routed_c::router::ledger_routed_c_test_set_inject_fatal
 CREATE  FUNCTION "ledger_routed_c_test_set_inject_fatal"(
 	"on" bool /* bool */
@@ -320,7 +320,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_inject_fatal_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:1009
+-- ledger-routed-c/src/router.rs:1023
 -- ledger_routed_c::router::ledger_routed_c_test_set_inject_unique
 CREATE  FUNCTION "ledger_routed_c_test_set_inject_unique"(
 	"on" bool /* bool */

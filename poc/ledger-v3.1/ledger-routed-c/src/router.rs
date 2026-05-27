@@ -112,7 +112,9 @@ pub extern "C-unwind" fn ledger_routed_c_router_main(_arg: pg_sys::Datum) {
         }
         // Test-only pause hook: a test backend flips `test_bgworker_paused` to
         // 1 to suspend ticking while synchronous test SQL inspects slot state
-        // without racing this worker. Production default is 0 (no skip).
+        // without racing this worker. Compiled out of production (acct-yojk.11);
+        // only test_hooks builds carry the read and can arm it.
+        #[cfg(feature = "test_hooks")]
         if COMMITTER_QUEUE.share().test_bgworker_paused.load(Acquire) == 1 {
             continue;
         }
@@ -299,9 +301,21 @@ fn emit_commit_group(chunk: Vec<Candidate>, committer_capacity: u32) -> EmitOutc
         }
     };
 
-    // Data-before-flag: commit_group_id Release BEFORE CAS valid 2→3
-    // Release. Honor the two test-injection atomics so the P3.4 recovery
-    // test can stress the ordering window. Production defaults are 0/0 (no-op).
+    // Data-before-flag: commit_group_id Release BEFORE CAS valid 2→3 Release.
+    // Production runs this canonical ordering unconditionally; the test_hooks build
+    // (below) additionally honors two injection atomics so the P3.4 recovery test
+    // can stress the ordering window. The reads are compiled out of production
+    // (acct-yojk.11) — they were always 0/0 no-ops there.
+    #[cfg(not(feature = "test_hooks"))]
+    {
+        let queue = STAGING_QUEUE.share();
+        for cand in &packed {
+            let slot = &queue.entries[cand.staging_idx as usize];
+            slot.commit_group_id.store(cg_id, Release);
+            let _ = slot.valid.compare_exchange(2, 3, Release, Relaxed);
+        }
+    }
+    #[cfg(feature = "test_hooks")]
     {
         let delay_us = COMMITTER_QUEUE
             .share()
