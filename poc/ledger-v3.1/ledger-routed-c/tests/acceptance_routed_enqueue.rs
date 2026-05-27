@@ -24,6 +24,15 @@ async fn enqueue_stages_to_shmem_without_db_write() {
     let pending_before = staging_pending(&pool).await;
     let arena_before = arena_outstanding(&pool).await;
 
+    // Pause the router + committer so the staged-but-unprocessed state is
+    // observable. Otherwise the router's ~50ms tick races this read and can move
+    // the slots pending→routed (and the committer can then drain their arena
+    // blocks) before the assertions run.
+    set_router_paused(&pool, true).await;
+    set_committer_paused(&pool, true).await;
+    // Let any in-progress tick finish so both workers are parked on their flags.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
     // One plain line, one carrying the optional variance account.
     let s1 = enqueue(&pool, "po_receipt", 1, vec![receipt_line(1, 10, 50)])
         .await
@@ -37,25 +46,27 @@ async fn enqueue_stages_to_shmem_without_db_write() {
     .await
     .expect("enqueue 2 (with variance_account)");
 
+    // Capture the staged-state readings while paused.
+    let trx_after = trx_count(&pool).await;
+    let pending_delta = staging_pending(&pool).await - pending_before;
+    let arena_delta = arena_outstanding(&pool).await - arena_before;
+
+    // Resume BEFORE asserting so a failed assert never leaves the workers parked
+    // for the rest of this test binary.
+    set_committer_paused(&pool, false).await;
+    set_router_paused(&pool, false).await;
+
     // Monotonic submission ids (request_seq increments by 1).
     assert_eq!(s2, s1 + 1, "submission_id must be monotonic");
 
     // No DB write at enqueue — the trx row is created only at commit (P3.3).
-    assert_eq!(trx_count(&pool).await, 0, "enqueue must not write a trx row");
+    assert_eq!(trx_after, 0, "enqueue must not write a trx row");
 
     // Both submissions are staged pending and their payloads are in the arena.
-    assert_eq!(
-        staging_pending(&pool).await - pending_before,
-        2,
-        "two slots should be pending"
-    );
+    assert_eq!(pending_delta, 2, "two slots should be pending");
     // Each submission allocates 3 arena blocks: lines blob + submission blob +
     // pool-keys blob.
-    assert_eq!(
-        arena_outstanding(&pool).await - arena_before,
-        6,
-        "two submissions × 3 arena blocks each"
-    );
+    assert_eq!(arena_delta, 6, "two submissions × 3 arena blocks each");
 }
 
 #[tokio::test]
