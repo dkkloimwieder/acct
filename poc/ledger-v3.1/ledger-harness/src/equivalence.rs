@@ -195,6 +195,13 @@ async fn apply_direct(pool: &PgPool, subs: &[Submission]) -> Result<(), String> 
 }
 
 async fn apply_routed(pool: &PgPool, subs: &[Submission], drain: Duration) -> Result<(), String> {
+    // The universe seeding (setup_universe → deepen) writes its own trx rows, so
+    // the routed submissions are a DELTA on top of this baseline, not the whole
+    // trx table. Capture it before enqueueing.
+    let baseline: i64 = sqlx::query_scalar("SELECT count(*) FROM trx")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("routed baseline count: {e}"))?;
     for s in subs {
         let lines_json = build_lines_json(&s.lines);
         sqlx::query("SELECT ledger_enqueue_trx_c($1, $2, $3, $4::jsonb)")
@@ -226,6 +233,28 @@ async fn apply_routed(pool: &PgPool, subs: &[Submission], drain: Duration) -> Re
             last = n;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // The drain loop above is a quiescence heuristic — it can stop early on the
+    // deadline or a premature stable-read run. Before the caller diffs aggregates,
+    // assert every enqueued submission actually materialized: the workload is
+    // oversell-free (direct would have errored otherwise) and uses globally-unique
+    // source_ids, so nothing is dropped or deduped → the routed phase must add
+    // exactly subs.len() trx beyond the seeding baseline. A shortfall means the
+    // drain was incomplete; report that distinctly so it doesn't masquerade as an
+    // aggregate-equivalence FAIL against a partially-drained state.
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM trx")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("routed drain final count: {e}"))?;
+    let committed = n - baseline;
+    let expected = subs.len() as i64;
+    if committed != expected {
+        return Err(format!(
+            "routed drain incomplete: {committed}/{expected} submissions materialized \
+             after {drain:?} (trx {baseline}→{n}); aggregate diff skipped (raise the \
+             drain budget or investigate the committer)"
+        ));
     }
     Ok(())
 }
