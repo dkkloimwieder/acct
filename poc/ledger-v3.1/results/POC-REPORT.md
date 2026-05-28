@@ -59,10 +59,10 @@ noise floor (artifact a) — consistent with a less-contended host; read absolut
 directional regardless. Where noise matters to a conclusion it is called out inline.
 
 All harness invocations were hard-`timeout`-wrapped; the deep (depth-1000) reseeds ran under a
-1800 s per-call cap. Every run completed (27 crossover + 3 lock-hold; equivalence — 3 runs —
-carries from the 2026-05-27 snapshot since the `.so` are unchanged, see (d)) — none wedged, failed,
-or timed out; no committer poisoned; **zero dropped submissions and zero deadlock-retries on the
-routed path across the whole matrix** (all 9 scenarios).
+1800 s per-call cap. Every run completed (27 crossover + 3 lock-hold + 1 fresh equivalence for s9;
+the s5/s7/s8 equivalence verdicts carry from the 2026-05-27 snapshot since the `.so` are unchanged,
+see (d)) — none wedged, failed, or timed out; no committer poisoned; **zero dropped submissions
+and zero deadlock-retries on the routed path across the whole matrix** (all 9 scenarios).
 
 ---
 
@@ -227,6 +227,7 @@ depth 5) replayed through the direct flavor (caller-serial) and the routed flavo
 | s5 | 20 | 400 | **0** | 0 | **PASS** |
 | s7 | 20 | 400 | **0** | 0 | **PASS** |
 | s8 | 20 | 400 | **0** | 0 | **PASS** |
+| **s9** | 20 | 400 | **0** | 0 | **PASS** |
 
 **Aggregate qty is identical across flavors on every pool** — the order-independent correctness
 invariant (a signed sum of line qtys) holds regardless of how routing batches/reorders submissions
@@ -239,10 +240,13 @@ across flavors. It did not differ here, for two compounding reasons:
 
 1. **s5/s7 are pure-depletion** (`deplete_pct=100`). Depletions read the running aggregate but do
    **not** mutate aggregate unit_cost — so there is no order-sensitive quantity to diverge.
-2. **s8 has receipts** (`deplete_pct=50`, random costs) yet still matched, because the router
-   **preserves per-pool enqueue order** within a commit_group and the committer applies in that
-   order. So the WAC running-average sees the *same per-pool operation order* as the caller-serial
-   direct flavor, yielding identical provisional costs.
+2. **s8 / s9 have receipts** (`deplete_pct=50`, random costs) yet still matched, because the
+   router **preserves per-pool enqueue order** within a commit_group and the committer applies in
+   that order. So the WAC running-average sees the *same per-pool operation order* as the
+   caller-serial direct flavor, yielding identical provisional costs. s9 additionally repeats one
+   pool 2–3× in ~40% of submissions; the in-submission `coalesce_aggregates` collapse converges to
+   the same per-pool aggregate on both flavors (direct: in-submission coalesce → bulk UPSERT;
+   routed: committer post-pass-snapshot reconstruction).
 
 Divergence therefore remains **architecturally permitted but unobserved** in this PoC: it would
 surface only if same-pool receipts were committed out of enqueue order (e.g. cross-chunk reordering
@@ -250,12 +254,10 @@ under a smaller `batch_size_max`). Crucially, even if/when provisional unit_cost
 the recalc/close input — stays exact**, so the divergence is a cosmetic provisional-cost artifact,
 not a correctness defect. Authoritative cost reconciliation is deferred (§13).
 
-The 2026-05-28 measurement **did not re-run equivalence** with the new s9 / multi-touch generation;
-the `.so` are unchanged since the 2026-05-27 run, so the verdict above carries forward. Adding a
-fourth equivalence row for s9 would formally close the question *"does multi-touch break aggregate
-qty?"* — sensible as a follow-up, but the multi-touch coalesce is exercised under cross-flavor
-load in artifact (e) below with `errors=0`, `drops=0`, `deadlock_retries=0` on both flavors, which
-is the same correctness signal at a coarser grain.
+The 2026-05-28 measurement **added a fresh equivalence run for s9** (the new multi-touch scenario):
+0 qty mismatches, 0 unit_cost divergences — PASS. The s5/s7/s8 verdicts carry from 2026-05-27
+since the `.so` are unchanged. So multi-touch (same-pool-twice within one submission) does not
+break the aggregate-qty invariant on either coalesce path.
 
 ---
 
@@ -296,8 +298,11 @@ size of the units it operates on shifts.
 
 This closes the only post-build review concern that distinct-pool generation had hidden:
 `acct-34ce` (the harness opt-in mode and the s9 preset) directly exercises the coalesce path under
-load — the s9 row in (b) and the equivalence-class verdict above (`errors=0` end-to-end on both
-correctness flavors) say the path is sound.
+load. Three independent signals say the path is sound — the s9 row in (b) (`errors=0` on
+direct-per-call, `drops=0 / poison=0 / deadlock_retries=0` on routed under 1000-caller load), the
+s9 equivalence row in (d) (**0 qty mismatches, 0 unit_cost divergences** in a deterministic
+identical-input replay through both flavors), and the three coalesce unit tests on `ledger-core` /
+direct / routed (the existing regression net).
 
 ---
 
@@ -342,8 +347,8 @@ per-group lock acquisitions (63 896 trx → 2 078 locks on the single-hot-pool s
 reduction, 6.3× the throughput of direct-per-call) and is the **only** mode that batches safely
 under cross-caller contention — standard-tx batching deadlocks (500–1300 aborts) wherever callers
 overlap and wins only when they are disjoint. (3) Direct and routed agree **exactly on aggregate
-qty** (verdict carries from 2026-05-27; the `.so` are unchanged), the invariant the deferred
-recalc/close pass will build on. (4, new) **Multi-touch (same-pool-twice) submissions commit
+qty** (s5/s7/s8 verdicts carry from 2026-05-27; s9 was re-run and also PASSes with 0 mismatches),
+the invariant the deferred recalc/close pass will build on. (4, new) **Multi-touch (same-pool-twice) submissions commit
 cleanly under load on both correctness flavors** — s9 (s8's shape + 40% multi-touch) shows
 `errors=0` on direct-per-call and `drops=0 / poison=0 / deadlock_retries=0` on routed at
 1000-caller deep-FIFO concurrency; ledger-core's `coalesce_aggregates` operates as designed.
