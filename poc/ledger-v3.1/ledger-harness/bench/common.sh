@@ -29,20 +29,20 @@ mkdir -p "$RESULTS_DIR"
 
 BIN="${BIN:-$WS_DIR/target/release/ledger-harness}"
 
+# Always (re)build so the binary tracks the current harness source — cargo is
+# incremental, so this is near-free when nothing changed.
 build_harness() {
-    if [ ! -x "$BIN" ]; then
-        echo "==> building ledger-harness (release)"
-        ( cd "$WS_DIR" && cargo build --release -p ledger-harness )
-        BIN="$WS_DIR/target/release/ledger-harness"
-    fi
+    echo "==> building ledger-harness (release)"
+    ( cd "$WS_DIR" && cargo build --release -p ledger-harness )
+    BIN="$WS_DIR/target/release/ledger-harness"
 }
 
 # Pick the DSN for a scenario's caller count: pooler for the 1000-caller
-# scenarios (s5/s6/s7/s8), direct otherwise.
+# scenarios (s5/s6/s7/s8/s9), direct otherwise.
 dsn_for_scenario() {
     case "$1" in
-        s5|s6|s7|s8) echo "$POOLER_DSN" ;;
-        *)           echo "$DIRECT_DSN" ;;
+        s5|s6|s7|s8|s9) echo "$POOLER_DSN" ;;
+        *)              echo "$DIRECT_DSN" ;;
     esac
 }
 

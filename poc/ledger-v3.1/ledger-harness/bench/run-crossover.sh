@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §11.4 crossover matrix: drive every scenario (S1-S8) under all three
+# §11.4 crossover matrix: drive every scenario (S1-S9) under all three
 # submission modes (direct-per-call, direct-batched, routed) and emit one JSON
 # report per (scenario, mode). P5 reads these to map the region where each Path C
 # configuration wins — in particular whether routed pulls meaningfully ahead of
@@ -7,16 +7,17 @@
 # most of routing's benefit.
 #
 # Per scenario the universe is reseeded to that scenario's expected depth
-# (s1-s4 shallow/receipt-only → depth 0; s5/s6 → depth 10; s7/s8 → depth 1000).
-# The DSN is chosen per scenario (pooler for the 1000-caller s5-s8). Each run is
-# HARD-timeout-wrapped.
+# (s1-s4 shallow/receipt-only → depth 0; s5/s6 → depth 10; s7/s8/s9 → depth 1000).
+# The DSN is chosen per scenario (pooler for the 1000-caller s5-s9). s9 is s8's
+# shape with multi-touch enabled (acct-34ce) — the coalesce-under-load case. Each
+# run is HARD-timeout-wrapped.
 #
 # NOTE: reseeding a large universe (SEED_COUNT) to depth 1000 for s7/s8 writes
 # SEED_COUNT×1000 layer rows — the slow part of the bake-off; size SEED_COUNT to
 # your run budget.
 #
 # Usage: bash bench/run-crossover.sh [duration] [scenarios...]
-#   bash bench/run-crossover.sh 30s              # all S1-S8, all modes
+#   bash bench/run-crossover.sh 30s              # all S1-S9, all modes
 #   bash bench/run-crossover.sh 30s s5 s7        # subset
 
 set -euo pipefail
@@ -26,7 +27,7 @@ DURATION="${1:-30s}"
 shift || true
 SCENARIOS=("$@")
 if [ "${#SCENARIOS[@]}" -eq 0 ]; then
-    SCENARIOS=(s1 s2 s3 s4 s5 s6 s7 s8)
+    SCENARIOS=(s1 s2 s3 s4 s5 s6 s7 s8 s9)
 fi
 
 SEED_COUNT="${SEED_COUNT:-10000}"
@@ -36,9 +37,9 @@ BATCH_SIZE="${BATCH_SIZE:-50}"
 
 depth_for() {
     case "$1" in
-        s5|s6) echo 10 ;;
-        s7|s8) echo 1000 ;;
-        *)     echo 0 ;;
+        s5|s6)    echo 10 ;;
+        s7|s8|s9) echo 1000 ;;
+        *)        echo 0 ;;
     esac
 }
 method_for() {
