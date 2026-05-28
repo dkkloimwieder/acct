@@ -84,6 +84,8 @@ async fn main() -> std::process::ExitCode {
             seed_depth,
             multi_touch_pct,
             touch_dist,
+            pareto_hot_pool_pct,
+            pareto_hot_traffic_pct,
         } => {
             // Parse the multi-touch distribution overlay up front so a bad spec
             // fails before any reseed/load work (acct-34ce).
@@ -138,6 +140,8 @@ async fn main() -> std::process::ExitCode {
                         max_callers,
                         multi_touch_pct,
                         touch_dist,
+                        pareto_hot_pool_pct,
+                        pareto_hot_traffic_pct,
                     })
                     .await
                 }
@@ -153,6 +157,8 @@ async fn main() -> std::process::ExitCode {
                         drain_deadline: Duration::from_secs(30),
                         multi_touch_pct,
                         touch_dist,
+                        pareto_hot_pool_pct,
+                        pareto_hot_traffic_pct,
                     })
                     .await
                 }

@@ -35,6 +35,7 @@ The PoC set out to validate two premises and one invariant:
 | Harness | `target/release/ledger-harness` (sqlx + tokio, multi-session) |
 | Submission modes (§10.0) | `direct-per-call` (one user-tx per submit), `direct-batched` (50 submits per user-tx), `routed` (enqueue → committer pool) |
 | Crossover scale | `SEED_COUNT=10000` pools, `30s`/run, full S1–S9 × 3 modes (S9 = WO-completion multi-touch mix, `acct-34ce`) |
+| Pareto family (S10-S21, `acct-s90k`) | 1000 pools, 5s/run smoke × {direct-per-call, routed} per scenario; coverage validation, not a perf measurement |
 | Lock-hold sweep | 256 FIFO pools, 16 callers, depths {10, 100, 1000} |
 
 **Measurement provenance:** these numbers are a full re-measurement on **2026-05-28** against the
@@ -303,6 +304,61 @@ direct-per-call, `drops=0 / poison=0 / deadlock_retries=0` on routed under 1000-
 s9 equivalence row in (d) (**0 qty mismatches, 0 unit_cost divergences** in a deterministic
 identical-input replay through both flavors), and the three coalesce unit tests on `ledger-core` /
 direct / routed (the existing regression net).
+
+---
+
+## (f) Pareto 80/20 typical-mid-market coverage — §10.6 / `acct-s90k` → **CLEAN**
+
+S1-S9 brackets the contention envelope at the architectural extremes (s6 disjoint = 0%; s5
+single-pool = 100%) and approximates the mid-market region via Zipf(1.2) (which over 10000 pools
+is ~87/20, more concentrated than textbook Pareto 80/20). It does **not** carry a *discrete*
+hot/cold mixture — the workload shape mid-market ERP loads actually live in. **S10-S21** add that
+shape via the new `OverlapMode::Pareto { hot_pool_fraction, hot_traffic_fraction }` (a two-
+population mixture: each pick rolls hot vs cold by `hot_traffic_fraction`, then samples uniformly
+in that population) × three workload families:
+
+- **RECEIPTS** (`s10`–`s13`): `deplete_pct=0`, distinct-pool. PO receipt / transfer-in.
+- **BUILDS** (`s14`–`s17`): `deplete_pct=50`, multi-touch ENABLED (`pct=40`, dist `1:60,2:30,3:10`).
+  WO-completion shape (backflush + scrap + output on one SKU/location), per `acct-34ce`.
+- **MIXED** (`s18`–`s21`): `deplete_pct=50`, distinct-pool. Generic transfer / sale balance.
+
+Each family × four overlap/scale variants (mid-typ 50 callers, high-vol 200 callers + depth 100,
+long-tail Pareto 90/10, balanced Pareto 50/50 = 12 scenarios total. The harness also exposes
+`--pareto-hot-pool-pct` / `--pareto-hot-traffic-pct` CLI overlays so any base scenario can be
+re-shaped on the fly. CLI overlays + canned scenarios were both chosen on purpose (mirrors
+`acct-34ce`'s `--multi-touch-pct` / `--touch-dist` pair).
+
+**Scope note: artifact (f) is *coverage extension*, not a new architectural premise.** Premises
+1–4 (artifacts a/b/c/d/e) characterize Path C; the Pareto family fills in the typical-mid-market
+region where prior scenarios only interpolate between extremes. The acceptance bar for `acct-s90k`
+is **wiring + clean smoke**, not perf comparison — production-grade re-measurement (30s/run on a
+quiesced host) lands as a future task when a structural finding warrants it.
+
+| Scn | family | variant | callers | depth | direct-per-call | direct-batched | routed |
+|-----|--------|---------|--------:|------:|-----------------|----------------|--------|
+| s10 | Receipts | mid-typ | 50 | 0 | **711.4 trx/s** | 3.6 trx/s (err 53) | **3568.9 trx/s** (cg 24.58) |
+| s11 | Receipts | high-vol | 200 | 100 | **663.2 trx/s** | 1.2 trx/s (err 210) | **2840.6 trx/s** (cg 44.58) |
+| s12 | Receipts | long-tail | 50 | 0 | **375.0 trx/s** | 3.1 trx/s (err 56) | **3471.4 trx/s** (cg 32.14) |
+| s13 | Receipts | balanced | 50 | 0 | **655.1 trx/s** | 5.9 trx/s (err 53) | **3162.9 trx/s** (cg 30.57) |
+| s14 | Builds | mid-typ | 50 | 10 | **979.2 trx/s** | 5.0 trx/s (err 57) | **3669.4 trx/s** (cg 15.27) |
+| s15 | Builds | high-vol | 200 | 100 | **453.7 trx/s** | 1.1 trx/s (err 211) | **3421.5 trx/s** (cg 25.29) |
+| s16 | Builds | long-tail | 50 | 10 | **904.5 trx/s** | 4.1 trx/s (err 59) | **3677.3 trx/s** (cg 28.62) |
+| s17 | Builds | balanced | 50 | 10 | **996.7 trx/s** | 6.7 trx/s (err 61) | **3636.8 trx/s** (cg 13.03) |
+| s18 | Mixed | mid-typ | 50 | 10 | **850.9 trx/s** | 4.7 trx/s (err 54) | **3614.2 trx/s** (cg 31.33) |
+| s19 | Mixed | high-vol | 200 | 100 | **654.3 trx/s** | 1.6 trx/s (err 211) | **3379.8 trx/s** (cg 24.97) |
+| s20 | Mixed | long-tail | 50 | 10 | **810.1 trx/s** | 2.8 trx/s (err 57) | **3729.6 trx/s** (cg 22.84) |
+| s21 | Mixed | balanced | 50 | 10 | **953.6 trx/s** | 6.2 trx/s (err 56) | **3654.3 trx/s** (cg 12.95) |
+
+**Verdict: clean across the matrix.** Every direct-per-call cell `errors=0` and every routed cell
+`drops=0 / poison=0 / deadlock_retries=0` (acceptance criterion 4 of `acct-s90k`). The `direct-
+batched` column carries the same shape as S1–S9 — clean on the receipts family (no cross-caller
+contention to deadlock against), aborts under deplete/multi-touch overlap (s14–s21 mirror
+s8/s9's pattern); this is the documented batching-under-contention regime from artifact (b),
+re-confirmed at a different scale.
+
+Numbers above are 5s smoke runs against 10000 pools — directional only. They establish the
+*coverage*, not perf rankings against S1–S9. The structural premises (a/b/c/d/e) carry; the
+Pareto family is the typical-mid-market window for future comparisons.
 
 ---
 

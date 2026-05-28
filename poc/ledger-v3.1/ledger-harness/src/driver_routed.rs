@@ -27,7 +27,7 @@ use sqlx::PgPool;
 use tokio::sync::Barrier;
 
 use crate::driver_common::{
-    apply_multi_touch, build_lines_json, cap_callers, multi_touch_report, run_prefix,
+    apply_multi_touch, apply_pareto, build_lines_json, cap_callers, multi_touch_report, run_prefix,
 };
 use crate::measure::{take_snapshot, LatencyHistogram, MeasureCollector};
 use crate::report::{self, RoutedReport, RunReport};
@@ -47,6 +47,10 @@ pub struct RunOptions {
     /// Multi-touch overlay (acct-34ce); None leaves the scenario's own setting.
     pub multi_touch_pct: Option<u8>,
     pub touch_dist: Option<crate::workload::TouchDistribution>,
+    /// Pareto overlap overlay (acct-s90k); either knob being Some switches the
+    /// scenario's overlap to Pareto. Both unset leaves the native overlap.
+    pub pareto_hot_pool_pct: Option<u8>,
+    pub pareto_hot_traffic_pct: Option<u8>,
 }
 
 type SubmissionMark = (i64, Instant);
@@ -66,9 +70,10 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
 
     let universe = crate::pool_universe::load(&pool).await?;
     let mut spec = scenarios::by_id(&opts.scenario, universe)
-        .ok_or_else(|| format!("unknown scenario '{}' (try s1..s8)", opts.scenario))?;
+        .ok_or_else(|| format!("unknown scenario '{}' (try s1..s21)", opts.scenario))?;
     cap_callers(&mut spec, opts.max_callers);
     apply_multi_touch(&mut spec, opts.multi_touch_pct, opts.touch_dist);
+    apply_pareto(&mut spec, opts.pareto_hot_pool_pct, opts.pareto_hot_traffic_pct);
     eprintln!(
         "scenario {} [routed]: {} (callers={}, duration={:?})",
         spec.id, spec.description, spec.callers, opts.duration

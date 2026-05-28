@@ -55,7 +55,8 @@ pub enum Cmd {
     },
     /// Drive a scenario in one submission mode and collect measurements.
     Run {
-        /// Scenario id (s1..s9 per §10.6; s9 is the canned multi-touch mix).
+        /// Scenario id (s1..s21 per §10.6; s9 is the canned multi-touch mix;
+        /// s10-s21 are the Pareto 80/20 receipts/builds/mixed family block).
         #[arg(long)]
         scenario: String,
         /// Submission mode (§10.0).
@@ -113,6 +114,20 @@ pub enum Cmd {
         /// consulted when multi-touch is active. Overrides the scenario's value.
         #[arg(long)]
         touch_dist: Option<String>,
+        /// Overlay the Pareto hot-pool fraction (acct-s90k): percent of the
+        /// universe that forms the hot population. Switches the scenario's
+        /// overlap to `Pareto` even if it was previously Uniform/Zipf/Disjoint;
+        /// the cold half is the complement. Pairs with `--pareto-hot-traffic-pct`
+        /// (defaults to 80 when only the pool fraction is set). 0/unset leaves
+        /// the scenario's overlap untouched.
+        #[arg(long)]
+        pareto_hot_pool_pct: Option<u8>,
+        /// Overlay the Pareto hot-traffic fraction (acct-s90k): percent of
+        /// submissions that target the hot population. Pairs with
+        /// `--pareto-hot-pool-pct` (defaults to 20 when only the traffic
+        /// fraction is set). Unset leaves the scenario's overlap untouched.
+        #[arg(long)]
+        pareto_hot_traffic_pct: Option<u8>,
     },
     /// Drive direct-c and routed-c against an identical input sequence and diff
     /// the resulting pool_state aggregate qty (§11.1). Aggregate qty must match

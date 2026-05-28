@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::report::MultiTouchReport;
 use crate::scenarios::ScenarioSpec;
-use crate::workload::{LineParam, TouchDistribution, Workload};
+use crate::workload::{LineParam, OverlapMode, TouchDistribution, Workload};
 
 /// Per-run, per-caller source_id namespace base. `run_prefix + caller_id*1e6 +
 /// tick` keeps the trx UNIQUE (trx_type, source_id) constraint from colliding
@@ -64,6 +64,32 @@ pub fn multi_touch_report(w: &Workload) -> Option<MultiTouchReport> {
         pct: w.multi_touch_pct,
         touch_dist: w.touch_dist.spec_string(),
     })
+}
+
+/// Overlay the optional `run --pareto-hot-pool-pct` / `--pareto-hot-traffic-pct`
+/// knobs onto a resolved scenario's workload (acct-s90k). Either knob being set
+/// switches the workload's overlap to `Pareto`; the other defaults to the
+/// textbook 80/20 complement (hot pool 20%, hot traffic 80%). Logs the
+/// substitution so bench logs make the overlay legible. With both unset the
+/// workload is untouched — the scenario's native overlap stands.
+pub fn apply_pareto(
+    spec: &mut ScenarioSpec,
+    hot_pool_pct: Option<u8>,
+    hot_traffic_pct: Option<u8>,
+) {
+    if hot_pool_pct.is_none() && hot_traffic_pct.is_none() {
+        return;
+    }
+    let hp = hot_pool_pct.unwrap_or(20).clamp(0, 100);
+    let ht = hot_traffic_pct.unwrap_or(80).clamp(0, 100);
+    eprintln!(
+        "scenario {}: overlap {:?} -> Pareto hot_pool={}% hot_traffic={}% via --pareto-*",
+        spec.id, spec.workload.overlap, hp, ht
+    );
+    spec.workload.overlap = OverlapMode::Pareto {
+        hot_pool_fraction: hp as f64 / 100.0,
+        hot_traffic_fraction: ht as f64 / 100.0,
+    };
 }
 
 /// JSONB array shape expected by `ledger_submit_trx_c` / `ledger_enqueue_trx_c`.

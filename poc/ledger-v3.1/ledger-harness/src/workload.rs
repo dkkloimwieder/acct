@@ -30,6 +30,13 @@ pub enum OverlapMode {
     /// Disjoint stripes: caller `c` only sees
     /// pool_ids[c*stripe_size .. (c+1)*stripe_size].
     Disjoint { stripe_size: usize },
+    /// Discrete two-population mixture (acct-s90k). Each pick rolls hot vs cold
+    /// by `hot_traffic_fraction` then samples uniformly within that population.
+    /// The hot population is `pool_ids[0 .. hot_count]` where `hot_count =
+    /// round(hot_pool_fraction * n)` clamped to `[1, n-1]` when both fractions
+    /// are in (0,1); at the boundaries (0.0 / 1.0) the empty side rolls fall
+    /// through to the populated side. Textbook 80/20 = `{0.2, 0.8}`.
+    Pareto { hot_pool_fraction: f64, hot_traffic_fraction: f64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -269,6 +276,12 @@ impl Workload {
             OverlapMode::Disjoint { stripe_size } => {
                 pick_disjoint(rng, &self.universe.pool_ids, caller_id, stripe_size)
             }
+            OverlapMode::Pareto { hot_pool_fraction, hot_traffic_fraction } => pick_pareto(
+                rng,
+                &self.universe.pool_ids,
+                hot_pool_fraction,
+                hot_traffic_fraction,
+            ),
         }
     }
 }
@@ -303,6 +316,48 @@ pub fn pick_disjoint<R: Rng + ?Sized>(
     let end = end.max(start + 1);
     let i = rng.random_range(start..end);
     pool_ids[i]
+}
+
+/// Discrete two-population mixture (acct-s90k). With probability
+/// `hot_traffic_fraction` sample uniformly from the first `hot_count` pools;
+/// otherwise from the remaining `cold_count`. `hot_count` is clamped to
+/// `[1, n-1]` whenever both populations should exist, so the textbook
+/// `{0.2, 0.8}` always has both a hot and a cold pool to draw from. When one
+/// side is empty by construction (`hot_pool_fraction` of 0.0 or 1.0), or when
+/// the fraction lands in the empty side, the roll falls through to the other —
+/// every call still returns a valid `pool_id`.
+pub fn pick_pareto<R: Rng + ?Sized>(
+    rng: &mut R,
+    pool_ids: &[i64],
+    hot_pool_fraction: f64,
+    hot_traffic_fraction: f64,
+) -> i64 {
+    let n = pool_ids.len();
+    if n == 0 {
+        panic!("pick_pareto called on empty pool_ids");
+    }
+    let hp = hot_pool_fraction.clamp(0.0, 1.0);
+    let ht = hot_traffic_fraction.clamp(0.0, 1.0);
+    let raw = (hp * n as f64).round() as usize;
+    let hot_count = if hp <= 0.0 {
+        0
+    } else if hp >= 1.0 {
+        n
+    } else {
+        raw.clamp(1, n - 1)
+    };
+    let roll_hot = rng.random::<f64>() < ht;
+    let take_hot = (roll_hot && hot_count > 0) || hot_count == n;
+    if take_hot {
+        let i = rng.random_range(0..hot_count.max(1));
+        pool_ids[i]
+    } else {
+        // Cold span starts at hot_count; if hot_count == n the take_hot branch
+        // above already covered the all-hot case, so this branch only runs when
+        // hot_count < n.
+        let i = rng.random_range(hot_count..n);
+        pool_ids[i]
+    }
 }
 
 #[cfg(test)]
@@ -555,6 +610,96 @@ mod tests {
         for _ in 0..1_000 {
             assert_eq!(always_two.sample(&mut rng), 2);
             assert_eq!(distinct.sample(&mut rng), 1);
+        }
+    }
+
+    fn count_hot_picks(
+        rng: &mut StdRng,
+        pool_ids: &[i64],
+        hot_pool_pct: f64,
+        hot_traffic_pct: f64,
+        rolls: usize,
+    ) -> (usize, usize) {
+        let hot_cutoff = pool_ids[((hot_pool_pct * pool_ids.len() as f64).round() as usize)
+            .clamp(1, pool_ids.len() - 1)];
+        let mut hot = 0usize;
+        for _ in 0..rolls {
+            let id = pick_pareto(rng, pool_ids, hot_pool_pct, hot_traffic_pct);
+            if id <= hot_cutoff {
+                hot += 1;
+            }
+        }
+        (hot, rolls)
+    }
+
+    #[test]
+    fn pareto_mixture_respects_traffic_fraction() {
+        // 80/20: ~80% of rolls land in the first 20% of pools (one-tenth windows
+        // are tight enough to catch a swapped fraction without flaking on noise).
+        let mut rng = StdRng::seed_from_u64(20);
+        let pool_ids = ids(1000);
+        let (hot, total) = count_hot_picks(&mut rng, &pool_ids, 0.2, 0.8, 20_000);
+        let frac = hot as f64 / total as f64;
+        assert!((0.75..=0.85).contains(&frac), "expected ~0.80 hot share; got {frac}");
+    }
+
+    #[test]
+    fn pareto_hot_pool_subset_is_disjoint_from_cold() {
+        // The hot half and cold half never overlap by construction: every hot
+        // pick is below the cutoff index, every cold pick at or above.
+        let mut rng = StdRng::seed_from_u64(21);
+        let pool_ids = ids(100);
+        let hot_count = 20usize;
+        let cutoff = pool_ids[hot_count - 1];
+        let mut saw_hot = false;
+        let mut saw_cold = false;
+        for _ in 0..5_000 {
+            let id = pick_pareto(&mut rng, &pool_ids, 0.2, 0.8);
+            if id <= cutoff {
+                saw_hot = true;
+            } else {
+                saw_cold = true;
+            }
+        }
+        assert!(saw_hot && saw_cold, "both populations must be reached");
+    }
+
+    #[test]
+    fn pareto_degenerate_values_are_handled() {
+        let mut rng = StdRng::seed_from_u64(22);
+        let pool_ids = ids(50);
+        // hot_traffic = 0.0 → always cold; never hits pool_ids[0..10].
+        for _ in 0..500 {
+            let id = pick_pareto(&mut rng, &pool_ids, 0.2, 0.0);
+            assert!(id > pool_ids[9], "ht=0.0 must avoid hot half; got {id}");
+        }
+        // hot_traffic = 1.0 → always hot; never hits pool_ids[10..].
+        for _ in 0..500 {
+            let id = pick_pareto(&mut rng, &pool_ids, 0.2, 1.0);
+            assert!(id <= pool_ids[9], "ht=1.0 must stay in hot half; got {id}");
+        }
+        // hot_pool = 1.0 → cold is empty; even cold rolls fall through to hot.
+        for _ in 0..500 {
+            let id = pick_pareto(&mut rng, &pool_ids, 1.0, 0.0);
+            assert!(pool_ids.contains(&id));
+        }
+        // hot_pool = 0.0 → hot is empty; even hot rolls fall through to cold.
+        for _ in 0..500 {
+            let id = pick_pareto(&mut rng, &pool_ids, 0.0, 1.0);
+            assert!(pool_ids.contains(&id));
+        }
+    }
+
+    #[test]
+    fn pareto_clamps_out_of_range_fractions() {
+        // Inputs outside [0,1] saturate rather than blow up — the harness CLI
+        // passes percent-based u8 → f64/100.0 which can be 0..=100 but
+        // defensive clamping protects programmatic callers too.
+        let mut rng = StdRng::seed_from_u64(23);
+        let pool_ids = ids(50);
+        for _ in 0..200 {
+            let id = pick_pareto(&mut rng, &pool_ids, -0.5, 1.5);
+            assert!(pool_ids.contains(&id));
         }
     }
 }
