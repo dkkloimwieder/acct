@@ -362,13 +362,156 @@ Pareto family is the typical-mid-market window for future comparisons.
 
 ---
 
+## (g) Routed long-duration cleanliness + clean throughput — §14 / `acct-0516` + `acct-235v` → **CLEAN**
+
+This artifact has two passes. **Pass 1 (`acct-0516`)** drove every scenario **S1–S21** through routed
+mode at **two durations (60 s, then 600 s)**, clean DB per scenario, to surface any
+*duration-dependent failure* — poison threshold, takeover after committer death, deadlock-retry
+accumulation, shmem-arena spillover, staging back-pressure, router-orphan recovery, drain-deadline
+behaviour. Verdict: **CLEAN** — zero `dropped`/`poisoned`/`deadlock_retries`/`takeover` across all 42
+cells, and no structural 10m-vs-1m divergence. That cleanliness verdict is robust on its own: it
+concerns failure counters, which host contention cannot manufacture.
+
+**Pass 2 (`acct-235v`)** is a **clean, load-gated re-measurement of throughput.** Pass 1's *absolute*
+throughput numbers were contaminated by two sources identified afterward: (a) ~15 foreign PoC
+BGWorkers left in `shared_preload_libraries` by other streams' install scripts (which append and
+never prune), contending for the 8 cores; and (b) Chrome on this daily-driver workstation (one
+renderer at ~89 % CPU), which swung identical-run throughput by up to ~2×. Both were removed —
+preload stripped to `pg_stat_statements, pg_cron, ledger_routed_c`, and a **per-run load gate**
+(`common.sh::wait_for_quiet_host`) that holds each timed run until the 1-min loadavg drops below 1.5.
+Direct-per-call and direct-batched stay dropped: their committer / shmem path is absent, so they do
+not develop new failure modes with duration (their verdicts live in artifact (b)).
+
+**Method.** `ledger-harness/bench/run-routed-longdur.sh` with `DURATIONS=120` — one **2-minute**
+load-gated run per scenario, clean DB each (21 routed cells). Clean = **DROP/CREATE `poc_v3_1` +
+re-run the 16 sqlx migrations + `CREATE EXTENSION` + postmaster restart** (clean-DB option a2 — the
+more aggressive choice over a1's restart-and-reset, because it surfaces migration / extension-init
+bugs). Seed depth follows the artifact-(b) crossover depths (s5/s6 = 10, s7/s8/s9 = 1000,
+s11/s15/s19 = 100, the remaining deplete scenarios = 10, receipts = 0). A committer-readiness canary
+runs after each clean and gates the timed run. S5–S9 (1000 callers) route through pgbouncer:6432.
+Every cell below ran with pre-run loadavg < 1.5.
+
+**FINDING (bench methodology, not a Path C defect): a bare `DROP DATABASE` wedges the routed
+committer.** The router / committer / recovery workers are `shared_preload_libraries` BGWorkers and
+the staging / commit-group **shmem arena lives for the cluster lifetime**, not the database
+lifetime. `DROP DATABASE … WITH (FORCE)` severs the committer's SPI connection and orphans the
+in-arena staging entries but does **not** clear the arena; the committer never resumes against the
+recreated database and orphaned entries jam the staging queue (observed pre-fix: 16 384 pending, 0
+drains, then new enqueues fail because staging is full). A **postmaster restart** after the
+DROP/CREATE re-execs `_PG_init`, cold-creates the arena, and respawns a committer that attaches to
+the recreated DB. This is why a1's restart-based clean (run-crossover.sh) keeps routed healthy; the
+routed-c README's "only a3 / volume-wipe clears the arena" is imprecise — *any* postmaster restart
+clears it. You would never `DROP DATABASE` under a live committer in production, so this is a
+benchmark-harness concern, captured here for the next operator. The committer-restart gate held
+across all 21 scenarios — every readiness canary passed on the first attempt.
+
+### Clean per-scenario routed throughput — 2-minute load-gated (`acct-235v`)
+
+These supersede Pass 1's contaminated absolutes. Each is a single 2-minute routed run on a clean DB,
+held until pre-run loadavg < 1.5, on the minimal-preload cluster.
+
+| scn | throughput | trx_committed | unseen | errors | drains | cg_avg | pool_lock | agg_upsert | dropped | poison | dlk_retry | takeover | ack_p99 µs |
+|-----|-----------:|--------------:|-------:|-------:|-------:|-------:|----------:|-----------:|--------:|-------:|----------:|---------:|-----------:|
+| s1 | 1,075 | 129,074 | 0 | 0 | 117,320 | 1.10 | 117,320 | 117,320 | 0 | 0 | 0 | 0 | 40,894 |
+| s2 | 925 | 111,119 | 0 | 0 | 14,714 | 7.55 | 14,714 | 14,714 | 0 | 0 | 0 | 0 | 1,192,230 |
+| s3 | 736 | 88,349 | 0 | 0 | 10,786 | 8.19 | 1,265,220 | 1,265,220 | 0 | 0 | 0 | 0 | 97,714 |
+| s4 | 499 | 60,106 | 0 | 24 | 5,365 | 11.20 | 490,398 | 490,398 | 0 | 0 | 0 | 0 | 2,602,565 |
+| s5 | 1,838 | 221,755 | 0 | 0 | 8,184 | 27.10 | 8,184 | 8,184 | 0 | 0 | 0 | 0 | 742,391 |
+| s6 | 713 | 86,752 | 0 | 0 | 79,974 | 1.08 | 79,974 | 79,974 | 0 | 0 | 0 | 0 | 2,128,609 |
+| s7 | 1,252 | 151,566 | 0 | 0 | 40,543 | 3.74 | 40,543 | 40,543 | 0 | 0 | 0 | 0 | 1,388,314 |
+| s8 | 598 | 72,984 | 0 | 0 | 6,300 | 11.58 | 584,159 | 584,159 | 0 | 0 | 0 | 0 | 2,749,366 |
+| s9 | 633 | 77,211 | 0 | 0 | 6,594 | 11.71 | 544,637 | 544,637 | 0 | 0 | 0 | 0 | 2,550,136 |
+| s10 | 632 | 75,827 | 0 | 0 | 8,446 | 8.98 | 1,029,024 | 1,029,024 | 0 | 0 | 0 | 0 | 429,129 |
+| s11 | 493 | 59,267 | 0 | 21 | 6,363 | 9.31 | 805,356 | 805,356 | 0 | 0 | 0 | 0 | 2,657,091 |
+| s12 | 681 | 81,734 | 0 | 0 | 8,539 | 9.57 | 998,045 | 998,045 | 0 | 0 | 0 | 0 | 404,226 |
+| s13 | 638 | 76,573 | 0 | 0 | 8,603 | 8.90 | 1,108,719 | 1,108,719 | 0 | 0 | 0 | 0 | 428,081 |
+| s14 | 673 | 80,830 | 0 | 0 | 8,569 | 9.43 | 967,038 | 967,038 | 0 | 0 | 0 | 0 | 405,536 |
+| s15 | 476 | 57,342 | 0 | 40 | 6,334 | 9.05 | 685,535 | 685,535 | 0 | 0 | 0 | 0 | 2,755,657 |
+| s16 | 671 | 80,588 | 0 | 0 | 8,531 | 9.45 | 873,691 | 873,691 | 0 | 0 | 0 | 0 | 411,041 |
+| s17 | 613 | 73,649 | 0 | 0 | 8,608 | 8.56 | 936,685 | 936,685 | 0 | 0 | 0 | 0 | 444,334 |
+| s18 | 602 | 72,268 | 0 | 0 | 8,342 | 8.66 | 982,159 | 982,159 | 0 | 0 | 0 | 0 | 454,033 |
+| s19 | 445 | 53,579 | 0 | 39 | 5,714 | 9.38 | 727,764 | 727,764 | 0 | 0 | 0 | 0 | 2,952,790 |
+| s20 | 645 | 77,383 | 0 | 0 | 8,453 | 9.15 | 949,539 | 949,539 | 0 | 0 | 0 | 0 | 433,324 |
+| s21 | 617 | 74,129 | 0 | 0 | 8,582 | 8.64 | 1,073,062 | 1,073,062 | 0 | 0 | 0 | 0 | 439,877 |
+
+`unseen` = `submitted_but_unseen`; `cg_avg` = `commit_group_size_avg`; `dlk_retry` =
+`deadlock_retries_total`. `pool_lock == agg_upsert` on every cell — the §6.7 coalescing identity
+holds. Per-cell `top_wait_events` and `com_p99` are in the raw `results/longdur_<scn>_120s.json`.
+
+**Verdict: CLEAN.** No routed cell — across Pass 1's 42 long-duration cells (60 s + 600 s) or Pass
+2's 21 clean 2-minute cells — recorded a single `dropped`, `poisoned`, `deadlock_retries`, or
+`takeover`. Pass 1 established that no failure mode emerges with duration (no 10m verdict diverged
+structurally from its 1m verdict — poison threshold, takeover after committer death, deadlock-retry
+accumulation, arena spillover, staging back-pressure, router-orphan recovery, drain-deadline
+behaviour all stayed at zero through the 10× window); Pass 2 re-confirms it on the clean cluster. The
+deep-pool cells (s7/s8/s9, 1000-layer) and single-hot-pool s5 sustained throughput for the whole run
+without exhausting — each seeded layer holds 1e9 units and routed/provisional mode never walks
+layers, so a pool cannot drain in these windows (P0006 exhaustion was never a real risk at these
+depths; the crossover seed depths suffice).
+
+### Throughput characterization — what governs the routed rate (`acct-235v`)
+
+A load-gated committer/caller sweep (clean DB per cell, `run-committer-count-sweep.sh`) pins down the
+dial. Three findings, none a defect:
+
+1. **Committers parallelize on disjoint work.** s6 (1000 callers, disjoint pools, cg≈1) scales
+   **958 → 1,234 → 1,791 trx/s** as `committer_count` goes 2 → 4 → 8 (ack p99 4.3 s → 1.2 s). The
+   committer pool is not a serial stage.
+2. **Hot-pool workloads serialize on per-pool `FOR UPDATE` locks.** s10 (Pareto receipts, 50 callers)
+   is **flat at ~1,390 trx/s** across committer_count 2/4/8 — committers idle (commits/s pinned
+   ~115) and contend on shared hot pools (each complex receipt touches ~13.5 pools; Pareto
+   concentrates them). More callers don't help (s11 200c ≈ s10 50c; the extra load becomes ack
+   latency). This serialization is inherent to any correct ledger, not a Path C defect.
+3. **Coalescing is the real throughput dial, and it needs same-pool overlap to engage.** s5 (single
+   hot pool, 1000 callers) coalesces to cg=32 → **0.03 locks/trx → 2,705 trx/s** (the highest cell),
+   trading ack latency (p50 450 ms). `batch_window_us` looks flat on low-concurrency hot cells (s10
+   @ 50 callers) only because there aren't enough concurrent same-pool submissions to grow the group
+   — the window can't batch arrivals that haven't happened yet. With overlap present (s5) the
+   lock-amortization win is large.
+
+The **router is not the bottleneck**: a direct profile (read-only counters added to
+`ledger_routed_c`) shows it scans ~9 staging entries per tick (not its 1000-slot window), defers
+< 2 % of ticks on the batch-window gate, and forms exactly as many commit_groups as the committers
+drain — it keeps up with arrival. The one genuine cost is **synchronous-ack latency** (p99 ~0.3 s
+@ 50 callers, 1–3 s @ 1000 callers) — the shape-L pseudo-sync target (Part VII Q3 escape hatch).
+
+### Other observations
+
+- **`submitted_but_unseen` = 0 on every clean 2-minute cell.** Pass 1's end-of-drain tail
+  (s3/s8/s9/s10/s11/s12, under the fixed 30 s drain deadline) does not appear at 2 minutes —
+  confirming it was a harness observer-window artifact, never data loss (`dropped = 0` throughout).
+  *Follow-up (bench-only):* scale the harness `drain_deadline` with run length — `acct-0516`-followup.
+- **Enqueue `errors` on the 200-caller cells (s4, s11, s15, s19) — expected staging back-pressure.**
+  `ledger_enqueue_trx_c` rejections when the queue is full under sustained 200-caller load;
+  `dropped = poisoned = 0`, so nothing is lost — the caller gets a retry signal. The documented
+  back-pressure regime, re-confirmed clean.
+- **Duration drives absolute rate more than contamination did.** A short (20 s) run catches a
+  fill-then-drain burst; a 2-minute run settles to a lower steady state with smaller groups (cg
+  drifts down as the arrival rate steadies). Pass 1's "1m → 10m sag" was that steady-state settling
+  plus contamination noise — *not* a routed-path degradation. The gated 2-minute figures above are
+  the trustworthy steady-state numbers; comparing them to Pass 1's 1m cells shows the contamination
+  effect was variable per cell (e.g. s1 1,170 → 1,075, s5 1,865 → 1,838, s10 539 → 632), not a
+  uniform multiplier.
+
+Net: the routed path is **clean** (zero data loss, zero committer-level failures across both passes),
+and its throughput is now characterized cleanly — committer-parallel on disjoint work,
+per-pool-lock-bound on hot work, coalescing-amortized when overlap exists, never router-bound, with
+synchronous-ack latency as the standing cost. No correctness defect; the lone follow-up is the
+bench-only drain-deadline ergonomics note.
+
+---
+
 ## Caveats & limitations
 
 - **Host load** keeps absolute throughput directional; structural ratios (lock-hold floor, collapse
   ratio, exact equivalence) are the load-robust findings. This run's numbers are tighter than the
   original snapshot (consistent with a less-contended host), but the absolute rates — and the
   close, host-sensitive deep-pool (s7/s8) ordering in particular — should still be read as
-  directional, not as hard rankings.
+  directional, not as hard rankings. **Exception: artifact (g) Pass 2 is load-gated** (each cell held
+  until 1-min loadavg < 1.5 on the minimal-preload cluster), so its 2-minute throughput figures are
+  the most trustworthy absolutes in this report. Earlier artifacts were measured before the
+  `shared_preload_libraries` foreign-BGWorker contamination was found and stripped, and before the
+  load gate existed — re-running them gated (`common.sh::wait_for_quiet_host`) would tighten them.
 - **Mixed-method scenarios (S3/S4)** are **no longer confounded.** The harness now seeds
   `standard_cost` for std/standard-basis pools (`acct-0z5m`, commit `9b6e6b5`), and S3/S4 ran with
   `errors=0` on the direct-per-call and routed paths in this run — so they are first-class

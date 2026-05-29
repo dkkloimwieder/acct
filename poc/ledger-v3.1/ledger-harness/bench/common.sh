@@ -65,3 +65,30 @@ restart_db() {
 harness() {
     timeout "$HARNESS_TIMEOUT" "$BIN" "$@"
 }
+
+# Block until the host 1-min loadavg drops below LOAD_GATE (default 1.5) before a
+# timed run. acct-postgres runs on a daily-driver workstation; external CPU load
+# (Chrome, other agents) swings routed throughput ~2x, so identical runs return
+# wildly different rates. Gating each timed run on a quiet host is load-bearing
+# for trustworthy absolute numbers. Polls every 5s, logs while waiting, and gives
+# up after LOAD_GATE_TIMEOUT seconds (default 600) so a permanently-busy host
+# fails loud rather than hanging forever.
+LOAD_GATE="${LOAD_GATE:-1.5}"
+LOAD_GATE_TIMEOUT="${LOAD_GATE_TIMEOUT:-600}"
+host_load1() { awk '{print $1}' /proc/loadavg; }
+wait_for_quiet_host() {
+    local waited=0 l
+    while :; do
+        l="$(host_load1)"
+        if awk -v a="$l" -v g="$LOAD_GATE" 'BEGIN{exit !(a+0 < g+0)}'; then
+            return 0
+        fi
+        if [ "$waited" -ge "$LOAD_GATE_TIMEOUT" ]; then
+            echo "    [load-gate] STILL BUSY after ${LOAD_GATE_TIMEOUT}s (load1=$l >= $LOAD_GATE); proceeding anyway — mark this cell contended" >&2
+            return 1
+        fi
+        echo "    [load-gate] host busy (load1=$l >= $LOAD_GATE); waiting…" >&2
+        sleep 5
+        waited=$((waited + 5))
+    done
+}

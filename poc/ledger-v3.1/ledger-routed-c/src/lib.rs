@@ -392,6 +392,59 @@ fn ledger_routed_c_recovery_complete() -> bool {
     COMMITTER_QUEUE.share().recovery_complete.load(Acquire) != 0
 }
 
+// ── Router observability (bench profiling) ──────────────────────────
+//
+// Cumulative since extension load (cluster lifetime). Sample as deltas over a
+// timed routed load to derive ticks/s, groups/tick, entries-scanned/tick, and
+// the window-defer rate — the inputs to locating the Path C throughput ceiling
+// (acct-235v: throughput is pinned at ~110 commit-groups/s independent of
+// batch_window_us, committer_count, and caller count, so the bound is the
+// single router worker's group-formation loop; these counters say where).
+
+#[pg_extern]
+fn ledger_routed_c_router_ticks_total() -> i64 {
+    COMMITTER_QUEUE.share().router_ticks_total.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_router_commit_group_count() -> i64 {
+    COMMITTER_QUEUE.share().router_commit_group_count.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_router_total_submissions() -> i64 {
+    COMMITTER_QUEUE.share().router_total_submissions.load(Relaxed) as i64
+}
+
+/// Staging entries inspected across all router_tick scans. Divided by ticks it
+/// gives the per-tick scan cost; divided by elapsed it gives the scan rate —
+/// the tell for a scan-bound (vs cadence-bound) router.
+#[pg_extern]
+fn ledger_routed_c_router_entries_scanned_total() -> i64 {
+    COMMITTER_QUEUE.share().router_entries_scanned_total.load(Relaxed) as i64
+}
+
+/// Ticks that produced no group because the oldest candidate had not yet aged
+/// past batch_window_us. High share => the window gate is throttling formation.
+#[pg_extern]
+fn ledger_routed_c_router_window_defers_total() -> i64 {
+    COMMITTER_QUEUE.share().router_window_defers_total.load(Relaxed) as i64
+}
+
+/// Cumulative committer apply-pipeline wall time (ns) and the count of groups it
+/// covers. The ratio is mean per-group committer work; multiplied by groups/s
+/// and divided by committer_count it gives committer pool utilization — the
+/// proof of whether committers have spare capacity at the ceiling.
+#[pg_extern]
+fn ledger_routed_c_committer_pipeline_ns_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_pipeline_ns_total.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_pipeline_count() -> i64 {
+    COMMITTER_QUEUE.share().committer_pipeline_count.load(Relaxed) as i64
+}
+
 // ── Smoke entry point ───────────────────────────────────────────────
 
 #[pg_extern]
