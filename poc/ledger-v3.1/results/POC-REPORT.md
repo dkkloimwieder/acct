@@ -510,8 +510,40 @@ neutral** (≤ +1 %) on s19 — and that is the expected, correct result, not a 
 mixed workload's residual ceiling is the **same-pool `FOR UPDATE` contention** of characterization #2,
 which packing deliberately does *not* touch (disjoint components carry no shared lock to relieve).
 Lever 1b is the commit-amortization half of the problem; the lock-contention half is **lever 2 —
-committer→pool affinity** (route a hot pool always to the same committer so its row lock is taken by
-one worker with no cross-committer handoff), the next step under `acct-xdwk`.
+committer→pool affinity**, characterized next.
+
+### Lever 2 — committer→pool affinity: characterized, no benefit on multi-pool workloads (`acct-xdwk`)
+
+The standing hypothesis (from characterization #2) was that hot-pool throughput is bounded by the
+**cross-committer `FOR UPDATE` handoff**: the committer claim queue is first-come with no pool affinity
+(`committer.rs::claim_next_committer_entry`), so the same hot pool's commit_groups across ticks land on
+different committers and block on each other's row lock. Lever 2 prototyped the fix — pin a commit_group
+to a committer by `hash(min pool_id) % committer_count` (with an age-gated steal fallback so a backed-up
+or dead owner can't starve the queue) — behind a default-off GUC, and swept `committer_count` 2/4/8 on
+the two Pareto-receipt cells, affinity off vs on (load-gated, clean DB per cell):
+
+| scenario | cc=2 off → on | cc=4 off → on | cc=8 off → on |
+|----------|--------------:|--------------:|--------------:|
+| s10 (50 callers)  | 1,280 → 1,221 | 1,374 → 1,352 | 1,376 → 1,407 |
+| s11 (200 callers) | 1,080 → 967   | 1,194 → 1,069 | 1,258 → 1,194 |
+
+**Affinity does not help — it is throughput-neutral on s10 and ~10 % worse on s11**, and it does not
+convert the flat committer-count curve into a scaling one (both off and on rise modestly cc=2→4 then
+flatten). The hypothesis was **wrong for realistic workloads**, and the reason is the pool count: the
+acct-235v "78 % of DB time in `pool_lock FOR UPDATE`" profile was taken on a *single-hot-pool* run, but
+a real Pareto receipt touches **~13.5 pools per trx** (`pool_lock_per_trx ≈ 13.5`). Affinity keys on the
+*min* pool_id, so a 13-pool group still acquires 12 *other* pools that neighbouring groups also touch —
+the contention is not removed, and affinity merely **fragments** the commit_groups (cg 12 → 7,
+commits/s 114 → 185) for the same or less throughput. A pool-*set*-aware affinity cannot rescue this
+either: a group spanning 13 hot pools cannot be owned by one committer without re-serializing the whole
+pool. Affinity only pays off in the degenerate single-pool case (s5) — already the fastest cell, which
+needs no help.
+
+**Disposition:** the lever-2 production claim-path code was **reverted** — a refuted optimization that
+only degrades multi-pool throughput should not sit in the committer hot path. The `AFFINITY` knob on
+`run-committer-count-sweep.sh` and the four `committer_count_sweep_s1{0,1}_aff{off,on}.csv` artifacts are
+kept so the result is reproducible. **Net for `acct-xdwk`: lever 1b (disjoint-component packing) is the
+real, shipped win; lever 2 (committer affinity) is a characterized dead-end.**
 
 ### Other observations
 

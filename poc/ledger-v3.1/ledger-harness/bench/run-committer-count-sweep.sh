@@ -21,15 +21,21 @@ CONTAINER="${CONTAINER:-acct-postgres}"
 DUR="${DUR:-30s}"
 COUNTS="${COUNTS:-2 4 8 16}"
 SCENARIOS=( ${CC_SCENARIOS:-s7 s10 s5} )   # s5 = single-pool control (should NOT scale)
+AFFINITY="${AFFINITY:-off}"   # committer_affinity: on pins a hot pool to one committer (acct-xdwk lever 2)
 SEED_SKUS="${SEED_SKUS:-1000}"; SEED_LOCS="${SEED_LOCS:-10}"; SEED_COUNT="${SEED_COUNT:-10000}"
-OUT="${RESULTS_DIR}/committer_count_sweep.csv"
+OUT="${RESULTS_DIR}/committer_count_sweep_aff${AFFINITY}.csv"
 SWEEP_LOG="${RESULTS_DIR}/committer_count_sweep.log"
 log() { echo "[ccsweep] $*" | tee -a "$SWEEP_LOG" >&2; }
 depth_for() { case "$1" in s5|s6) echo 10 ;; s7|s8|s9) echo 1000 ;; s11|s15|s19) echo 100 ;; s14|s16|s17|s18|s20|s21) echo 10 ;; *) echo 0 ;; esac; }
 jget() { grep -oE "\"$2\"[[:space:]]*:[[:space:]]*[0-9.]+" "$1" | head -1 | grep -oE '[0-9.]+$'; }
 
 set_committers() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.committer_count = $1" >/dev/null; }
-restore_defaults() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.committer_count = 4" >/dev/null 2>&1 || true; }
+set_affinity() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.committer_affinity = $1" >/dev/null; docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT pg_reload_conf()" >/dev/null; }
+restore_defaults() {
+  docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.committer_count = 4" >/dev/null 2>&1 || true
+  docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.committer_affinity = off" >/dev/null 2>&1 || true
+  docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT pg_reload_conf()" >/dev/null 2>&1 || true
+}
 trap restore_defaults EXIT
 
 clean_seed() { # $1=sid  — fresh DB + extension + restart (also respawns committers at the SET count) + seed
@@ -58,9 +64,9 @@ running_committers() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc \
   "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'ledger_routed_c_committer%'" 2>/dev/null | tr -d '[:space:]'; }
 
 build_harness
-log "=== committer_count sweep (acct-235v follow-on) ==="
-log "scenarios=${SCENARIOS[*]} counts=[$COUNTS] dur=$DUR window=500us(default)"
-echo "scenario,committer_count,committers_seen,callers,depth,throughput_trx_s,commit_group_avg,commits_per_s,pool_lock_per_trx,trx_materialized,errors,ack_p50_us,ack_p95_us,ack_p99_us,load1_end" > "$OUT"
+log "=== committer_count sweep (acct-235v follow-on; affinity=$AFFINITY acct-xdwk lever 2) ==="
+log "scenarios=${SCENARIOS[*]} counts=[$COUNTS] affinity=$AFFINITY dur=$DUR window=500us(default)"
+echo "scenario,affinity,committer_count,committers_seen,callers,depth,throughput_trx_s,commit_group_avg,commits_per_s,pool_lock_per_trx,trx_materialized,errors,ack_p50_us,ack_p95_us,ack_p99_us,load1_end" > "$OUT"
 
 for sid in "${SCENARIOS[@]}"; do
   depth="$(depth_for "$sid")"; dsn="$(dsn_for_scenario "$sid")"
@@ -68,6 +74,9 @@ for sid in "${SCENARIOS[@]}"; do
     log "--- $sid committer_count=$n : set + clean + restart + seed ---"
     set_committers "$n"
     clean_seed "$sid"
+    # committer_affinity is Sighup (live); set it AFTER clean_seed's restart so
+    # the freshly-respawned committer pool reads it (acct-xdwk lever 2).
+    set_affinity "$AFFINITY"
     seen="$(running_committers)"; log "  committers running: $seen (requested $n)"
     committer_ready "$sid" || log "  WARN: $sid canary did not drain"
     out="${RESULTS_DIR}/ccsweep_${sid}_n${n}.json"
@@ -85,8 +94,8 @@ for sid in "${SCENARIOS[@]}"; do
     p95="$(python3 -c "import json;print(json.load(open('$out'))['ack_latency_us']['p95'])")"
     p99="$(python3 -c "import json;print(json.load(open('$out'))['ack_latency_us']['p99'])")"
     callers="$(python3 -c "import json;print(json.load(open('$out'))['callers'])")"
-    echo "$sid,$n,$seen,$callers,$depth,$tput,$cg,$cps,$lpt,$trx,$err,$p50,$p95,$p99,$load_end" >> "$OUT"
-    log "  cc=$n cg=$cg tput=$tput commits/s=$cps ack_p99=${p99}us load1_end=$load_end"
+    echo "$sid,$AFFINITY,$n,$seen,$callers,$depth,$tput,$cg,$cps,$lpt,$trx,$err,$p50,$p95,$p99,$load_end" >> "$OUT"
+    log "  aff=$AFFINITY cc=$n cg=$cg tput=$tput commits/s=$cps ack_p99=${p99}us load1_end=$load_end"
   done
 done
 restore_defaults
