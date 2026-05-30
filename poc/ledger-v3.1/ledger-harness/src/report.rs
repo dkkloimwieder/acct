@@ -78,6 +78,29 @@ pub struct RoutedReport {
     pub deadlock_retries_total: u64,
     /// Dead-committer commit_group takeovers (§6.5 recovery).
     pub takeover_count: u64,
+
+    // ── Committer pipeline-span decomposition (acct-0usf STEP 1) ──────
+    // Cumulative ns over the window, summed across all committer workers. The
+    // breakdown answers "where does committer wall-time go" directly, instead of
+    // inferring the bottleneck from throughput. `pool_lock_ns_total` is the
+    // cross-committer hot-pool FOR UPDATE handoff span affinity targets.
+    pub txn_ns_total: u64,
+    pub pipeline_ns_total: u64,
+    pub pool_lock_ns_total: u64,
+    pub hydrate_ns_total: u64,
+    pub apply_ns_total: u64,
+    /// Derived: BEGIN/COMMIT/fsync wrapper cost = txn − pipeline (clamped ≥0).
+    pub commit_ns_total: u64,
+    /// Derived: decode + triage + dedup + line-decode = pipeline − (pool_lock +
+    /// hydrate + apply) (clamped ≥0).
+    pub prep_ns_total: u64,
+    /// Each span as a fraction of `txn_ns_total` (0.0 if no transactions). The
+    /// per-scenario row of the "where does committer wall-time go" table.
+    pub pool_lock_frac: f64,
+    pub hydrate_frac: f64,
+    pub apply_frac: f64,
+    pub commit_frac: f64,
+    pub prep_frac: f64,
 }
 
 /// Multi-touch overlay parameters in effect for the run (acct-34ce). Null when

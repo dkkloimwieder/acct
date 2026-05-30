@@ -230,7 +230,10 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         \"ack_p99_us\":{},\"committed_p99_us\":{},\"trx_materialized\":{},\"attempts\":{},\
         \"enqueue_errors\":{},\"submitted_but_unseen\":{},\"drains\":{},\"commit_group_avg\":{:.2},\
         \"pool_lock_acq\":{},\"agg_upserts\":{},\"dropped\":{},\"poisoned\":{},\
-        \"deadlock_retries\":{},\"takeovers\":{},\"output\":\"{}\"}}",
+        \"deadlock_retries\":{},\"takeovers\":{},\
+        \"span_pool_lock_frac\":{:.3},\"span_hydrate_frac\":{:.3},\"span_apply_frac\":{:.3},\
+        \"span_commit_frac\":{:.3},\"span_prep_frac\":{:.3},\"txn_ns_total\":{},\
+        \"output\":\"{}\"}}",
         spec.id,
         report.pool_depth.map(|d| d as i64).unwrap_or(-1),
         report.throughput_trx_per_sec,
@@ -248,6 +251,12 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         routed.poisoned_total,
         routed.deadlock_retries_total,
         routed.takeover_count,
+        routed.pool_lock_frac,
+        routed.hydrate_frac,
+        routed.apply_frac,
+        routed.commit_frac,
+        routed.prep_frac,
+        routed.txn_ns_total,
         output_path.display()
     );
     Ok(())
@@ -348,6 +357,12 @@ struct RoutedCounterSnapshot {
     poisoned: i64,
     deadlock_retries: i64,
     takeover_count: i64,
+    // Committer pipeline-span ns totals (acct-0usf STEP 1).
+    txn_ns: i64,
+    pipeline_ns: i64,
+    pool_lock_ns: i64,
+    hydrate_ns: i64,
+    apply_ns: i64,
 }
 
 async fn read_routed_counters(pool: &PgPool) -> Result<RoutedCounterSnapshot, String> {
@@ -378,6 +393,11 @@ async fn read_routed_counters(pool: &PgPool) -> Result<RoutedCounterSnapshot, St
         deadlock_retries: scalar(pool, "SELECT ledger_routed_c_committer_deadlock_retries_total()")
             .await?,
         takeover_count: scalar(pool, "SELECT ledger_routed_c_committer_takeover_count()").await?,
+        txn_ns: scalar(pool, "SELECT ledger_routed_c_committer_txn_ns_total()").await?,
+        pipeline_ns: scalar(pool, "SELECT ledger_routed_c_committer_pipeline_ns_total()").await?,
+        pool_lock_ns: scalar(pool, "SELECT ledger_routed_c_committer_pool_lock_ns_total()").await?,
+        hydrate_ns: scalar(pool, "SELECT ledger_routed_c_committer_hydrate_ns_total()").await?,
+        apply_ns: scalar(pool, "SELECT ledger_routed_c_committer_apply_ns_total()").await?,
     })
 }
 
@@ -390,6 +410,20 @@ fn derive_routed_report(pre: &RoutedCounterSnapshot, post: &RoutedCounterSnapsho
     } else {
         0.0
     };
+    // Committer pipeline-span decomposition (acct-0usf STEP 1).
+    let txn_ns = d(pre.txn_ns, post.txn_ns);
+    let pipeline_ns = d(pre.pipeline_ns, post.pipeline_ns);
+    let pool_lock_ns = d(pre.pool_lock_ns, post.pool_lock_ns);
+    let hydrate_ns = d(pre.hydrate_ns, post.hydrate_ns);
+    let apply_ns = d(pre.apply_ns, post.apply_ns);
+    // commit/fsync = whole-txn − pipeline (the COMMIT happens outside the pipeline
+    // span). prep = pipeline − (pool_lock + hydrate + apply): decode + triage +
+    // dedup + line-decode. Both saturating-subtract: a committer that started a
+    // span inside the window but finished after the post-snapshot can leave the
+    // outer span lagging the inner, which would otherwise underflow.
+    let commit_ns = txn_ns.saturating_sub(pipeline_ns);
+    let prep_ns = pipeline_ns.saturating_sub(pool_lock_ns + hydrate_ns + apply_ns);
+    let frac = |part: u64| if txn_ns > 0 { part as f64 / txn_ns as f64 } else { 0.0 };
     RoutedReport {
         drains_total: drains,
         trx_committed_total: trx_committed,
@@ -402,6 +436,18 @@ fn derive_routed_report(pre: &RoutedCounterSnapshot, post: &RoutedCounterSnapsho
         poisoned_total: d(pre.poisoned, post.poisoned),
         deadlock_retries_total: d(pre.deadlock_retries, post.deadlock_retries),
         takeover_count: d(pre.takeover_count, post.takeover_count),
+        txn_ns_total: txn_ns,
+        pipeline_ns_total: pipeline_ns,
+        pool_lock_ns_total: pool_lock_ns,
+        hydrate_ns_total: hydrate_ns,
+        apply_ns_total: apply_ns,
+        commit_ns_total: commit_ns,
+        prep_ns_total: prep_ns,
+        pool_lock_frac: frac(pool_lock_ns),
+        hydrate_frac: frac(hydrate_ns),
+        apply_frac: frac(apply_ns),
+        commit_frac: frac(commit_ns),
+        prep_frac: frac(prep_ns),
     }
 }
 

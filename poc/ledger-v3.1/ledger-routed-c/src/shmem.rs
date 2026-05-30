@@ -258,6 +258,27 @@ pub struct CommitterQueue {
     pub eject_total_count: AtomicU64,
     pub committer_pipeline_ns_total: AtomicU64,
     pub committer_pipeline_count: AtomicU64,
+    /// Wall-time (ns) the committer spends inside `pool_lock::acquire_pool_locks`
+    /// — the per-pool FOR UPDATE acquisition, summed across all committed
+    /// commit_groups. This is the cross-committer hot-pool-handoff span: when a
+    /// hot pool's groups land on different committers across ticks, they serialize
+    /// here on each other's row lock. The affinity question (acct-0usf) is
+    /// precisely whether pinning a pool to one committer shrinks this span. Timed
+    /// at the call site (not test_hooks-gated) so it is live in bench builds.
+    pub committer_pool_lock_ns_total: AtomicU64,
+    /// Wall-time (ns) in `hydration::hydrate_snapshot` — one aggregate read per
+    /// touched pool, summed across committed commit_groups.
+    pub committer_hydrate_ns_total: AtomicU64,
+    /// Wall-time (ns) in `plan_and_write` — drop-and-continue apply + batch write
+    /// (trx / trx_line / layer-mutations / posting_line / aggregate UPSERT),
+    /// summed across committed commit_groups. Excludes the COMMIT itself.
+    pub committer_apply_ns_total: AtomicU64,
+    /// Wall-time (ns) of the whole `BackgroundWorker::transaction` wrapper around
+    /// `process_commit_group` — BEGIN + pipeline + COMMIT (the group-commit /
+    /// fsync). `committer_txn_ns_total − committer_pipeline_ns_total` isolates the
+    /// commit/fsync cost; `committer_pipeline_ns_total − (pool_lock + hydrate +
+    /// apply)` isolates decode + triage + dedup + line-decode (the "prep" span).
+    pub committer_txn_ns_total: AtomicU64,
 
     // ── Committer identity slots ───────────────────────────────────
     pub identity_slots: [CommitterIdentitySlot; LEDGER_V3_COMMITTER_IDENTITY_SLOTS],

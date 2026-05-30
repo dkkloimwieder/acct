@@ -138,9 +138,18 @@ pub extern "C-unwind" fn ledger_routed_c_committer_main(_arg: pg_sys::Datum) {
                 )
             };
 
+            let txn_t0 = now_ns();
             let outcome = BackgroundWorker::transaction(AssertUnwindSafe(|| {
                 process_commit_group(cq_idx, cg_id)
             }));
+            // Whole-transaction span (BEGIN + pipeline + COMMIT/fsync). The
+            // commit/fsync cost is committer_txn_ns_total − committer_pipeline_ns_total
+            // (acct-0usf STEP 1). Recorded for every drained group regardless of
+            // outcome — the COMMIT happens even for AllEjected / TxError groups.
+            COMMITTER_QUEUE
+                .share()
+                .committer_txn_ns_total
+                .fetch_add(now_ns().saturating_sub(txn_t0), Relaxed);
 
             // Cleanup runs OUTSIDE the tx scope (shmem CAS + arena, no tracked
             // rows). Committed / AllEjected / TxError release their slots back to
@@ -554,7 +563,19 @@ fn attempt_commit_phase(pool_ids: &[i64], prepared: &[Prepared]) -> PhaseOutcome
     // closure captures nothing, so it trivially satisfies catch_others's
     // RefUnwindSafe bound. Err = a Rust-level SPI error short-circuited a `?`.
     let result: Result<PhaseStep, pgrx::spi::Error> = PgTryBuilder::new(AssertUnwindSafe(|| {
+        // Scoped wall-time spans (acct-0usf STEP 1): decompose the committer
+        // pipeline into pool_lock / hydrate / apply so the affinity question can be
+        // answered from a *measured* per-span breakdown rather than inferred from
+        // throughput. fetch_add is plain shmem-atomic work — it never longjmps, so
+        // it is safe inside the catch closure; on an early `?` or a caught Postgres
+        // ERROR the post-span add is simply skipped (a failed attempt contributes
+        // no span, which is what we want).
+        let cq = COMMITTER_QUEUE.share();
+        let t_lock0 = now_ns();
         pool_lock::acquire_pool_locks(pool_ids)?;
+        let t_lock1 = now_ns();
+        cq.committer_pool_lock_ns_total
+            .fetch_add(t_lock1.saturating_sub(t_lock0), Relaxed);
         // Test-only injection sites — compiled out of production builds entirely
         // (acct-yojk.11); only test_hooks builds carry them and can arm them.
         #[cfg(feature = "test_hooks")]
@@ -565,7 +586,12 @@ fn attempt_commit_phase(pool_ids: &[i64], prepared: &[Prepared]) -> PhaseOutcome
             maybe_stall();
         }
         let snapshot = hydration::hydrate_snapshot(pool_ids)?;
+        let t_hyd = now_ns();
+        cq.committer_hydrate_ns_total
+            .fetch_add(t_hyd.saturating_sub(t_lock1), Relaxed);
         let summary = plan_and_write(snapshot, prepared)?;
+        cq.committer_apply_ns_total
+            .fetch_add(now_ns().saturating_sub(t_hyd), Relaxed);
         Ok(PhaseStep::Wrote(summary))
     }))
     .catch_others(|caught| Ok(PhaseStep::Caught(sqlstate_of(&caught))))

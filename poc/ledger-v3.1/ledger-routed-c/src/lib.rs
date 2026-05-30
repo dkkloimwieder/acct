@@ -458,6 +458,35 @@ fn ledger_routed_c_committer_pipeline_count() -> i64 {
     COMMITTER_QUEUE.share().committer_pipeline_count.load(Relaxed) as i64
 }
 
+// Scoped pipeline-span totals (acct-0usf STEP 1). Decompose the single
+// `committer_pipeline_ns_total` span so the affinity question is answered from a
+// measured per-span breakdown, not inferred from throughput. Cumulative ns since
+// extension load; sample as deltas over a timed routed load. Derived views:
+//   commit/fsync ns ≈ txn_ns_total − pipeline_ns_total
+//   prep (decode+triage+dedup+line-decode) ns ≈ pipeline_ns_total − (pool_lock + hydrate + apply)
+// pool_lock_ns_total is the cross-committer hot-pool FOR UPDATE handoff span — the
+// quantity affinity is hypothesized to shrink.
+
+#[pg_extern]
+fn ledger_routed_c_committer_pool_lock_ns_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_pool_lock_ns_total.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_hydrate_ns_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_hydrate_ns_total.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_apply_ns_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_apply_ns_total.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_txn_ns_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_txn_ns_total.load(Relaxed) as i64
+}
+
 // ── Smoke entry point ───────────────────────────────────────────────
 
 #[pg_extern]
