@@ -170,7 +170,17 @@ fn router_tick() -> u32 {
     }
 
     let candidates = hydrate_candidates(&candidates_meta);
-    let groups = affinity_group(candidates);
+    let mut groups = affinity_group(candidates);
+
+    // acct-xdwk lever 1b: when router_pack_disjoint is on, greedily first-fit
+    // the disjoint affinity components into commit_groups of up to
+    // batch_size_max so a tick on a spread/Pareto workload emits a few full
+    // groups instead of many tiny one-component groups, amortizing the
+    // per-group commit/fsync. Disjoint components share no pool_id, so this
+    // adds no cross-pool FOR UPDATE contention. Off → one group per component.
+    if crate::router_pack_disjoint_now() {
+        groups = pack_disjoint_components(groups, (batch_max as usize).max(1));
+    }
 
     // Path C: every component is chunked uniformly at batch_size_max. No
     // order-sensitive no-split case (§14.2) — splitting a FIFO/LIFO pool's
@@ -389,6 +399,48 @@ fn affinity_group(candidates: Vec<Candidate>) -> Vec<Vec<Candidate>> {
     }
     groups.sort_by_key(|g| g[0].request_seq);
     groups
+}
+
+/// Greedily first-fit the disjoint affinity components from `affinity_group`
+/// into commit_group bins of at most `cap` submissions (acct-xdwk lever 1b,
+/// gated on `router_pack_disjoint`). Components are pool-disjoint by
+/// construction — `affinity_group` unions every same-pool submission into one
+/// component — so a bin's members share no pool_id; one committer drains the
+/// whole bin sequentially with zero cross-pool FOR UPDATE contention, and the
+/// single commit/fsync amortizes over more submissions than the per-component
+/// emission would on a spread/Pareto workload.
+///
+/// A component with `len >= cap` is left standalone so the caller's chunk loop
+/// splits it at `cap` and records the cross-group FOR UPDATE waits (those
+/// chunks DO share a pool). Smaller components first-fit into the earliest bin
+/// with room (a standalone large bin never has room, so it is skipped without
+/// special-casing). `cap == 1` packs nothing — every component is its own bin,
+/// matching the unbatched baseline. Bins and their members are returned sorted
+/// by request_seq so oldest-first dispatch is preserved.
+fn pack_disjoint_components(groups: Vec<Vec<Candidate>>, cap: usize) -> Vec<Vec<Candidate>> {
+    let mut bins: Vec<Vec<Candidate>> = Vec::with_capacity(groups.len());
+    for mut comp in groups {
+        if comp.len() >= cap {
+            bins.push(comp);
+            continue;
+        }
+        let mut placed = false;
+        for bin in bins.iter_mut() {
+            if bin.len() + comp.len() <= cap {
+                bin.append(&mut comp);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            bins.push(comp);
+        }
+    }
+    for bin in bins.iter_mut() {
+        bin.sort_by_key(|c| c.request_seq);
+    }
+    bins.sort_by_key(|bin| bin[0].request_seq);
+    bins
 }
 
 /// Disjoint-set with path compression and union-by-rank.
@@ -1334,5 +1386,104 @@ mod tests {
         let active: HashSet<u64> = HashSet::new();
         assert!(try_revert_orphan_staging(&q, 3, &active));
         assert!(!try_revert_orphan_staging(&q, 3, &active));
+    }
+
+    // ── pack_disjoint_components (acct-xdwk lever 1b) ────────────────
+
+    #[test]
+    fn pack_empty_input_returns_empty() {
+        assert!(pack_disjoint_components(vec![], 50).is_empty());
+    }
+
+    #[test]
+    fn pack_combines_small_disjoint_components_into_one_bin() {
+        let bins = pack_disjoint_components(
+            vec![
+                vec![cand(0, 1, vec![10])],
+                vec![cand(1, 2, vec![20])],
+                vec![cand(2, 3, vec![30])],
+            ],
+            50,
+        );
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].len(), 3);
+    }
+
+    #[test]
+    fn pack_respects_cap_first_fit() {
+        // Five 2-submission components, cap 4 → bins of 4, 4, 2.
+        let mk2 = |base: u32, seq: u64| vec![cand(base, seq, vec![]), cand(base + 1, seq + 1, vec![])];
+        let bins = pack_disjoint_components(
+            vec![mk2(0, 1), mk2(10, 3), mk2(20, 5), mk2(30, 7), mk2(40, 9)],
+            4,
+        );
+        for b in &bins {
+            assert!(b.len() <= 4, "bin exceeded cap: {}", b.len());
+        }
+        let mut sizes: Vec<usize> = bins.iter().map(|b| b.len()).collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![2, 4, 4]);
+    }
+
+    #[test]
+    fn pack_large_component_stays_standalone_for_chunking() {
+        // A component with len >= cap is left whole so the caller's chunk loop
+        // splits it (and records cross-group FOR UPDATE waits).
+        let big = vec![
+            cand(0, 1, vec![10]),
+            cand(1, 2, vec![10]),
+            cand(2, 3, vec![10]),
+            cand(3, 4, vec![10]),
+            cand(4, 5, vec![10]),
+        ];
+        let small = vec![cand(10, 6, vec![20])];
+        let bins = pack_disjoint_components(vec![big, small], 3);
+        assert_eq!(bins.len(), 2);
+        assert!(bins.iter().any(|b| b.len() == 5));
+        assert!(bins.iter().any(|b| b.len() == 1));
+    }
+
+    #[test]
+    fn pack_cap_one_packs_nothing() {
+        let bins = pack_disjoint_components(
+            vec![vec![cand(0, 1, vec![10])], vec![cand(1, 2, vec![20])]],
+            1,
+        );
+        assert_eq!(bins.len(), 2);
+    }
+
+    #[test]
+    fn pack_preserves_oldest_first_dispatch_and_member_sort() {
+        let bins = pack_disjoint_components(
+            vec![
+                vec![cand(0, 5, vec![10])],
+                vec![cand(1, 2, vec![20])],
+                vec![cand(2, 8, vec![30])],
+            ],
+            50,
+        );
+        assert_eq!(bins.len(), 1);
+        assert_eq!(
+            bins[0].iter().map(|c| c.request_seq).collect::<Vec<_>>(),
+            vec![2, 5, 8]
+        );
+    }
+
+    #[test]
+    fn pack_orders_bins_by_min_request_seq() {
+        // First-fit in input order then sort: comp(100) opens bin0, comp(1)
+        // joins bin0 (cap 2), comp(2) opens bin1, comp(101) joins bin1.
+        let bins = pack_disjoint_components(
+            vec![
+                vec![cand(0, 100, vec![10])],
+                vec![cand(1, 1, vec![20])],
+                vec![cand(2, 2, vec![30])],
+                vec![cand(3, 101, vec![40])],
+            ],
+            2,
+        );
+        assert_eq!(bins.len(), 2);
+        assert_eq!(bins[0][0].request_seq, 1);
+        assert_eq!(bins[1][0].request_seq, 2);
     }
 }

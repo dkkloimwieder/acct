@@ -55,6 +55,7 @@ static MAX_EJECT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(10_000);
 static CALLER_TX_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 static COMMITTER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
 static EJECT_COOLDOWN_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
+static ROUTER_PACK_DISJOINT: GucSetting<bool> = GucSetting::<bool>::new(false);
 static TARGET_DATABASE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"poc_v3_1"));
 
@@ -98,6 +99,10 @@ pub(crate) fn committer_count_now() -> i32 {
 #[allow(dead_code)]
 pub(crate) fn eject_cooldown_ms_now() -> i32 {
     EJECT_COOLDOWN_MS.get().max(0)
+}
+#[allow(dead_code)]
+pub(crate) fn router_pack_disjoint_now() -> bool {
+    ROUTER_PACK_DISJOINT.get()
 }
 
 // ── _PG_init ────────────────────────────────────────────────────────
@@ -215,6 +220,14 @@ pub extern "C-unwind" fn _PG_init() {
         &EJECT_COOLDOWN_MS,
         0,
         60_000,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
+        c"ledger_routed_c.router_pack_disjoint",
+        c"Pack disjoint pool-components into one commit_group",
+        c"When on, the router greedily bin-packs disjoint affinity components (no shared pool_id) into a single commit_group up to batch_size_max, amortizing per-group commit/fsync on spread/Pareto workloads where same-pool coalescing alone leaves commit_groups small. Safe by construction: disjoint pools share no row lock, so one committer takes them sequentially without cross-pool FOR UPDATE contention. Off preserves one-commit_group-per-component.",
+        &ROUTER_PACK_DISJOINT,
         GucContext::Sighup,
         GucFlags::empty(),
     );

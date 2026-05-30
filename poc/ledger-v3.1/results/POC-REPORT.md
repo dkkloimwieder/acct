@@ -475,6 +475,44 @@ The **router is not the bottleneck**: a direct profile (read-only counters added
 drain — it keeps up with arrival. The one genuine cost is **synchronous-ack latency** (p99 ~0.3 s
 @ 50 callers, 1–3 s @ 1000 callers) — the shape-L pseudo-sync target (Part VII Q3 escape hatch).
 
+### Lever 1b — disjoint-component packing breaks the spread-workload `cg` plateau (`acct-xdwk`)
+
+Characterization #3 above exposed an asymmetry: coalescing only engages when submissions **share a
+pool**. The router's `affinity_group` unions same-pool submissions into one connected component and
+emits **one commit_group per component**, so on a spread/Pareto workload (many small disjoint
+components) `commit_group_size_avg` plateaus around ~10–12 *no matter how high `batch_size_max` goes*
+— each small component ships as its own group and the per-group commit/fsync is never amortized. A
+batch-size sweep with the coalesce window held wide (`batch_window_us=20000`, so the size cap binds)
+confirmed it: on **s19** (Pareto mixed, 200 callers) `cg` flatlined at **12.4** at `batch_size_max=200`.
+
+**Fix (gated, default off):** a new `ledger_routed_c.router_pack_disjoint` GUC (Sighup). When on, the
+router greedily first-fits the disjoint components — in `request_seq` order, preserving oldest-first
+dispatch — into commit_groups of up to `batch_size_max`. **Safe by construction:** every pool already
+lives in exactly one component per tick, so a packed group's members share no `pool_id`; one committer
+drains the whole group taking each pool's `FOR UPDATE` sequentially with **zero new cross-pool
+contention**. A component already ≥ cap is left standalone for the existing chunk path. Correctness is
+unchanged — the cross-flavor aggregate-qty equivalence property (`property_ledger_enqueue_trx_c`)
+passes with packing both off and on.
+
+Load-gated s19 sweep, `batch_window_us=20000`, clean DB per cell (`run-batch-size-sweep.sh --pack`):
+
+| `batch_size_max` | cg off → on | commits/s off → on | throughput off → on |
+|-----------------:|------------:|-------------------:|--------------------:|
+| 25  (cc=1) | 8.9 → 20.5  | 104 → 45 | 925 → 921 |
+| 50  (cc=1) | 9.6 → 33.2  | 98 → 28  | 939 → 945 |
+| 100 (cc=1) | 11.1 → 49.8 | 88 → 20  | 971 → 978 |
+| 200 (cc=1) | **12.4 → 66.3** | 80 → 15 | 993 → 979 |
+| 200 (cc=4) | **12.7 → 71.7** | 104 → 19 | 1,321 → 1,337 |
+
+Packing makes `cg` **track the cap** instead of plateauing (5.3–5.6× larger groups at `batch_size_max=200`),
+collapsing commit/fsync operations ~5.5× for the same ~20 k committed trx. **Throughput is roughly
+neutral** (≤ +1 %) on s19 — and that is the expected, correct result, not a disappointment: a Pareto
+mixed workload's residual ceiling is the **same-pool `FOR UPDATE` contention** of characterization #2,
+which packing deliberately does *not* touch (disjoint components carry no shared lock to relieve).
+Lever 1b is the commit-amortization half of the problem; the lock-contention half is **lever 2 —
+committer→pool affinity** (route a hot pool always to the same committer so its row lock is taken by
+one worker with no cross-committer handoff), the next step under `acct-xdwk`.
+
 ### Other observations
 
 - **`submitted_but_unseen` = 0 on every clean 2-minute cell.** Pass 1's end-of-drain tail

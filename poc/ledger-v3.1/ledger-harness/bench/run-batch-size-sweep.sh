@@ -27,9 +27,10 @@ SCENARIO="${SCENARIO:-s5}"
 COMMITTERS="${COMMITTERS:-4}"
 SIZES="${SIZES:-1 5 10 25 50 100 200}"
 WINDOW="${WINDOW:-20000}"            # batch_window_us held wide so batch_size_max binds
+PACK="${PACK:-off}"                   # router_pack_disjoint: on packs disjoint pool-components (acct-xdwk lever 1b)
 DUR="${DUR:-20s}"
 SEED_SKUS="${SEED_SKUS:-1000}"; SEED_LOCS="${SEED_LOCS:-10}"; SEED_COUNT="${SEED_COUNT:-10000}"
-OUT="${OUT:-${RESULTS_DIR}/batch_size_sweep_${SCENARIO}_cc${COMMITTERS}.csv}"
+OUT="${OUT:-${RESULTS_DIR}/batch_size_sweep_${SCENARIO}_cc${COMMITTERS}_pack${PACK}.csv}"
 SWEEP_LOG="${RESULTS_DIR}/batch_size_sweep.log"
 log() { echo "[bssweep] $*" | tee -a "$SWEEP_LOG" >&2; }
 depth_for() { case "$1" in s5|s6) echo 10 ;; s7|s8|s9) echo 1000 ;; s11|s15|s19) echo 100 ;; s14|s16|s17|s18|s20|s21) echo 10 ;; *) echo 0 ;; esac; }
@@ -40,6 +41,7 @@ restore_defaults() {
   asys batch_size_max 50 2>/dev/null || true
   asys batch_window_us 500 2>/dev/null || true
   asys committer_count 4 2>/dev/null || true
+  asys router_pack_disjoint off 2>/dev/null || true
   reload 2>/dev/null || true
 }
 trap restore_defaults EXIT
@@ -74,16 +76,16 @@ committer_ready() { local dsn cj; dsn="$(dsn_for_scenario "$SCENARIO")"; cj="${R
   python3 -c "import json;print(json.load(open('$cj'))['routed']['trx_committed_total'])" 2>/dev/null | grep -qvx 0; }
 
 build_harness
-log "=== batch_size sweep: scenario=$SCENARIO committers=$COMMITTERS sizes=[$SIZES] window=${WINDOW}us dur=$DUR ==="
+log "=== batch_size sweep: scenario=$SCENARIO committers=$COMMITTERS sizes=[$SIZES] window=${WINDOW}us pack=$PACK dur=$DUR ==="
 asys committer_count "$COMMITTERS"
 clean_seed
 running="$(docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'ledger_routed_c_committer%'" | tr -d '[:space:]')"
 log "committers running: $running (requested $COMMITTERS)"
 committer_ready || log "WARN: canary did not drain"
-asys batch_window_us "$WINDOW"; reload
+asys batch_window_us "$WINDOW"; asys router_pack_disjoint "$PACK"; reload
 
 dsn="$(dsn_for_scenario "$SCENARIO")"; depth="$(depth_for "$SCENARIO")"
-echo "scenario,committers,batch_size_max,window_us,throughput_trx_s,cg_avg,commits_s,locks_per_trx,trx,ack_p50_us,ack_p99_us,dropped,load1_end" > "$OUT"
+echo "scenario,committers,pack,batch_size_max,window_us,throughput_trx_s,cg_avg,commits_s,locks_per_trx,trx,ack_p50_us,ack_p99_us,dropped,load1_end" > "$OUT"
 for sz in $SIZES; do
   asys batch_size_max "$sz"; reload
   wait_for_quiet_host || log "  NOTE: size=$sz ran busy"
@@ -92,7 +94,7 @@ for sz in $SIZES; do
   timeout 360 "$BIN" --dsn "$dsn" run --scenario "$SCENARIO" --mode routed --duration "$DUR" \
     --depth "$depth" --output "$out" >/dev/null 2>&1 || { log "  FAIL sz=$sz"; continue; }
   read -r tput cg cps lpt trx p50 p99 drop <<<"$(extract "$out")"
-  echo "$SCENARIO,$COMMITTERS,$sz,$WINDOW,$tput,$cg,$cps,$lpt,$trx,$p50,$p99,$drop,$(host_load1)" >> "$OUT"
+  echo "$SCENARIO,$COMMITTERS,$PACK,$sz,$WINDOW,$tput,$cg,$cps,$lpt,$trx,$p50,$p99,$drop,$(host_load1)" >> "$OUT"
   log "  sz=$sz cg=$cg tput=$tput commits/s=$cps locks/trx=$lpt ack_p99=${p99}us"
 done
 restore_defaults
