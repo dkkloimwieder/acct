@@ -205,7 +205,20 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         None
     };
 
-    let routed_report = derive_routed_report(&pre_routed, &post_routed);
+    let mut routed_report = derive_routed_report(&pre_routed, &post_routed);
+    // Fold in the committer-only wait segmentation (acct-0usf STEP 1b). Zero when
+    // --no-sampler (the sampler never ran), which is fine: the spans (STEP 1a)
+    // still carry the wall-time breakdown; this block adds the wait-vs-on-CPU
+    // discriminator only on profiling runs that keep the sampler on.
+    {
+        let cs = sampler_report.committer_wait_summary();
+        routed_report.committer_samples_total = cs.total;
+        routed_report.committer_idle_samples = cs.idle;
+        routed_report.committer_busy_frac = cs.busy_frac();
+        routed_report.committer_lock_frac_of_busy = cs.lock_frac_of_busy();
+        routed_report.committer_running_frac_of_busy = cs.running_frac_of_busy();
+        routed_report.committer_lwlock_frac_of_busy = cs.lwlock_frac_of_busy();
+    }
     let report = RunReport::new_routed(
         spec.id.to_string(),
         opts.pool_depth.or(Some(spec.depth_hint)),
@@ -233,7 +246,9 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         \"deadlock_retries\":{},\"takeovers\":{},\
         \"span_pool_lock_frac\":{:.3},\"span_hydrate_frac\":{:.3},\"span_apply_frac\":{:.3},\
         \"span_commit_frac\":{:.3},\"span_prep_frac\":{:.3},\"txn_ns_total\":{},\
-        \"output\":\"{}\"}}",
+        \"committer_busy_frac\":{:.3},\"committer_lock_frac_of_busy\":{:.3},\
+        \"committer_running_frac_of_busy\":{:.3},\"committer_lwlock_frac_of_busy\":{:.3},\
+        \"committer_samples\":{},\"output\":\"{}\"}}",
         spec.id,
         report.pool_depth.map(|d| d as i64).unwrap_or(-1),
         report.throughput_trx_per_sec,
@@ -257,6 +272,11 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         routed.commit_frac,
         routed.prep_frac,
         routed.txn_ns_total,
+        routed.committer_busy_frac,
+        routed.committer_lock_frac_of_busy,
+        routed.committer_running_frac_of_busy,
+        routed.committer_lwlock_frac_of_busy,
+        routed.committer_samples_total,
         output_path.display()
     );
     Ok(())
@@ -448,6 +468,10 @@ fn derive_routed_report(pre: &RoutedCounterSnapshot, post: &RoutedCounterSnapsho
         apply_frac: frac(apply_ns),
         commit_frac: frac(commit_ns),
         prep_frac: frac(prep_ns),
+        // Committer-wait segmentation (acct-0usf STEP 1b) is folded in by the
+        // caller from the SamplerReport (the sampler isn't in scope here); default
+        // to zero so the struct is complete.
+        ..Default::default()
     }
 }
 

@@ -101,6 +101,27 @@ pub struct RoutedReport {
     pub apply_frac: f64,
     pub commit_frac: f64,
     pub prep_frac: f64,
+
+    // ── Committer wait-event segmentation (acct-0usf STEP 1b) ─────────
+    // Sourced from the committer-only pg_stat_activity histogram, NOT the
+    // in-process spans. Cross-checks the spans: span pool_lock_frac tells you how
+    // much wall-time is inside acquire_pool_locks; these tell you whether that
+    // time is spent BLOCKED on another committer's row lock (committer_lock_frac_
+    // of_busy, the affinity-addressable handoff) vs running the SELECT on-CPU
+    // (committer_running_frac_of_busy, irreducible). Zero when --no-sampler.
+    pub committer_samples_total: i64,
+    pub committer_idle_samples: i64,
+    /// Non-idle / total — committer pool utilization. Low ⇒ spare capacity, the
+    /// ceiling is upstream (router/arrival), affinity is a priori pointless.
+    pub committer_busy_frac: f64,
+    /// Of busy samples, share blocked on a row lock (the cross-committer handoff
+    /// — the only span committer→pool affinity can shrink).
+    pub committer_lock_frac_of_busy: f64,
+    /// Of busy samples, share on-CPU (query execution — affinity-irreducible).
+    pub committer_running_frac_of_busy: f64,
+    /// Of busy samples, share on shmem LWLock contention (staging ring / arena —
+    /// a separate bottleneck affinity does not address).
+    pub committer_lwlock_frac_of_busy: f64,
 }
 
 /// Multi-touch overlay parameters in effect for the run (acct-34ce). Null when

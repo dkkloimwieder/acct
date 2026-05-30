@@ -37,7 +37,77 @@ pub struct SamplerReport {
     pub duration_ms: u64,
     pub lock_observations: HashMap<(String, String, String, bool), i64>,
     pub wait_observations: HashMap<(String, String), i64>,
+    /// Committer-BGWorker-only wait histogram (acct-0usf STEP 1b). Keyed by
+    /// (wait_event_type, wait_event), summed over ticks. UNLIKE `wait_observations`
+    /// this does NOT filter `state='active'` (committer BGWorkers report
+    /// state=NULL even mid-pipeline) and maps a NULL wait_event to ('Running',
+    /// 'Running') so on-CPU samples are counted. The idle bucket is
+    /// ('Extension','Extension') — a committer parked on its 50ms latch between
+    /// drains. The discriminator the lever-2 pass lacked: of the non-idle
+    /// samples, the ('Lock','transactionid') share is the cross-committer
+    /// pool_lock handoff (what affinity targets); the ('Running','Running') share
+    /// is on-CPU query cost (which affinity cannot reduce).
+    pub committer_wait_observations: HashMap<(String, String), i64>,
     pub poll_errors: u64,
+}
+
+/// Committer wait-time decomposition (acct-0usf STEP 1b), derived from
+/// `committer_wait_observations`. All counts are backend-samples (sum over ticks
+/// of committer backends in that bucket), not wall-time — but at a fixed sample
+/// rate the sample share IS the time share.
+#[derive(Debug, Clone, Default)]
+pub struct CommitterWaitSummary {
+    /// Total committer backend-samples across the run.
+    pub total: i64,
+    /// Idle on the latch between drains (('Extension','Extension')).
+    pub idle: i64,
+    /// Blocked on a heavyweight row lock (wait_event_type='Lock'): the
+    /// cross-committer pool_lock handoff. Split in the raw histogram into
+    /// Lock/transactionid (waiting on the pool_lock row's writer xid) and
+    /// Lock/tuple (waiting on the tuple itself) — both are the handoff affinity
+    /// targets, summed here.
+    pub lock_wait: i64,
+    /// On-CPU (NULL wait_event → ('Running','Running')): query execution cost.
+    pub running: i64,
+    /// Lightweight-lock contention on the shmem structures (wait_event_type=
+    /// 'LWLock', e.g. ledger_v31_staging_queue / _spillover_arena). A SEPARATE
+    /// bottleneck from the row-lock handoff: committers contending on the staging
+    /// ring / arena, which committer→pool affinity does NOT address. Kept distinct
+    /// so it isn't mistaken for either the handoff or on-CPU cost.
+    pub lwlock_wait: i64,
+    /// Disk / WAL IO waits (wait_event_type in ('IO','WALSync')).
+    pub io_wait: i64,
+}
+
+impl CommitterWaitSummary {
+    /// Non-idle samples: total − idle. The committer pool's actual work.
+    pub fn busy(&self) -> i64 {
+        (self.total - self.idle).max(0)
+    }
+    /// Fraction of all committer samples spent NOT idle — committer pool
+    /// utilization. Low ⇒ committers have spare capacity (the ceiling is upstream:
+    /// router formation or arrival rate), so committer-side affinity cannot help.
+    pub fn busy_frac(&self) -> f64 {
+        if self.total > 0 { self.busy() as f64 / self.total as f64 } else { 0.0 }
+    }
+    /// Of the BUSY samples, the share blocked on a row lock. High ⇒ the
+    /// cross-committer handoff is real and affinity has something to remove.
+    pub fn lock_frac_of_busy(&self) -> f64 {
+        let b = self.busy();
+        if b > 0 { self.lock_wait as f64 / b as f64 } else { 0.0 }
+    }
+    /// Of the BUSY samples, the share on-CPU (query execution). Affinity cannot
+    /// reduce this — it's the irreducible per-group apply/commit cost.
+    pub fn running_frac_of_busy(&self) -> f64 {
+        let b = self.busy();
+        if b > 0 { self.running as f64 / b as f64 } else { 0.0 }
+    }
+    /// Of the BUSY samples, the share on shmem LWLock contention (staging ring /
+    /// arena). A secondary bottleneck affinity does NOT touch.
+    pub fn lwlock_frac_of_busy(&self) -> f64 {
+        let b = self.busy();
+        if b > 0 { self.lwlock_wait as f64 / b as f64 } else { 0.0 }
+    }
 }
 
 impl SamplerReport {
@@ -63,6 +133,27 @@ impl SamplerReport {
         for ((wet, we), count) in waits.iter().take(30) {
             out.push_str(&format!("{:<22} {:<32} {:>16}\n", wet, we, count));
         }
+
+        // Committer-segmented wait histogram + summary (acct-0usf STEP 1b).
+        let mut cwaits: Vec<_> = self.committer_wait_observations.iter().collect();
+        cwaits.sort_by(|a, b| b.1.cmp(a.1));
+        out.push_str("--- committer-only wait_event histogram (no state filter; NULL→Running) ---\n");
+        out.push_str(&format!("{:<22} {:<32} {:>16}\n", "wait_event_type", "wait_event", "sum_samples"));
+        for ((wet, we), count) in cwaits.iter().take(30) {
+            out.push_str(&format!("{:<22} {:<32} {:>16}\n", wet, we, count));
+        }
+        let cs = self.committer_wait_summary();
+        out.push_str(&format!(
+            "committer summary: total={} idle={} busy={} ({:.1}% util) | of busy: lock={:.1}% running={:.1}% lwlock={:.1}% io={:.1}%\n",
+            cs.total,
+            cs.idle,
+            cs.busy(),
+            100.0 * cs.busy_frac(),
+            100.0 * cs.lock_frac_of_busy(),
+            100.0 * cs.running_frac_of_busy(),
+            100.0 * cs.lwlock_frac_of_busy(),
+            if cs.busy() > 0 { 100.0 * cs.io_wait as f64 / cs.busy() as f64 } else { 0.0 },
+        ));
         out
     }
 
@@ -72,6 +163,30 @@ impl SamplerReport {
             .iter()
             .max_by_key(|(_, c)| **c)
             .map(|((wet, we), c)| (wet.clone(), we.clone(), *c))
+    }
+
+    /// Bucket `committer_wait_observations` into the acct-0usf STEP 1b summary.
+    /// Bucketing rules (by wait_event_type, then wait_event):
+    ///   ('Extension','Extension') → idle (parked on the latch between drains)
+    ///   wait_event_type 'Lock'    → lock_wait (row-lock / transactionid handoff)
+    ///   ('Running','Running')      → running (on-CPU, NULL wait_event)
+    ///   wait_event_type 'IO' | 'WALSync' | 'LWLock' → io_wait
+    /// Everything else still counts toward `total` but no sub-bucket (so the four
+    /// sub-buckets need not sum to total; `busy − lock − running − io` is "other").
+    pub fn committer_wait_summary(&self) -> CommitterWaitSummary {
+        let mut s = CommitterWaitSummary::default();
+        for ((wet, we), c) in &self.committer_wait_observations {
+            s.total += *c;
+            match (wet.as_str(), we.as_str()) {
+                ("Extension", "Extension") => s.idle += *c,
+                ("Running", "Running") => s.running += *c,
+                ("Lock", _) => s.lock_wait += *c,
+                ("LWLock", _) => s.lwlock_wait += *c,
+                ("IO", _) | ("WALSync", _) | ("IPC", _) => s.io_wait += *c,
+                _ => {}
+            }
+        }
+        s
     }
 }
 
@@ -167,6 +282,47 @@ impl PgLocksSampler {
                         for s in rows {
                             *report
                                 .wait_observations
+                                .entry((s.wait_event_type, s.wait_event))
+                                .or_insert(0) += s.backend_count;
+                        }
+                    }
+                    Err(_) => report.poll_errors += 1,
+                }
+
+                // Committer-segmented wait histogram (acct-0usf STEP 1b). NO
+                // state filter (committer BGWorkers report state=NULL even
+                // mid-pipeline) and NULL wait_event → 'Running' (on-CPU) so the
+                // idle / lock-wait / on-CPU split is complete. Scoped to the
+                // committer backend_type so caller/router/autovacuum noise is
+                // excluded.
+                let committer_rows: Result<Vec<WaitSample>, sqlx::Error> =
+                    sqlx::query_as::<_, (String, String, i64)>(
+                        r#"
+                        SELECT COALESCE(wait_event_type, 'Running')::text,
+                               COALESCE(wait_event, 'Running')::text,
+                               COUNT(*)::BIGINT
+                          FROM pg_stat_activity
+                         WHERE backend_type LIKE 'ledger_routed_c_committer%'
+                           AND pid <> pg_backend_pid()
+                         GROUP BY wait_event_type, wait_event
+                        "#,
+                    )
+                    .fetch_all(&pool_clone)
+                    .await
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|(wet, we, count)| WaitSample {
+                                wait_event_type: wet,
+                                wait_event: we,
+                                backend_count: count,
+                            })
+                            .collect()
+                    });
+                match committer_rows {
+                    Ok(rows) => {
+                        for s in rows {
+                            *report
+                                .committer_wait_observations
                                 .entry((s.wait_event_type, s.wait_event))
                                 .or_insert(0) += s.backend_count;
                         }
