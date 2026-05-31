@@ -75,6 +75,15 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_aggregate_upserts_total_wrapper
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:480
+-- ledger_routed_c::ledger_routed_c_committer_apply_ns_total
+CREATE  FUNCTION "ledger_routed_c_committer_apply_ns_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_apply_ns_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- ledger-routed-c/src/lib.rs:385
 -- ledger_routed_c::ledger_routed_c_committer_deadlock_retries_total
 CREATE  FUNCTION "ledger_routed_c_committer_deadlock_retries_total"() RETURNS bigint /* i64 */
@@ -120,6 +129,15 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_duplicate_redrives_total_wrappe
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:475
+-- ledger_routed_c::ledger_routed_c_committer_hydrate_ns_total
+CREATE  FUNCTION "ledger_routed_c_committer_hydrate_ns_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_hydrate_ns_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- ledger-routed-c/src/lib.rs:456
 -- ledger_routed_c::ledger_routed_c_committer_pipeline_count
 CREATE  FUNCTION "ledger_routed_c_committer_pipeline_count"() RETURNS bigint /* i64 */
@@ -153,6 +171,15 @@ CREATE  FUNCTION "ledger_routed_c_committer_pool_lock_acquisitions_total"() RETU
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pool_lock_acquisitions_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:470
+-- ledger_routed_c::ledger_routed_c_committer_pool_lock_ns_total
+CREATE  FUNCTION "ledger_routed_c_committer_pool_lock_ns_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pool_lock_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -195,7 +222,16 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_tx_failures_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:463
+-- ledger-routed-c/src/lib.rs:485
+-- ledger_routed_c::ledger_routed_c_committer_txn_ns_total
+CREATE  FUNCTION "ledger_routed_c_committer_txn_ns_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_txn_ns_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:492
 -- ledger_routed_c::ledger_routed_c_hello
 CREATE  FUNCTION "ledger_routed_c_hello"() RETURNS TEXT /* String */
 STRICT
