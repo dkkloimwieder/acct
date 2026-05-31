@@ -21,7 +21,25 @@ AS 'MODULE_PATHNAME', 'ledger_enqueue_trx_c_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:296
+-- ledger-routed-c/src/lib.rs:356
+-- ledger_routed_c::ledger_routed_c_affinity_owned_claims_total
+CREATE  FUNCTION "ledger_routed_c_affinity_owned_claims_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_affinity_owned_claims_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:364
+-- ledger_routed_c::ledger_routed_c_affinity_steals_total
+CREATE  FUNCTION "ledger_routed_c_affinity_steals_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_affinity_steals_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:332
 -- ledger_routed_c::ledger_routed_c_arena_bump_offset
 CREATE  FUNCTION "ledger_routed_c_arena_bump_offset"() RETURNS bigint /* i64 */
 STRICT
@@ -30,7 +48,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_arena_bump_offset_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:302
+-- ledger-routed-c/src/lib.rs:338
 -- ledger_routed_c::ledger_routed_c_arena_freelist_count
 CREATE  FUNCTION "ledger_routed_c_arena_freelist_count"() RETURNS bigint /* i64 */
 STRICT
@@ -39,7 +57,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_arena_freelist_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:291
+-- ledger-routed-c/src/lib.rs:327
 -- ledger_routed_c::ledger_routed_c_arena_outstanding
 CREATE  FUNCTION "ledger_routed_c_arena_outstanding"() RETURNS bigint /* i64 */
 STRICT
@@ -48,7 +66,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_arena_outstanding_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:279
+-- ledger-routed-c/src/lib.rs:315
 -- ledger_routed_c::ledger_routed_c_arena_total_allocs
 CREATE  FUNCTION "ledger_routed_c_arena_total_allocs"() RETURNS bigint /* i64 */
 STRICT
@@ -57,7 +75,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_arena_total_allocs_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:284
+-- ledger-routed-c/src/lib.rs:320
 -- ledger_routed_c::ledger_routed_c_arena_total_frees
 CREATE  FUNCTION "ledger_routed_c_arena_total_frees"() RETURNS bigint /* i64 */
 STRICT
@@ -66,7 +84,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_arena_total_frees_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:327
+-- ledger-routed-c/src/lib.rs:377
 -- ledger_routed_c::ledger_routed_c_committer_aggregate_upserts_total
 CREATE  FUNCTION "ledger_routed_c_committer_aggregate_upserts_total"() RETURNS bigint /* i64 */
 STRICT
@@ -75,7 +93,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_aggregate_upserts_total_wrapper
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:480
+-- ledger-routed-c/src/lib.rs:530
 -- ledger_routed_c::ledger_routed_c_committer_apply_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_apply_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -84,7 +102,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_apply_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:385
+-- ledger-routed-c/src/lib.rs:435
 -- ledger_routed_c::ledger_routed_c_committer_deadlock_retries_total
 CREATE  FUNCTION "ledger_routed_c_committer_deadlock_retries_total"() RETURNS bigint /* i64 */
 STRICT
@@ -93,7 +111,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_deadlock_retries_total_wrapper'
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:343
+-- ledger-routed-c/src/lib.rs:393
 -- ledger_routed_c::ledger_routed_c_committer_dedup_skips_total
 CREATE  FUNCTION "ledger_routed_c_committer_dedup_skips_total"() RETURNS bigint /* i64 */
 STRICT
@@ -102,7 +120,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_dedup_skips_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:314
+-- ledger-routed-c/src/lib.rs:350
 -- ledger_routed_c::ledger_routed_c_committer_drains_total
 CREATE  FUNCTION "ledger_routed_c_committer_drains_total"() RETURNS bigint /* i64 */
 STRICT
@@ -111,7 +129,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_drains_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:351
+-- ledger-routed-c/src/lib.rs:401
 -- ledger_routed_c::ledger_routed_c_committer_dropped_submissions_total
 CREATE  FUNCTION "ledger_routed_c_committer_dropped_submissions_total"() RETURNS bigint /* i64 */
 STRICT
@@ -120,7 +138,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_dropped_submissions_total_wrapp
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:362
+-- ledger-routed-c/src/lib.rs:412
 -- ledger_routed_c::ledger_routed_c_committer_duplicate_redrives_total
 CREATE  FUNCTION "ledger_routed_c_committer_duplicate_redrives_total"() RETURNS bigint /* i64 */
 STRICT
@@ -129,7 +147,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_duplicate_redrives_total_wrappe
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:475
+-- ledger-routed-c/src/lib.rs:525
 -- ledger_routed_c::ledger_routed_c_committer_hydrate_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_hydrate_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -138,7 +156,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_hydrate_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:456
+-- ledger-routed-c/src/lib.rs:506
 -- ledger_routed_c::ledger_routed_c_committer_pipeline_count
 CREATE  FUNCTION "ledger_routed_c_committer_pipeline_count"() RETURNS bigint /* i64 */
 STRICT
@@ -147,7 +165,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pipeline_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:451
+-- ledger-routed-c/src/lib.rs:501
 -- ledger_routed_c::ledger_routed_c_committer_pipeline_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_pipeline_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -156,7 +174,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pipeline_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:378
+-- ledger-routed-c/src/lib.rs:428
 -- ledger_routed_c::ledger_routed_c_committer_poisoned_total
 CREATE  FUNCTION "ledger_routed_c_committer_poisoned_total"() RETURNS bigint /* i64 */
 STRICT
@@ -165,7 +183,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_poisoned_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:319
+-- ledger-routed-c/src/lib.rs:369
 -- ledger_routed_c::ledger_routed_c_committer_pool_lock_acquisitions_total
 CREATE  FUNCTION "ledger_routed_c_committer_pool_lock_acquisitions_total"() RETURNS bigint /* i64 */
 STRICT
@@ -174,7 +192,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pool_lock_acquisitions_total_wr
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:470
+-- ledger-routed-c/src/lib.rs:520
 -- ledger_routed_c::ledger_routed_c_committer_pool_lock_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_pool_lock_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -183,7 +201,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pool_lock_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:705
+-- ledger-routed-c/src/router.rs:712
 -- ledger_routed_c::router::ledger_routed_c_committer_queue_state_counts
 CREATE  FUNCTION "ledger_routed_c_committer_queue_state_counts"() RETURNS TABLE (
 	"state" TEXT,  /* String */
@@ -195,7 +213,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_queue_state_counts_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:395
+-- ledger-routed-c/src/lib.rs:445
 -- ledger_routed_c::ledger_routed_c_committer_takeover_count
 CREATE  FUNCTION "ledger_routed_c_committer_takeover_count"() RETURNS bigint /* i64 */
 STRICT
@@ -204,7 +222,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_takeover_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:335
+-- ledger-routed-c/src/lib.rs:385
 -- ledger_routed_c::ledger_routed_c_committer_trx_committed_total
 CREATE  FUNCTION "ledger_routed_c_committer_trx_committed_total"() RETURNS bigint /* i64 */
 STRICT
@@ -213,7 +231,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_trx_committed_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:370
+-- ledger-routed-c/src/lib.rs:420
 -- ledger_routed_c::ledger_routed_c_committer_tx_failures_total
 CREATE  FUNCTION "ledger_routed_c_committer_tx_failures_total"() RETURNS bigint /* i64 */
 STRICT
@@ -222,7 +240,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_tx_failures_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:485
+-- ledger-routed-c/src/lib.rs:535
 -- ledger_routed_c::ledger_routed_c_committer_txn_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_txn_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -231,7 +249,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_txn_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:492
+-- ledger-routed-c/src/lib.rs:542
 -- ledger_routed_c::ledger_routed_c_hello
 CREATE  FUNCTION "ledger_routed_c_hello"() RETURNS TEXT /* String */
 STRICT
@@ -240,7 +258,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_hello_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:732
+-- ledger-routed-c/src/router.rs:739
 -- ledger_routed_c::router::ledger_routed_c_ready_commit_groups
 CREATE  FUNCTION "ledger_routed_c_ready_commit_groups"() RETURNS TABLE (
 	"commit_group_id" bigint,  /* i64 */
@@ -253,7 +271,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_ready_commit_groups_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:402
+-- ledger-routed-c/src/lib.rs:452
 -- ledger_routed_c::ledger_routed_c_recovery_complete
 CREATE  FUNCTION "ledger_routed_c_recovery_complete"() RETURNS bool /* bool */
 STRICT
@@ -262,7 +280,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_recovery_complete_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:422
+-- ledger-routed-c/src/lib.rs:472
 -- ledger_routed_c::ledger_routed_c_router_commit_group_count
 CREATE  FUNCTION "ledger_routed_c_router_commit_group_count"() RETURNS bigint /* i64 */
 STRICT
@@ -271,7 +289,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_router_commit_group_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:435
+-- ledger-routed-c/src/lib.rs:485
 -- ledger_routed_c::ledger_routed_c_router_entries_scanned_total
 CREATE  FUNCTION "ledger_routed_c_router_entries_scanned_total"() RETURNS bigint /* i64 */
 STRICT
@@ -280,7 +298,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_router_entries_scanned_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:417
+-- ledger-routed-c/src/lib.rs:467
 -- ledger_routed_c::ledger_routed_c_router_ticks_total
 CREATE  FUNCTION "ledger_routed_c_router_ticks_total"() RETURNS bigint /* i64 */
 STRICT
@@ -289,7 +307,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_router_ticks_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:427
+-- ledger-routed-c/src/lib.rs:477
 -- ledger_routed_c::ledger_routed_c_router_total_submissions
 CREATE  FUNCTION "ledger_routed_c_router_total_submissions"() RETURNS bigint /* i64 */
 STRICT
@@ -298,7 +316,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_router_total_submissions_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:442
+-- ledger-routed-c/src/lib.rs:492
 -- ledger_routed_c::ledger_routed_c_router_window_defers_total
 CREATE  FUNCTION "ledger_routed_c_router_window_defers_total"() RETURNS bigint /* i64 */
 STRICT
