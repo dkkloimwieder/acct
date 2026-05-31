@@ -551,7 +551,7 @@ columns partition the **busy** time:
 |-----|--------:|------:|-----:|------:|------:|--------:|--------:|---------------------------|
 | s5  | 1000 | 2814 | 49.9 | 74 | **67** | 24 | 6  | CANDIDATE — single hot pool |
 | s6  | 1000 | 1411 |  1.1 | 88 | **0**  | 29 | 46 | **SKIP** — disjoint, 0 % lock, LWLock-bound |
-| s7  | 1000 | 2095 |  3.6 | 77 | **9**  | 41 | 28 | **SKIP** — deep-zipf, on-CPU FIFO-bound |
+| s7  | 1000 | 2095 |  3.6 | 77 | **9**  | 41 | 28 | **SKIP** — deep-zipf, on-CPU (hydration layer-scan, not FIFO cost) |
 | s8  | 1000 | 1379 | 49.7 | 85 | **72** | 26 | 1  | CANDIDATE — deep-zipf complex |
 | s9  | 1000 | 1418 | 49.7 | 84 | **72** | 26 | 1  | CANDIDATE — deep-zipf multi-touch |
 | s10 |   50 | 1401 | 49.6 | 90 | **65** | 26 | 8  | CANDIDATE — Pareto receipts |
