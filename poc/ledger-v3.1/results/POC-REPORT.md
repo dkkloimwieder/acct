@@ -551,7 +551,7 @@ columns partition the **busy** time:
 |-----|--------:|------:|-----:|------:|------:|--------:|--------:|---------------------------|
 | s5  | 1000 | 2814 | 49.9 | 74 | **67** | 24 | 6  | CANDIDATE — single hot pool |
 | s6  | 1000 | 1411 |  1.1 | 88 | **0**  | 29 | 46 | **SKIP** — disjoint, 0 % lock, LWLock-bound |
-| s7  | 1000 | 2095 |  3.6 | 77 | **9**  | 41 | 28 | **SKIP** — deep-zipf, on-CPU (hydration layer-scan, not FIFO cost) |
+| s7  | 1000 | 2095 |  3.6 | 77 | **9**  | 41 | 28 | **SKIP** — deep-zipf, on-CPU/commit-bound (not FIFO/lock; see below) |
 | s8  | 1000 | 1379 | 49.7 | 85 | **72** | 26 | 1  | CANDIDATE — deep-zipf complex |
 | s9  | 1000 | 1418 | 49.7 | 84 | **72** | 26 | 1  | CANDIDATE — deep-zipf multi-touch |
 | s10 |   50 | 1401 | 49.6 | 90 | **65** | 26 | 8  | CANDIDATE — Pareto receipts |
@@ -571,8 +571,16 @@ What the measured decomposition establishes that the inference could not:
    (lock 50–72 % of busy), so the handoff is real. But **two scenarios are not lock-bound at all** and the
    throughput-only view silently misfiled them: **s6 (disjoint, lock 0 %)** is **LWLock-bound** (46 % — the
    staging-ring / arena, `cg`≈1 so nothing coalesces) and **s7 (deep-zipf-simple, lock 9 %)** is **on-CPU
-   bound** (41 % — the FIFO layer-walk over depth 1000). Affinity is *a priori* moot on both; they are
-   **SKIP** in the STEP 3 variants.
+   bound** (41 %). The on-CPU cost is emphatically **not** FIFO layer math: Path C posts FIFO depletions
+   provisionally at the aggregate running-average (`provisional::plan_apply_provisional`, aggregate-only, no
+   layer iteration; strict layer math is stubbed off the hot path and deferred to recalc/close, per
+   `fifo.rs` / `provisional.rs`), and hydration reads only the `layer_id = 0` aggregate row per FIFO pool.
+   Consistent with that, s7's spans put hydrate at only ~6 % of committer txn time; its cost is spread
+   across **commit (39 %) + apply (26 %) + prep (21 %)** — i.e. WAL/commit and per-line work over the
+   depth-1000 universe, not cost-method or lock work. The *exact* driver of the on-CPU share is not yet
+   pinned (a pg_stat_statements / `perf` pass on s7 would localize it); what the data establishes
+   unambiguously is that s7 is **not lock-bound** (9 %), so affinity is *a priori* moot. Affinity is moot on
+   both s6 and s7; they are **SKIP** in the STEP 3 variants.
 2. **A new, affinity-immune bottleneck surfaces under high concurrency.** The 200-caller Pareto cells
    (s11/s15/s19) spend **22–24 % of committer time on shmem-ring `LWLock` contention** — invisible to the
    lever-2 row-lock-only framing. Even a perfect affinity scheme leaves it untouched.
