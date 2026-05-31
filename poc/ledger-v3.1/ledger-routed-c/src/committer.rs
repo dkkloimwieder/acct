@@ -223,20 +223,51 @@ fn claim_next_committer_entry() -> Option<u32> {
     let (my_slot, my_gen) =
         my_committer_identity().expect("claim_next_committer_entry requires a claimed identity");
 
+    // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE] read the scheme once per
+    // scan. When off, `aff_scheme == SCHEME_OFF` and the per-entry gate below is
+    // a single compare that always passes — the claim path is unchanged.
+    let aff_scheme = crate::affinity_scheme_now();
+    let aff_steal_us = (crate::affinity_steal_ms_now() as u64).saturating_mul(1000);
+
     for i in 0..capacity {
         let idx = ((head + i) % capacity) as usize;
         let slot = &queue.entries[idx];
-        if slot.valid.load(Relaxed) == 1
-            && slot
-                .committer_bgw_generation
-                .compare_exchange(0, my_gen, AcqRel, Relaxed)
-                .is_ok()
+        // Acquire pairs with the router's `valid` 0→1 Release so the plain
+        // `affinity_owner` field published before that CAS is visible here.
+        if slot.valid.load(Acquire) != 1 {
+            continue;
+        }
+        // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE] owner / age-gated-steal
+        // gate. Owners claim immediately; non-owners skip until the entry has
+        // aged past affinity_steal_ms, then steal it (no starvation on a
+        // backed-up or dead owner). `claim_was_steal` is counted only after a
+        // successful claim so the engagement counters stay exact under races.
+        let mut claim_was_steal = false;
+        if aff_scheme != crate::affinity::SCHEME_OFF && slot.affinity_owner != my_slot {
+            let age_us = crate::shmem::now_us().saturating_sub(slot.enqueued_at_micros);
+            if age_us < aff_steal_us {
+                continue;
+            }
+            claim_was_steal = true;
+        }
+        if slot
+            .committer_bgw_generation
+            .compare_exchange(0, my_gen, AcqRel, Relaxed)
+            .is_ok()
         {
             slot.committer_bgw_slot.store(my_slot, Release);
             if slot.valid.compare_exchange(1, 2, Acquire, Relaxed).is_ok() {
                 slot.committer_acquired_at_ns.store(now_ns(), Relaxed);
                 queue.head.store((head + i + 1) % capacity, Relaxed);
                 queue.committer_claim_count.fetch_add(1, Relaxed);
+                // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
+                if aff_scheme != crate::affinity::SCHEME_OFF {
+                    if claim_was_steal {
+                        queue.affinity_steals_total.fetch_add(1, Relaxed);
+                    } else {
+                        queue.affinity_owned_claims_total.fetch_add(1, Relaxed);
+                    }
+                }
                 return Some(idx as u32);
             } else {
                 slot.committer_bgw_slot.store(u32::MAX, Relaxed);

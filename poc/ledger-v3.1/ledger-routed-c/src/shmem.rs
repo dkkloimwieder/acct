@@ -129,6 +129,12 @@ pub struct CommitterQueueEntry {
     pub pool_keys_offset: u32,
     pub pool_keys_count: u16,
     pub _pad_pool: [u8; 2],
+    /// [acct-0usf affinity — EXPERIMENTAL/REMOVABLE] Router-stamped owner
+    /// ordinal = mix(min pool_id) % committer_count. Published together with the
+    /// other router fields by the `valid` 0→1 Release; a committer reads it (via
+    /// an Acquire load of `valid`) on the claim scan when `affinity_scheme != 0`,
+    /// and ignores it (dead field) when affinity is off.
+    pub affinity_owner: u32,
     /// Owning committer's identity-slot index in
     /// `CommitterQueue.identity_slots`. Only meaningful when
     /// `committer_bgw_generation > 0`; generation == 0 is the
@@ -279,6 +285,14 @@ pub struct CommitterQueue {
     /// commit/fsync cost; `committer_pipeline_ns_total − (pool_lock + hydrate +
     /// apply)` isolates decode + triage + dedup + line-decode (the "prep" span).
     pub committer_txn_ns_total: AtomicU64,
+    // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE] claim-path engagement
+    // counters. owned = a committer claimed a group it owns; steals = a
+    // committer claimed a non-owned group after it aged past affinity_steal_ms.
+    // steal_fraction = steals / (owned + steals) shows whether affinity is
+    // actually pinning groups to owners (≈0 steals) or degenerating to OFF
+    // (steals ≈ owned). Zero when affinity_scheme = 0.
+    pub affinity_owned_claims_total: AtomicU64,
+    pub affinity_steals_total: AtomicU64,
 
     // ── Committer identity slots ───────────────────────────────────
     pub identity_slots: [CommitterIdentitySlot; LEDGER_V3_COMMITTER_IDENTITY_SLOTS],

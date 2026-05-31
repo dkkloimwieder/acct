@@ -289,6 +289,13 @@ fn emit_commit_group(chunk: Vec<Candidate>, committer_capacity: u32) -> EmitOutc
             slot.staging_entry_offsets = staging_offsets_off;
             slot.pool_keys_offset = pool_keys_off;
             slot.pool_keys_count = pool_keys_count;
+            // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE] stamp the owner
+            // ordinal from the group's minimum pool_id. Computed unconditionally
+            // (one cheap mix); the committer ignores it when affinity is off.
+            slot.affinity_owner = crate::affinity::owner_for_min_pool(
+                pool_union_sorted.first().copied().unwrap_or(0),
+                crate::committer_count_now(),
+            );
             slot.committer_bgw_slot.store(u32::MAX, Relaxed);
             slot.committer_bgw_generation.store(0, Relaxed);
             slot.committer_acquired_at_ns.store(0, Relaxed);

@@ -27,6 +27,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 ::pgrx::pg_module_magic!();
 
+pub(crate) mod affinity; // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
 pub(crate) mod arena;
 pub(crate) mod cleanup;
 pub(crate) mod committer;
@@ -56,6 +57,9 @@ static CALLER_TX_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 static COMMITTER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
 static EJECT_COOLDOWN_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static ROUTER_PACK_DISJOINT: GucSetting<bool> = GucSetting::<bool>::new(false);
+// [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
+static AFFINITY_SCHEME: GucSetting<i32> = GucSetting::<i32>::new(0);
+static AFFINITY_STEAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
 static TARGET_DATABASE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"poc_v3_1"));
 
@@ -103,6 +107,16 @@ pub(crate) fn eject_cooldown_ms_now() -> i32 {
 #[allow(dead_code)]
 pub(crate) fn router_pack_disjoint_now() -> bool {
     ROUTER_PACK_DISJOINT.get()
+}
+// [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
+#[allow(dead_code)]
+pub(crate) fn affinity_scheme_now() -> i32 {
+    AFFINITY_SCHEME.get()
+}
+// [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
+#[allow(dead_code)]
+pub(crate) fn affinity_steal_ms_now() -> i32 {
+    AFFINITY_STEAL_MS.get().max(0)
 }
 
 // ── _PG_init ────────────────────────────────────────────────────────
@@ -223,6 +237,28 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Sighup,
         GucFlags::empty(),
     );
+    // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
+    GucRegistry::define_int_guc(
+        c"ledger_routed_c.affinity_scheme",
+        c"Committer→pool affinity scheme (acct-0usf STEP 3, default off)",
+        c"0=off (production default: first-come committer claim, no affinity). 1=min_pool: a commit_group is owned by mix(min pool_id) % committer_count; non-owner committers skip it on the claim scan until it ages past affinity_steal_ms, then steal. EXPERIMENTAL — measures whether committer→pool affinity shrinks the cross-committer pool_lock handoff on lock-bound scenarios; the reverted acct-xdwk lever 2, rebuilt for rigorous measurement.",
+        &AFFINITY_SCHEME,
+        0,
+        1,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
+    GucRegistry::define_int_guc(
+        c"ledger_routed_c.affinity_steal_ms",
+        c"Age (ms) after which a non-owner committer may steal a group (acct-0usf)",
+        c"Only meaningful when affinity_scheme != 0. A queued commit_group whose owner committer has not claimed it within this many ms becomes claimable by any committer (age-gated steal). Lower → affinity engages less (more stealing, closer to off); higher → stronger pinning but worse tail latency if an owner is backed up. Keyed off the entry's enqueued_at_micros.",
+        &AFFINITY_STEAL_MS,
+        0,
+        60_000,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
     GucRegistry::define_bool_guc(
         c"ledger_routed_c.router_pack_disjoint",
         c"Pack disjoint pool-components into one commit_group",
@@ -314,6 +350,20 @@ fn ledger_routed_c_arena_freelist_count() -> i64 {
 #[pg_extern]
 fn ledger_routed_c_committer_drains_total() -> i64 {
     COMMITTER_QUEUE.share().committer_drains_total.load(Relaxed) as i64
+}
+
+// [acct-0usf affinity — EXPERIMENTAL/REMOVABLE] claim-path engagement counters.
+#[pg_extern]
+fn ledger_routed_c_affinity_owned_claims_total() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .affinity_owned_claims_total
+        .load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_affinity_steals_total() -> i64 {
+    COMMITTER_QUEUE.share().affinity_steals_total.load(Relaxed) as i64
 }
 
 #[pg_extern]
