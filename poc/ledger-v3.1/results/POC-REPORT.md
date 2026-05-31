@@ -512,38 +512,92 @@ which packing deliberately does *not* touch (disjoint components carry no shared
 Lever 1b is the commit-amortization half of the problem; the lock-contention half is **lever 2 —
 committer→pool affinity**, characterized next.
 
-### Lever 2 — committer→pool affinity: characterized, no benefit on multi-pool workloads (`acct-xdwk`)
+### Lever 2 — committer→pool affinity: refuted (`acct-xdwk`), then re-investigated rigorously (`acct-0usf`)
 
 The standing hypothesis (from characterization #2) was that hot-pool throughput is bounded by the
 **cross-committer `FOR UPDATE` handoff**: the committer claim queue is first-come with no pool affinity
 (`committer.rs::claim_next_committer_entry`), so the same hot pool's commit_groups across ticks land on
 different committers and block on each other's row lock. Lever 2 prototyped the fix — pin a commit_group
-to a committer by `hash(min pool_id) % committer_count` (with an age-gated steal fallback so a backed-up
-or dead owner can't starve the queue) — behind a default-off GUC, and swept `committer_count` 2/4/8 on
-the two Pareto-receipt cells, affinity off vs on (load-gated, clean DB per cell):
+to a committer by `hash(min pool_id) % committer_count` (with an age-gated steal fallback) — behind a
+default-off GUC, and swept `committer_count` 2/4/8 on the two Pareto-receipt cells, affinity off vs on
+(load-gated, clean DB per cell):
 
 | scenario | cc=2 off → on | cc=4 off → on | cc=8 off → on |
 |----------|--------------:|--------------:|--------------:|
 | s10 (50 callers)  | 1,280 → 1,221 | 1,374 → 1,352 | 1,376 → 1,407 |
 | s11 (200 callers) | 1,080 → 967   | 1,194 → 1,069 | 1,258 → 1,194 |
 
-**Affinity does not help — it is throughput-neutral on s10 and ~10 % worse on s11**, and it does not
-convert the flat committer-count curve into a scaling one (both off and on rise modestly cc=2→4 then
-flatten). The hypothesis was **wrong for realistic workloads**, and the reason is the pool count: the
-acct-235v "78 % of DB time in `pool_lock FOR UPDATE`" profile was taken on a *single-hot-pool* run, but
-a real Pareto receipt touches **~13.5 pools per trx** (`pool_lock_per_trx ≈ 13.5`). Affinity keys on the
-*min* pool_id, so a 13-pool group still acquires 12 *other* pools that neighbouring groups also touch —
-the contention is not removed, and affinity merely **fragments** the commit_groups (cg 12 → 7,
-commits/s 114 → 185) for the same or less throughput. A pool-*set*-aware affinity cannot rescue this
-either: a group spanning 13 hot pools cannot be owned by one committer without re-serializing the whole
-pool. Affinity only pays off in the degenerate single-pool case (s5) — already the fastest cell, which
-needs no help.
+Affinity was throughput-neutral on s10, ~10 % worse on s11, and never converted the flat committer-count
+curve into a scaling one. The production claim-path code was **reverted**.
 
-**Disposition:** the lever-2 production claim-path code was **reverted** — a refuted optimization that
-only degrades multi-pool throughput should not sit in the committer hot path. The `AFFINITY` knob on
-`run-committer-count-sweep.sh` and the four `committer_count_sweep_s1{0,1}_aff{off,on}.csv` artifacts are
-kept so the result is reproducible. **Net for `acct-xdwk`: lever 1b (disjoint-component packing) is the
-real, shipped win; lever 2 (committer affinity) is a characterized dead-end.**
+**That pass was too thin to be conclusive.** Its bottleneck *mechanism* was **inferred** — the acct-235v
+"78 % of DB time in `pool_lock FOR UPDATE`" figure was one `pg_stat_statements` snapshot on a
+*single-hot-pool* run, total-DB-time across **all** backends, then generalized to every workload. Only two
+scenarios were measured, single noisy runs, deltas inside the host-load band; affinity-ON correctness was
+never cleanly proven; only one affinity key (min-pool) was tried. `acct-0usf` redoes it rigorously, and
+STEP 1 (this subsection) replaces the inference with **direct per-scenario measurement**. The committer
+pipeline is instrumented with in-process wall-time spans (`committer_{pool_lock,hydrate,apply,txn}_ns_total`,
+`acct-0usf` STEP 1a) and a committer-segmented `pg_stat_activity` wait sampler (STEP 1b) that splits busy
+committer time into the row-lock handoff (the *only* span affinity can shrink), on-CPU query execution
+(irreducible), shmem-ring `LWLock` contention (a separate bottleneck affinity can't touch), and IO.
+
+**Measured: where does committer wall-time go** (full matrix, 5 reps/scenario, `committer_count=4`,
+affinity OFF, sampler ON, clean-seed + load-gated per cell on a daily-driver host; median across reps —
+`results/committer_profile_sweep.csv`, `bench/run-committer-profile-sweep.sh` + `bench/profile-aggregate.py`,
+75 rows / 0 FAILs). `busy%` is committer pool utilization (non-idle / total samples); the `of-busy`
+columns partition the **busy** time:
+
+| scn | callers | trx/s | `cg` | busy% | lock% | on-CPU% | LWLock% | a-priori affinity verdict |
+|-----|--------:|------:|-----:|------:|------:|--------:|--------:|---------------------------|
+| s5  | 1000 | 2814 | 49.9 | 74 | **67** | 24 | 6  | CANDIDATE — single hot pool |
+| s6  | 1000 | 1411 |  1.1 | 88 | **0**  | 29 | 46 | **SKIP** — disjoint, 0 % lock, LWLock-bound |
+| s7  | 1000 | 2095 |  3.6 | 77 | **9**  | 41 | 28 | **SKIP** — deep-zipf, on-CPU FIFO-bound |
+| s8  | 1000 | 1379 | 49.7 | 85 | **72** | 26 | 1  | CANDIDATE — deep-zipf complex |
+| s9  | 1000 | 1418 | 49.7 | 84 | **72** | 26 | 1  | CANDIDATE — deep-zipf multi-touch |
+| s10 |   50 | 1401 | 49.6 | 90 | **65** | 26 | 8  | CANDIDATE — Pareto receipts |
+| s11 |  200 | 1235 | 48.9 | 90 | **50** | 26 | 23 | CANDIDATE — Pareto receipts, high-conc |
+| s14 |   50 | 1416 | 49.3 | 89 | **64** | 26 | 8  | CANDIDATE — Pareto builds |
+| s15 |  200 | 1263 | 48.9 | 90 | **50** | 25 | 24 | CANDIDATE — Pareto builds, high-conc |
+| s16 |   50 | 1431 | 49.8 | 90 | **64** | 26 | 9  | CANDIDATE — Pareto builds, long-tail |
+| s17 |   50 | 1405 | 47.0 | 89 | **64** | 26 | 9  | CANDIDATE — Pareto builds, balanced |
+| s18 |   50 | 1387 | 49.6 | 89 | **66** | 26 | 7  | CANDIDATE — Pareto mixed |
+| s19 |  200 | 1222 | 48.8 | 90 | **52** | 26 | 22 | CANDIDATE — Pareto mixed, high-conc |
+| s20 |   50 | 1421 | 49.9 | 91 | **64** | 26 | 9  | CANDIDATE — Pareto mixed, long-tail |
+| s21 |   50 | 1358 | 48.2 | 89 | **65** | 26 | 8  | CANDIDATE — Pareto mixed, balanced |
+
+What the measured decomposition establishes that the inference could not:
+
+1. **The bottleneck *diagnosis* was right; its *universality* was not.** 13 of 15 scenarios are lock-bound
+   (lock 50–72 % of busy), so the handoff is real. But **two scenarios are not lock-bound at all** and the
+   throughput-only view silently misfiled them: **s6 (disjoint, lock 0 %)** is **LWLock-bound** (46 % — the
+   staging-ring / arena, `cg`≈1 so nothing coalesces) and **s7 (deep-zipf-simple, lock 9 %)** is **on-CPU
+   bound** (41 % — the FIFO layer-walk over depth 1000). Affinity is *a priori* moot on both; they are
+   **SKIP** in the STEP 3 variants.
+2. **A new, affinity-immune bottleneck surfaces under high concurrency.** The 200-caller Pareto cells
+   (s11/s15/s19) spend **22–24 % of committer time on shmem-ring `LWLock` contention** — invisible to the
+   lever-2 row-lock-only framing. Even a perfect affinity scheme leaves it untouched.
+3. **Even the single-hot-pool best case is only ~67 % lock.** s5 — where affinity *should* help most — still
+   spends a quarter of busy time on-CPU and 6 % on LWLock, capping any affinity upside well below the naive
+   "78 % is `FOR UPDATE`" headline (that figure was total-DB-time across all backends, not committer
+   busy-time).
+4. **The fractions are load-robust.** Every scenario's `lock_of_busy` IQR is tight (mostly < 2 pp) despite
+   per-cell load1 medians of 1.6–2.8 and individual reps spanning load 1.4–6.4 — vindicating reporting
+   structural fractions, not absolute throughput, on a noisy host. (Throughput absolutes here run below the
+   lever-1b table's because the sampler is on and the host was contended; they are context, not comparable.)
+
+**Disposition.** The lever-2 refutation **stands** (min-pool affinity reverted). `acct-0usf` STEP 1 is
+complete: the mechanism is now measured per scenario, not inferred. The 13 CANDIDATE scenarios proceed to
+STEP 2 (pre-registered hypotheses H1/H2/H3 with falsification criteria) and STEP 3 (affinity variants
+V0–V3 — min-pool / whole-pool-set / per-pool-ownership / router-side — each tested *only* where this table
+says lock contention is the dominant addressable cost); s6 and s7 are recorded a-priori SKIP. The open
+question is no longer "does affinity help?" but the sharper one this table frames: on the lock-bound cells,
+can *any* committer→pool assignment shrink the row-lock handoff without (a) re-serializing the ~13.5-pool
+Pareto groups (`pool_lock_per_trx ≈ 13.5`) or (b) trading row-lock wait for even more staging-ring
+`LWLock` wait — given that on the high-concurrency cells the handoff is already only ~half of busy time.
+The lever-2 reproducibility artifacts (`AFFINITY` knob on `run-committer-count-sweep.sh`, the four
+`committer_count_sweep_s1{0,1}_aff{off,on}.csv`) are retained. **Net for `acct-xdwk`: lever 1b
+(disjoint-component packing) is the real, shipped win; lever 2 (committer affinity) is refuted as shipped;
+`acct-0usf` carries the rigorous re-investigation.**
 
 ### Other observations
 
