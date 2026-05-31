@@ -607,6 +607,74 @@ The lever-2 reproducibility artifacts (`AFFINITY` knob on `run-committer-count-s
 (disjoint-component packing) is the real, shipped win; lever 2 (committer affinity) is refuted as shipped;
 `acct-0usf` carries the rigorous re-investigation.**
 
+### acct-0usf STEP 2 — pre-registered hypotheses (affinity), dated 2026-05-31
+
+Written **before any affinity variant exists** (`acct-iqx2`; STEP 3 V0–V3 unwritten) to fix the pass/fail
+rules and numeric thresholds in advance, so STEP 3 results cannot be post-hoc rationalized into a "win" —
+the failure mode of the acct-xdwk lever-2 pass. Thresholds are derived from the STEP 1 OFF-arm sweep
+(`results/committer_profile_sweep.csv`, 15×5, `committer_count=4`): each cell's own measured within-arm
+IQR, with a floor.
+
+**Metric + comparison rules.**
+- Dispersion = **median + IQR** (robust to this host's load spikes), N≥5 reps per cell.
+- Arms interleaved **ABAB** (OFF,ON,OFF,ON,…) so host drift cannot alias onto one arm; load1 recorded per
+  rep; reps above the load gate discarded. A variant is compared only against the **matched OFF arm at the
+  same `committer_count` and comparable load1** measured *in the same STEP 3 sweep* — NOT against this
+  STEP 1 table (which is `committer_count=4` only).
+- A delta counts only if it **clears the cell's noise band** below: the ON median lies outside
+  `[OFF median ± band]`.
+
+**Per-cell thresholds** (CANDIDATE cells only; s6/s7 are a-priori SKIP per the verdict table).
+`X_lock` = minimum `lock_of_busy` reduction (pp) that counts = `max(2×lockIQR, 5pp floor)`.
+`tput band` = minimum throughput delta (trx/s) that counts = `max(2×tputIQR, 3% of median)`.
+
+| scenario | lock med % | lockIQR pp | **X_lock (pp)** | tput med | tputIQR | **tput band** |
+|---|---|---|---|---|---|---|
+| s5  | 67.2 | 0.5 | **5.0** | 2814 | 8.9  | **84** (3%) |
+| s8  | 72.2 | 0.5 | **5.0** | 1379 | 24.0 | **48** (2×IQR) |
+| s9  | 71.6 | 0.5 | **5.0** | 1418 | 47.4 | **95** (2×IQR) |
+| s10 | 64.5 | 0.4 | **5.0** | 1401 | 1.2  | **42** (3%) |
+| s11 | 49.8 | 0.8 | **5.0** | 1235 | 12.8 | **37** (3%) |
+| s14 | 64.1 | 1.1 | **5.0** | 1416 | 10.1 | **42** (3%) |
+| s15 | 49.6 | 1.6 | **5.0** | 1263 | 6.8  | **38** (3%) |
+| s16 | 63.9 | 0.7 | **5.0** | 1431 | 11.5 | **43** (3%) |
+| s17 | 64.0 | 0.3 | **5.0** | 1405 | 9.4  | **42** (3%) |
+| s18 | 65.5 | 0.2 | **5.0** | 1387 | 20.7 | **42** (3%) |
+| s19 | 51.8 | 2.0 | **5.0** | 1222 | 29.3 | **59** (2×IQR) |
+| s20 | 64.4 | 0.4 | **5.0** | 1421 | 7.6  | **43** (3%) |
+| s21 | 65.0 | 0.8 | **5.0** | 1358 | 7.9  | **41** (3%) |
+
+(The 5pp lock floor binds for every cell — measured lockIQR ≤2pp everywhere, too tight to use raw as a
+kill threshold. The 3%-of-median throughput floor binds except s8/s9/s19, whose own 2×IQR is wider.)
+
+**H1 — affinity shrinks the committer handoff.** On a CANDIDATE cell an affinity variant reduces committer
+`lock_of_busy` vs the matched OFF arm by **≥ X_lock**, *without* raising committer `lwlock_of_busy` by ≥
+the lock reduction it removed.
+*FALSIFIED* for that (variant, cell) if `lock_of_busy` does not drop by ≥ X_lock, **or** if `lwlock_of_busy`
+rises by ≥ the lock drop (contention merely migrated from the pool_lock row to the affinity-*immune*
+shmem-ring LWLock STEP 1 found at 22–24 % on the Pareto-200c cells).
+
+**H2 — a lock reduction converts to throughput, and only where lock was the binding share.** Where H1 holds
+for a cell, ON-arm median throughput exceeds the OFF-arm median by **≥ that cell's tput band**.
+*FALSIFIED* if the median throughput delta is inside the band; **or** if throughput moves without
+`lock_of_busy` moving past X_lock; **or** if `lock_of_busy` drops past X_lock but throughput does not clear
+the band (lock was not the binding constraint — expected on s11/s15/s19, where lock is only ~50 % of busy
+and LWLock ~23 %).
+
+**H3 — the many-pools kill criterion (pre-committed).** On the high-pool-count Pareto cells
+(~13.5 pools/trx: s11, s15, s19, and the s14–s21 builds/mixed family), **no** single-committer-ownership
+key can both (a) preserve commit_group atomicity and (b) avoid re-serializing a group whose pool-set spans
+N owners; affinity is therefore structurally bounded there regardless of key (V0 min-pool / V1
+whole-pool-set / V2 per-pool-majority / V3 router-side).
+*CONFIRMED* (→ those classes declared **KILL-for-affinity** with evidence) if H1 fails — or H1 holds but H2
+fails — for **all four** variants V0–V3 on those cells.
+*REFUTED* only if **some** variant clears **both** H1 and H2 on a high-pool Pareto cell, with the delta
+surviving all N≥5 reps (not a single-run artifact).
+
+Verdict is decided **per scenario-class** (single-hot s5; deep-zipf s8/s9; Pareto-50c; Pareto-200c) in
+STEP 6 (`acct-0usf.6`), each citing the supporting numbers. Reproduce the thresholds:
+`python3 ledger-harness/bench/profile-aggregate.py results/committer_profile_sweep.csv`.
+
 ### Other observations
 
 - **`submitted_but_unseen` = 0 on every clean 2-minute cell.** Pass 1's end-of-drain tail
