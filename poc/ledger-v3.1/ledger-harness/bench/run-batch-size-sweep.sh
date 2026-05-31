@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # run-batch-size-sweep.sh — does making commit_groups LARGER raise routed
-# throughput? (acct-xdwk, lever 1). The measured bottleneck (acct-235v) is the
-# per-pool `pool_lock FOR UPDATE`: committers serialize on a hot pool's row lock
-# (~29ms handoff). Throughput on a contended pool ~= trx-per-group /
-# (lock-hold + handoff), so a bigger batch should amortize the handoff over more
-# trx. This sweep raises the achievable batch size and measures throughput,
-# achieved cg, locks/trx, and ack latency.
+# throughput, and WHAT does the committer block on at each size? (acct-czz4
+# batch-diag; supersedes the N=1 acct-xdwk lever-1 sweep.)
 #
-# Knobs swept LIVE (both GucContext::Sighup — ALTER SYSTEM + pg_reload_conf, no
+# Throughput on a contended pool ~= trx-per-group / (per-group commit cost), so a
+# bigger batch amortizes the per-group cost (FOR UPDATE handoff on hot pools;
+# commit/WAL LWLock on disjoint many-pool work) over more trx. This sweep raises
+# batch_size_max and measures throughput, achieved cg, locks/trx, ack latency,
+# AND the NAMED committer wait event (the mechanism), at N>=5 reps/cell.
+#
+# Rigor (acct-czz4):
+#   - REPS>=5 per cell, each load-gated (common.sh wait_for_quiet_host), load1
+#     recorded per rep. One row PER REP; batch-aggregate.py rolls up median+IQR.
+#   - LEDGER_V3_1_PRINT_SAMPLER=1 so each rep writes a <output>.sampler.txt;
+#     parse-committer-sampler.py extracts the of-busy fractions + the dominant
+#     NAMED wait event (largest committer histogram bucket excluding idle/on-CPU).
+#
+# Knobs swept LIVE (GucContext::Sighup — ALTER SYSTEM + pg_reload_conf, no
 # restart): ledger_routed_c.batch_size_max (the per-group cap). batch_window_us
 # is held WIDE ($WINDOW) so the cap — not the coalesce window — is the binding
 # constraint: with a wide window the router accumulates a deep backlog per tick
@@ -15,7 +24,7 @@
 #
 # committer_count is set ONCE (restart-only GUC); COMMITTERS=1 = "single drain",
 # which removes cross-committer FOR UPDATE contention entirely, isolating the
-# pure batching/commit-amortization effect from the affinity problem.
+# pure batching/commit-amortization effect.
 #
 # Bench-only. One clean+seed per run (after committer_count is set); load-gated.
 set -euo pipefail
@@ -25,14 +34,18 @@ source "$HERE/common.sh"
 CONTAINER="${CONTAINER:-acct-postgres}"
 SCENARIO="${SCENARIO:-s5}"
 COMMITTERS="${COMMITTERS:-4}"
-SIZES="${SIZES:-1 5 10 25 50 100 200}"
+SIZES="${SIZES:-50 100 200 400 800}"
+REPS="${REPS:-5}"                     # acct-czz4: N>=5 reps/cell, load-gated each
+SAMPLER="${SAMPLER:-1}"               # 1 => dump committer wait histogram per rep
 WINDOW="${WINDOW:-20000}"            # batch_window_us held wide so batch_size_max binds
 PACK="${PACK:-off}"                   # router_pack_disjoint: on packs disjoint pool-components (acct-xdwk lever 1b)
 DUR="${DUR:-20s}"
 SEED_SKUS="${SEED_SKUS:-1000}"; SEED_LOCS="${SEED_LOCS:-10}"; SEED_COUNT="${SEED_COUNT:-10000}"
-OUT="${OUT:-${RESULTS_DIR}/batch_size_sweep_${SCENARIO}_cc${COMMITTERS}_pack${PACK}.csv}"
-SWEEP_LOG="${RESULTS_DIR}/batch_size_sweep.log"
-log() { echo "[bssweep] $*" | tee -a "$SWEEP_LOG" >&2; }
+OUT="${OUT:-${RESULTS_DIR}/batchdiag_${SCENARIO}_cc${COMMITTERS}_pack${PACK}.csv}"
+SWEEP_LOG="${RESULTS_DIR}/batchdiag.log"
+PARSE="$HERE/parse-committer-sampler.py"
+AGG="$HERE/batch-aggregate.py"
+log() { echo "[batchdiag] $*" | tee -a "$SWEEP_LOG" >&2; }
 depth_for() { case "$1" in s5|s6) echo 10 ;; s7|s8|s9) echo 1000 ;; s11|s15|s19) echo 100 ;; s14|s16|s17|s18|s20|s21) echo 10 ;; *) echo 0 ;; esac; }
 
 asys() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.$1 = $2" >/dev/null; }
@@ -76,7 +89,7 @@ committer_ready() { local dsn cj; dsn="$(dsn_for_scenario "$SCENARIO")"; cj="${R
   python3 -c "import json;print(json.load(open('$cj'))['routed']['trx_committed_total'])" 2>/dev/null | grep -qvx 0; }
 
 build_harness
-log "=== batch_size sweep: scenario=$SCENARIO committers=$COMMITTERS sizes=[$SIZES] window=${WINDOW}us pack=$PACK dur=$DUR ==="
+log "=== batch-diag sweep: scenario=$SCENARIO committers=$COMMITTERS sizes=[$SIZES] reps=$REPS window=${WINDOW}us pack=$PACK sampler=$SAMPLER dur=$DUR ==="
 asys committer_count "$COMMITTERS"
 clean_seed
 running="$(docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'ledger_routed_c_committer%'" | tr -d '[:space:]')"
@@ -85,18 +98,29 @@ committer_ready || log "WARN: canary did not drain"
 asys batch_window_us "$WINDOW"; asys router_pack_disjoint "$PACK"; reload
 
 dsn="$(dsn_for_scenario "$SCENARIO")"; depth="$(depth_for "$SCENARIO")"
-echo "scenario,committers,pack,batch_size_max,window_us,throughput_trx_s,cg_avg,commits_s,locks_per_trx,trx,ack_p50_us,ack_p99_us,dropped,load1_end" > "$OUT"
+echo "scenario,committers,pack,batch_size_max,window_us,rep,throughput_trx_s,cg_avg,commits_s,locks_per_trx,trx,ack_p50_us,ack_p99_us,dropped,busy_frac,lock_of_busy,running_of_busy,lwlock_of_busy,io_of_busy,top_wait_type,top_wait_event,top_wait_samples,load1_end" > "$OUT"
 for sz in $SIZES; do
   asys batch_size_max "$sz"; reload
-  wait_for_quiet_host || log "  NOTE: size=$sz ran busy"
-  out="${RESULTS_DIR}/bssweep_${SCENARIO}_cc${COMMITTERS}_sz${sz}.json"
-  log "RUN $SCENARIO cc=$COMMITTERS batch_size_max=$sz (load1=$(host_load1))"
-  timeout 360 "$BIN" --dsn "$dsn" run --scenario "$SCENARIO" --mode routed --duration "$DUR" \
-    --depth "$depth" --output "$out" >/dev/null 2>&1 || { log "  FAIL sz=$sz"; continue; }
-  read -r tput cg cps lpt trx p50 p99 drop <<<"$(extract "$out")"
-  echo "$SCENARIO,$COMMITTERS,$PACK,$sz,$WINDOW,$tput,$cg,$cps,$lpt,$trx,$p50,$p99,$drop,$(host_load1)" >> "$OUT"
-  log "  sz=$sz cg=$cg tput=$tput commits/s=$cps locks/trx=$lpt ack_p99=${p99}us"
+  for rep in $(seq 1 "$REPS"); do
+    wait_for_quiet_host || log "  NOTE: sz=$sz rep=$rep ran busy"
+    out="${RESULTS_DIR}/bssweep_${SCENARIO}_cc${COMMITTERS}_sz${sz}_r${rep}.json"
+    smp="${out%.json}.sampler.txt"
+    log "RUN $SCENARIO cc=$COMMITTERS batch_size_max=$sz rep=$rep/$REPS (load1=$(host_load1))"
+    LEDGER_V3_1_PRINT_SAMPLER="$SAMPLER" timeout 360 "$BIN" --dsn "$dsn" run --scenario "$SCENARIO" \
+      --mode routed --duration "$DUR" --depth "$depth" --output "$out" >/dev/null 2>&1 \
+      || { log "  FAIL sz=$sz rep=$rep"; continue; }
+    read -r tput cg cps lpt trx p50 p99 drop <<<"$(extract "$out")"
+    # Named committer wait diagnostic from the sampler dump (best-effort).
+    if [ "$SAMPLER" = "1" ] && [ -f "$smp" ]; then
+      read -r busy lob rob wob iob tw_type tw_event tw_n <<<"$(python3 "$PARSE" "$smp")"
+    else
+      busy=; lob=; rob=; wob=; iob=; tw_type=none; tw_event=none; tw_n=0
+    fi
+    le="$(host_load1)"
+    echo "$SCENARIO,$COMMITTERS,$PACK,$sz,$WINDOW,$rep,$tput,$cg,$cps,$lpt,$trx,$p50,$p99,$drop,$busy,$lob,$rob,$wob,$iob,$tw_type,$tw_event,$tw_n,$le" >> "$OUT"
+    log "  sz=$sz r$rep cg=$cg tput=$tput cmt/s=$cps lk/trx=$lpt ack_p99=${p99}us top_wait=${tw_type}/${tw_event}(${tw_n}) load=$le"
+  done
 done
 restore_defaults
 log "=== done. CSV: $OUT ==="
-column -s, -t "$OUT" >&2 || cat "$OUT"
+python3 "$AGG" "$OUT" | tee -a "$SWEEP_LOG" >&2 || cat "$OUT"
