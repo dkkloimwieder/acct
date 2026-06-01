@@ -39,6 +39,8 @@ REPS="${REPS:-5}"                     # acct-czz4: N>=5 reps/cell, load-gated ea
 SAMPLER="${SAMPLER:-1}"               # 1 => dump committer wait histogram per rep
 WINDOW="${WINDOW:-20000}"            # batch_window_us held wide so batch_size_max binds
 PACK="${PACK:-off}"                   # router_pack_disjoint: on packs disjoint pool-components (acct-xdwk lever 1b)
+AFFINITY_SCHEME="${AFFINITY_SCHEME:-0}"     # acct-0usf: 0=off (default), 1=min_pool committer→pool pin
+AFFINITY_STEAL_MS="${AFFINITY_STEAL_MS:-5}" # high (e.g. 60000 >> run) => CLEAN static pin: owner never starves, non-owners never steal
 DUR="${DUR:-20s}"
 SEED_SKUS="${SEED_SKUS:-1000}"; SEED_LOCS="${SEED_LOCS:-10}"; SEED_COUNT="${SEED_COUNT:-10000}"
 OUT="${OUT:-${RESULTS_DIR}/batchdiag_${SCENARIO}_cc${COMMITTERS}_pack${PACK}.csv}"
@@ -55,6 +57,8 @@ restore_defaults() {
   asys batch_window_us 500 2>/dev/null || true
   asys committer_count 4 2>/dev/null || true
   asys router_pack_disjoint off 2>/dev/null || true
+  asys affinity_scheme 0 2>/dev/null || true
+  asys affinity_steal_ms 5 2>/dev/null || true
   reload 2>/dev/null || true
 }
 trap restore_defaults EXIT
@@ -89,13 +93,14 @@ committer_ready() { local dsn cj; dsn="$(dsn_for_scenario "$SCENARIO")"; cj="${R
   python3 -c "import json;print(json.load(open('$cj'))['routed']['trx_committed_total'])" 2>/dev/null | grep -qvx 0; }
 
 build_harness
-log "=== batch-diag sweep: scenario=$SCENARIO committers=$COMMITTERS sizes=[$SIZES] reps=$REPS window=${WINDOW}us pack=$PACK sampler=$SAMPLER dur=$DUR ==="
+log "=== batch-diag sweep: scenario=$SCENARIO committers=$COMMITTERS sizes=[$SIZES] reps=$REPS window=${WINDOW}us pack=$PACK affinity=${AFFINITY_SCHEME}/steal${AFFINITY_STEAL_MS}ms sampler=$SAMPLER dur=$DUR ==="
 asys committer_count "$COMMITTERS"
 clean_seed
 running="$(docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'ledger_routed_c_committer%'" | tr -d '[:space:]')"
 log "committers running: $running (requested $COMMITTERS)"
 committer_ready || log "WARN: canary did not drain"
-asys batch_window_us "$WINDOW"; asys router_pack_disjoint "$PACK"; reload
+asys batch_window_us "$WINDOW"; asys router_pack_disjoint "$PACK"
+asys affinity_scheme "$AFFINITY_SCHEME"; asys affinity_steal_ms "$AFFINITY_STEAL_MS"; reload
 
 dsn="$(dsn_for_scenario "$SCENARIO")"; depth="$(depth_for "$SCENARIO")"
 echo "scenario,committers,pack,batch_size_max,window_us,rep,throughput_trx_s,cg_avg,commits_s,locks_per_trx,trx,ack_p50_us,ack_p99_us,dropped,busy_frac,lock_of_busy,running_of_busy,lwlock_of_busy,io_of_busy,top_wait_type,top_wait_event,top_wait_samples,load1_end" > "$OUT"
@@ -121,6 +126,14 @@ for sz in $SIZES; do
     log "  sz=$sz r$rep cg=$cg tput=$tput cmt/s=$cps lk/trx=$lpt ack_p99=${p99}us top_wait=${tw_type}/${tw_event}(${tw_n}) load=$le"
   done
 done
+# acct-0usf pin check: with affinity on, owned_claims should dominate and steals
+# should be ≈0 (cluster-lifetime counters, reset by clean_seed's restart). Nonzero
+# steals => the age-gated steal fired => the static pin leaked => run is suspect.
+if [ "$AFFINITY_SCHEME" != "0" ]; then
+  owned="$(docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT ledger_routed_c_affinity_owned_claims_total()" 2>/dev/null | tr -d '[:space:]')"
+  steals="$(docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT ledger_routed_c_affinity_steals_total()" 2>/dev/null | tr -d '[:space:]')"
+  log "PIN CHECK (affinity_scheme=$AFFINITY_SCHEME steal=${AFFINITY_STEAL_MS}ms): owned_claims=$owned steals=$steals  (steals≈0 => clean static pin; nonzero => steal leaked, run suspect)"
+fi
 restore_defaults
 log "=== done. CSV: $OUT ==="
 python3 "$AGG" "$OUT" | tee -a "$SWEEP_LOG" >&2 || cat "$OUT"
