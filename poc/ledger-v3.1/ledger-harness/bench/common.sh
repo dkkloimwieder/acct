@@ -37,13 +37,15 @@ build_harness() {
     BIN="$WS_DIR/target/release/ledger-harness"
 }
 
-# Pick the DSN for a scenario's caller count: pooler for the 1000-caller
-# scenarios (s5/s6/s7/s8/s9), direct otherwise.
+# All measured caller/canary traffic goes through the pgbouncer transaction pool
+# (acct-uix8): backends are bounded by default_pool_size regardless of caller
+# count, which kills per-caller backend churn on the dev box and keeps absolutes
+# comparable across scenarios. The admin/DDL/seed paths use DIRECT_DSN directly
+# (not this helper) — CREATE DATABASE / ALTER SYSTEM / sqlx migrate can't run
+# through a transaction pooler. $1 (scenario) is retained for call-site
+# compatibility; routing no longer depends on it.
 dsn_for_scenario() {
-    case "$1" in
-        s5|s6|s7|s8|s9) echo "$POOLER_DSN" ;;
-        *)              echo "$DIRECT_DSN" ;;
-    esac
+    echo "$POOLER_DSN"
 }
 
 # Restart the DB container for a clean shmem / committer / staging slate before a
