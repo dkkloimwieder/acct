@@ -31,7 +31,11 @@ PG_CONTAINER="${PG_CONTAINER:-acct-postgres}"
 HOST_PORT="${PGBOUNCER_HOST_PORT:-6432}"
 POOL_MODE="${POOL_MODE:-transaction}"
 MAX_CLIENT_CONN="${MAX_CLIENT_CONN:-2000}"
-DEFAULT_POOL_SIZE="${DEFAULT_POOL_SIZE:-64}"
+# 24 (not 64): bound PG backends low for this dev box — now that ALL scenarios
+# route through the pooler (acct-uix8), this caps per-run backends regardless of
+# caller count and kills the per-caller backend churn. Override via the
+# DEFAULT_POOL_SIZE env for a run that needs more ingress concurrency.
+DEFAULT_POOL_SIZE="${DEFAULT_POOL_SIZE:-24}"
 
 cmd="${1:-up}"
 
