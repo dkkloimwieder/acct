@@ -190,6 +190,224 @@ fn ledger_enqueue_trx_c(
     request_seq as i64
 }
 
+/// Diagnostic batch enqueue (acct-ruex): publish N submissions under ONE
+/// `SPILLOVER_ARENA.exclusive()` (alloc all) followed by ONE
+/// `STAGING_QUEUE.exclusive()` (push all), so the per-trx ingress-lock
+/// HANDOFFS — where the LWLock contention actually lives — are amortized ~Nx.
+/// With handoffs removed, the residual routed throughput is the pure
+/// downstream drain ceiling (router grouping + committer commit + WAL); the
+/// committer sampler then names whatever that ceiling is.
+///
+/// `trxs` is a JSONB array of `{trx_type, source_id, posted_at, lines:[...]}`;
+/// returns the count of submissions published.
+///
+/// Deliberately self-contained — it shares no code with the hot single-push
+/// `ledger_enqueue_trx_c`, so the production path carries zero risk from this
+/// probe. Staging push is BACKPRESSURED for the saturation use-case: each lock
+/// acquisition pushes as many entries as currently fit, then CV-waits for the
+/// committers to free slots and pushes the rest, honoring
+/// `queue_full_timeout_ms` as a per-call deadline. The arena allocs stay live
+/// across waits (no free/realloc thrash), so a half-ring batch from several
+/// callers keeps the ring saturated without error churn. Arena alloc itself is
+/// all-or-nothing (size `spillover_arena_mb` above the in-flight payload set);
+/// on `ArenaFull` or a backpressure timeout it frees this batch's
+/// not-yet-published allocs and raises `INSUFFICIENT_RESOURCES` (already-pushed
+/// slots ride this user-tx; if it aborts, the committer's eject loop reclaims
+/// them, same as an aborted single-push caller).
+#[pg_extern]
+fn ledger_enqueue_trx_batch_c(trxs: pgrx::JsonB) -> i64 {
+    #[derive(serde::Deserialize)]
+    struct TrxEnvelope {
+        trx_type: String,
+        source_id: i64,
+        posted_at: String,
+        lines: Vec<PocV3Line>,
+    }
+
+    let envelopes: Vec<TrxEnvelope> = match serde_json::from_value(trxs.0) {
+        Ok(v) => v,
+        Err(e) => ereport_invalid_arg(
+            PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+            format!("ledger_enqueue_trx_batch_c: trxs JSONB decode failed: {e}"),
+            "Expected a JSON array of {trx_type, source_id, posted_at, lines:[...]}.",
+        ),
+    };
+    if envelopes.is_empty() {
+        ereport_invalid_arg(
+            PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+            "ledger_enqueue_trx_batch_c: trxs must be non-empty".to_string(),
+            "Empty batches are no-ops and are rejected.",
+        );
+    }
+
+    let user_tx_xid: u64 = unsafe { pg_sys::GetCurrentTransactionId().into_inner() } as u64;
+
+    // Per-trx prep — parse + pool-id computation, no lock held.
+    struct Prepared {
+        sub_shell: PocV3Submission,
+        line_vec: Vec<PocV3Line>,
+        pool_ids: Vec<i64>,
+        pool_count: u16,
+        trx_type_id: u16,
+    }
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(envelopes.len());
+    for env in envelopes {
+        let posted_at_micros: i64 = match DateTime::parse_from_rfc3339(&env.posted_at) {
+            Ok(t) => t.timestamp_micros(),
+            Err(e) => ereport_invalid_arg(
+                PgSqlErrorCode::ERRCODE_INVALID_DATETIME_FORMAT,
+                format!("ledger_enqueue_trx_batch_c: posted_at not RFC3339: {e}"),
+                "Use ISO 8601 with offset, e.g. '2026-05-21T12:00:00+00:00'.",
+            ),
+        };
+        if env.lines.is_empty() {
+            ereport_invalid_arg(
+                PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                "ledger_enqueue_trx_batch_c: each trx's lines must be non-empty".to_string(),
+                "Submissions with zero lines are no-ops and are rejected.",
+            );
+        }
+        let pool_ids: Vec<i64> = pack_pool_ids(&env.lines);
+        let pool_count: u16 = match u16::try_from(pool_ids.len()) {
+            Ok(n) => n,
+            Err(_) => ereport_invalid_arg(
+                PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+                format!(
+                    "ledger_enqueue_trx_batch_c: too many distinct pools touched ({} > {})",
+                    pool_ids.len(),
+                    u16::MAX
+                ),
+                "Split into multiple submissions or reduce per-submission pool fan-out.",
+            ),
+        };
+        let sub_shell = PocV3Submission {
+            trx_type: env.trx_type.clone(),
+            source_id: env.source_id,
+            posted_at_micros,
+            line_count: 0,
+            line_offset: 0,
+        };
+        let trx_type_id = trx_type_to_id(&env.trx_type);
+        prepared.push(Prepared {
+            sub_shell,
+            line_vec: env.lines,
+            pool_ids,
+            pool_count,
+            trx_type_id,
+        });
+    }
+
+    // One arena-lock acquisition: alloc payload + pool-keys blocks for all N.
+    struct Alloced {
+        payload_offset: u32,
+        payload_length: u32,
+        line_offset: u32,
+        pool_keys_offset: u32,
+        pool_count: u16,
+        trx_type_id: u16,
+    }
+    let free_alloced = |arena: &mut SpilloverArena, items: &[Alloced]| {
+        for a in items {
+            payload::free_submission(arena, a.payload_offset, a.line_offset);
+            if a.pool_keys_offset != 0 {
+                arena.free(a.pool_keys_offset);
+            }
+        }
+    };
+    let alloced: Vec<Alloced> = {
+        let mut arena_guard = SPILLOVER_ARENA.exclusive();
+        let mut out: Vec<Alloced> = Vec::with_capacity(prepared.len());
+        for p in prepared.iter_mut() {
+            match try_alloc_blocks(&mut arena_guard, &mut p.sub_shell, &p.line_vec, &p.pool_ids) {
+                AllocOutcome::Ok((payload_offset, payload_length, pool_keys_offset)) => {
+                    out.push(Alloced {
+                        payload_offset,
+                        payload_length,
+                        line_offset: p.sub_shell.line_offset,
+                        pool_keys_offset,
+                        pool_count: p.pool_count,
+                        trx_type_id: p.trx_type_id,
+                    });
+                }
+                AllocOutcome::ArenaFull => {
+                    free_alloced(&mut arena_guard, &out);
+                    drop(arena_guard);
+                    ereport!(
+                        ERROR,
+                        PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
+                        format!(
+                            "ledger_enqueue_trx_batch_c: spillover arena exhausted at {}/{} of batch",
+                            out.len(),
+                            prepared.len()
+                        )
+                    );
+                }
+                AllocOutcome::Internal(detail) => {
+                    free_alloced(&mut arena_guard, &out);
+                    drop(arena_guard);
+                    ereport_internal(format!(
+                        "ledger_enqueue_trx_batch_c: payload encode failed: {detail}"
+                    ));
+                }
+            }
+        }
+        out
+    };
+
+    // Backpressured staging push: each acquisition pushes as many as fit, then
+    // waits for the committers to free slots and pushes the rest. Allocs stay
+    // live across waits, so a saturated ring causes a wait — not error churn.
+    let timeout_ms = crate::queue_full_timeout_ms_now();
+    let deadline_micros: i128 = (now_us() as i128) + (timeout_ms as i128) * 1000;
+    let cv = backpressure_cv_ptr();
+    unsafe { pg_sys::ConditionVariablePrepareToSleep(cv) };
+
+    let mut pushed: usize = 0;
+    while pushed < alloced.len() {
+        {
+            let mut queue_guard = STAGING_QUEUE.exclusive();
+            while pushed < alloced.len() {
+                let a = &alloced[pushed];
+                match push_entry_into_queue(
+                    &mut queue_guard,
+                    a.payload_offset,
+                    a.payload_length,
+                    a.line_offset,
+                    a.pool_count,
+                    a.pool_keys_offset,
+                    a.trx_type_id,
+                    user_tx_xid,
+                ) {
+                    Ok(_) => pushed += 1,
+                    Err(PushError::QueueFull) => break,
+                }
+            }
+        }
+        if pushed >= alloced.len() {
+            break;
+        }
+        if past_deadline(deadline_micros) {
+            unsafe { pg_sys::ConditionVariableCancelSleep() };
+            let mut arena_guard = SPILLOVER_ARENA.exclusive();
+            free_alloced(&mut arena_guard, &alloced[pushed..]);
+            drop(arena_guard);
+            ereport!(
+                ERROR,
+                PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
+                format!(
+                    "ledger_enqueue_trx_batch_c: staging queue full and backpressure timeout elapsed ({timeout_ms}ms) at {}/{} of batch",
+                    pushed,
+                    alloced.len()
+                )
+            );
+        }
+        cv_wait_for_slot(cv, deadline_micros);
+    }
+    unsafe { pg_sys::ConditionVariableCancelSleep() };
+
+    pushed as i64
+}
+
 /// Per-state counts of `StagingEntry.valid`. Returns one row per state
 /// label (empty / pending / processing / routed / abandoned) with its
 /// current count. Walks `entries[]` under the LWLock-shared guard.

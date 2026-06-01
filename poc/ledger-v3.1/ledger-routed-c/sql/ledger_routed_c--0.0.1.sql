@@ -7,6 +7,17 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- ledger-routed-c/src/enqueue.rs:217
+-- ledger_routed_c::enqueue::ledger_enqueue_trx_batch_c
+CREATE  FUNCTION "ledger_enqueue_trx_batch_c"(
+	"trxs" jsonb /* pgrx :: JsonB */
+) RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_enqueue_trx_batch_c_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- ledger-routed-c/src/enqueue.rs:51
 -- ledger_routed_c::enqueue::ledger_enqueue_trx_c
 CREATE  FUNCTION "ledger_enqueue_trx_c"(
@@ -325,7 +336,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_router_window_defers_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/enqueue.rs:220
+-- ledger-routed-c/src/enqueue.rs:438
 -- ledger_routed_c::enqueue::ledger_routed_c_staging_request_seq_max
 CREATE  FUNCTION "ledger_routed_c_staging_request_seq_max"() RETURNS bigint /* i64 */
 STRICT
@@ -334,7 +345,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_staging_request_seq_max_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/enqueue.rs:196
+-- ledger-routed-c/src/enqueue.rs:414
 -- ledger_routed_c::enqueue::ledger_routed_c_staging_state_counts
 CREATE  FUNCTION "ledger_routed_c_staging_state_counts"() RETURNS TABLE (
 	"state" TEXT,  /* String */

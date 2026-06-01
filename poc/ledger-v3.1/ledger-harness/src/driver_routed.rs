@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Barrier;
@@ -42,6 +43,12 @@ pub struct RunOptions {
     pub output: Option<PathBuf>,
     pub no_sampler: bool,
     pub max_callers: Option<usize>,
+    /// Caller-side batch size (acct-ruex diagnostic). >1 makes each caller push
+    /// N envelopes per tick through `ledger_enqueue_trx_batch_c` (one staging-
+    /// lock acquisition per N), amortizing the ingress-lock handoffs so the
+    /// residual throughput is the downstream drain ceiling. 1 = the production
+    /// single-push path (unchanged).
+    pub batch_size: usize,
     /// Hard cap on the post-callers observer + drain wait.
     pub drain_deadline: Duration,
     /// Multi-touch overlay (acct-34ce); None leaves the scenario's own setting.
@@ -115,13 +122,19 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
 
     let workload = Arc::new(spec.workload.clone());
     let barrier = Arc::new(Barrier::new(spec.callers));
+    let batch_size = opts.batch_size.max(1);
+    if batch_size > 1 {
+        eprintln!(
+            "[run] routed caller-batch probe (acct-ruex): {batch_size} envelopes/push via ledger_enqueue_trx_batch_c"
+        );
+    }
     let mut handles = Vec::with_capacity(spec.callers);
     for caller_id in 0..spec.callers {
         let pool = pool.clone();
         let workload = workload.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            caller_loop(pool, workload, barrier, caller_id, prefix, deadline).await
+            caller_loop(pool, workload, barrier, caller_id, prefix, deadline, batch_size).await
         }));
     }
 
@@ -289,6 +302,7 @@ async fn caller_loop(
     caller_id: usize,
     run_prefix: i64,
     deadline: Instant,
+    batch_size: usize,
 ) -> (LatencyHistogram, Vec<SubmissionMark>, u64) {
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
     let mut ack_hist = LatencyHistogram::new();
@@ -296,31 +310,74 @@ async fn caller_loop(
     let mut errors: u64 = 0;
     let caller_base: i64 = run_prefix + (caller_id as i64) * 1_000_000;
     let mut tick: i64 = 0;
+    let batch_n = batch_size.max(1);
 
     barrier.wait().await;
 
     while Instant::now() < deadline {
-        let lines = workload.next_lines(&mut rng, caller_id);
-        let lines_json = build_lines_json(&lines);
-        let source_id = caller_base + tick;
-        tick += 1;
+        if batch_n == 1 {
+            // Production single-push path (unchanged): one trx, one
+            // ledger_enqueue_trx_c, one staging-lock acquisition.
+            let lines = workload.next_lines(&mut rng, caller_id);
+            let lines_json = build_lines_json(&lines);
+            let source_id = caller_base + tick;
+            tick += 1;
 
-        let started = Instant::now();
-        let res = sqlx::query("SELECT ledger_enqueue_trx_c($1, $2, $3, $4::jsonb)")
-            .bind(TRX_TYPE)
-            .bind(source_id)
-            .bind(POSTED_AT)
-            .bind(&lines_json)
-            .execute(&pool)
-            .await;
-        let ack_ns = started.elapsed().as_nanos() as u64;
+            let started = Instant::now();
+            let res = sqlx::query("SELECT ledger_enqueue_trx_c($1, $2, $3, $4::jsonb)")
+                .bind(TRX_TYPE)
+                .bind(source_id)
+                .bind(POSTED_AT)
+                .bind(&lines_json)
+                .execute(&pool)
+                .await;
+            let ack_ns = started.elapsed().as_nanos() as u64;
 
-        match res {
-            Ok(_) => {
-                ack_hist.record(ack_ns);
-                submission_log.push((source_id, started));
+            match res {
+                Ok(_) => {
+                    ack_hist.record(ack_ns);
+                    submission_log.push((source_id, started));
+                }
+                Err(_) => errors += 1,
             }
-            Err(_) => errors += 1,
+        } else {
+            // acct-ruex batch probe: build batch_n envelopes (each a distinct
+            // trx with its own source_id) and publish them in ONE
+            // ledger_enqueue_trx_batch_c call — one staging-lock acquisition for
+            // the whole batch. The observer still sees batch_n distinct trx, so
+            // throughput counts each one; ack latency here is per-batch-call.
+            let mut envelopes: Vec<Value> = Vec::with_capacity(batch_n);
+            let mut source_ids: Vec<i64> = Vec::with_capacity(batch_n);
+            for _ in 0..batch_n {
+                let lines = workload.next_lines(&mut rng, caller_id);
+                let source_id = caller_base + tick;
+                tick += 1;
+                envelopes.push(json!({
+                    "trx_type": TRX_TYPE,
+                    "source_id": source_id,
+                    "posted_at": POSTED_AT,
+                    "lines": build_lines_json(&lines),
+                }));
+                source_ids.push(source_id);
+            }
+            let batch_json = Value::Array(envelopes);
+
+            let started = Instant::now();
+            let res = sqlx::query("SELECT ledger_enqueue_trx_batch_c($1::jsonb)")
+                .bind(&batch_json)
+                .execute(&pool)
+                .await;
+            let ack_ns = started.elapsed().as_nanos() as u64;
+
+            match res {
+                Ok(_) => {
+                    ack_hist.record(ack_ns);
+                    for source_id in &source_ids {
+                        submission_log.push((*source_id, started));
+                    }
+                }
+                Err(_) => errors += 1,
+            }
         }
     }
     (ack_hist, submission_log, errors)

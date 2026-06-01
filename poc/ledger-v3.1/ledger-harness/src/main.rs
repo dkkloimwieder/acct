@@ -154,6 +154,7 @@ async fn main() -> std::process::ExitCode {
                         output,
                         no_sampler,
                         max_callers,
+                        batch_size,
                         drain_deadline: Duration::from_secs(30),
                         multi_touch_pct,
                         touch_dist,
