@@ -84,8 +84,14 @@ clean_seed_pinned() {
     --max-callers 1 --method-mix all-fifo \
     --seed-count "$smax" --seed-skus "$smax" --seed-locations 1 --seed-depth 0 \
     --no-sampler --output "${RESULTS_DIR}/.1sku-seed.json" >/dev/null
-  # Trim to the 1:1 set (dependency order: trx_line -> pool_state/pool_lock -> pool).
+  # Trim to the 1:1 set. FK children-first order:
+  #   posting_line_dimension -> posting_line -> trx_line -> pool_state/pool_lock -> pool
+  # posting_line.trx_line_id and posting_line_dimension.posting_line_id are NO ACTION
+  # FKs, so the doomed pools' seed posting history must be cleared before their
+  # trx_lines and the pool rows themselves.
   if [ "$(echo "$keep" | wc -w)" != "$smax" ]; then
+    psql_v3 "DELETE FROM posting_line_dimension WHERE posting_line_id IN (SELECT pl.id FROM posting_line pl JOIN trx_line t ON t.id = pl.trx_line_id WHERE t.pool_id NOT IN ($keepcsv))" >/dev/null
+    psql_v3 "DELETE FROM posting_line WHERE trx_line_id IN (SELECT id FROM trx_line WHERE pool_id NOT IN ($keepcsv))" >/dev/null
     psql_v3 "DELETE FROM trx_line  WHERE pool_id NOT IN ($keepcsv)" >/dev/null
     psql_v3 "DELETE FROM pool_state WHERE pool_id NOT IN ($keepcsv)" >/dev/null
     psql_v3 "DELETE FROM pool_lock  WHERE pool_id NOT IN ($keepcsv)" >/dev/null
