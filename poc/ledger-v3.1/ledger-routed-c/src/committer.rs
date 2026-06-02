@@ -972,11 +972,14 @@ fn run_prepared_read<R>(
 }
 
 /// Query `trx` for which of the given (trx_type, source_id) keys already exist.
-/// The stored enum is rendered as text and compared against the input text so an
-/// unknown trx_type can't fail an enum cast on the input side. Shared by
-/// pre-flight dedup and the re-drive re-dedup. Runs on a kept plan (acct-e95d):
-/// the query shape is fixed and only its `text[]` / `bigint[]` params vary, so
-/// the parse+plan happens once per backend, not once per commit group.
+/// Input text keys are pre-filtered to valid `trx_type` labels (`u.tt = ANY
+/// enum_range`) then compared enum-to-enum, so the `(trx_type, source_id)` unique
+/// index drives a 2-column seek (acct-e95d). An unknown trx_type is dropped from
+/// the probe by the filter rather than failing the enum cast — it can't be a
+/// duplicate of an existing row anyway, and it surfaces later at insert (the
+/// `$1::text::trx_type` cast in `insert_trx`). Shared by pre-flight dedup and the
+/// re-drive re-dedup. Runs on a kept plan: the query shape is fixed and only its
+/// `text[]` / `bigint[]` params vary, so parse+plan happens once per backend.
 fn existing_trx_keys(
     trx_types: Vec<String>,
     source_ids: Vec<i64>,
@@ -987,7 +990,8 @@ fn existing_trx_keys(
         "SELECT trx.trx_type::text, trx.source_id \
            FROM trx \
            JOIN UNNEST($1::text[], $2::bigint[]) AS u(tt, sid) \
-             ON trx.trx_type::text = u.tt AND trx.source_id = u.sid",
+             ON trx.trx_type = u.tt::trx_type AND trx.source_id = u.sid \
+          WHERE u.tt = ANY(enum_range(NULL::trx_type)::text[])",
         &pgrx::oids_of![Vec<String>, Vec<i64>],
         &args,
         |mut t| {
