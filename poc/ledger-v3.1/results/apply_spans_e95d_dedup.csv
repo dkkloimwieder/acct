@@ -1,0 +1,11 @@
+span,seconds,pct_txn,us_per_trx
+_meta,groups=5208;trx=944000;trx_per_group=181.26
+prep,7.093,11.30,7.514
+apply,42.840,68.25,45.382
+fsync,10.954,17.45,11.604
+hydrate,1.464,2.33,1.551
+pool_lock,0.418,0.67,0.443
+prep.decode,1.003,1.60,1.063
+prep.xact,0.665,1.06,0.705
+prep.dedup,5.192,8.27,5.500
+prep.other,0.234,0.37,0.247
