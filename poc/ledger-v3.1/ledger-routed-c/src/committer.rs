@@ -67,6 +67,9 @@ use pgrx::pg_guard;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
+use pgrx::datum::DatumWithOid;
+use pgrx::pg_sys::PgOid;
+use pgrx::spi::{OwnedPreparedStatement, SpiTupleTable};
 
 /// §6.8 retry-on-deadlock budget: a commit_group whose write phase hits a
 /// transient SQLSTATE (40P01 deadlock / 40001 serialization) is retried up to
@@ -87,6 +90,13 @@ use crate::shmem::{
 
 thread_local! {
     static MY_COMMITTER_IDENTITY: RefCell<Option<(u32, u32)>> = const { RefCell::new(None) };
+
+    /// Kept (`SPI_keepplan`) plan for the prep-phase dedup SELECT against `trx`
+    /// (acct-e95d). One-shot SPI re-parsed/re-planned this query on every commit
+    /// group, which dominated the prep span once acct-sczx gutted apply; caching
+    /// it for the backend's lifetime removes that re-plan. Read-only — built with
+    /// `prepare` (not `prepare_mut`) and run via `select`.
+    static PLAN_DEDUP_TRX: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
 }
 
 fn set_my_committer_identity(slot: u32, generation: u32) {
@@ -913,31 +923,63 @@ fn dedup_against_trx(kept: Vec<Decoded>) -> Result<(Vec<Decoded>, u64), String> 
     Ok((out, skipped))
 }
 
+/// Execute a kept (`SPI_keepplan`) read-only prepared statement, preparing +
+/// keeping it on first use for this backend. The read-path twin of
+/// `bulk_write::run_prepared` (acct-sczx Lever B): `prepare` / `select`
+/// (read_only = true) instead of `prepare_mut` / `update`. Args are built by the
+/// caller in the outer memory context (same as bulk_write) and `read_rows`
+/// consumes the result table.
+fn run_prepared_read<R>(
+    slot: &'static std::thread::LocalKey<RefCell<Option<OwnedPreparedStatement>>>,
+    sql: &str,
+    arg_oids: &[PgOid],
+    args: &[DatumWithOid<'_>],
+    read_rows: impl FnOnce(SpiTupleTable<'_>) -> Result<R, pgrx::spi::Error>,
+) -> Result<R, pgrx::spi::Error> {
+    Spi::connect(|client| {
+        slot.with_borrow_mut(|opt| -> Result<(), pgrx::spi::Error> {
+            if opt.is_none() {
+                *opt = Some(client.prepare(sql, arg_oids)?.keep());
+            }
+            Ok(())
+        })?;
+        slot.with_borrow(|opt| {
+            let plan = opt.as_ref().expect("plan prepared above");
+            let table = client.select(plan, None, args)?;
+            read_rows(table)
+        })
+    })
+}
+
 /// Query `trx` for which of the given (trx_type, source_id) keys already exist.
 /// The stored enum is rendered as text and compared against the input text so an
 /// unknown trx_type can't fail an enum cast on the input side. Shared by
-/// pre-flight dedup and the re-drive re-dedup.
+/// pre-flight dedup and the re-drive re-dedup. Runs on a kept plan (acct-e95d):
+/// the query shape is fixed and only its `text[]` / `bigint[]` params vary, so
+/// the parse+plan happens once per backend, not once per commit group.
 fn existing_trx_keys(
     trx_types: Vec<String>,
     source_ids: Vec<i64>,
 ) -> Result<HashSet<(String, i64)>, String> {
-    Spi::connect(|client| -> Result<HashSet<(String, i64)>, pgrx::spi::Error> {
-        let mut set = HashSet::new();
-        let mut t = client.select(
-            "SELECT trx.trx_type::text, trx.source_id \
-               FROM trx \
-               JOIN UNNEST($1::text[], $2::bigint[]) AS u(tt, sid) \
-                 ON trx.trx_type::text = u.tt AND trx.source_id = u.sid",
-            None,
-            &[trx_types.into(), source_ids.into()],
-        )?;
-        while let Some(row) = t.next() {
-            let tt: String = row.get::<String>(1)?.unwrap_or_default();
-            let sid: i64 = row.get::<i64>(2)?.unwrap_or(0);
-            set.insert((tt, sid));
-        }
-        Ok(set)
-    })
+    let args: [DatumWithOid<'_>; 2] = [trx_types.into(), source_ids.into()];
+    run_prepared_read(
+        &PLAN_DEDUP_TRX,
+        "SELECT trx.trx_type::text, trx.source_id \
+           FROM trx \
+           JOIN UNNEST($1::text[], $2::bigint[]) AS u(tt, sid) \
+             ON trx.trx_type::text = u.tt AND trx.source_id = u.sid",
+        &pgrx::oids_of![Vec<String>, Vec<i64>],
+        &args,
+        |mut t| {
+            let mut set = HashSet::new();
+            while let Some(row) = t.next() {
+                let tt: String = row.get::<String>(1)?.unwrap_or_default();
+                let sid: i64 = row.get::<i64>(2)?.unwrap_or(0);
+                set.insert((tt, sid));
+            }
+            Ok(set)
+        },
+    )
     .map_err(|e| format!("trx dedup query: {e}"))
 }
 
