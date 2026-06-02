@@ -1269,6 +1269,148 @@ fn decode_lines(lines: &[PocV3Line]) -> Result<Vec<TrxLineRequest>, String> {
     Ok(out)
 }
 
+// ── In-process apply-path microbench (bench_hooks builds only; acct-q6sx) ──
+//
+// Measures the committer's single-core *apply* ceiling — `plan_and_write` (plan +
+// batched INSERT of trx / trx_line / posting_line + the per-pool aggregate
+// UPSERT) — with NO ingress: no staging ring, no router, no pool_lock, no hydrate
+// in the timed region. That is precisely the ceiling the end-to-end harness cannot
+// reach, because the staging-ring LWLock starves committers as caller count rises
+// (acct-ruex). It is the in-process, Docker-native counterpart to a pgrx
+// `#[pg_bench]`, which would require a separate pgrx-managed cluster plus a
+// hand-injected base schema (the apply path INSERTs into migration-created tables);
+// see acct-q6sx.
+//
+// Each iteration applies a `p_batch`-submission po_receipt commit_group into the
+// pre-seeded pool `p_pool_id` inside an internal subtransaction, times ONLY
+// plan_and_write (the snapshot clone and the subtx begin/rollback are bench
+// artifacts, excluded from the sample), then ROLLS THE SUBTX BACK so the pool's
+// base state is byte-identical for every iteration — every sample measures the
+// same work. `p_warmup` iterations are discarded first to warm bulk_write's
+// per-backend prepared-plan cache (kept plans survive subtx rollback).
+//
+// Returns a JSONB summary: per-iteration ns stats (min/p50/mean/p99/max/stddev),
+// `us_per_trx` (mean / batch), and `committed_per_iter` (a sanity signal — it must
+// equal `batch`; 0 means the pool isn't seeded, e.g. no posting_account_map). The
+// `us_per_trx` at a large batch is directly comparable to the span-measured apply
+// ~44 us/trx from measure-apply-spans.sh.
+#[cfg(feature = "bench_hooks")]
+#[pg_extern]
+fn ledger_routed_c_bench_apply(
+    p_pool_id: i64,
+    p_batch: i32,
+    p_iters: i32,
+    p_warmup: i32,
+) -> pgrx::JsonB {
+    use std::time::Instant;
+
+    let batch = p_batch.max(1) as usize;
+    let iters = p_iters.max(1) as usize;
+    let warmup = p_warmup.max(0) as usize;
+
+    // Base snapshot read once; every iteration rolls back, so the base never moves.
+    let base = match hydration::hydrate_snapshot(&[p_pool_id]) {
+        Ok(s) => s,
+        Err(e) => return pgrx::JsonB(serde_json::json!({ "error": format!("hydrate: {e}") })),
+    };
+
+    // A `batch`-submission commit_group of po_receipts into the pool. Distinct
+    // source_ids satisfy the trx (trx_type, source_id) UNIQUE within one
+    // plan_and_write; across iterations the rollback discards them, so the same ids
+    // are safely reused. posted_at is fixed — apply cost is timestamp-independent.
+    let posted_at = DateTime::<Utc>::from_timestamp_micros(0).expect("epoch is a valid timestamp");
+    let prepared: Vec<Prepared> = (0..batch as i64)
+        .map(|i| Prepared {
+            trx_type: "po_receipt".to_string(),
+            source_id: 1_000_000_000 + i,
+            posted_at,
+            lines: vec![TrxLineRequest {
+                pool_id: p_pool_id,
+                line_type: ledger_core::LineType::PoReceiptLine,
+                source_id: Some(1_000_000_000 + i),
+                qty: 10,
+                unit_cost: 50,
+            }],
+        })
+        .collect();
+
+    // One iteration: time plan_and_write inside a rolled-back subtx. Returns the
+    // elapsed ns + committed count, or an error string. The memory-context /
+    // resource-owner save+restore around the subtx mirrors pgrx-bench's runtime so a
+    // caught apply ERROR cannot leave the backend on a freed context.
+    let run_once = |prepared: &[Prepared]| -> Result<(u64, usize), String> {
+        let snap = base.clone(); // argument prep — NOT timed
+        let sp = CString::new("rc_bench_apply").expect("savepoint name has no NUL");
+        unsafe {
+            let old_ctx = pg_sys::CurrentMemoryContext;
+            let old_ro = pg_sys::CurrentResourceOwner;
+            pg_sys::BeginInternalSubTransaction(sp.as_ptr());
+            let outcome: Result<(u64, usize), String> = PgTryBuilder::new(AssertUnwindSafe(|| {
+                let t0 = Instant::now();
+                let summary = plan_and_write(snap, prepared).map_err(|e| e.to_string())?;
+                let dt = t0.elapsed().as_nanos() as u64;
+                Ok((dt, summary.committed))
+            }))
+            .catch_others(|caught| Err(format!("apply raised: {:?}", sqlstate_of(&caught))))
+            .execute();
+            // Always roll back: the base pool state must be unchanged for the next
+            // iteration, so we never release/commit the savepoint.
+            pg_sys::MemoryContextSwitchTo(old_ctx);
+            pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            pg_sys::MemoryContextSwitchTo(old_ctx);
+            pg_sys::CurrentResourceOwner = old_ro;
+            outcome
+        }
+    };
+
+    // Warmup (discarded) — the first call builds bulk_write's prepared plans.
+    for _ in 0..warmup {
+        if let Err(e) = run_once(&prepared) {
+            return pgrx::JsonB(serde_json::json!({ "error": format!("warmup: {e}") }));
+        }
+    }
+
+    let mut samples: Vec<u64> = Vec::with_capacity(iters);
+    let mut committed_seen: usize = 0;
+    for _ in 0..iters {
+        match run_once(&prepared) {
+            Ok((ns, committed)) => {
+                samples.push(ns);
+                committed_seen = committed;
+            }
+            Err(e) => return pgrx::JsonB(serde_json::json!({ "error": format!("sample: {e}") })),
+        }
+    }
+
+    samples.sort_unstable();
+    let n = samples.len() as f64;
+    let sum: u64 = samples.iter().sum();
+    let mean = sum as f64 / n;
+    let stddev = (samples.iter().map(|&s| (s as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
+    let pct = |q: f64| -> u64 {
+        let idx = ((q * (samples.len() as f64 - 1.0)).round() as usize).min(samples.len() - 1);
+        samples[idx]
+    };
+
+    pgrx::JsonB(serde_json::json!({
+        "pool_id": p_pool_id,
+        "batch": batch,
+        "iters": iters,
+        "warmup": warmup,
+        "committed_per_iter": committed_seen,
+        "iter_ns": {
+            "min": samples[0],
+            "p50": pct(0.50),
+            "mean": mean,
+            "p99": pct(0.99),
+            "max": samples[samples.len() - 1],
+            "stddev": stddev,
+        },
+        "us_per_iter_mean": mean / 1000.0,
+        "us_per_trx": mean / 1000.0 / batch as f64,
+    }))
+}
+
 // ── Unit tests for pure helpers ─────────────────────────────────────
 
 #[cfg(test)]

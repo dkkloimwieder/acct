@@ -28,6 +28,10 @@ if [ "${WITH_TEST_HOOKS:-0}" = "1" ]; then
     FEATURES="pg18,test_hooks"
     echo "==> including test_hooks feature (test build)"
 fi
+if [ "${WITH_BENCH_HOOKS:-0}" = "1" ]; then
+    FEATURES="$FEATURES,bench_hooks"
+    echo "==> including bench_hooks feature (apply-path microbench, acct-q6sx)"
+fi
 
 mkdir -p "$CRATE_DIR/sql"
 

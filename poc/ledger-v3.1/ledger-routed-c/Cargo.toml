@@ -16,6 +16,10 @@ pg18 = ["pgrx/pg18", "ledger-spi-common/pg18"]
 pg_test = []
 # See ledger-direct-c/Cargo.toml; same gating pattern.
 test_hooks = []
+# In-process apply-path microbench entry point (acct-q6sx). Opt-in, NOT in the
+# production .so: it adds a #[pg_extern] timing harness that drives plan_and_write
+# directly. Build via WITH_BENCH_HOOKS=1 scripts/install-routed-c.sh.
+bench_hooks = []
 
 [dependencies]
 pgrx            = { workspace = true }
