@@ -15,6 +15,16 @@
 //! snapshot — that collapse is how a whole commit_group's depletions become one
 //! aggregate UPSERT (§6.7), so it does not use `apply_plan_result`.
 //!
+//! Each statement is parsed + planned once per backend and kept for the life of
+//! the process (`SPI_keepplan`, via pgrx's `prepare_mut(..).keep()`), cached in a
+//! `thread_local`. The committer is a long-lived BGWorker, so a kept plan is
+//! reused across every commit group: `SPI_execute_plan` reruns the cached generic
+//! plan with new parameters and skips the parse/analyze/plan pipeline that
+//! dominated the apply hot path (acct-q6sx: ~47% of committer CPU was per-call
+//! parse+analyze+plan; acct-sczx Lever B). The statements are parameterized, so
+//! one generic plan serves all calls; the plancache revalidates and replans
+//! transparently if the schema changes.
+//!
 //! v3.1 deltas vs the strict bulk_write: pool_state carries `value_sum` (the
 //! cumulative book value behind the running average, acct-0qps) but no
 //! `last_trx_line_id`, and trx_line has no `trx_seq`. Mutations are
@@ -22,9 +32,60 @@
 //! trx_line.id, resolved from RETURNING), and `DeleteLayer`. There is no
 //! provisional-posting side table (that is recalc/close, out of scope §13).
 
+use std::cell::RefCell;
+use std::thread::LocalKey;
+
 use chrono::{DateTime, Utc};
 use ledger_core::{PlanResult, PoolStateMutation, PostingLineRequest, TrxLineOutput};
+use pgrx::datum::DatumWithOid;
+use pgrx::pg_sys::PgOid;
 use pgrx::prelude::*;
+use pgrx::spi::{OwnedPreparedStatement, SpiTupleTable};
+
+// Type tags for `oids_of!` — the param-type OIDs handed to `prepare_mut` come
+// from the same `IntoDatum::type_oid()` the args' `.into()` uses, so prepare-time
+// and execute-time OIDs match by construction (`From<T> for DatumWithOid`).
+type Int8 = i64;
+type Text = String;
+type Int8Arr = Vec<i64>;
+type Int8ArrNullable = Vec<Option<i64>>;
+type TextArr = Vec<String>;
+
+thread_local! {
+    static PLAN_INSERT_TRX: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
+    static PLAN_INSERT_TRX_LINES: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
+    static PLAN_UPSERT_AGGREGATE: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
+    static PLAN_INSERT_LAYER: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
+    static PLAN_DELETE_LAYER: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
+    static PLAN_INSERT_POSTING_LINES: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
+}
+
+/// Execute a kept (`SPI_keepplan`) prepared statement, preparing + keeping it on
+/// first use for this backend. All callers mutate, so the plan is built with
+/// `prepare_mut` (read_only = false) and run via `update` (marks the xact mutable).
+/// `read_rows` consumes the result table — RETURNING readers collect ids, the
+/// write-only statements ignore it.
+fn run_prepared<R>(
+    slot: &'static LocalKey<RefCell<Option<OwnedPreparedStatement>>>,
+    sql: &str,
+    arg_oids: &[PgOid],
+    args: &[DatumWithOid<'_>],
+    read_rows: impl FnOnce(SpiTupleTable<'_>) -> Result<R, pgrx::spi::Error>,
+) -> Result<R, pgrx::spi::Error> {
+    Spi::connect_mut(|client| {
+        slot.with_borrow_mut(|opt| -> Result<(), pgrx::spi::Error> {
+            if opt.is_none() {
+                *opt = Some(client.prepare_mut(sql, arg_oids)?.keep());
+            }
+            Ok(())
+        })?;
+        slot.with_borrow(|opt| {
+            let plan = opt.as_ref().expect("plan prepared above");
+            let table = client.update(plan, None, args)?;
+            read_rows(table)
+        })
+    })
+}
 
 /// 8.1 — INSERT INTO trx. Returns the new trx.id.
 ///
@@ -36,17 +97,25 @@ pub fn insert_trx(
     source_id: i64,
     posted_at: DateTime<Utc>,
 ) -> Result<i64, pgrx::spi::Error> {
-    let id: Option<i64> = Spi::get_one_with_args(
+    let args: [DatumWithOid<'_>; 3] = [
+        trx_type.to_string().into(),
+        source_id.into(),
+        posted_at.to_rfc3339().into(),
+    ];
+    run_prepared(
+        &PLAN_INSERT_TRX,
         "INSERT INTO trx (trx_type, source_id, posted_at) \
          VALUES ($1::text::trx_type, $2, $3::text::timestamptz) \
          RETURNING id",
-        &[
-            trx_type.to_string().into(),
-            source_id.into(),
-            posted_at.to_rfc3339().into(),
-        ],
-    )?;
-    Ok(id.unwrap_or_default())
+        &pgrx::oids_of![Text, Int8, Text],
+        &args,
+        |mut table| {
+            Ok(match table.next() {
+                Some(row) => row.get::<i64>(1)?.unwrap_or_default(),
+                None => 0,
+            })
+        },
+    )
 }
 
 /// 8.2 — Bulk INSERT INTO trx_line ... RETURNING id, realigned to input order.
@@ -74,32 +143,35 @@ pub fn insert_trx_lines(
     let source_trx_line_id: Vec<Option<i64>> =
         outputs.iter().map(|o| o.source_trx_line_id).collect();
 
-    let mut ids: Vec<i64> = Spi::connect(|client| -> Result<Vec<i64>, pgrx::spi::Error> {
-        let mut out = Vec::with_capacity(outputs.len());
-        let mut t = client.select(
-            "INSERT INTO trx_line \
-               (trx_id, pool_id, line_type, source_id, qty, unit_cost, source_trx_line_id) \
-             SELECT $1, pid, lt::line_type, sid, q, uc, stl \
-               FROM UNNEST($2::bigint[], $3::text[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[]) \
-                    WITH ORDINALITY AS t(pid, lt, sid, q, uc, stl, ord) \
-              ORDER BY ord \
-             RETURNING id",
-            None,
-            &[
-                trx_id.into(),
-                pool_id.into(),
-                line_type.into(),
-                source_id.into(),
-                qty.into(),
-                unit_cost.into(),
-                source_trx_line_id.into(),
-            ],
-        )?;
-        while let Some(row) = t.next() {
-            out.push(row.get::<i64>(1)?.unwrap_or(0));
-        }
-        Ok(out)
-    })?;
+    let args: [DatumWithOid<'_>; 7] = [
+        trx_id.into(),
+        pool_id.into(),
+        line_type.into(),
+        source_id.into(),
+        qty.into(),
+        unit_cost.into(),
+        source_trx_line_id.into(),
+    ];
+
+    let mut ids = run_prepared(
+        &PLAN_INSERT_TRX_LINES,
+        "INSERT INTO trx_line \
+           (trx_id, pool_id, line_type, source_id, qty, unit_cost, source_trx_line_id) \
+         SELECT $1, pid, lt::line_type, sid, q, uc, stl \
+           FROM UNNEST($2::bigint[], $3::text[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[]) \
+                WITH ORDINALITY AS t(pid, lt, sid, q, uc, stl, ord) \
+          ORDER BY ord \
+         RETURNING id",
+        &pgrx::oids_of![Int8, Int8Arr, TextArr, Int8ArrNullable, Int8Arr, Int8Arr, Int8ArrNullable],
+        &args,
+        |mut table| {
+            let mut out = Vec::with_capacity(outputs.len());
+            while let Some(row) = table.next() {
+                out.push(row.get::<i64>(1)?.unwrap_or(0));
+            }
+            Ok(out)
+        },
+    )?;
 
     ids.sort_unstable();
     debug_assert_eq!(ids.len(), outputs.len(), "trx_line RETURNING dropped a row");
@@ -166,7 +238,10 @@ pub fn apply_pool_state_mutations(
     }
 
     if !up_pid.is_empty() {
-        Spi::run_with_args(
+        let args: [DatumWithOid<'_>; 4] =
+            [up_pid.into(), up_qty.into(), up_uc.into(), up_vs.into()];
+        run_prepared(
+            &PLAN_UPSERT_AGGREGATE,
             "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) \
              SELECT pid, 0, q, uc, vs \
                FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[]) \
@@ -174,26 +249,37 @@ pub fn apply_pool_state_mutations(
              ON CONFLICT (pool_id, layer_id) DO UPDATE \
                 SET qty = EXCLUDED.qty, unit_cost = EXCLUDED.unit_cost, \
                     value_sum = EXCLUDED.value_sum",
-            &[up_pid.into(), up_qty.into(), up_uc.into(), up_vs.into()],
+            &pgrx::oids_of![Int8Arr, Int8Arr, Int8Arr, Int8Arr],
+            &args,
+            |_table| Ok(()),
         )?;
     }
 
     if !ins_pid.is_empty() {
-        Spi::run_with_args(
+        let args: [DatumWithOid<'_>; 5] =
+            [ins_pid.into(), ins_lid.into(), ins_qty.into(), ins_uc.into(), ins_vs.into()];
+        run_prepared(
+            &PLAN_INSERT_LAYER,
             "INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) \
              SELECT pid, lid, q, uc, vs \
                FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[]) \
                     AS t(pid, lid, q, uc, vs)",
-            &[ins_pid.into(), ins_lid.into(), ins_qty.into(), ins_uc.into(), ins_vs.into()],
+            &pgrx::oids_of![Int8Arr, Int8Arr, Int8Arr, Int8Arr, Int8Arr],
+            &args,
+            |_table| Ok(()),
         )?;
     }
 
     if !del_pid.is_empty() {
-        Spi::run_with_args(
+        let args: [DatumWithOid<'_>; 2] = [del_pid.into(), del_lid.into()];
+        run_prepared(
+            &PLAN_DELETE_LAYER,
             "DELETE FROM pool_state \
               USING UNNEST($1::bigint[], $2::bigint[]) AS d(pid, lid) \
               WHERE pool_state.pool_id = d.pid AND pool_state.layer_id = d.lid",
-            &[del_pid.into(), del_lid.into()],
+            &pgrx::oids_of![Int8Arr, Int8Arr],
+            &args,
+            |_table| Ok(()),
         )?;
     }
 
@@ -218,22 +304,26 @@ pub fn insert_posting_lines(
     let credit: Vec<i64> = requests.iter().map(|r| r.credit_account).collect();
     let posted_at: Vec<String> = requests.iter().map(|r| r.posted_at.to_rfc3339()).collect();
 
-    Spi::run_with_args(
+    let args: [DatumWithOid<'_>; 6] = [
+        tl_id.into(),
+        event_type.into(),
+        amount.into(),
+        debit.into(),
+        credit.into(),
+        posted_at.into(),
+    ];
+
+    run_prepared(
+        &PLAN_INSERT_POSTING_LINES,
         "INSERT INTO posting_line \
            (trx_line_id, event_type, amount, debit_account, credit_account, posted_at) \
          SELECT tl, et::posting_event_type, amt, deb, cr, pa::timestamptz \
            FROM UNNEST($1::bigint[], $2::text[], $3::bigint[], $4::bigint[], $5::bigint[], $6::text[]) \
                 AS t(tl, et, amt, deb, cr, pa)",
-        &[
-            tl_id.into(),
-            event_type.into(),
-            amount.into(),
-            debit.into(),
-            credit.into(),
-            posted_at.into(),
-        ],
-    )?;
-    Ok(())
+        &pgrx::oids_of![Int8Arr, TextArr, Int8Arr, Int8Arr, Int8Arr, TextArr],
+        &args,
+        |_table| Ok(()),
+    )
 }
 
 /// Run the full §5.1 step 8 sequence and return the new trx.id. The direct-flavor
