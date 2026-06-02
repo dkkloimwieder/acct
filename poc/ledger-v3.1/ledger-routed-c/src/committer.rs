@@ -97,6 +97,16 @@ thread_local! {
     /// it for the backend's lifetime removes that re-plan. Read-only — built with
     /// `prepare` (not `prepare_mut`) and run via `select`.
     static PLAN_DEDUP_TRX: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
+
+    /// Valid `trx_type` enum labels, queried once per backend via `enum_range`
+    /// and cached. Used to drop unknown trx_types from the dedup probe in Rust so
+    /// the probe's `u.tt::trx_type` cast only ever sees valid input and can't
+    /// raise 22P02 (acct-e95d) — dedup runs outside the write subtx's
+    /// `catch_others`, and `BackgroundWorker::transaction` re-raises an uncaught
+    /// ERROR, so a raise here would abort the committer tick, not just the group.
+    /// A new enum value added at runtime won't appear until restart — consistent
+    /// with the kept-plan cache (both assume a schema stable for the backend).
+    static DEDUP_TRX_TYPE_LABELS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
 }
 
 fn set_my_committer_identity(slot: u32, generation: u32) {
@@ -971,27 +981,69 @@ fn run_prepared_read<R>(
     })
 }
 
+/// Populate the per-backend `trx_type` label cache on first use, then return the
+/// (trx_type, source_id) pairs whose trx_type is a known enum label as aligned
+/// arrays. Unknown labels are dropped here, in Rust, so the dedup probe's enum
+/// cast only ever sees valid input (see `DEDUP_TRX_TYPE_LABELS`).
+fn filter_to_known_trx_types(
+    trx_types: Vec<String>,
+    source_ids: Vec<i64>,
+) -> Result<(Vec<String>, Vec<i64>), String> {
+    if DEDUP_TRX_TYPE_LABELS.with_borrow(|o| o.is_none()) {
+        let labels = Spi::connect(|client| -> Result<HashSet<String>, pgrx::spi::Error> {
+            let mut set = HashSet::new();
+            let mut t = client.select("SELECT unnest(enum_range(NULL::trx_type))::text", None, &[])?;
+            while let Some(row) = t.next() {
+                if let Some(s) = row.get::<String>(1)? {
+                    set.insert(s);
+                }
+            }
+            Ok(set)
+        })
+        .map_err(|e| format!("trx_type label cache: {e}"))?;
+        DEDUP_TRX_TYPE_LABELS.with_borrow_mut(|o| *o = Some(labels));
+    }
+    Ok(DEDUP_TRX_TYPE_LABELS.with_borrow(|o| {
+        let labels = o.as_ref().expect("labels populated above");
+        let mut tt = Vec::with_capacity(trx_types.len());
+        let mut sid = Vec::with_capacity(source_ids.len());
+        for (t, s) in trx_types.into_iter().zip(source_ids) {
+            if labels.contains(&t) {
+                tt.push(t);
+                sid.push(s);
+            }
+        }
+        (tt, sid)
+    }))
+}
+
 /// Query `trx` for which of the given (trx_type, source_id) keys already exist.
-/// Input text keys are pre-filtered to valid `trx_type` labels (`u.tt = ANY
-/// enum_range`) then compared enum-to-enum, so the `(trx_type, source_id)` unique
-/// index drives a 2-column seek (acct-e95d). An unknown trx_type is dropped from
-/// the probe by the filter rather than failing the enum cast — it can't be a
-/// duplicate of an existing row anyway, and it surfaces later at insert (the
-/// `$1::text::trx_type` cast in `insert_trx`). Shared by pre-flight dedup and the
-/// re-drive re-dedup. Runs on a kept plan: the query shape is fixed and only its
-/// `text[]` / `bigint[]` params vary, so parse+plan happens once per backend.
+/// Keys are pre-filtered in Rust to valid `trx_type` labels, then compared
+/// enum-to-enum (`u.tt::trx_type`) so the `(trx_type, source_id)` unique index
+/// drives a 2-column seek (acct-e95d) instead of a `source_id`-only scan. The
+/// Rust pre-filter (not a SQL `enum_range` filter, which is STABLE and would be
+/// re-evaluated per probe row) keeps the cast unreachable for unknown input so it
+/// can't raise 22P02 outside the write subtx's catch. An unknown trx_type can't
+/// match an existing row anyway, so dropping it is output-preserving; it surfaces
+/// later at `insert_trx`'s `$1::text::trx_type` cast, exactly as before. Shared by
+/// pre-flight dedup and the re-drive re-dedup. Runs on a kept plan: the shape is
+/// fixed and only its `text[]` / `bigint[]` params vary, so parse+plan is once
+/// per backend.
 fn existing_trx_keys(
     trx_types: Vec<String>,
     source_ids: Vec<i64>,
 ) -> Result<HashSet<(String, i64)>, String> {
-    let args: [DatumWithOid<'_>; 2] = [trx_types.into(), source_ids.into()];
+    let (tt, sid) = filter_to_known_trx_types(trx_types, source_ids)?;
+    if tt.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let args: [DatumWithOid<'_>; 2] = [tt.into(), sid.into()];
     run_prepared_read(
         &PLAN_DEDUP_TRX,
         "SELECT trx.trx_type::text, trx.source_id \
            FROM trx \
            JOIN UNNEST($1::text[], $2::bigint[]) AS u(tt, sid) \
-             ON trx.trx_type = u.tt::trx_type AND trx.source_id = u.sid \
-          WHERE u.tt = ANY(enum_range(NULL::trx_type)::text[])",
+             ON trx.trx_type = u.tt::trx_type AND trx.source_id = u.sid",
         &pgrx::oids_of![Vec<String>, Vec<i64>],
         &args,
         |mut t| {
