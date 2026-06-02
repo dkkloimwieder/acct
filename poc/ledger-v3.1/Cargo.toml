@@ -39,3 +39,4 @@ panic = "unwind"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+debug = true   # DWARF for perf/flamegraph (acct-q6sx); larger .so, no perf change
