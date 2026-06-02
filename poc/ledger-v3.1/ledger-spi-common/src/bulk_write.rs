@@ -7,13 +7,17 @@
 //!   4. `insert_posting_lines`        — UNNEST INSERT
 //!
 //! Direct flavor (`submit::ledger_submit_trx_c`) calls `apply_plan_result`, the
-//! per-submission convenience wrapper that runs all four in order. The routed
-//! committer (`committer::write_commit_group`) drives the primitives itself: it
-//! calls `insert_trx` / `insert_trx_lines` / `insert_posting_lines` once per
-//! submission, applies only each submission's *layer* mutations (specific pools)
-//! inline, and writes the *aggregate* row once per pool from the final working
-//! snapshot — that collapse is how a whole commit_group's depletions become one
-//! aggregate UPSERT (§6.7), so it does not use `apply_plan_result`.
+//! per-submission convenience wrapper that runs the per-submission primitives in
+//! order. The routed committer (`committer::plan_and_write`) plans every
+//! submission sequentially (WAC running average), then drives the *batch*
+//! variants — `insert_trx_batch` (8.1b) / `insert_trx_lines_batch` (8.2b) /
+//! `insert_posting_lines_batch` (8.4b) — to write the whole commit group in one
+//! multi-row INSERT per table (acct-sczx Lever A). It applies each submission's
+//! *layer* mutations (specific pools) against that submission's slice of the
+//! batched trx_line ids and writes the *aggregate* row once per pool from the
+//! final working snapshot — that collapse is how a whole commit_group's
+//! depletions become one aggregate UPSERT (§6.7), so it does not use
+//! `apply_plan_result`.
 //!
 //! Each statement is parsed + planned once per backend and kept for the life of
 //! the process (`SPI_keepplan`, via pgrx's `prepare_mut(..).keep()`), cached in a
@@ -53,7 +57,9 @@ type TextArr = Vec<String>;
 
 thread_local! {
     static PLAN_INSERT_TRX: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
+    static PLAN_INSERT_TRX_BATCH: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
     static PLAN_INSERT_TRX_LINES: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
+    static PLAN_INSERT_TRX_LINES_BATCH: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
     static PLAN_UPSERT_AGGREGATE: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
     static PLAN_INSERT_LAYER: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
     static PLAN_DELETE_LAYER: RefCell<Option<OwnedPreparedStatement>> = const { RefCell::new(None) };
@@ -118,6 +124,56 @@ pub fn insert_trx(
     )
 }
 
+/// 8.1b — Batch INSERT INTO trx for a whole commit group (acct-sczx Lever A).
+/// Returns trx.ids realigned to input order. trx.id is GENERATED ALWAYS AS
+/// IDENTITY; identity values are drawn in the order the INSERT...SELECT feeds
+/// rows, `ORDER BY ord` fixes that to the input array order, so sorting the
+/// RETURNING ids ascending recovers input-order alignment (same trick as 8.2).
+/// A duplicate `(trx_type, source_id)` anywhere in the batch raises here; the
+/// committer runs the whole phase in a subtransaction, so the abort rolls back
+/// the entire attempt and the §6.8 re-drive re-queries `trx` to drop the
+/// now-visible offender(s) — it never needs to know which row collided.
+pub fn insert_trx_batch(
+    trx_type: &[String],
+    source_id: &[i64],
+    posted_at: &[DateTime<Utc>],
+) -> Result<Vec<i64>, pgrx::spi::Error> {
+    debug_assert_eq!(trx_type.len(), source_id.len());
+    debug_assert_eq!(trx_type.len(), posted_at.len());
+    if trx_type.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let tt: Vec<String> = trx_type.to_vec();
+    let sid: Vec<i64> = source_id.to_vec();
+    let pa: Vec<String> = posted_at.iter().map(|t| t.to_rfc3339()).collect();
+
+    let args: [DatumWithOid<'_>; 3] = [tt.into(), sid.into(), pa.into()];
+
+    let mut ids = run_prepared(
+        &PLAN_INSERT_TRX_BATCH,
+        "INSERT INTO trx (trx_type, source_id, posted_at) \
+         SELECT tt::trx_type, sid, pa::timestamptz \
+           FROM UNNEST($1::text[], $2::bigint[], $3::text[]) \
+                WITH ORDINALITY AS t(tt, sid, pa, ord) \
+          ORDER BY ord \
+         RETURNING id",
+        &pgrx::oids_of![TextArr, Int8Arr, TextArr],
+        &args,
+        |mut table| {
+            let mut out = Vec::with_capacity(trx_type.len());
+            while let Some(row) = table.next() {
+                out.push(row.get::<i64>(1)?.unwrap_or(0));
+            }
+            Ok(out)
+        },
+    )?;
+
+    ids.sort_unstable();
+    debug_assert_eq!(ids.len(), trx_type.len(), "trx batch RETURNING dropped a row");
+    Ok(ids)
+}
+
 /// 8.2 — Bulk INSERT INTO trx_line ... RETURNING id, realigned to input order.
 ///
 /// trx_line.id is `GENERATED ALWAYS AS IDENTITY`; identity values are drawn in
@@ -175,6 +231,67 @@ pub fn insert_trx_lines(
 
     ids.sort_unstable();
     debug_assert_eq!(ids.len(), outputs.len(), "trx_line RETURNING dropped a row");
+    Ok(ids)
+}
+
+/// 8.2b — Batch INSERT INTO trx_line across a whole commit group (acct-sczx
+/// Lever A). Identical to 8.2 except `trx_id` is a per-row array (`$1`) instead
+/// of a scalar, so one INSERT carries every submission's trx_lines, each tagged
+/// with its own submission's trx.id from 8.1b. The returned Vec is index-aligned
+/// to `outputs` (the flattened, submission-ordered line stream) via the same
+/// `ORDER BY ord` + ascending-sort recovery, so the caller can slice it back
+/// per submission to resolve posting-line and layer-mutation references.
+pub fn insert_trx_lines_batch(
+    trx_id_per_row: &[i64],
+    outputs: &[TrxLineOutput],
+) -> Result<Vec<i64>, pgrx::spi::Error> {
+    debug_assert_eq!(trx_id_per_row.len(), outputs.len());
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let tid: Vec<i64> = trx_id_per_row.to_vec();
+    let pool_id: Vec<i64> = outputs.iter().map(|o| o.pool_id).collect();
+    let line_type: Vec<String> =
+        outputs.iter().map(|o| o.line_type.as_sql().to_string()).collect();
+    let source_id: Vec<Option<i64>> = outputs.iter().map(|o| o.source_id).collect();
+    let qty: Vec<i64> = outputs.iter().map(|o| o.qty).collect();
+    let unit_cost: Vec<i64> = outputs.iter().map(|o| o.unit_cost).collect();
+    let source_trx_line_id: Vec<Option<i64>> =
+        outputs.iter().map(|o| o.source_trx_line_id).collect();
+
+    let args: [DatumWithOid<'_>; 7] = [
+        tid.into(),
+        pool_id.into(),
+        line_type.into(),
+        source_id.into(),
+        qty.into(),
+        unit_cost.into(),
+        source_trx_line_id.into(),
+    ];
+
+    let mut ids = run_prepared(
+        &PLAN_INSERT_TRX_LINES_BATCH,
+        "INSERT INTO trx_line \
+           (trx_id, pool_id, line_type, source_id, qty, unit_cost, source_trx_line_id) \
+         SELECT tid, pid, lt::line_type, sid, q, uc, stl \
+           FROM UNNEST($1::bigint[], $2::bigint[], $3::text[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[]) \
+                WITH ORDINALITY AS t(tid, pid, lt, sid, q, uc, stl, ord) \
+          ORDER BY ord \
+         RETURNING id",
+        &pgrx::oids_of![Int8Arr, Int8Arr, TextArr, Int8ArrNullable, Int8Arr, Int8Arr, Int8ArrNullable],
+        &args,
+        |mut table| {
+            let mut out = Vec::with_capacity(outputs.len());
+            while let Some(row) = table.next() {
+                out.push(row.get::<i64>(1)?.unwrap_or(0));
+            }
+            Ok(out)
+        },
+    )?;
+
+    ids.sort_unstable();
+    debug_assert_eq!(ids.len(), outputs.len(), "trx_line batch RETURNING dropped a row");
     Ok(ids)
 }
 
@@ -295,8 +412,32 @@ pub fn insert_posting_lines(
     if requests.is_empty() {
         return Ok(());
     }
-
     let tl_id: Vec<i64> = requests.iter().map(|r| trx_line_ids[r.trx_line_idx]).collect();
+    insert_posting_lines_with_tlid(tl_id, requests)
+}
+
+/// 8.4b — Batch INSERT INTO posting_line with trx_line ids pre-resolved by the
+/// caller (acct-sczx Lever A). `trx_line_id_per_row[i]` is the resolved
+/// trx_line.id for `requests[i]`; the committer resolves each submission's
+/// posting lines against that submission's slice of the batched trx_line ids,
+/// then flattens, so a whole commit group's posting_lines write in one INSERT.
+pub fn insert_posting_lines_batch(
+    trx_line_id_per_row: &[i64],
+    requests: &[PostingLineRequest],
+) -> Result<(), pgrx::spi::Error> {
+    debug_assert_eq!(trx_line_id_per_row.len(), requests.len());
+    if requests.is_empty() {
+        return Ok(());
+    }
+    insert_posting_lines_with_tlid(trx_line_id_per_row.to_vec(), requests)
+}
+
+/// Shared body for 8.4 / 8.4b: build the column arrays from `requests` against an
+/// already-resolved `tl_id` (parallel to `requests`), then run the kept plan.
+fn insert_posting_lines_with_tlid(
+    tl_id: Vec<i64>,
+    requests: &[PostingLineRequest],
+) -> Result<(), pgrx::spi::Error> {
     let event_type: Vec<String> =
         requests.iter().map(|r| r.event_type.as_sql().to_string()).collect();
     let amount: Vec<i64> = requests.iter().map(|r| r.amount).collect();

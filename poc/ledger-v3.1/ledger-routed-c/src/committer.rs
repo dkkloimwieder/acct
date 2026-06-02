@@ -58,7 +58,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use ledger_core::{
-    PlanResult, PoolStateMutation, Snapshot, TrxLineRequest, plan_apply_provisional,
+    PlanResult, PoolStateMutation, PostingLineRequest, Snapshot, TrxLineOutput, TrxLineRequest,
+    plan_apply_provisional,
 };
 use pgrx::PgTryBuilder;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
@@ -684,21 +685,62 @@ fn plan_and_write(
         });
     }
 
-    for (p, plan) in &planned {
-        let trx_id = bulk_write::insert_trx(&p.trx_type, p.source_id, p.posted_at)?;
-        let trx_line_ids = bulk_write::insert_trx_lines(trx_id, &plan.trx_lines)?;
-        // Aggregate (layer_id = 0) mutations are collapsed and written once at the
-        // end; here only this submission's layer mutations (specific
-        // InsertLayer/DeleteLayer), keyed to its own trx_line ids.
+    // ── Batched write across the whole commit group (acct-sczx Lever A) ──
+    // The PLAN pass above stays per-submission and sequential (WAC running
+    // average depends on prior submissions' pool effects); only the WRITE
+    // collapses. One multi-row INSERT per table replaces the ~700 one-shot
+    // statements/group the flamegraph charged for. The trx.id → trx_line.id →
+    // posting_line.trx_line_id FK chain is preserved via UNNEST WITH ORDINALITY
+    // + ascending-id recovery (8.1b / 8.2b), the same alignment the
+    // per-submission primitives use. A UNIQUE collision anywhere in the batch
+    // aborts the whole attempt inside the subtx; the §6.8 re-drive re-queries
+    // `trx`, drops the now-visible offender(s), and re-drives the reduced set.
+    let trx_types: Vec<String> = planned.iter().map(|(p, _)| p.trx_type.clone()).collect();
+    let source_ids: Vec<i64> = planned.iter().map(|(p, _)| p.source_id).collect();
+    let posted_ats: Vec<DateTime<Utc>> = planned.iter().map(|(p, _)| p.posted_at).collect();
+    let trx_ids = bulk_write::insert_trx_batch(&trx_types, &source_ids, &posted_ats)?;
+
+    // Flatten every submission's trx_lines in submission order, tagging each row
+    // with its submission's trx.id, and batch-insert. Returned ids are aligned to
+    // this flattened order, so they slice back per submission.
+    let total_lines: usize = planned.iter().map(|(_, plan)| plan.trx_lines.len()).sum();
+    let mut flat_lines: Vec<TrxLineOutput> = Vec::with_capacity(total_lines);
+    let mut line_trx_id: Vec<i64> = Vec::with_capacity(total_lines);
+    for (i, (_, plan)) in planned.iter().enumerate() {
+        for line in &plan.trx_lines {
+            flat_lines.push(line.clone());
+            line_trx_id.push(trx_ids[i]);
+        }
+    }
+    let flat_line_ids = bulk_write::insert_trx_lines_batch(&line_trx_id, &flat_lines)?;
+
+    // Per submission: apply its layer mutations (specific FIFO/LIFO; none for WAC,
+    // the only active method) against its own slice of the batched trx_line ids,
+    // and flatten its posting_lines with pre-resolved trx_line ids for one batched
+    // posting INSERT. Aggregate (layer_id = 0) mutations are collapsed below.
+    let total_postings: usize = planned.iter().map(|(_, plan)| plan.posting_lines.len()).sum();
+    let mut posting_tlid: Vec<i64> = Vec::with_capacity(total_postings);
+    let mut flat_postings: Vec<PostingLineRequest> = Vec::with_capacity(total_postings);
+    let mut offset = 0usize;
+    for (_, plan) in &planned {
+        let len = plan.trx_lines.len();
+        let slice = &flat_line_ids[offset..offset + len];
+        offset += len;
+
         let layer_muts: Vec<PoolStateMutation> = plan
             .pool_state_mutations
             .iter()
             .filter(|m| !matches!(m, PoolStateMutation::UpsertAggregate { .. }))
             .cloned()
             .collect();
-        bulk_write::apply_pool_state_mutations(&layer_muts, &trx_line_ids)?;
-        bulk_write::insert_posting_lines(&plan.posting_lines, &trx_line_ids)?;
+        bulk_write::apply_pool_state_mutations(&layer_muts, slice)?;
+
+        for req in &plan.posting_lines {
+            posting_tlid.push(slice[req.trx_line_idx]);
+            flat_postings.push(req.clone());
+        }
     }
+    bulk_write::insert_posting_lines_batch(&posting_tlid, &flat_postings)?;
 
     // Collapsed aggregate per touched pool, read from the post-pass snapshot.
     let agg_muts: Vec<PoolStateMutation> = agg_pools
