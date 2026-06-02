@@ -55,8 +55,8 @@ clean_seed() {
     --seed-depth 0 --no-sampler --output "${RESULTS_DIR}/.apply-spans-seed.json" >/dev/null
 }
 
-spans() {  # read cumulative span counters -> breakdown
-  local pipe lock hyd app txn grp trx
+spans() {  # read cumulative span counters -> breakdown (+ acct-e95d prep refold)
+  local pipe lock hyd app txn grp trx dec xct ddp
   pipe="$(psql_v3 'SELECT ledger_routed_c_committer_pipeline_ns_total()')"
   lock="$(psql_v3 'SELECT ledger_routed_c_committer_pool_lock_ns_total()')"
   hyd="$(psql_v3 'SELECT ledger_routed_c_committer_hydrate_ns_total()')"
@@ -64,22 +64,32 @@ spans() {  # read cumulative span counters -> breakdown
   txn="$(psql_v3 'SELECT ledger_routed_c_committer_txn_ns_total()')"
   grp="$(psql_v3 'SELECT ledger_routed_c_committer_pipeline_count()')"
   trx="$(psql_v3 'SELECT ledger_routed_c_committer_trx_committed_total()')"
-  python3 - "$pipe" "$lock" "$hyd" "$app" "$txn" "$grp" "$trx" "$OUT" <<'PY'
+  dec="$(psql_v3 'SELECT ledger_routed_c_committer_decode_ns_total()')"
+  xct="$(psql_v3 'SELECT ledger_routed_c_committer_xact_ns_total()')"
+  ddp="$(psql_v3 'SELECT ledger_routed_c_committer_dedup_ns_total()')"
+  python3 - "$pipe" "$lock" "$hyd" "$app" "$txn" "$grp" "$trx" "$dec" "$xct" "$ddp" "$OUT" <<'PY'
 import sys
-pipe,lock,hyd,app,txn,grp,trx = (int(x) for x in sys.argv[1:8])
-out = sys.argv[8]
+pipe,lock,hyd,app,txn,grp,trx,dec,xct,ddp = (int(x) for x in sys.argv[1:11])
+out = sys.argv[11]
 prep = pipe - (lock + hyd + app)
 fsync = txn - pipe
+prep_other = prep - (dec + xct + ddp)
 tot = txn if txn else 1
+g = grp if grp else 1
+t = trx if trx else 1
 def pct(x): return 100.0*x/tot
+def us(x): return (x/1e3)/t          # us per committed trx
 rows = [("prep",prep),("apply",app),("fsync",fsync),("hydrate",hyd),("pool_lock",lock)]
-print(f"groups={grp} trx={trx} trx_per_group={trx/grp:.1f}" if grp else "no groups")
-print(f"{'span':<10} {'seconds':>10} {'%txn':>8}")
-for n,v in rows: print(f"{n:<10} {v/1e9:>10.2f} {pct(v):>7.1f}%")
+sub  = [("prep.decode",dec),("prep.xact",xct),("prep.dedup",ddp),("prep.other",prep_other)]
+print(f"groups={grp} trx={trx} trx_per_group={trx/g:.1f}")
+print(f"{'span':<12} {'seconds':>10} {'%txn':>8} {'us/trx':>9}")
+for n,v in rows: print(f"{n:<12} {v/1e9:>10.2f} {pct(v):>7.1f}% {us(v):>8.2f}")
+print("  -- prep refold (acct-e95d) --")
+for n,v in sub:  print(f"{n:<12} {v/1e9:>10.2f} {pct(v):>7.1f}% {us(v):>8.2f}")
 with open(out,"w") as f:
-    f.write("span,seconds,pct_txn\n")
-    f.write(f"_meta,groups={grp};trx={trx};trx_per_group={trx/grp:.2f}\n" if grp else "_meta,nogroups\n")
-    for n,v in rows: f.write(f"{n},{v/1e9:.3f},{pct(v):.2f}\n")
+    f.write("span,seconds,pct_txn,us_per_trx\n")
+    f.write(f"_meta,groups={grp};trx={trx};trx_per_group={trx/g:.2f}\n" if grp else "_meta,nogroups\n")
+    for n,v in rows+sub: f.write(f"{n},{v/1e9:.3f},{pct(v):.2f},{us(v):.3f}\n")
 PY
 }
 

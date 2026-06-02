@@ -351,7 +351,8 @@ fn process_commit_group(cq_idx: u32, _cg_id: u64) -> ProcessOutcome {
 fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
     let staging_indices = read_staging_indices(cq_idx);
 
-    // Step 3: decode submissions from arena.
+    // Step 3: decode submissions from arena. (acct-e95d prep refold: decode span.)
+    let t_decode0 = now_ns();
     let decoded = match decode_submissions(&staging_indices) {
         Ok(d) => d,
         Err(e) => {
@@ -361,8 +362,13 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
             };
         }
     };
+    COMMITTER_QUEUE
+        .share()
+        .committer_decode_ns_total
+        .fetch_add(now_ns().saturating_sub(t_decode0), Relaxed);
 
-    // Step 4: pg_xact_status triage + eject.
+    // Step 4: pg_xact_status triage + eject. (acct-e95d prep refold: xact span.)
+    let t_xact0 = now_ns();
     let kept = match classify_and_eject(&decoded) {
         Ok(k) => k,
         Err(e) => {
@@ -372,11 +378,16 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
             };
         }
     };
+    COMMITTER_QUEUE
+        .share()
+        .committer_xact_ns_total
+        .fetch_add(now_ns().saturating_sub(t_xact0), Relaxed);
     if kept.is_empty() {
         return ProcessOutcome::AllEjected { staging_indices };
     }
 
-    // Step 5: pre-flight dedup against trx + within-batch.
+    // Step 5: pre-flight dedup against trx + within-batch. (acct-e95d: dedup span.)
+    let t_dedup0 = now_ns();
     let (kept, dedup_skips) = match dedup_against_trx(kept) {
         Ok(p) => p,
         Err(e) => {
@@ -386,6 +397,10 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
             };
         }
     };
+    COMMITTER_QUEUE
+        .share()
+        .committer_dedup_ns_total
+        .fetch_add(now_ns().saturating_sub(t_dedup0), Relaxed);
     if dedup_skips > 0 {
         COMMITTER_QUEUE
             .share()
@@ -404,6 +419,7 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
     // Step 6: pre-decode lines (pure — no DB). Malformed submissions are dropped
     // here (consistent with drop-and-continue) and counted once, before the
     // retry loop, so a retry never re-pays the decode.
+    let t_decode1 = now_ns();
     let mut prepared: Vec<Prepared> = Vec::with_capacity(kept.len());
     let mut predrop: u64 = 0;
     for d in &kept {
@@ -419,6 +435,10 @@ fn process_commit_group_inner(cq_idx: u32) -> ProcessOutcome {
             _ => predrop += 1,
         }
     }
+    COMMITTER_QUEUE
+        .share()
+        .committer_decode_ns_total
+        .fetch_add(now_ns().saturating_sub(t_decode1), Relaxed);
     if prepared.is_empty() {
         if predrop > 0 {
             COMMITTER_QUEUE

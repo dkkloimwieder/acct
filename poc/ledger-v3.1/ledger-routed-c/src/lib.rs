@@ -537,6 +537,28 @@ fn ledger_routed_c_committer_txn_ns_total() -> i64 {
     COMMITTER_QUEUE.share().committer_txn_ns_total.load(Relaxed) as i64
 }
 
+// Prep-span refold (acct-e95d). Split the "prep" residual
+// (pipeline − pool_lock − hydrate − apply) into its components so the prep floor
+// is targeted from a measured breakdown. decode = payload + line decode (Rust,
+// per-trx/line); xact = pg_xact_status triage SPI (per group); dedup = dedup
+// SELECT against trx (per group). prep − (decode + xact + dedup) = staging-index
+// read + subtx/retry framing.
+
+#[pg_extern]
+fn ledger_routed_c_committer_decode_ns_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_decode_ns_total.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_xact_ns_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_xact_ns_total.load(Relaxed) as i64
+}
+
+#[pg_extern]
+fn ledger_routed_c_committer_dedup_ns_total() -> i64 {
+    COMMITTER_QUEUE.share().committer_dedup_ns_total.load(Relaxed) as i64
+}
+
 // ── Smoke entry point ───────────────────────────────────────────────
 
 #[pg_extern]

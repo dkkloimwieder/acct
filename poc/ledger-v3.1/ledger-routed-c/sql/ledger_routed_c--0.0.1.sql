@@ -122,6 +122,24 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_deadlock_retries_total_wrapper'
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:547
+-- ledger_routed_c::ledger_routed_c_committer_decode_ns_total
+CREATE  FUNCTION "ledger_routed_c_committer_decode_ns_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_decode_ns_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:557
+-- ledger_routed_c::ledger_routed_c_committer_dedup_ns_total
+CREATE  FUNCTION "ledger_routed_c_committer_dedup_ns_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_dedup_ns_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- ledger-routed-c/src/lib.rs:393
 -- ledger_routed_c::ledger_routed_c_committer_dedup_skips_total
 CREATE  FUNCTION "ledger_routed_c_committer_dedup_skips_total"() RETURNS bigint /* i64 */
@@ -260,7 +278,16 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_txn_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:542
+-- ledger-routed-c/src/lib.rs:552
+-- ledger_routed_c::ledger_routed_c_committer_xact_ns_total
+CREATE  FUNCTION "ledger_routed_c_committer_xact_ns_total"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_xact_ns_total_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:564
 -- ledger_routed_c::ledger_routed_c_hello
 CREATE  FUNCTION "ledger_routed_c_hello"() RETURNS TEXT /* String */
 STRICT

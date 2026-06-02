@@ -285,6 +285,16 @@ pub struct CommitterQueue {
     /// commit/fsync cost; `committer_pipeline_ns_total − (pool_lock + hydrate +
     /// apply)` isolates decode + triage + dedup + line-decode (the "prep" span).
     pub committer_txn_ns_total: AtomicU64,
+    /// Prep-span refold (acct-e95d). The "prep" residual above lumps four costs;
+    /// these split it so the prep floor is targeted from a measured breakdown, not
+    /// guessed. `decode` = `decode_submissions` + `decode_lines` (Rust payload /
+    /// line decode, scales per-trx/per-line); `xact` = `classify_and_eject` (one
+    /// `pg_xact_status` SPI query per group); `dedup` = `dedup_against_trx` (one
+    /// dedup SELECT per group). prep − (decode + xact + dedup) = staging-index read
+    /// + subtx/retry framing. Cumulative ns since load; sample as deltas.
+    pub committer_decode_ns_total: AtomicU64,
+    pub committer_xact_ns_total: AtomicU64,
+    pub committer_dedup_ns_total: AtomicU64,
     // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE] claim-path engagement
     // counters. owned = a committer claimed a group it owns; steals = a
     // committer claimed a non-owned group after it aged past affinity_steal_ms.
