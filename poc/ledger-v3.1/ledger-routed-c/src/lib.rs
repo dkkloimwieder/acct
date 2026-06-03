@@ -494,6 +494,31 @@ fn ledger_routed_c_router_window_defers_total() -> i64 {
     COMMITTER_QUEUE.share().router_window_defers_total.load(Relaxed) as i64
 }
 
+/// High-water mark: the largest submission count any single CommitGroup reached
+/// since cluster start. With batch_size_max held non-binding, this is the
+/// time-window-only formation's worst-case group size — the tell for whether a
+/// pure time gate can form an unbounded group under an arrival spike.
+#[pg_extern]
+fn ledger_routed_c_router_max_group_size() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .router_max_submission_count_per_group
+        .load(Relaxed) as i64
+}
+
+/// Log2-spaced CommitGroup-size histogram as 8 comma-joined bucket counts:
+/// [1],[2-3],[4-7],[8-15],[16-31],[32-63],[64-127],[128+]. Exposes the group-size
+/// DISTRIBUTION (not just the mean) — the tail a balance window must bound.
+#[pg_extern]
+fn ledger_routed_c_router_submission_histogram() -> String {
+    let q = COMMITTER_QUEUE.share();
+    let mut parts = Vec::with_capacity(8);
+    for b in 0..8 {
+        parts.push(q.router_submission_histogram[b].load(Relaxed).to_string());
+    }
+    parts.join(",")
+}
+
 /// Cumulative committer apply-pipeline wall time (ns) and the count of groups it
 /// covers. The ratio is mean per-group committer work; multiplied by groups/s
 /// and divided by committer_count it gives committer pool utilization — the
