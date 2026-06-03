@@ -60,10 +60,10 @@ reload() { docker exec "$CONTAINER" psql -U acct -d postgres -tAc "SELECT pg_rel
 # postmaster restart; the SIGHUP ones reload immediately).
 restore_gucs() {
     asys committer_count 4 2>/dev/null || true
-    asys batch_size_max 50 2>/dev/null || true
+    asys batch_size_max 200 2>/dev/null || true
     asys batch_window_us 500 2>/dev/null || true
     asys affinity_scheme 0 2>/dev/null || true
-    asys router_pack_disjoint off 2>/dev/null || true
+    asys router_pack_disjoint on 2>/dev/null || true
     reload 2>/dev/null || true
 }
 trap restore_gucs EXIT

@@ -1493,4 +1493,63 @@ mod tests {
         assert_eq!(bins[0][0].request_seq, 1);
         assert_eq!(bins[1][0].request_seq, 2);
     }
+
+    /// Document atomicity (acct-p1al Phase 2 invariant): pack_disjoint_components
+    /// moves whole Candidates only. A submission is one Candidate carrying all its
+    /// lines in one staging entry (payload.rs encode_submission, line_count u32),
+    /// so packing can never split a submission across commit_groups, drop one, or
+    /// duplicate one. The output must be an exact partition of the input by
+    /// staging_idx: every submission lands in exactly one bin, exactly once.
+    #[test]
+    fn pack_preserves_document_atomicity_exact_partition() {
+        let input = vec![
+            vec![cand(0, 1, vec![10, 11, 12])], // multi-line (multi-pool) submission
+            vec![cand(1, 2, vec![20])],
+            vec![cand(2, 3, vec![30])],
+            vec![cand(3, 4, vec![40])],
+            vec![cand(4, 5, vec![50])],
+        ];
+        let input_idxs: HashSet<u32> = input.iter().flatten().map(|c| c.staging_idx).collect();
+        let bins = pack_disjoint_components(input, 3);
+
+        let mut seen: HashSet<u32> = HashSet::new();
+        for bin in &bins {
+            assert!(bin.len() <= 3, "bin exceeded document cap: {}", bin.len());
+            for c in bin {
+                assert!(
+                    seen.insert(c.staging_idx),
+                    "submission {} split or duplicated across bins",
+                    c.staging_idx
+                );
+            }
+        }
+        assert_eq!(seen, input_idxs, "packing dropped or invented a submission");
+    }
+
+    /// The cap counts DOCUMENTS, never lines: a submission touching many pools
+    /// (a fat multi-line document) occupies exactly one slot toward batch_size_max
+    /// and is never broken up to fit.
+    #[test]
+    fn pack_caps_by_document_not_by_line_count() {
+        let fat: Vec<i64> = (0..100).collect(); // one document, 100 pools/lines
+        let bins = pack_disjoint_components(
+            vec![
+                vec![cand(0, 1, fat)],
+                vec![cand(1, 2, vec![200])],
+                vec![cand(2, 3, vec![201])],
+            ],
+            2,
+        );
+        for bin in &bins {
+            assert!(bin.len() <= 2, "document cap counted lines, not documents: {}", bin.len());
+        }
+        let fat_members: Vec<&Candidate> =
+            bins.iter().flatten().filter(|c| c.staging_idx == 0).collect();
+        assert_eq!(fat_members.len(), 1, "fat submission split or duplicated");
+        assert_eq!(
+            fat_members[0].pool_keys.len(),
+            100,
+            "fat submission lost lines/pools during packing"
+        );
+    }
 }

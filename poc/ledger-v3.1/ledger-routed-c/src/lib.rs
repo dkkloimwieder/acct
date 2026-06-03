@@ -50,13 +50,13 @@ static COMMITTER_QUEUE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(2048);
 static SPILLOVER_ARENA_MB: GucSetting<i32> = GucSetting::<i32>::new(128);
 static QUEUE_FULL_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
 static ROUTER_WINDOW_SIZE: GucSetting<i32> = GucSetting::<i32>::new(1000);
-static BATCH_SIZE_MAX: GucSetting<i32> = GucSetting::<i32>::new(50);
+static BATCH_SIZE_MAX: GucSetting<i32> = GucSetting::<i32>::new(200);
 static BATCH_WINDOW_US: GucSetting<i32> = GucSetting::<i32>::new(500);
 static MAX_EJECT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(10_000);
 static CALLER_TX_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 static COMMITTER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
 static EJECT_COOLDOWN_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
-static ROUTER_PACK_DISJOINT: GucSetting<bool> = GucSetting::<bool>::new(false);
+static ROUTER_PACK_DISJOINT: GucSetting<bool> = GucSetting::<bool>::new(true);
 // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
 static AFFINITY_SCHEME: GucSetting<i32> = GucSetting::<i32>::new(0);
 static AFFINITY_STEAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
@@ -262,7 +262,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_bool_guc(
         c"ledger_routed_c.router_pack_disjoint",
         c"Pack disjoint pool-components into one commit_group",
-        c"When on, the router greedily bin-packs disjoint affinity components (no shared pool_id) into a single commit_group up to batch_size_max, amortizing per-group commit/fsync on spread/Pareto workloads where same-pool coalescing alone leaves commit_groups small. Safe by construction: disjoint pools share no row lock, so one committer takes them sequentially without cross-pool FOR UPDATE contention. Off preserves one-commit_group-per-component.",
+        c"Production default: on. When on, the router greedily bin-packs disjoint affinity components (no shared pool_id) into a single commit_group up to batch_size_max, amortizing per-group commit/fsync on spread/Pareto workloads where same-pool coalescing alone leaves commit_groups small. Safe by construction: disjoint pools share no row lock, so one committer takes them sequentially without cross-pool FOR UPDATE contention; packing only co-locates DISJOINT pools, so each pool still takes one pool_lock + one aggregate UPSERT — no new same-pool contention. acct-p1al measured it win-or-neutral across spread (2x), deep-zipf (+170%), mixed (neutral) and single-hot-pool (inert). Off preserves one-commit_group-per-component.",
         &ROUTER_PACK_DISJOINT,
         GucContext::Sighup,
         GucFlags::empty(),
