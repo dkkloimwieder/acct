@@ -49,6 +49,12 @@ pub struct RunOptions {
     /// residual throughput is the downstream drain ceiling. 1 = the production
     /// single-push path (unchanged).
     pub batch_size: usize,
+    /// Total offered rate (trx/s) to pace the caller pool at, split evenly
+    /// across callers (staggered absolute-schedule interval pacing). A caller
+    /// that falls behind (enqueue blocked on staging backpressure) sheds debt
+    /// rather than burst-catching-up, so achieved rate degrades gracefully past
+    /// saturation. None/0 = full-blast open-loop (original behavior).
+    pub target_rate: Option<u64>,
     /// Hard cap on the post-callers observer + drain wait.
     pub drain_deadline: Duration,
     /// Multi-touch overlay (acct-34ce); None leaves the scenario's own setting.
@@ -128,13 +134,34 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
             "[run] routed caller-batch probe (acct-ruex): {batch_size} envelopes/push via ledger_enqueue_trx_batch_c"
         );
     }
+    // Pacing: one push submits batch_size trx, so the per-caller push interval
+    // for a total offered rate R across C callers is C*batch_size/R seconds.
+    // Starts are staggered across one interval so the pool's pushes spread
+    // evenly instead of firing in lockstep bursts.
+    let pace_interval = match opts.target_rate {
+        Some(r) if r > 0 => {
+            let iv = Duration::from_secs_f64(
+                spec.callers as f64 * batch_size as f64 / r as f64,
+            );
+            eprintln!(
+                "[run] paced open-loop: target_rate={r} trx/s ({} callers, {batch_size}/push, interval {:?}/caller)",
+                spec.callers, iv
+            );
+            Some(iv)
+        }
+        _ => None,
+    };
     let mut handles = Vec::with_capacity(spec.callers);
     for caller_id in 0..spec.callers {
         let pool = pool.clone();
         let workload = workload.clone();
         let barrier = barrier.clone();
+        let pace = pace_interval.map(|iv| {
+            (iv, iv.mul_f64(caller_id as f64 / spec.callers as f64))
+        });
         handles.push(tokio::spawn(async move {
-            caller_loop(pool, workload, barrier, caller_id, prefix, deadline, batch_size).await
+            caller_loop(pool, workload, barrier, caller_id, prefix, deadline, batch_size, pace)
+                .await
         }));
     }
 
@@ -303,6 +330,7 @@ async fn caller_loop(
     run_prefix: i64,
     deadline: Instant,
     batch_size: usize,
+    pace: Option<(Duration, Duration)>, // (interval, initial stagger offset)
 ) -> (LatencyHistogram, Vec<SubmissionMark>, u64) {
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
     let mut ack_hist = LatencyHistogram::new();
@@ -314,7 +342,23 @@ async fn caller_loop(
 
     barrier.wait().await;
 
+    // Absolute-schedule pacing: fire at stagger, stagger+iv, stagger+2iv, …
+    // measured from barrier release. When a push overruns its slot (enqueue
+    // blocked on staging backpressure), the schedule resets to now — debt is
+    // shed, not burst-repaid — so past saturation the caller degrades to
+    // closed-loop and the achieved rate honestly falls below the offered rate.
+    let mut next_fire = pace.map(|(_, offset)| tokio::time::Instant::now() + offset);
+
     while Instant::now() < deadline {
+        if let (Some((interval, _)), Some(nf)) = (pace, next_fire.as_mut()) {
+            let now = tokio::time::Instant::now();
+            if *nf > now {
+                tokio::time::sleep_until(*nf).await;
+            } else {
+                *nf = now;
+            }
+            *nf += interval;
+        }
         if batch_n == 1 {
             // Production single-push path (unchanged): one trx, one
             // ledger_enqueue_trx_c, one staging-lock acquisition.

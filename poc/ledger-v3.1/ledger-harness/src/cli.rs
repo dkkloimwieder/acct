@@ -81,6 +81,15 @@ pub enum Cmd {
         /// the other modes.
         #[arg(long, default_value_t = 50)]
         batch_size: usize,
+        /// Pace the routed caller pool to this total offered rate (trx/s),
+        /// split evenly across callers with staggered absolute-schedule
+        /// interval pacing. Callers that fall behind (enqueue blocked on
+        /// staging backpressure) shed debt rather than burst-catch-up, so
+        /// achieved rate degrades gracefully past saturation; offered vs
+        /// achieved are both observable. Unset/0 = full-blast open-loop (the
+        /// original behavior). Routed mode only.
+        #[arg(long)]
+        target_rate: Option<u64>,
         /// The pool depth the universe was seeded to (informational; recorded
         /// in the report so the §11.2 lock-hold-vs-depth sweep can label runs).
         /// Establish the depth itself with `seed-pools --depth`.
