@@ -40,6 +40,7 @@ COMMITTER_COUNT="${COMMITTER_COUNT:-1}"
 BATCH_SIZE_MAX="${BATCH_SIZE_MAX:-200}"
 BATCH_WINDOW_US="${BATCH_WINDOW_US:-20000}"
 AFFINITY="${AFFINITY:-0}"
+PACK_DISJOINT="${PACK_DISJOINT:-off}"   # router_pack_disjoint (acct-xdwk) — on|off
 STAMP="${STAMP:-sustained}"
 OUT="${OUT:-${RESULTS_DIR}/sustained_${SCEN}.json}"
 SAMPLES="${RESULTS_DIR}/sustained_${SCEN}_rate.samples"
@@ -62,6 +63,7 @@ restore_gucs() {
     asys batch_size_max 50 2>/dev/null || true
     asys batch_window_us 500 2>/dev/null || true
     asys affinity_scheme 0 2>/dev/null || true
+    asys router_pack_disjoint off 2>/dev/null || true
     reload 2>/dev/null || true
 }
 trap restore_gucs EXIT
@@ -133,16 +135,17 @@ committer_ready() {
 
 build_harness
 log "=== sustained ${DUR}s routed run: scenario=$SCEN method=$METHOD callers=$MAX_CALLERS via pgbouncer ==="
-log "    config: committer_count=$COMMITTER_COUNT batch_size_max=$BATCH_SIZE_MAX batch_window_us=$BATCH_WINDOW_US affinity=$AFFINITY (e95d apply-span baseline)"
+log "    config: committer_count=$COMMITTER_COUNT batch_size_max=$BATCH_SIZE_MAX batch_window_us=$BATCH_WINDOW_US affinity=$AFFINITY pack_disjoint=$PACK_DISJOINT (e95d apply-span baseline)"
 psql "$POOLER_DSN" -c 'SELECT 1' >/dev/null 2>&1 || { log "pgbouncer :6432 not reachable — run setup-pgbouncer.sh"; exit 1; }
 # Set the GUCs BEFORE clean_seed: its restart applies committer_count (read at
 # _PG_init) and the SIGHUP knobs together.
 asys committer_count "$COMMITTER_COUNT"; asys batch_size_max "$BATCH_SIZE_MAX"
-asys batch_window_us "$BATCH_WINDOW_US"; asys affinity_scheme "$AFFINITY"; reload
+asys batch_window_us "$BATCH_WINDOW_US"; asys affinity_scheme "$AFFINITY"
+asys router_pack_disjoint "$PACK_DISJOINT"; reload
 clean_seed
 committer_ready || true
 
-GUCS="$(psql_v3 "SELECT string_agg(replace(name,'ledger_routed_c.','')||'='||setting, ',' ORDER BY name) FROM pg_settings WHERE name IN ('ledger_routed_c.committer_count','ledger_routed_c.batch_size_max','ledger_routed_c.batch_window_us','ledger_routed_c.affinity_scheme')")"
+GUCS="$(psql_v3 "SELECT string_agg(replace(name,'ledger_routed_c.','')||'='||setting, ',' ORDER BY name) FROM pg_settings WHERE name IN ('ledger_routed_c.committer_count','ledger_routed_c.batch_size_max','ledger_routed_c.batch_window_us','ledger_routed_c.affinity_scheme','ledger_routed_c.router_pack_disjoint')")"
 log "GUCs: $GUCS"
 
 wait_for_quiet_host || log "NOTE: starting on a busy host (load1=$(host_load1))"
