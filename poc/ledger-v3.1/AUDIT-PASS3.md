@@ -646,7 +646,179 @@ as epic children; nothing here disturbs any shipped measurement (every P2 sits b
 precondition no bench run arms: open caller txns at triage, standard-basis pools, SPI failure,
 or committer ERROR-exit).
 
-## C-i. coverage map + gap classification (acct-mvq4.5 — pending)
+## C-i. coverage map + gap classification (acct-mvq4.5 — 2026-06-06)
+
+**Method.** Static census only — no cluster contact, no GUC changes (the suite RUN is C-ii).
+Every `.rs` file in all 5 crates censused with annotation-aware patterns (`#[ignore` open-bracket
+for the string-reason form; `#[tokio::test` counted separately from plain `#[test]`;
+`proptest!` blocks expanded by reading). **Population: 193 test fns** — 150 offline units
+(ledger-core 38 + spi-common 2 + routed-c src-inline 71 + harness src-inline 39), 3 `#[pg_test]`
+(routed ×2, direct ×1), 40 `#[ignore]` integration (direct-c 14 + routed-c 24 + harness smokes 2).
+Dedup honored: gap rows cite `acct-uwsp`, `acct-mvq4.22/.25/.28/.29/.30/.31/.35` where those
+issues already carry the coverage implication; only NEW untested surfaces earn C# findings.
+
+### C-i.0 Census corrections (pinning exact counts; §0.6-style)
+
+1. **routed-c integration tests are `#[tokio::test]`-style too** — §0.6 correction 6's second
+   clause ("routed-c integration tests are plain `#[test]`") is itself wrong. ALL `tests/`-dir
+   integration tests in the three test-bearing crates are tokio-style; routed-c's plain-`#[test]`
+   population is entirely src-inline. (§0.3's class-(b) *counts* were nonetheless correct.)
+2. **harness carries 39 src-inline pure units** across 7 files (driver_common 1, driver_routed 2,
+   measure 3, pool_universe 2, report 4, scenarios 9, workload 18) — counted by NO class of the
+   §0.3 matrix as written: class (a) omits `-p ledger-harness`; class (d)'s `-- --ignored` runs
+   only the 2 smokes. Matrix correction in C-i.3.
+3. Exact src-inline counts (correcting B-ii prose approximations): router **34** (not ~30:
+   affinity_group ×7, union_find ×3, cooldown ×5, histogram ×1, restamp ×4, revert_orphan ×5,
+   pack ×9), cleanup **8** (not 9), payload **7** = 6 plain + 1 proptest property
+   (`round_trip_property`, 64 cases — the workspace's only proptest site), arena 11 ✓,
+   enqueue 6 ✓, committer 5 ✓.
+4. `#[ignore]` reason census (40): `"needs running poc_v3_1 with ledger_direct_c installed"` ×15
+   (direct-c 14 + smoke_measure), `"…with ledger_routed_c (test_hooks) preloaded"` ×19,
+   `"…with ledger_routed_c preloaded"` ×5, bare `"needs running poc_v3_1"` ×1 (smoke_sampler).
+5. ledger-core declares `proptest` as a dev-dependency but contains no proptest usage → .7.
+
+### C-i.1 Coverage map
+
+**(a) SPI / entry-point surface** (rows per the §0.2 enumeration; getter/hook families grouped):
+
+| Entry point | Units | Integration (`#[ignore]`) | pg_test | Property | Smoke / bench | Verdict |
+|---|---|---|---|---|---|---|
+| `ledger_submit_trx_c` | full plan/apply logic via ledger-core 38 (the SPI shell itself has none) | acceptance_direct_methods ×10 + acceptance_direct_lock_and_concurrency ×3 | — | `invariants_hold_across_random_submissions`; + baseline leg of all 3 routed properties | smoke_measure (~50 receipts); equivalence subcommand | **COVERED** — best-covered surface in the workspace |
+| `ledger_enqueue_trx_c` | helpers only (enqueue 6: pack_pool_ids ×4, trx_type_to_id ×2 — the push loop is integration-covered) | all 4 routed acceptance binaries (21 tests) drive it | — | ×3 (`routed_aggregate_qty_equivalent…`, `…replay_deterministic`, `…unit_cost_is_value_weighted`) | every routed bench | **COVERED** |
+| `ledger_enqueue_trx_batch_c` | none (batch loop, deadline remainder-free, per-chunk lock cycling all untested) | **none** | — | **none** | harness `--batch-size>1` arm + run-1sku-batched.sh / run-caller-batch-probe.sh | **SUITE-DARK → C1** |
+| `staging_state_counts` / `staging_request_seq_max` | — | consumed by routed acceptance (2 / 1 refs) | — | — | bench | covered-as-observability |
+| `committer_queue_state_counts` / `ready_commit_groups` | — | consumed by routed acceptance (1 / 2 refs) | — | — | — | covered-as-observability |
+| lib.rs getter family ×36 | — | committer counters polled via `await_committer_stat` + `arena_outstanding` + `recovery_complete` | — | property tests poll counters | measure.rs consumes 25+ (counters + spans) | covered-as-family; the 9 Q14 fields have NO getter (`acct-mvq4.35`) |
+| test_hooks ×10 | — | 9/10 consumed by the acceptance suite (common/mod.rs) | — | — | — | test infra; `test_router_pid` has ZERO consumers → .7 zero-ref disposition |
+| `bench_apply` (bench_hooks) | — | — | — | — | bench-apply-inproc.sh only | bench infra by design → .7 |
+| hellos | — | — | direct ×1 (`hello_pg_extern_reachable`); routed ×2 (+ `shmem_regions_visible`) | — | — | covered |
+
+**(b) Per-module rows** (test-kind → file:test-name or none; indirect = exercised through a
+higher-layer suite):
+
+*ledger-core (12 src + 2 tests-dir files):*
+
+| Module | Coverage | Cell |
+|---|---|---|
+| lib.rs | n/a | module map / re-exports |
+| error.rs | indirect | every variant raised across strict/provisional tests; consumer map compile-enforced (B-i.3) |
+| method.rs | tests-dir | plan_apply_strict ×17 (dispatch incl. `unknown_pool_raises`, `aggregate_only_for_wac_and_std`) |
+| fifo.rs / lifo.rs | tests-dir | `strict_fifo_returns_method_mismatch` / `strict_lifo_returns_method_mismatch` |
+| numeric.rs | **11 src units** | banker_div full §3.0 case table incl. i128-limit + `wac_formula_overflow_regression_needs_i128` |
+| plan.rs | tests-dir | coalesce ×2 (provisional) + LineType bijectivity via spi-common decode tests |
+| snapshot.rs | indirect | exercised by all 27 plan_apply tests (pure data + resolve fns; no in-file units — fine) |
+| wac.rs | tests-dir | strict wac ×5 + provisional running-avg ×2; over-book deplete shape untested → gap row 10 (`acct-mvq4.22`) |
+| standard.rs | tests-dir | strict std ×5 incl. favorable flip + equal-cost-no-leg |
+| specific.rs | tests-dir + integration | strict ×3 + `specific_receipt_then_depletion_materializes_and_links` / `specific_second_receipt_rejected_while_stocked` |
+| provisional.rs | tests-dir | plan_apply_provisional ×10 (both bases, NULL source-link, dispatch-to-strict) |
+
+*ledger-spi-common (5):*
+
+| Module | Coverage | Cell |
+|---|---|---|
+| lib.rs | n/a | — |
+| line_type.rs | **2 src units** | decoder bijectivity (9/9 + unknown→None) |
+| pool_lock.rs / hydration.rs / bulk_write.rs | indirect only | ZERO direct tests (SPI-bound; not unit-testable outside PG). Covered via BOTH flavors' acceptance suites — single-sourced post-yojk.2, so the direct path exercises the per-submission variants and the routed path the batch variants (8.1b/8.2b/8.4b). Adequate; noted, not a finding |
+
+*ledger-direct-c (3):*
+
+| Module | Coverage | Cell |
+|---|---|---|
+| lib.rs | pg_test ×1 | `hello_pg_extern_reachable` |
+| ledger_error_map.rs | indirect | 4 of 8 SQLSTATE arms raised through the SPI shell (`std_without_standard_cost_raises`, `missing_posting_account_map_raises`, `insufficient_inventory_raises_and_rolls_back`, `specific_second_receipt_rejected_while_stocked`); MethodMismatch / UnknownPool / MissingVarianceAccount / Overflow raised only in core units, never through SQL. Map is mechanical + compile-enforced (B-i.3) — acceptable |
+| submit.rs | integration | 13 acceptance + 1 property (14 `#[ignore]`) |
+
+*ledger-routed-c (11):*
+
+| Module | Coverage | Cell |
+|---|---|---|
+| lib.rs | pg_test ×2 | hello + `shmem_regions_visible`; getters via harness/tests (map (a)) |
+| shmem.rs | pg_test + indirect | structure via `shmem_regions_visible` + every integration transitively; `now_us`/`now_ns` clamps and CV 3-state init have no direct unit (micro) |
+| enqueue.rs | **6 src units** + integration | helpers unit-tested; push path via acceptance_routed_enqueue ×5 + everything transitively; backpressure FAILURE arms test-dark → **C2** |
+| router.rs | **34 src units** + integration | grouping/cooldown/restamp/revert/pack fully unit-pinned; live via acceptance_routed_affinity_grouping ×4 + boot sweep |
+| committer.rs | **5 src units** + integration | decode/parse_caller_status/identity-TL units; pipeline via acceptance_routed_committer ×8 + orphan ×3 (deadlock retry, fatal poison, recovery-op) |
+| arena.rs | **11 src units** + integration | incl. corrupted-cycle termination + stress; live reclaim via `committed_group_reclaims_all_arena_blocks` |
+| payload.rs | **6 + 1 property@64** | round-trip, tamper, OOB, error-path frees (`outstanding == 0` pinned — yojk.5) |
+| cleanup.rs | **8 src units** + indirect | all 3 CAS cases + eject-blocks + cg-mismatch + idempotence; live on every committed group |
+| identity.rs | indirect only | dead-pid (ESRCH) reclaim via synthetic orphan acceptance + `takeover_count`; EPERM-alive arm and 64-slot-exhaustion panic untested (micro — folded into gap row 1) |
+| recovery.rs | integration | `recovery_complete_at_boot_and_system_operational` |
+| affinity.rs | **none** | zero tests (default-off EXPERIMENTAL, acct-0usf). NOTE: acceptance_routed_affinity_grouping tests the ROUTER's union-find grouping, not this module — name collision. Disposition .7 / `acct-m4g5` |
+
+*ledger-harness (15 src + 2 smokes):*
+
+| Module | Coverage | Cell |
+|---|---|---|
+| cli.rs / main.rs | none | clap glue; parse exercised by every bench invocation — (iii) |
+| driver_common.rs | 1 src unit | `build_lines_json_shape_matches_spi_contract` |
+| driver_direct.rs | **none** | incl. the batched arm — POC-REPORT (b)'s measurement path; honesty gap already filed (`acct-mvq4.25`); gap row 18 |
+| driver_routed.rs | 2 src units | `derive_report_*` (pure math); pacer/observer logic bench-validated only |
+| equivalence.rs | none | self-checking subcommand (model quiescence assert per B-i.4); IS itself the §11.1 checker |
+| measure.rs | 3 src units + smoke | histograms + WAL math; `collector_captures_nonzero_deltas` (self-seeding: TRUNCATE + minimal fixture) |
+| sampler.rs | smoke only | `sampler_captures_ticks` |
+| pool_universe.rs | 2 src units | deterministic Mixed 50/30/20 + enum-text map |
+| report.rs | 4 src units | percentiles, wait-event sort, path shape, JSON round-trip |
+| scenarios.rs | 9 src units | incl. `by_id_resolves_all_canned_scenarios` (×21) + family-shape pins |
+| seed.rs | none | any-row idempotency heuristic noted at Q6 (`acct-mvq4.27`) |
+| workload.rs | 18 src units | distributions, multi-touch, pareto edge-clamps |
+
+### C-i.2 Untested-surface table (3-way verdicts)
+
+Verdicts: **(i)** verdict-threatening for POC-REPORT conclusions / **(ii)** production-blocking-later /
+**(iii)** nice-to-have. Rows 1–9 are the charter-listed surfaces; 10–18 are .3/.4-surfaced additions.
+
+| # | Surface | What IS tested (evidence) | Untested residue | Verdict | Cite / file |
+|---|---|---|---|---|---|
+| 1 | Staging-ring crash-recovery completeness | Synthetic orphan-CQ + boot sweep (orphan_recovery ×2); router-death restamp/revert pure helpers (9 units); dead-pid ESRCH reclaim via synthetic injection | The ERROR-exit TRIGGER (no sweep at committer respawn); EPERM-alive arm; 64-slot exhaustion; literal postmaster-crash (§9.3 bullet 6, A-dim noted "indirect") | (ii) | `acct-mvq4.31` (Q10) — no new filing |
+| 2 | Arena overflow / fragmentation | Unit-complete: `alloc_returns_none_when_arena_full`, first-fit ×2, corrupted-cycle termination, stress (11) | End-to-end exhaustion under live enqueue (ArenaFull → CV wait → deadline error); no integration fills 128 MB | (ii) | folds into **C2** |
+| 3 | Drop-and-continue under load | Mechanism: `failed_submission_excluded_via_drop_and_continue`; uniform plan-time isolation verified by read (B-ii.5b) | Sustained mixed-failure load across many concurrent groups — every long-dur bench ran 0 drops (POC-REPORT (g)) | (iii) | mechanism pinned; no headline rests on it |
+| 4 | Dedup under sustained deadlock injection | Deadlock retry alone (`deadlock_during_write_retries_then_commits`, count=2); preflight dup alone; racing-dup re-drive alone | Combined deadlock-retry × duplicate (the A9 retry-skips-re-dedup shape — safety rides UNIQUE backstop → DuplicateRace, reasoned never exercised); sustained-injection soak | (ii) | **C3** (NEW) |
+| 5 | pack_disjoint at extreme Pareto | 9 pack units (exact partition, caps, document-atomicity); measured live at zipf-1.5 hot pool (latency_vs_load s2 — the production-shaped extreme) | Adversarial synthetic extremes beyond measured shapes | (iii) | — |
+| 6 | Idempotency across BGWorker restarts | Dedup is durable-state-based (trx table); preflight + UNIQUE backstop both tested | Resubmit-after-committer-restart end-to-end (overlaps the Q10 orphan scenario) | (ii) | `acct-mvq4.31` overlap |
+| 7 | GUC SIGHUP reload mid-run | nothing | Entirely untested (benches reload between cells; router busy-loop defers SIGHUP under backlog — B-ii notes; `committer_count` Sighup-context benignity reasoned only) | (iii) | PoC scope |
+| 8 | Provisional cost-variance bound — empirical vs §3.0/§14.3 | Receipts-only unit-cost EXACTNESS (property `…unit_cost_is_value_weighted`, banker_div assert); qty equivalence (POC-REPORT (d)) | Depletion-cost drift magnitude provisional-vs-strict — spec 12-P4 explicitly excluded variance magnitude from the harness (honored as written, A-dim) | (ii) | documented-deferred (§7 recalc tier) |
+| 9 | Multi-DB | — | §13 out-of-scope; verified genuinely absent (A-dim §13 row) | N-A | — |
+| 10 | Q1 over-book standard-basis depletion (negative value_sum) | All depletion value_sum asserts are positive-residual; every harness pool seeded `running_avg` (pool_universe.rs:159) | The mutation-shape assert IS the repro test the fix will add | carried by finding | `acct-mvq4.22` |
+| 11 | Eject path under open-caller-tx load | zero ejects in every shipped result; nothing arms it | Open-tx callers racing the stamp loop (the §6.1 designed-for usage) | carried by finding | `acct-mvq4.28` (Q7) |
+| 12 | Triage SPI-failure path | — | fail-open swallow never driven | carried by finding | `acct-mvq4.30` (Q9) |
+| 13 | Data-shaped write-phase poison | Poison via `inject_fatal` only (`fatal_error_during_write_poisons_commit_group`) | A real 23514-class data error driving whole-group poison | carried by finding | `acct-mvq4.29` (Q8) |
+| 14 | Eject observability | — | `eject_total_count` + 8 siblings have no getter → SQL-level tests CANNOT assert eject counts | carried by finding | `acct-mvq4.35` (Q14) |
+| 15 | Cross-method-mixed equivalence | equivalence subcommand + properties run per-mix | mixed-method interleaving equivalence | (ii) | OPEN `acct-uwsp` — never re-file |
+| 16 | Enqueue backpressure FAILURE arms | The wait/recover arm is heavily empirically exercised (hh7b full-blast multi-second acks; zero drops at 14k offered) | Queue-full CV-timeout → `ERRCODE_INSUFFICIENT_RESOURCES` and arena-full-deadline error exits: no test drives either; no bench ever fired them (errors=0 everywhere) — the zero-drop story's error surface is test-dark | (ii) | **C2** (NEW) |
+| 17 | `ledger_enqueue_trx_batch_c` | enqueue-core shared with single-push (that part covered) | The entire batch entry point: chunk loop, deadline remainder-free, per-chunk lock cycling, partial-push return shape | (ii) | **C1** (NEW) |
+| 18 | direct-batched mode semantics | bench-measured (POC-REPORT (b)) | No acceptance test pins whole-batch-rollback semantics; conclusion direction conservative per Q4 | (iii) | `acct-mvq4.25` (Q4) |
+
+No gap classifies as **(i) verdict-threatening** — consistent with dimensions A/B: every
+POC-REPORT conclusion rests on surfaces that are either tested or measured, and every latent
+defect found so far sits behind a precondition no shipped run arms.
+
+### C-i.3 Invocation-matrix runnability (static prereq check for C-ii)
+
+| Class | Runnable as written? | Evidence | Correction for C-ii |
+|---|---|---|---|
+| (a) pure units | YES + **extend** | ledger-core is pgrx-free (serde/chrono/uuid/thiserror); spi-common default `pg18` compiles offline | run `cargo test -p ledger-core -p ledger-spi-common -p ledger-harness` — the `-p ledger-harness` addition covers the 39 src units no class ran as written. Expected: **79** tests |
+| (b) integration | YES | `scripts/run-tests.sh` discovers `^(acceptance\|property)_.*\.rs$` → exactly the 8 binaries (6 acceptance + 2 property); WITH_TEST_HOOKS install + per-binary `docker restart` + `--ignored --test-threads=1` in-script; FAIL_FAST=1 | Expected: **38** ignored (14 direct + 24 routed). Cluster-touching — the audit's only such step |
+| (c) pg_test | YES | cargo-pgrx **0.18.0** == workspace pin `=0.18.0`; `~/.pgrx/config.toml` has `pg18 = /usr/bin/pg_config` + `data-18` initialized; routed-c `pg_test` module sets `shared_preload_libraries='ledger_routed_c'` (shmem boots in the pgrx-managed instance); direct-c empty conf | **Count correction to §0.3**: `cargo pgrx test pg18` runs the src units TOO, not just hellos — expected routed-c **73** (71 units + 2 pg_test), direct-c **1**. The `tests/` binaries compile but stay skipped (`#[ignore]`) — no shared-cluster contact |
+| (d) harness smokes | YES | DSN-pinned `postgres://acct:acct_dev@localhost:5111/poc_v3_1`; smoke_measure is self-seeding (TRUNCATE + minimal fixture — state-destructive on poc_v3_1); prereq scripts exist (create-poc-v3-1-db.sh, run-migrations.sh, install-direct-c.sh) | Expected: **2**. Run after (b) or re-seed afterward — the TRUNCATE wipes any seeded universe |
+
+No class overlaps another's test population; corrected totals 79 + 38 + 74 + 2 = **193** ✓ census.
+
+### C-i.4 Findings
+
+| ID | Sev | Verdict | Finding |
+|---|---|---|---|
+| C1 | P3 | COVERAGE-gap (entry point) | **`ledger_enqueue_trx_batch_c` is suite-dark: one of the four production SPI entry points has zero test coverage of any kind.** No acceptance, property, unit, or pg_test invokes it (grep: only harness driver_routed `--batch-size>1` + run-1sku-batched.sh / run-caller-batch-probe.sh). The batch-specific logic — multi-chunk push loop, per-chunk staging-lock acquisition cycling, deadline-expiry remainder-free (arena blocks for unpushed envelopes), partial-push return contract — is verified only by reading (B-ii enqueue walk: CLEAN) and by bench behavior (acct-ruex). The shared core (`push_entry_into_queue`) is well-covered via the single-push path. Production-blocking-later: any caller adopting the batch API relies on untested seams; the deadline remainder-free path in particular is arena-leak-critical (yojk.15 class). Fix shape: extend acceptance_routed_enqueue with a batch round-trip + a deadline-partial-push case asserting `arena_outstanding` returns to 0. |
+| C2 | P3 | COVERAGE-gap (failure arms) | **Enqueue backpressure FAILURE arms are test-dark: the queue-full CV-timeout → `ERRCODE_INSUFFICIENT_RESOURCES` exit and the arena-full-deadline exit have never executed — not in any test, not in any bench.** The wait-and-recover arm is heavily empirically exercised (hh7b full-blast: multi-second acks = CV-wait engaged; zero drops at 14k offered), but no run ever waited past `queue_full_timeout_ms` (5 s) or filled the 128 MB arena, and no test drives either error exit (grep tests for queue_full/INSUFFICIENT/ArenaFull: 0). The zero-drop headline (POC-REPORT, latency_vs_load) leans on backpressure-by-blocking whose error surface is unverified; A10 (`acct-mvq4.18`) covers the spec-doc silence — this finding covers the test gap. CV-protocol balance on those paths was verified by read (B-ii.2 cat. 4). Fix shape: test_hooks-shrunk ring (or GUC-tiny `queue_full_timeout_ms`) acceptance case asserting the SQLSTATE and post-error slot/arena cleanliness. |
+| C3 | P3 | COVERAGE-gap (interaction) | **The §6.8 retry path's re-dedup deferral is untested: no test combines deadlock-retry with duplicate arrival, and no soak sustains injection.** `deadlock_during_write_retries_then_commits` (count=2) proves retry-then-commit alone; `duplicate_source_caught_by_preflight_dedup` and `racing_duplicate_redrives_group_minus_offender` prove dedup arms alone. The shipped retry shape (A9 / `acct-mvq4.17`: subtx re-attempt skips re-triage AND re-dedup; safety argument = UNIQUE backstop converts the missed duplicate into 23505 → DuplicateRace re-drive) is reasoned-only — the specific interleaving "duplicate lands between attempt N's rollback and attempt N+1's write" has never executed. The injection hooks needed (`set_inject_deadlock_count` + a concurrent duplicate submitter) already exist. Fix shape: one acceptance case arming both, asserting the offender drops and survivors commit exactly once. |
+
+**C-i summary.** 193 test fns censused and mapped; every §0.2-enumerated entry point has a
+verdict (one suite-dark → C1); all 46 modules across 5 crates have coverage rows (zero-direct-test
+modules: spi-common's 3 SPI-bound helpers — adequately covered via both flavors; identity/
+affinity/shmem — micro-gaps noted; harness glue — (iii)). 18 untested-surface rows: 9
+charter-listed + 9 audit-surfaced; **none verdict-threatening** — 7 carried by already-filed
+findings or OPEN issues (dedup honored), 3 NEW (C1–C3, all P3 production-blocking-later).
+The §0.3 matrix is runnable for C-ii with two corrections: class (a) extends to
+`-p ledger-harness` (39 otherwise-unrun units) and class (c) expects full src-unit counts
+(73/1), not just hellos. Expected per-class totals: 79 / 38 / 74 / 2 = 193.
 
 ## C-ii. suite-run ledger (acct-mvq4.6 — pending)
 
@@ -683,3 +855,6 @@ or committer ERROR-exit).
 | Q12 | P3 | STRUCTURAL | COMMITTER_QUEUE share guard held across entire SPI write phase — router exclusive starvation | `acct-mvq4.33` (x-ref acct-ozln, acct-m4g5.2) |
 | Q13 | P3 | CODE-DEFECT (production-later) | u32 xid staged where xid8 epoch semantics required — post-epoch triage misclassifies to keep | `acct-mvq4.34` |
 | Q14 | P3 | DEAD-OBSERVABILITY | Nine written-never-read shmem fields; free_slot_wake_count doc-comment false | `acct-mvq4.35` |
+| C1 | P3 | COVERAGE-gap | `ledger_enqueue_trx_batch_c` suite-dark — zero test coverage on a production SPI entry point | `acct-mvq4.36` |
+| C2 | P3 | COVERAGE-gap | Enqueue backpressure failure arms test-dark — queue-full timeout error + arena-full deadline never executed | `acct-mvq4.37` (x-ref acct-mvq4.18/A10) |
+| C3 | P3 | COVERAGE-gap | Retry-path re-dedup deferral untested — no deadlock-retry × duplicate combination case | `acct-mvq4.38` (x-ref acct-mvq4.17/A9) |
