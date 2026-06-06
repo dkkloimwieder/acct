@@ -296,7 +296,217 @@ numeric spot-check exact); provenance clean (D4.1 re-verified resolved); 2×P2 +
 all doc-side — **no code-behavior defect found in dimension A**. The shipped code is in every
 checked divergence either equivalent to or stronger/safer than the spec text.
 
-## B-i. quality: core + spi-common + direct-c + harness + scripts (acct-mvq4.3 — pending)
+## B-i. quality: core + spi-common + direct-c + harness + scripts (acct-mvq4.3 — 2026-06-06)
+
+**Method.** Per-module walk of the 4 non-routed crates (every `src/` file read in full this
+pass), seven questions each: Q1 panic discipline / Q2 unsafe / Q3 atomic ordering / Q4 error
+mapping / Q5 resource cleanup / Q6 measurement validity / Q7 structural. Then all 31 shell
+scripts (26 `bench/` + 5 `scripts/`) on the S1–S4 checklist. Findings Q1–Q6 in §B-i.7;
+class-(a) script findings annotated on OPEN `acct-xdkd` (not re-filed); drain-tail notes on
+`acct-x9bg`; `acct-vsfy` reconciled in §B-i.6.
+
+**Sweep-level results.** `unsafe`: **zero blocks in all 4 crates** (Q2 closed wholesale).
+Atomics: only harness `AtomicBool` stop-flags (measure/sampler/driver_routed), all
+`Relaxed` — correct, since no data is ordered behind the flag (reports hand off via
+`JoinHandle.await`, which synchronizes). Panic-family grep: 34 sites, every one classified
+below — none unjustified on a production path.
+
+### B-i.1 Module verdicts
+
+**ledger-core (12 src + 2 test files)**
+
+| Module | Verdict | Notes |
+|---|---|---|
+| lib.rs | CLEAN | Module map + re-exports; doc accurate (strict vs provisional entry points). |
+| error.rs | CLEAN | 8 variants, every one doc-commented with §-refs. The closed-enum + no-wildcard consumers (see B-i.3) make variant additions compile-enforced. |
+| method.rs | CLEAN | Strict dispatcher; `UnknownPool` via `ok_or` before dispatch. |
+| fifo.rs / lifo.rs | CLEAN w/ note | Stubs as spec'd (§8). Note: `MethodMismatch{expected: Fifo, got: Fifo}` — fields degenerate by construction (dispatcher already resolved the method), and the in-stub `UnknownPool` re-lookup is unreachable. Harmless redundancy; the error text reads oddly but the doc on error.rs:16-18 explains the real meaning. |
+| numeric.rs | CLEAN | `banker_div` exact §3.0 shape. 1 `expect` (:44) — documented, has a `should_panic` test; `debug_assert` (:22) — caller-guard contract documented, wac.rs honors it. 11 tests incl. i128-limit + overflow regression. |
+| plan.rs | CLEAN | `coalesce_aggregates` keep-last logic correct (fast path + enumerate-stable rebuild); LineType/PostingEventType `as_sql` bijective with line_type.rs decoder. |
+| snapshot.rs | CLEAN | `unwrap_or((0,0))` (:130) is graceful error-message degradation, fine. `resolve_posting_accounts` returns owned `Copy` to end the borrow — documented. |
+| wac.rs | CLEAN w/ **Q1** + A4 | All arithmetic checked-or-i128 → `Overflow`. **Q1**: `aggregate_deplete` (:175) subtracts the posted amount from `value_sum` unclamped when `new_qty > 0` — negative `value_sum` reachable (standard-basis; rounding edge), violates the 0007 CHECK at write. A4 (stale header :4-6) already filed → `acct-mvq4.12`. The :90 `new_qty > 0` receipt guard is unreachable-defensive (receipt implies qty>0) but documented as such. |
+| standard.rs | CLEAN | `value_sum = new_qty × C_std` recomputed fresh — cannot go negative. Variance flip + `MissingVarianceAccount` gate only when delta ≠ 0 (zero-delta receipts need no variance account — correct). |
+| specific.rs | CLEAN | `SpecificPoolOccupied` guard (A7, doc-side). Deplete clamps aggregate at 0 (`.max(0)` :169). D3.2 residual (partial-deplete of oversized layer leaves aggregate qty > 0) re-verified still-true — documented caller contract, not a new finding. In-memory layer removal (:183-185) makes same-submission double-deplete fail correctly. |
+| provisional.rs | CLEAN w/ **Q1** | Dispatch §3.5-exact. Standard-basis depletion (:78-82) prices at `C_std` fully decoupled from pool book value — the Q1 trigger. |
+| tests/plan_apply_strict.rs (17) + tests/plan_apply_provisional.rs (10) | CLEAN w/ gap | Cover every §9.1 bullet. Gap (part of Q1): all depletion `value_sum` assertions are positive-residual shapes; the standard-basis test (:110) uses `C_std=90 < avg=100`; no test pins what `value_sum` does when the posted depletion amount exceeds book value. |
+
+**ledger-spi-common (5)**
+
+| Module | Verdict | Notes |
+|---|---|---|
+| lib.rs | CLEAN | States the single-sourcing rationale (the acct-vsfy supersession evidence, §B-i.6). |
+| line_type.rs | CLEAN | Decoder bijective with `LineType::as_sql` (9/9); tests pin all variants + unknown→None. |
+| pool_lock.rs | CLEAN | Optimistic pattern spec-exact; in-function sort+dedup documented as defensive. The lazy-create path's re-`SELECT FOR UPDATE` result is discarded — sound because no code path deletes `pool_lock` rows and `ON CONFLICT DO NOTHING` + READ COMMITTED guarantee the row is visible; noted, not a finding. |
+| hydration.rs | CLEAN w/ A13 | 5-connect split + lazy fail-loud = A13 (filed → `acct-mvq4.21`). `unwrap_or(0)`-style NULL coercion throughout — moot under current NOT NULL schema; unknown enum text → `continue` → UnknownPool downstream (documented inline). |
+| bulk_write.rs | CLEAN | 1 `expect` (:89) locally provable (set two lines above). `ORDER BY ord` + ascending-sort identity-alignment trick documented; `debug_assert`s on RETURNING cardinality ride PG semantics in release. Index panics (:345/:415) ride ledger-core's `trx_line_idx` construction invariant — a violation would ereport (fail-loud), not corrupt. Kept-plan `thread_local` cache intentional process-lifetime (Q5 n/a). |
+
+**ledger-direct-c (3)**
+
+| Module | Verdict | Notes |
+|---|---|---|
+| lib.rs | CLEAN | No-op `_PG_init` documented (shmem-free); 2 `expect`s are in the `#[pg_test]`. |
+| ledger_error_map.rs | CLEAN — **8/8** | See B-i.3. |
+| submit.rs | CLEAN | 3 `unreachable!()` — all diverge-typing shims after `ereport!`, documented + `#[allow]`ed. Validation order cheap-fail-first (parse → decode → lock). SQL-level errors (e.g. the UNIQUE idempotency backstop) propagate with their own SQLSTATE via pgrx guard, not masked by `ereport_internal`. |
+
+**ledger-harness (13 src + 2 smokes)**
+
+| Module | Verdict | Notes |
+|---|---|---|
+| main.rs | CLEAN | All failure paths → exit code 1 with message; `--touch-dist` parsed before any reseed work (documented). |
+| cli.rs | CLEAN | `--batch-size` default 50 ✓ §10.0; every flag doc-commented incl. pooler guidance. |
+| driver_common.rs | CLEAN | `run_prefix` wraparound (~11.5 days) documented; 1 test pins the SPI wire shape. |
+| seed.rs | CLEAN w/ note | `expect` (:69) is insert-then-lookup invariant. Note (Q6-misc): the `pool_state > 0` skip heuristic is any-row, so a partially-seeded universe would be silently accepted — contrast pool_universe's count-exact check; harness-grade, reseed paths TRUNCATE first. |
+| pool_universe.rs | CLEAN | Count-exact idempotency with fail-loud mismatch; deterministic `Mixed` (tested 50/30/20); standard_cost seeded for std pools only — and `provisional_basis='running_avg'` for ALL pools (:159), which is why Q1's standard-basis path is bench-unreached. |
+| workload.rs | CLEAN | Both panics are documented fail-loud guards on degenerate config (empty universe). `sample()` fallback (:138) documented-unreachable — the honest version of what scenarios.rs:158 does wrong. Exhausted-overlap shrinkage documented (:191-193). Receipt costs 1..=1000 micro-units (1000× below seed cost) — irrelevant to lock/throughput claims, noted for any future cost-magnitude reading. |
+| scenarios.rs | CLEAN w/ **Q2** | All 21 builders match §10.6 (re-verified at .2). **Q2**: :158 unreachable `unwrap_or(1)` + hardcoded `1000` caller-count copy. `expected_method_mix` dead_code → .7. |
+| measure.rs | CLEAN | Histogram `expect`s constant-bounds-provable. Q6 caveats: `commits_observed` is database-wide (includes observer/sampler poll txns — informational field, not used for throughput); `wal_lsn_bytes` is cluster-global (background WAL from other streams pollutes `wal_bytes_per_trx` on the shared cluster — preload pruning keeps this small). Drop aborts the task ✓. |
+| sampler.rs | CLEAN w/ **Q3** | **Q3**: bucketing-rules comment (:169-175) stale vs code (:183-185) — LWLock has its own bucket, IPC added to io. Committer scoping by `backend_type` ✓; 3 queries/tick at 10 Hz with `--no-sampler` escape documented. |
+| report.rs | CLEAN | All 8 panic-grep hits in tests. Direct ack==committed documented; routed throughput from observer count; errors excluded from hist but included in `attempts_total` — honest. |
+| driver_direct.rs | CLEAN w/ **Q4** | **Q4**: batched mode records pre-rollback successes in the ack hist (:232) — rolled-back work counts toward throughput under mid-batch failure. Conservative w.r.t. POC-REPORT (b)'s conclusion; `commits_observed` allows cross-check. Throughput denominator captured before the 2 s stats-settle sleep ✓. |
+| driver_routed.rs | CLEAN | `expect` (:280) locally provable. Observer-before-callers ✓; incremental-scan skip hazard closed by the final reconciling sweep (:192-206) ✓; quiet-heuristic (3×200 ms) can fire early under a 1 s deadlock-backoff stall — effect surfaces visibly as `submitted_but_unseen > 0` and errs conservative (→ x9bg note). Observer poll errors silently `unwrap_or_default` (:453) vs measure.rs's counted `poll_errors` — asymmetry noted (Q6-misc). Pacing math + debt-shed documented and correct. |
+| equivalence.rs | CLEAN (model) | Drain quiescence backed by an explicit completeness assertion — early-stop produces a distinct "drain incomplete" error, never a false PASS. The Q6 drain-wait question's best-in-crate answer. Nit: :73 hint "try s1..s8" (Q6-misc). |
+| tests/smoke_{measure,sampler}.rs | CLEAN | `#[ignore]`d, DSN-pinned, `#[path]`-include of the src module — smoke-grade, fine. |
+
+### B-i.2 Panic-discipline table (production-path sites)
+
+| Site | Kind | Classification |
+|---|---|---|
+| numeric.rs:44 | `expect` | Justified: i64 overflow on downcast = application-level numeric error; documented + `should_panic` test. |
+| numeric.rs:22 | `debug_assert` | Caller contract (non-zero denominator) documented; wac.rs guards. |
+| bulk_write.rs:89 | `expect` | Locally provable (slot populated two lines above). |
+| bulk_write.rs:345/:415 | index | Cross-crate invariant (`trx_line_idx` constructed valid by ledger-core); violation ereports, fail-loud. |
+| submit.rs:119/:135/:141 | `unreachable!` | Diverge-typing shims after `ereport!`; documented. |
+| seed.rs:69 | `expect` | Insert-then-lookup invariant (own UNNEST insert). |
+| measure.rs:47/:57/:59 | `expect` | Constant-bounds histograms; merge of same-bounds cannot fail. |
+| scenarios.rs:193/:206 | `expect` | Constant-string `TouchDistribution::parse`. |
+| workload.rs:299 | `expect` | `Zipf::new` fails only on empty universe / exp≤0 — config error, fail-loud. |
+| workload.rs:337 | `panic!` | Explicit documented guard (empty pool_ids). |
+| driver_routed.rs:280 | `expect` | Locally provable (`routed: Some(..)` set in the constructor call above). |
+| cleanup.rs:240-242/:264/:297 (routed-c) | `expect` | **Re-classified per §0.6: `#[cfg(test)]` helpers, NOT production paths — non-findings** (recorded here as the .3-scope half of that correction; .4 re-records for the routed walk). |
+| All other grep hits | — | `#[cfg(test)]` / smoke-test code. |
+
+### B-i.3 Error-map completeness (Q4)
+
+`ledger_error_map.rs::raise_ledger_error` matches **all 8** `LedgerError` variants with **no
+wildcard arm** — a future variant fails to compile here, the strongest completeness guarantee.
+Every arm carries message + hint + a deliberate SQLSTATE:
+
+| Variant | SQLSTATE | Sane? |
+|---|---|---|
+| InsufficientInventory | 23000 integrity_constraint_violation | ✓ (§3.6 invariant) |
+| MethodMismatch | 22000 data_exception | ✓ (dispatch bug surface) |
+| UnknownPool | 42704 undefined_object | ✓ |
+| MissingStandardCost | 22000 | ✓ (config error) |
+| MissingPostingAccounts | 22000 | ✓ (config error) |
+| MissingVarianceAccount | 22000 | ✓ (config error) |
+| SpecificPoolOccupied | 23000 | ✓ (K=1 invariant) |
+| Overflow | 22003 numeric_value_out_of_range | ✓ |
+
+None of the 8 fall in the routed committer's retryable set (40P01/40001) — correct: every
+LedgerError is deterministic, not transient. (The routed-side classification itself is .4
+scope.) Q1's failure shape bypasses this map entirely — it surfaces as a raw 23514 CHECK
+violation from the write phase, which is part of why it's finding-worthy.
+
+### B-i.4 Harness measurement-validity (Q6 synthesis)
+
+1. **Latency**: per-caller hdrhistograms, merged; errors excluded from latency but included
+   in `attempts_total`. Direct ack==committed documented. Routed committed-latency from a
+   pre-started observer with a post-drain reconciling sweep — the out-of-order-id skip
+   hazard is correctly closed. **One gap: Q4** (batched-mode pre-rollback recording).
+2. **Throughput convention (routed)**: submitted-in-window / caller-window; work drained
+   after callers stop still counts. Bounded by O(ring/total) ≈ up to ~25 % ambiguity on the
+   short 20–30 s cells vs instantaneous drain rate, ≲2 % at the 120–300 s durations every
+   headline doc uses. Annotated on `acct-x9bg` (with the 1 s-backoff vs 600 ms quiet-window
+   early-fire note; both effects surface visibly as `submitted_but_unseen`).
+3. **Counters**: `commits_observed` database-wide and `wal_lsn_bytes` cluster-global —
+   informational fields; neither feeds a headline number. Routed counter deltas clamp at 0
+   (`max(0)`) and saturating-subtract span derivations are comment-justified.
+4. **Quiescence**: equivalence.rs is the model (completeness assert); driver_routed
+   deliberately tolerates partial drain (overload cells must) and reports the shortfall.
+5. **Seeding honesty**: deep-seed writes trx_line-consistent layers (§10.5-exact);
+   pool_universe count-exact idempotency; seed.rs any-row heuristic is the one soft spot
+   (Q6-misc note). Perturbation: sampler/collector documented, `--no-sampler` escape, and
+   the report records whether it ran.
+
+### B-i.5 Script table (S1 pipefail / S2 GUC-pin→trap / S3 pgrep / S4 psql-multi-stmt)
+
+Sweep results: **S1 31/31** (`run-tests.sh` deliberately `set -uo pipefail` — its own
+per-binary FAIL_FAST handling, §0.3); **S3 zero** pgrep/pkill anywhere; **S4 zero**
+multi-statement `psql -c` strings (all helpers single-statement `-tAc`; no ON_ERROR_STOP
+needed). S2 per script:
+
+| Script | Pins GUCs? | Trap/restore | Verdict |
+|---|---|---|---|
+| bench-apply-inproc.sh | no | — | CLEAN |
+| common.sh | helper defs only | — | CLEAN (model posture: HARNESS_TIMEOUT hard-wrap, load-gate fail-loud, restart_db readiness wait) |
+| measure-apply-spans.sh | yes | trap → **bsm 50** | **class (a)** → xdkd ✓ (named there) |
+| probe-hh7b-rwsize.sh | yes | trap → 200/500/4/on/1000 | CLEAN (current defaults) |
+| run-1sku-batched.sh | yes | trap → **bsm 50** | **class (a)** → xdkd ✓ |
+| run-1sku-per-committer.sh | yes | trap → **bsm 50** | **class (a)** → xdkd ✓ |
+| run-affinity-steal-tune.sh | yes (scheme/steal) | trap → scheme 0, steal 5 | CLEAN (narrow pin, narrow restore) |
+| run-affinity-sweep.sh | yes (scheme) | trap → scheme 0 | CLEAN (narrow) |
+| run-basic-2pool.sh | yes (cc) | trap → cc 4 + affinity off | CLEAN (narrow) |
+| run-batch-size-sweep.sh | yes | trap → **bsm 50 + pack off** | **class (a)** → xdkd ✓ |
+| run-batch-window-sweep.sh | yes (window) | trap → window 500 | CLEAN (narrow) |
+| run-caller-batch-probe.sh | yes | trap → **bsm 50** | **class (a)** → xdkd ✓ |
+| run-committer-count-sweep.sh | yes (cc + relic) | trap → cc 4 + relic | **Q5(i)**: pins/restores `committer_affinity` — a GUC removed with the lever-2 revert (e9a77d8); pgrx reserves no prefix, so the ALTER lands as a silent placeholder no-op. Benign for results (the affinity code was removed too); relic. |
+| run-committer-profile-sweep.sh | **no** | — | **Q5(ii)**: runs at ambient GUCs while LOGGING "committer_count=4 affinity=OFF" as a claim — no SHOW/current_setting verification. |
+| run-crossover.sh | no | — | Q5(ii) ambient-assumption class (docker restart each cell mitigates shmem state, not auto.conf pins). |
+| run-equivalence.sh | no | — | Q5(ii) class. |
+| run-lockhold-sweep.sh | no | — | Q5(ii) class. |
+| run-routed-longdur.sh | no | — | Q5(ii) class (5× restart_db; ambient GUCs = "shipped config" by intent). |
+| run-sustained-5min.sh | yes | trap → 200/on/500/4 | CLEAN (current defaults) |
+| setup-cc1-for-perf.sh | yes (cc 1, bw 20000, bsm 200) | **none — deliberate** | **Q5(iii)**: persistent profiling regime with no restore partner and no header note on how to undo; the pin outlives docker restart (auto.conf). Modern sweeps' `production_defaults()`-at-start mitigates only if the next run is one of them. |
+| setup-pgbouncer.sh | no | — | CLEAN |
+| sweep-hh7b.sh | no (delegates) | — | CLEAN (orchestrator; children pin) |
+| sweep-hh7b-window.sh | yes | trap → 200/on/500/4 | CLEAN (current defaults) |
+| sweep-latency-vs-load.sh | yes | trap → 200/on/500/4/1000 | CLEAN — the model class-(a) scripts should converge to |
+| sweep-p1al-decisive.sh | no (delegates) | — | CLEAN (orchestrator) |
+| sweep-p1al-nonregress.sh | no (delegates) | — | CLEAN (orchestrator) |
+| scripts/create-poc-v3-1-db.sh | no | — | CLEAN |
+| scripts/install-direct-c.sh | no | — | CLEAN |
+| scripts/install-routed-c.sh | preload append | — | CLEAN for v3.1 scope (the cross-stream preload-accumulation hazard is a cluster-policy matter, already covered by standing guidance — not a v3.1 finding) |
+| scripts/run-migrations.sh | no | — | CLEAN |
+| scripts/run-tests.sh | no (installs test_hooks .so) | — | CLEAN (`set -uo` deliberate) |
+
+Planning-time class-(b) ("pins with no trap", 8 candidates) **dissolved on verification**:
+7 of 8 don't pin at all — run-lockhold-sweep / run-committer-profile-sweep / run-crossover /
+run-equivalence are the no-pin ambient-assumption class (→ Q5(ii)), sweep-p1al-decisive /
+-nonregress / sweep-hh7b are orchestrators whose children pin-and-trap correctly. Only
+setup-cc1-for-perf actually pins trap-less, and that is deliberate (→ Q5(iii)).
+
+### B-i.6 acct-vsfy reconciliation
+
+acct-vsfy (paired-file direct↔routed copy-paste hazard) is **superseded in substance** by the
+acct-yojk.2 spi-common extraction: `pool_lock` / `hydration` / `bulk_write` / `line_type` are
+now single-sourced in `ledger-spi-common` and consumed by both flavors (lib.rs documents
+exactly this rationale). Residual pairing that remains is **intra-file and adjacent**:
+bulk_write.rs's per-submission vs batch variants (8.1/8.1b, 8.2/8.2b, 8.4/8.4b share a column
+extraction shape; 8.4 pair already shares `insert_posting_lines_with_tlid`). That residual is
+co-located, commented as paired, and an order of magnitude smaller than the cross-crate
+hazard vsfy named. **Recommendation: close acct-vsfy as superseded-by-yojk.2** (annotated on
+the issue; closure is the epic owner's call at remediation time).
+
+### B-i.7 Findings
+
+| ID | Sev | Verdict | Finding |
+|---|---|---|---|
+| Q1 | **P2** | CODE-DEFECT (latent) | **Provisional standard-basis partial depletion can emit aggregate `value_sum < 0` → migration-0007 CHECK violation (23514) at write time, not a typed LedgerError.** `wac::aggregate_deplete` (:175) subtracts the posted amount unclamped whenever `new_qty > 0`; under `ProvisionalBasis::Standard` (provisional.rs:78-82) the posted amount is `qty × C_std`, fully decoupled from the pool's book value. Repro shape: receipt 10 @ 100 (`value_sum=1000`), `standard_cost=150`, deplete 7 → mutation `{qty: 3, value_sum: −50}` → `pool_state_aggregate_value_sum_nonneg` rejects. Realistic: any `C_std` above the running average plus a deep-but-partial depletion (10 % drift breaks at >91 % depletion). The 0007 header's own semantics ("value_sum stays reconcilable to Σ posting_line amounts") *legitimately* goes negative here — the CHECK and the stated semantics conflict. Coverage: unit test (provisional :110-122) and integration test (acceptance_direct_methods :224-239) both use `C_std < avg`; no test asserts the mutation's `value_sum` in the over-book shape; **every harness pool is seeded `running_avg`** (pool_universe.rs:159) so no measured run ever drove the path — all shipped results unaffected. Twin edge on the running-avg basis: banker-rounding-up of the average (e.g. qty 5 / value_sum 3 → avg 1) times a large partial deplete → `value_sum −1`; reachable only at sub-micro-unit costs. Remediation options (clamp like the empty-pool case / typed error / relax CHECK to match the GL semantics) are the fix-issue's call. |
+| Q2 | P3 | MISLEADING-CODE | scenarios.rs:158 — `checked_div(1000).unwrap_or(1)`: `checked_div` returns None only on zero divisor; the divisor is the literal 1000, so the `unwrap_or` arm is unreachable and reads as load-bearing when the actual floor is `.max(1)`. The `1000` is also a hardcoded copy of s6's caller count, not derived from it. Contrast workload.rs:138, which documents its unreachable fallback honestly. |
+| Q3 | P3 | STALE-comment | sampler.rs:169-175 — `committer_wait_summary` bucketing-rules comment says `'IO' | 'WALSync' | 'LWLock' → io_wait`; the code (:183-185) gives LWLock its own bucket (struct docs agree) and adds IPC to io_wait. Same in-code-comment-contradicts-code class as A4. |
+| Q4 | P3 | MEASUREMENT-honesty | driver_direct.rs caller_loop (batched arm, :232) — successes recorded into the ack histogram before a later mid-batch failure rolls the whole tx back; rolled-back submissions count toward `throughput_trx_per_sec`. At POC-REPORT (b)'s high batched error rates the inflation is non-trivial, but it is conservative w.r.t. that doc's conclusion (real batched is worse than reported), and `commits_observed` permits a cross-check. Fix shape: buffer per-batch latencies, flush to hist on commit. |
+| Q5 | P3 | SCRIPT-hygiene | Bench GUC-hygiene cluster, the parts beyond acct-xdkd's scope: **(i)** run-committer-count-sweep.sh:33/:36 pins and "restores" `ledger_routed_c.committer_affinity` — removed with the lever-2 revert (e9a77d8); lands as a silent placeholder (pgrx reserves no GUC prefix), benign but masks real rename errors. **(ii)** The no-pin measurement scripts (run-committer-profile-sweep, run-crossover, run-equivalence, run-lockhold-sweep, run-routed-longdur) assume ambient GUCs equal production defaults without a `SHOW`/`current_setting` assert — profile-sweep logs "committer_count=4" as a literal claim; a stale pin (e.g. from setup-cc1-for-perf) would silently mislabel cells. **(iii)** setup-cc1-for-perf.sh deliberately leaves a persistent cc=1/bw=20000 regime with no restore partner and no undo note in its header. One shared verify-or-pin helper in common.sh closes all three. |
+| Q6 | P3 | MISC-structural | Cluster of small items, none individually finding-grade: equivalence.rs:73 error hint "try s1..s8" (21 exist); driver_routed.rs:453 observer poll errors silently `unwrap_or_default` (measure.rs counts `poll_errors` — asymmetric observability); seed.rs:43 any-row idempotency heuristic accepts a partially-seeded universe (pool_universe's count-exact check is the model); routed throughput convention (submitted-in-window/window — drain-tail ambiguity bounded by ring/total, annotated on x9bg). |
+
+**B-i summary.** 33 modules + 4 test files versed: 31 CLEAN (several with notes), wac.rs +
+provisional.rs carry the one latent code defect (**Q1, P2 — the first code-behavior finding
+of Pass 3**; dimension A found none, and Q1 is consistent with that: it lives in a
+configuration path no measurement nor doc claim ever exercised). Zero unsafe; panic
+discipline sound (every production-path site justified); error map 8/8 compile-enforced;
+harness measurement validity solid with one honesty gap (Q4) and documented conventions.
+Scripts: S1/S3/S4 fully clean; S2 confirms exactly the five xdkd-named class-(a) scripts (no
+new members), dissolves the planning-time class-(b) into orchestrators + the no-pin
+ambient-assumption class (Q5). 1×P2 + 5×P3, all filed as epic children.
 
 ## B-ii. quality: ledger-routed-c deep (acct-mvq4.4 — pending)
 
@@ -323,3 +533,9 @@ checked divergence either equivalent to or stronger/safer than the spec text.
 | A11 | P3 | UNDOCUMENTED | No GUC reference; 7 GUCs doc-absent; sizing trio doesn't size shmem | `acct-mvq4.19` |
 | A12 | P3 | STALE-doc | README/results staleness cluster (migrations, S1–S8, bench list, "16 migrations", "prod default 50") | `acct-mvq4.20` |
 | A13 | P3 | DIVERGENT | §5.1/§5.3/§6.6 pipeline micro-deltas (split hydrate, lazy fail-loud, SPI counts) | `acct-mvq4.21` |
+| Q1 | P2 | CODE-DEFECT (latent) | Provisional standard-basis partial depletion emits negative value_sum → 0007 CHECK violation, not typed error | `acct-mvq4.22` |
+| Q2 | P3 | MISLEADING-CODE | scenarios.rs:158 unreachable `unwrap_or` arm + hardcoded s6 caller-count literal | `acct-mvq4.23` |
+| Q3 | P3 | STALE-comment | sampler.rs bucketing-rules comment stale vs code (LWLock split-out, IPC) | `acct-mvq4.24` |
+| Q4 | P3 | MEASUREMENT-honesty | direct-batched counts pre-rollback successes in throughput | `acct-mvq4.25` |
+| Q5 | P3 | SCRIPT-hygiene | relic committer_affinity GUC; no-pin scripts assume ambient defaults; setup-cc1 no restore path | `acct-mvq4.26` (x-ref acct-xdkd) |
+| Q6 | P3 | MISC-structural | stale s1..s8 hint; swallowed observer poll errors; seed any-row heuristic; throughput convention | `acct-mvq4.27` (x-ref acct-x9bg) |
