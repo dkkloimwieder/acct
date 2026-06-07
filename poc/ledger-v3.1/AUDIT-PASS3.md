@@ -7,10 +7,11 @@ surfaces), **(B)** code quality (per-module structural walk, both halves), **(C)
 disposition). Tracked as epic **acct-mvq4**; one child per section below, findings filed as
 additional epic children as they emerge.
 
-> **Status.** Assess-only, point-in-time (started 2026-06-05). Pass-3 **re-verifies** Pass-1/
-> Pass-2 findings (registry §0.5) rather than inheriting them; the prior passes' prose is not
-> corrected in place (their own convention). Sections A–D land incrementally, one commit per
-> child issue.
+> **Status.** Assess-only, point-in-time (2026-06-05 → 2026-06-06, **complete**). Pass-3
+> **re-verifies** Pass-1/Pass-2 findings (registry §0.5) rather than inheriting them; the prior
+> passes' prose is not corrected in place (their own convention). All sections landed, one
+> commit per child issue; synthesis at the end of this document. **34 findings: 0 P1 · 8 P2 ·
+> 26 P3 — POC-REPORT.md conclusions survive unchanged.**
 
 **Severity** P1/P2/P3 as in prior passes. **Finding ids**: `A#` docs↔code, `Q#` quality,
 `C#` coverage, `X#` complexity (no collision with Pass-1 `Dx.y` / Pass-2 `P2.x`).
@@ -744,7 +745,7 @@ higher-layer suite):
 | recovery.rs | integration | `recovery_complete_at_boot_and_system_operational` |
 | affinity.rs | **none** | zero tests (default-off EXPERIMENTAL, acct-0usf). NOTE: acceptance_routed_affinity_grouping tests the ROUTER's union-find grouping, not this module — name collision. Disposition .7 / `acct-m4g5` |
 
-*ledger-harness (15 src + 2 smokes):*
+*ledger-harness (13 src + 2 smokes):*
 
 | Module | Coverage | Cell |
 |---|---|---|
@@ -820,7 +821,7 @@ The §0.3 matrix is runnable for C-ii with two corrections: class (a) extends to
 `-p ledger-harness` (39 otherwise-unrun units) and class (c) expects full src-unit counts
 (73/1), not just hellos. Expected per-class totals: 79 / 38 / 74 / 2 = 193.
 
-## C-ii. suite-run ledger (acct-mvq4.6 — 2026-06-07)
+## C-ii. suite-run ledger (acct-mvq4.6 — 2026-06-06)
 
 **Protocol executed** (deltas from the planned §0.3 matrix, all per C-i.3's corrections plus two
 runtime discoveries): `FAIL_FAST=0` for a complete ledger; class (a) extended with
@@ -928,7 +929,7 @@ class is host-infra (C5, P3). Every code-behavior surface that ran, ran green �
 routed-equivalence run clean), and both live smokes. Cluster restored: GUC snapshot
 byte-identical, preload list unchanged, production .so verified, 5 workers resident.
 
-## D. complexity disposition (acct-mvq4.7 — 2026-06-07)
+## D. complexity disposition (acct-mvq4.7 — 2026-06-06)
 
 **Method.** Every enumerated candidate (issue list items 1–8) plus a fresh sweep:
 `#[allow(dead_code)]`/`#[allow(unused)]` inventory (30 sites, every one classified),
@@ -1001,7 +1002,7 @@ lists plus the affinity/window sweeps that iterate the family.)
 No zero-value flags: the three bench-zero groups are each deliberate affordances with a
 documented home.
 
-### D.4 Artifact retention (live re-census, 2026-06-07)
+### D.4 Artifact retention (live re-census, 2026-06-06)
 
 `results/` = **1,129 files**: 791 `.json` (ignored), 229 `.txt` (sampler dumps, ignored),
 56 `.csv`, 33 `.log` (ignored), 13 `.md`, 2 `.svg`, 1 `.samples`, 1 `.runlog`; 346
@@ -1032,7 +1033,7 @@ suppression hygiene (X1) and artifact strays (X2), both P3. The Q14 observabilit
 land as recommendations on `acct-mvq4.35`; the A.4 getter-derivation imprecision is corrected
 in D.1 #6. TODO/marker debt: zero. D7.1: still resolved.
 
-## Findings index (acct-mvq4.8 — pending)
+## Findings index (acct-mvq4.8 — 2026-06-06)
 
 | ID | Sev | Verdict | Title | Filed issue / duplicate-of |
 |---|---|---|---|---|
@@ -1070,3 +1071,76 @@ in D.1 #6. TODO/marker debt: zero. D7.1: still resolved.
 | C5 | P3 | ENV-blocked (infra) | Matrix class (c) unrunnable on this host — pg_test framework install targets root-owned system pg dirs | `acct-mvq4.40` |
 | X1 | P3 | DEAD-CODE debt | 3 module-blanket allows defeat dead-code detection; ~18 stale allows on live code; 6 dead items | `acct-mvq4.41` (x-ref acct-mvq4.23, acct-mvq4.35, acct-m4g5) |
 | X2 | P3 | ARTIFACT-retention | 7 results/ strays: commit 3 deliverables, extend .gitignore for 4 scratch shapes | `acct-mvq4.42` |
+
+---
+
+## Headline + reconciliation note (acct-mvq4.8 — 2026-06-06)
+
+**34 findings: 0 P1 · 8 P2 · 26 P3.** All four dimensions complete; every finding filed as an
+epic child (`acct-mvq4.9`–`.42`, index 1:1-verified against bd), duplicates annotated on their
+owning OPEN issues (`acct-xdkd`, `acct-x9bg`, `acct-ozln`, `acct-m4g5.2`, `acct-uwsp`,
+`acct-vsfy`), never re-filed. The 8 P2s: **2 doc-side** (A1 §14.2 order-preservation overreach;
+A2 §6.3 router staleness — the acct-p1al default flips reached no normative doc), **5 latent
+code defects** (Q1 negative-value_sum CHECK violation; Q7 eject-vs-stamp race; Q8 whole-group
+poison amplification; Q9 triage fail-open; Q10 committer ERROR-exit recovery gap), **1
+test-side** (C4 suite-red at production defaults). Zero findings disturb a shipped measurement.
+
+### Do the POC-REPORT.md conclusions survive? — YES. (a)–(g) all stand.
+
+1. **The numbers are real.** Every numeric spot-check across all 13 results docs reconciles
+   exactly against its named backing artifact (A.2): POC-REPORT 4/4, latency-knee rows,
+   window-escalation rows, every generated report's internal arithmetic.
+2. **Dimension A found no code-behavior defect.** In every checked divergence the shipped code
+   is equivalent to, or stronger/safer than, the spec text (A-dimension summary). The
+   divergence debt is documentation debt.
+3. **Every latent P2 sits behind a precondition no shipped run arms**: open caller transactions
+   at triage (Q7), standard-basis provisional pools (Q1/Q8 — every harness pool is seeded
+   `running_avg`, pool_universe.rs:159), SPI failure inside a healthy BGWorker (Q9), committer
+   ERROR-exit (Q10). Triangulated three ways: the B walks, the C-i.2 gap table (zero rows
+   verdict-threatening), and the C-ii run (every bench-driven path green).
+4. **The suite reds are test-staleness, not code defects** (C4): the 2 red tests hard-assert
+   the pre-p1al pack-off formation contract; live behavior matches the router's own pack unit
+   tests. They contradict no results headline — `errors=0` is a bench-cell claim, and every
+   bench-driven class ran green (C-ii.4).
+5. **Zero REMOVE-grade complexity** (D): no scenario, flag, mechanism, or subcommand is
+   unjustified; the real debt is mechanical hygiene (X1 dead-code suppression, X2 artifact
+   strays).
+
+**Boundary conditions the YES carries** (the conclusions' edges, not threats to them):
+
+- (d)'s equivalence holds as measured; A1 establishes that strict cross-chunk qty-equality is
+  not architecturally guaranteed in oversell scenarios under `committer_count > 1` (unobserved
+  in every run).
+- The zero-drop/zero-error story (g) leans on backpressure-by-blocking whose error arms have
+  never executed anywhere (C2), an eject mechanism with no observability surface (Q14), and a
+  batch entry point with zero suite coverage (C1) — untested ≠ broken, but the regression net
+  has holes an adopter must close before production reliance, starting with C4 (the net is
+  currently red at shipped defaults).
+- Production-posture cliff: the latent P2 cluster (Q1+Q8, Q7, Q9, Q10) plus Q13 (xid-epoch)
+  must be fixed before any real deployment; none is reachable inside the PoC envelope.
+
+### Epic acceptance criteria — 6/6 met
+
+| # | Criterion | Evidence |
+|---|---|---|
+| 1 | every spec heading + results doc versed | A.1 68/68 verdict rows; A.2 13/13 reconciliations |
+| 2 | every module quality-versed; panics classified; unsafe inventoried | B-i.1 + B-ii.1 = 44 src modules across 5 crates (+ 4 test files); B-i.2 panic table covers all 34 grep sites; zero unsafe in 4 crates + B-ii.2 45-site inventory with per-site soundness |
+| 3 | coverage map + 3-way gaps + matrix + suites RUN | C-i.1 map (193 tests; every entry point + all modules); C-i.2 18 gap rows, none verdict-threatening; §0.3 + C-i.3 matrix; C-ii ledger 188 green / 2 red / 3 env-blocked — all 193 accounted |
+| 4 | every complexity candidate dispositioned | D.1 16/16 + D.2/D.3 usage maps + full allow (30/30) / TODO (0) / zero-caller sweeps |
+| 5 | AUDIT-PASS3.md committed with all catalogs + findings index | 8 child commits, this one final |
+| 6 | new findings = children; duplicates annotated, not re-filed | 34 children verified 1:1 vs index (titles + severities); annotations live on xdkd / x9bg / ozln / m4g5.2 / vsfy / m4g5 / uwsp |
+
+### Prior-pass reconciliation (§0.5 registry closes)
+
+Every registry row re-verified: D4.1 resolved-and-improved (A.3); D5.1 superseded by the
+spi-common extraction (B-i.6 — close-as-superseded recommended on `acct-vsfy`); D8.1 still
+removed (B-ii.4); P2.1–P2.4 still fixed (B-ii.4); P2.5 annotated on `acct-x9bg` (B-i.4); D7.1
+still gone (D method); D1.x / D3.x re-verified through their A.1 claim rows (D3.2's caller-side
+residual re-confirmed); D6.1 closed by the three routed property tests (C-i.1). The new P2s all
+came from ground the prior passes never walked end-to-end — the one-time suite RUN (C4) and the
+eject / triage / recovery failure-direction seams (Q7/Q9/Q10) — while every previously-walked
+surface re-verified clean.
+
+*Synthesis-pass corrections*: the C-ii / D section headers and the D.4 census line said
+2026-06-07 while their commits are dated 2026-06-06 — corrected to match; C-i.1's harness
+file-count label corrected 15 → 13 (matching B-i.1 and `ls`).
