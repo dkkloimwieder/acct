@@ -131,6 +131,56 @@ fn standard_basis_missing_standard_cost_raises_on_depletion() {
 }
 
 #[test]
+fn standard_basis_over_book_depletion_drives_value_sum_negative() {
+    // §3.5 + migration 0009 (acct-mvq4.22): standard-basis depletions price at
+    // standard_cost, decoupled from the book average. Depleting deep while
+    // standard_cost > avg posts more value out than the pool carries; the
+    // GL-reconcilable value_sum (and its derived average) go negative rather
+    // than erroring or clamping — the deferred recalc tier (§7) trues it up.
+    let mut s = Snapshot::default();
+    fifo_pool(&mut s, 1, ProvisionalBasis::Standard);
+    s.standard_cost_of.insert(1, 150);
+    seed_aggregate(&mut s, 1, 10, 100); // book value 1000
+    let r = plan_apply_provisional(&mut s, &[deplete(1, 7)], ts()).unwrap();
+    assert!(no_layer_mutations(&r));
+    assert_eq!(r.trx_lines[0].unit_cost, 150);
+    assert_eq!(r.posting_lines[0].amount, 1050, "7 × 150 posted to the GL");
+    assert_eq!(
+        r.pool_state_mutations,
+        // 1000 − 1050 = −50 at qty 3; derived avg banker_div(−50, 3) = −17.
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 3, unit_cost: -17, value_sum: -50 }]
+    );
+}
+
+#[test]
+fn running_avg_rounding_edge_briefly_negative_then_clears_on_empty() {
+    // Twin edge on the running-avg basis: banker-rounding the derived average
+    // UP (value 3 / qty 5 → avg 1) times a large partial deplete posts 4 out
+    // of a book value of 3 → value_sum −1 at qty 1. Emptying the pool clears
+    // the residual to 0 (acct-0qps).
+    let mut s = Snapshot::default();
+    fifo_pool(&mut s, 1, ProvisionalBasis::RunningAvg);
+    // 3 @ 1 + 2 @ 0 → qty 5, value_sum 3, avg = banker_div(3, 5) = 1.
+    let r = plan_apply_provisional(
+        &mut s,
+        &[receipt(1, 3, 1), receipt(1, 2, 0), deplete(1, 4)],
+        ts(),
+    )
+    .unwrap();
+    assert_eq!(
+        r.pool_state_mutations,
+        // deplete 4 @ avg 1 = 4 > book 3 → value_sum −1; avg follows to −1.
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 1, unit_cost: -1, value_sum: -1 }]
+    );
+    // Draining the last unit empties the pool: residual forced to 0.
+    let r2 = plan_apply_provisional(&mut s, &[deplete(1, 1)], ts()).unwrap();
+    assert_eq!(
+        r2.pool_state_mutations,
+        vec![PoolStateMutation::UpsertAggregate { pool_id: 1, qty: 0, unit_cost: -1, value_sum: 0 }]
+    );
+}
+
+#[test]
 fn lifo_behaves_identically_under_provisional() {
     let mut s = Snapshot::default();
     s.method_of.insert(1, PoolMethod::Lifo);

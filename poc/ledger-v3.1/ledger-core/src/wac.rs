@@ -169,10 +169,25 @@ pub(crate) fn aggregate_deplete(
     // is re-derived from the reduced value_sum (preserved up to rounding). When
     // the pool empties, force value_sum = 0 to clear the rounding residual and
     // avoid a stranded value with zero qty (acct-0qps).
+    //
+    // value_sum may legitimately go NEGATIVE while qty > 0: a provisional
+    // standard-basis depletion (§3.5) prices at standard_cost, decoupled from
+    // the book average, so depleting deep while standard_cost > avg posts more
+    // value out than the pool carries (banker-rounded running-average
+    // depletions can do the same at ±1 scale). The derived average follows it
+    // below zero — standard-basis pools never price off it. The GL stays the
+    // truth; the deferred recalc tier (§7) trues the pool up (acct-mvq4.22;
+    // migration 0009 permits the negative aggregate).
     let amount: i64 = (qty_to_deplete as i128 * applied_unit_cost as i128)
         .try_into()
         .map_err(|_| overflow(format!("deplete amount on pool {}", line.pool_id)))?;
-    let new_value_sum = if new_qty == 0 { 0 } else { current_value_sum - amount };
+    let new_value_sum = if new_qty == 0 {
+        0
+    } else {
+        current_value_sum
+            .checked_sub(amount)
+            .ok_or_else(|| overflow(format!("deplete value_sum on pool {}", line.pool_id)))?
+    };
     let new_unit_cost =
         if new_qty > 0 { banker_div(new_value_sum as i128, new_qty) } else { current_unit_cost };
 

@@ -227,6 +227,19 @@ pub async fn aggregate(pool: &PgPool, pool_id: i64) -> Option<(i64, i64)> {
         .expect("read aggregate")
 }
 
+/// Aggregate row `(qty, unit_cost, value_sum)` for a pool — value_sum is the
+/// net posted book value (0007), legitimately negative under provisional
+/// standard-basis over-book depletion (0009, acct-mvq4.22).
+pub async fn aggregate_with_value(pool: &PgPool, pool_id: i64) -> Option<(i64, i64, i64)> {
+    sqlx::query_as(
+        "SELECT qty, unit_cost, value_sum FROM pool_state WHERE pool_id = $1 AND layer_id = 0",
+    )
+    .bind(pool_id)
+    .fetch_optional(pool)
+    .await
+    .expect("read aggregate with value_sum")
+}
+
 /// Count of materialized layer rows (`layer_id > 0`) for a pool. Path C
 /// FIFO/LIFO must keep this at zero.
 pub async fn layer_count(pool: &PgPool, pool_id: i64) -> i64 {

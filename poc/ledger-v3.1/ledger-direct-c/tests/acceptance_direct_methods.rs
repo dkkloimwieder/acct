@@ -240,6 +240,33 @@ async fn fifo_standard_basis_depletes_at_standard_not_average() {
 
 #[tokio::test]
 #[ignore = "needs running poc_v3_1 with ledger_direct_c installed"]
+async fn fifo_standard_basis_over_book_depletion_writes_negative_value_sum() {
+    // §3.5 + migration 0009 (acct-mvq4.22): a standard-basis depletion prices
+    // at standard_cost, decoupled from the book average. Depleting deep while
+    // standard_cost > avg posts more value out than the pool carries — the
+    // write must SUCCEED with a negative GL-reconcilable value_sum (and the
+    // derived average following it), not reject on a non-negativity CHECK.
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let f = seed_fixture(&pool, "fifo", "standard").await;
+    seed_standard_cost(&pool, f.sku_id, f.loc_id, 150).await;
+
+    // Receipt 10 @ 100 → book value 1000; deplete 7 @ standard 150 = 1050.
+    submit(&pool, "po_receipt", 1, vec![receipt(&f, 10, 100)]).await.expect("r");
+    let dep = submit(&pool, "transfer_shipment", 2, vec![depletion(&f, 7)])
+        .await
+        .expect("over-book standard-basis depletion must succeed");
+
+    let lines = trx_lines(&pool, dep).await;
+    assert_eq!(lines[0].1, 150, "depletion records the standard provisional cost");
+    assert_eq!(posting_lines(&pool, dep).await[0].1, 1050, "7 × 150 posted to the GL");
+    assert_eq!(layer_count(&pool, f.pool_id).await, 0);
+    // 1000 − 1050 = −50 at qty 3; derived avg banker_div(−50, 3) = −17.
+    assert_eq!(aggregate_with_value(&pool, f.pool_id).await, Some((3, -17, -50)));
+}
+
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_direct_c installed"]
 async fn fifo_standard_basis_without_standard_cost_raises_on_depletion() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
