@@ -928,7 +928,109 @@ class is host-infra (C5, P3). Every code-behavior surface that ran, ran green �
 routed-equivalence run clean), and both live smokes. Cluster restored: GUC snapshot
 byte-identical, preload list unchanged, production .so verified, 5 workers resident.
 
-## D. complexity disposition (acct-mvq4.7 — pending)
+## D. complexity disposition (acct-mvq4.7 — 2026-06-07)
+
+**Method.** Every enumerated candidate (issue list items 1–8) plus a fresh sweep:
+`#[allow(dead_code)]`/`#[allow(unused)]` inventory (30 sites, every one classified),
+TODO/FIXME/XXX/HACK grep (**zero hits across all src** — the workspace carries no marker debt),
+zero-caller checks for every flagged symbol (dynamic-construction-aware: `committer_stat(pool,
+name)` builds getter names via `format!`, which rescued `duplicate_redrives_total` from a
+false zero-consumer verdict — ×4 test consumers), per-GUC read-site map, scenario and CLI-flag
+usage maps, live artifact re-census. Pass-1 D7.1 re-verified: `committer_lease_ms` has zero
+hits anywhere — still gone. Verdicts: REMOVE / QUARANTINE / KEEP+document / PROMOTE /
+DEFER-to-`<issue>`.
+
+### D.1 Disposition table
+
+| # | Candidate | Verdict | Rationale / evidence |
+|---|---|---|---|
+| 1 | `affinity.rs` (47 lines) + GUCs `affinity_scheme`/`affinity_steal_ms` + getters `affinity_{owned_claims,steals}_total` | **DEFER-to-`acct-m4g5`** (record-only) | Default-off verified end-to-end (GUC 0; one compare on the claim path when off; the unconditional mix64 owner stamp measured-benign in p1al-era runs); every site greppable via `[acct-0usf affinity — EXPERIMENTAL/REMOVABLE]`. Keep-kill is `acct-m4g5.4`'s verdict, owned by another stream. Recorded for m4g5: `SCHEME_MIN_POOL` (affinity.rs:28) is zero-ref even within the affinity code — dead either way; the two getters ARE harness-consumed. |
+| 2 | test_hooks SPI subset (×10) | **KEEP ×9** + **REMOVE `test_router_pid`** (→X1) | Feature-gating verified twice: static (B-ii.4 / P2.3-yojk.11 re-verification) and **live** (C-ii.5: test fns unresolvable in the production catalog after the restore install). 9/10 are suite infrastructure with live consumers; `test_router_pid` has zero consumers anywhere (not even a test). |
+| 3 | `bench_apply` + `bench_hooks` feature | **KEEP+documented** | Opt-in (`WITH_BENCH_HOOKS=1` install), consumed by bench-apply-inproc.sh, documented in apply_inproc_microbench.md; gate anchor corrected at A.2 (committer.rs:1297). |
+| 4 | D8.1's 13 dead shmem fields | **re-verified REMOVED** | yojk.1 holds (B-ii.4 grep-zero). No regression. |
+| 5 | Q14's 9 written-never-read shmem fields | per-field recommendations → **annotated on `acct-mvq4.35`** | EXPOSE: `eject_total_count` (a designed mechanism with zero observability; also unblocks C-i.2 row 14's untestability), `router_cross_commit_group_for_update_waits` (would evidence the A1/§14.2 order-divergence rate). FIX-DOC-or-DELETE: `free_slot_wake_count` (the false "tests assert this grew" comment is the actionable bit). DELETE: `committer_claim_count` (≈ `drains_total`), `StagingEntry.backend_pid`, `.correlation_id` (never meaningfully stamped), `.trx_type_id` (payload decode is authoritative; deletion removes the `unknown→0` trap B-ii noted), `CQE.committer_tx_id` (only ever cleared). DEFER-to-`acct-mvq4.31`-fix: `committer_acquired_at_ns` (a periodic stuck-group sweep would want group age; delete if the Q10 fix doesn't add one). |
+| 6 | lib.rs getter family ×36 | **KEEP+document** (x-ref `acct-mvq4.19`) | 28 consumed (harness 25+, tests via static + dynamic names); **8 zero-consumer**: `arena_{freelist_count,total_allocs,total_frees}` + `router_{ticks,entries_scanned,total_submissions,commit_group_count,window_defers}_total`-family. Zero-consumer ≠ zero-value: the SQL getter surface is the only window into BGWorker internals (8 lines each; arena alloc/free totals = leak forensics, router ticks = liveness probe). **Correction to A.4 recorded**: the arena leak assertions use `outstanding` only, and POC-REPORT (g) derives from committer counters + the two consumed router getters (`max_group_size`, `submission_histogram`) — NOT the 5-counter router family. |
+| 7 | `staging_state_counts` / `staging_request_seq_max` | **KEEP** | Test-consumed (×2 / ×1, C-i map); documentation rides the mvq4.19 SPI/GUC reference table. |
+| 8 | Module-blanket `#![allow(dead_code)]` ×3 (committer.rs:50, cleanup.rs:42, payload.rs:25) | **REMOVE-blanket**, scope to items (→X1) | Blanket suppression is exactly how Q14's dead fields and helpers stayed invisible to the compiler — the cheapest structural guard this audit can recommend. |
+| 9 | Stale per-item allows on LIVE code (~18 sites) | **REMOVE-attribute** (→X1) | All 12 lib.rs `*_now()` GUC accessors have 1–3 live callers; arena.rs:62 impl block (comment "as they land" — they landed) + :230 `align_up`; shmem.rs:416/:430/:451/:460 (`backpressure_cv_ptr` ×3, `signal_staging_slot_freed` ×6, `now_us`/`now_ns` pervasive); sampler.rs:160 `top_wait_event` ×3. The compiler now proves liveness; the attributes would mask future regressions to dead. |
+| 10 | Genuinely dead code | **REMOVE** (→X1) | identity.rs:117 `_silence_unused_warnings_when_no_callers_yet` (callers exist now); scenarios.rs:63 `expected_method_mix` (write-only — constructed at :122, never read); workload.rs:47 `Complexity::Medium` + its :197 match arm (no scenario constructs it — A.1 §10.3 confirmed); ledger-core's `proptest` dev-dependency (zero proptest usage in the crate — payload.rs is the workspace's only proptest site). X-ref Q2/`acct-mvq4.23` (adjacent scenarios.rs cleanup, already filed). |
+| 11 | `max_touches` / `caller_count` allows | **KEEP** | `max_touches` is test-consumed (×2 — allow correct for prod-dead/test-live); `caller_count` is in-source documented as informational. |
+| 12 | `seed-pools` subcommand + `--count/--skus/--locations` | **KEEP+documented** | README quickstart operator path; benches use the run-embedded reseed instead — both paths intentional. |
+| 13 | `--multi-touch-pct` / `--touch-dist` CLI overrides | **KEEP** | Mechanism preset-proven (s9: 40 % / 1:60,2:30,3:10); the CLI flags are ad-hoc exploration affordances, documented in results docs. |
+| 14 | Identity/slot machinery (identity.rs, 123 lines) | **KEEP** | Generation monotonicity + two-pass claim + ESRCH probe are each load-bearing for PID-recycling-safe takeover (B-ii walk); nothing simpler suffices for the §6.5 contract. Only the shim (row 10) is removable. |
+| 15 | Scenario set s1–s21 | **KEEP all** | D.2: zero zero-ref scenarios (min 2 bench scripts + 1 results doc each). |
+| 16 | results/ strays + retention | act per D.4 (→X2) | — |
+
+### D.2 Scenario usage map
+
+Word-boundary grep per scenario across `bench/*.sh` (26) and tracked+stray `results/*.md` (13).
+Every scenario is live — **no REMOVE/QUARANTINE candidates**:
+
+| Scenario | bench scripts | results docs | Scenario | bench scripts | results docs |
+|---|--:|--:|---|--:|--:|
+| s1 | 5 | 1 | s12 | 3 | 1 |
+| s2 | 13 | 10 | s13 | 3 | 1 |
+| s3 | 2 | 1 | s14 | 11 | 1 |
+| s4 | 4 | 1 | s15 | 11 | 1 |
+| s5 | 15 | 3 | s16 | 11 | 1 |
+| s6 | 13 | 3 | s17 | 11 | 1 |
+| s7 | 16 | 4 | s18 | 11 | 1 |
+| s8 | 13 | 2 | s19 | 12 | 2 |
+| s9 | 11 | 2 | s20 | 11 | 1 |
+| s10 | 10 | 3 | s21 | 11 | 1 |
+| s11 | 11 | 1 | | | |
+
+(The s14–s21 Pareto family's uniform ~11 reflects the sweep scripts' shared `depth_for()` case
+lists plus the affinity/window sweeps that iterate the family.)
+
+### D.3 CLI-flag usage map
+
+| Flag | bench | docs | Verdict | Flag | bench | docs | Verdict |
+|---|--:|--:|---|---|--:|--:|---|
+| `--dsn` | 22 | 0 | KEEP | `--seed-count` | 20 | 0 | KEEP |
+| `--scenario` | 21 | 0 | KEEP | `--seed-skus` | 20 | 0 | KEEP |
+| `--duration` | 21 | 0 | KEEP | `--seed-locations` | 20 | 0 | KEEP |
+| `--method-mix` | 21 | 1 | KEEP | `--seed-depth` | 20 | 0 | KEEP |
+| `--mode` | 20 | 1 | KEEP | `--batch-size` | 4 | 1 | KEEP |
+| `--output` | 20 | 0 | KEEP | `--depth` | 14 | 0 | KEEP |
+| `--no-sampler` | 20 | 0 | KEEP | `--target-rate` | 1 | 1 | KEEP (raison d'être of sweep-latency-vs-load) |
+| `--max-callers` | 20 | 0 | KEEP | `--pareto-hot-{pool,traffic}-pct` | 1 | 1 | KEEP |
+| `--submissions-per-caller` / `--callers` | 1 | 0 | KEEP (equivalence) | `--multi-touch-pct` / `--touch-dist` | 0 | 1 | KEEP (preset-internal; CLI = exploration, D.1 #13) |
+| `--count` / `--skus` / `--locations` (seed-pools) | 0 | 0 | KEEP+documented (README operator path, D.1 #12) | | | | |
+
+No zero-value flags: the three bench-zero groups are each deliberate affordances with a
+documented home.
+
+### D.4 Artifact retention (live re-census, 2026-06-07)
+
+`results/` = **1,129 files**: 791 `.json` (ignored), 229 `.txt` (sampler dumps, ignored),
+56 `.csv`, 33 `.log` (ignored), 13 `.md`, 2 `.svg`, 1 `.samples`, 1 `.runlog`; 346
+dot-prefixed scratch. Tracked: **69** = 54 csv + 12 md + 2 svg + `.gitignore`. The implicit
+policy is coherent — **track deliverables {csv, md, svg}, ignore bulk artifacts {json,
+sampler.txt, log}** — and the 7 strays are the policy's only violations/holes:
+
+1. **Commit 3 deliverables** the policy says to track: `sustained_s2_cc4_c16_p64.md` + `.csv`
+   (already headline-reconciled at A.2) and `batch_window_sweep.csv`.
+2. **Extend `results/.gitignore`** with the uncovered scratch shapes: `*.runlog`, `*.samples`,
+   `.sustained_snap*` (or a general dot-prefix rule + `!.gitignore`).
+
+Recommendation filed as X2; no archive/ split needed at 1.1k files — the ignore patterns keep
+`git status` clean, which is the actual operational need.
+
+### D.5 Findings
+
+| ID | Sev | Verdict | Finding |
+|---|---|---|---|
+| X1 | P3 | DEAD-CODE debt | **Dead-code suppression debt: 3 module-blanket `#![allow(dead_code)]` defeat compiler detection; ~18 stale per-item allows sit on provably-live code; 6 genuinely dead items removable.** The blankets (committer.rs:50, cleanup.rs:42, payload.rs:25) are how Q14's written-never-read fields stayed invisible. Dead items: `test_router_pid` (zero consumers incl. tests), identity.rs shim, `expected_method_mix` (write-only), `Complexity::Medium` (+ match arm), `SCHEME_MIN_POOL` (→ m4g5 caveat), ledger-core `proptest` dev-dep. Fix: remove blankets, scope to items; drop stale attributes (compiler proves liveness); delete dead items. Filed `acct-mvq4.41`. |
+| X2 | P3 | ARTIFACT-retention | **7 results/ strays = 3 policy violations + 4 policy holes.** Commit the 3 deliverables (`sustained_s2_cc4_c16_p64.{md,csv}`, `batch_window_sweep.csv`); extend `results/.gitignore` with `*.runlog`, `*.samples`, `.sustained_snap*`. Filed `acct-mvq4.42`. |
+
+**D summary.** 16 disposition rows, every enumerated and swept candidate versed: **zero
+REMOVE-grade architecture** — no scenario, flag, subcommand, or machinery is unjustified
+(identity, arena, packing, test/bench hook gating all KEEP on evidence; affinity defers to its
+owning stream). The complexity debt that does exist is small and mechanical: dead-code
+suppression hygiene (X1) and artifact strays (X2), both P3. The Q14 observability dispositions
+land as recommendations on `acct-mvq4.35`; the A.4 getter-derivation imprecision is corrected
+in D.1 #6. TODO/marker debt: zero. D7.1: still resolved.
 
 ## Findings index (acct-mvq4.8 — pending)
 
@@ -966,3 +1068,5 @@ byte-identical, preload list unchanged, production .so verified, 5 workers resid
 | C3 | P3 | COVERAGE-gap | Retry-path re-dedup deferral untested — no deadlock-retry × duplicate combination case | `acct-mvq4.38` (x-ref acct-mvq4.17/A9) |
 | C4 | P2 | TEST-stale (suite-red) | Routed acceptance suite RED at production defaults — 2 affinity-grouping tests encode the pre-p1al pack-off contract | `acct-mvq4.39` (x-ref acct-mvq4.10/A2) |
 | C5 | P3 | ENV-blocked (infra) | Matrix class (c) unrunnable on this host — pg_test framework install targets root-owned system pg dirs | `acct-mvq4.40` |
+| X1 | P3 | DEAD-CODE debt | 3 module-blanket allows defeat dead-code detection; ~18 stale allows on live code; 6 dead items | `acct-mvq4.41` (x-ref acct-mvq4.23, acct-mvq4.35, acct-m4g5) |
+| X2 | P3 | ARTIFACT-retention | 7 results/ strays: commit 3 deliverables, extend .gitignore for 4 scratch shapes | `acct-mvq4.42` |
