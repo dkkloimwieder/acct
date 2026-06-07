@@ -820,7 +820,113 @@ The §0.3 matrix is runnable for C-ii with two corrections: class (a) extends to
 `-p ledger-harness` (39 otherwise-unrun units) and class (c) expects full src-unit counts
 (73/1), not just hellos. Expected per-class totals: 79 / 38 / 74 / 2 = 193.
 
-## C-ii. suite-run ledger (acct-mvq4.6 — pending)
+## C-ii. suite-run ledger (acct-mvq4.6 — 2026-06-07)
+
+**Protocol executed** (deltas from the planned §0.3 matrix, all per C-i.3's corrections plus two
+runtime discoveries): `FAIL_FAST=0` for a complete ledger; class (a) extended with
+`-p ledger-harness`; class (c) found env-blocked at framework init → its unit population
+recovered via a direct `--lib` run; the one red binary re-run once to rule out flake.
+**Preamble record**: no orphan shells (ps/pgrep sweep clean); host quiet (load1 0.30);
+pre-run GUC snapshot taken (= production defaults exactly: bsm 200 / win 500 / cc 4 / pack on /
+rws 1000 / affinity 0; auto.conf pins at those values); `docker restart acct-postgres` for clean
+shmem. All runs sequential, backgrounded without timeout, never two cluster-touching at once.
+
+### C-ii.1 Run ledger
+
+| # | Class | Binary / invocation | Result | Tests | Wall (recorded) | Notes |
+|---|---|---|---|---|---|---|
+| 1 | (a) | ledger-core `src/lib.rs` (numeric) | GREEN | 11/11 | 0.00 s | |
+| 2 | (a) | ledger-core `tests/plan_apply_provisional` | GREEN | 10/10 | 0.00 s | |
+| 3 | (a) | ledger-core `tests/plan_apply_strict` | GREEN | 17/17 | 0.00 s | |
+| 4 | (a) | ledger-harness `src/main.rs` units | GREEN | 39/39 | 0.03 s | |
+| 5 | (a) | ledger-harness `tests/smoke_measure` (unit portion) | GREEN | 3/3 | 0.00 s | **unmapped +3**: the `#[path]`-include re-compiles measure.rs's 3 units into the smoke binary — C-i map didn't predict the duplication |
+| 6 | (a) | ledger-harness `tests/smoke_sampler` (unit portion) | — | 0 | 0.00 s | 1 ignored (the smoke → class d) |
+| 7 | (a) | ledger-spi-common `src/lib.rs` | GREEN | 2/2 | 0.00 s | |
+| 8 | (b) | direct-c `acceptance_direct_lock_and_concurrency` | GREEN | 3/3 | 1.51 s | |
+| 9 | (b) | direct-c `acceptance_direct_methods` | GREEN | 10/10 | 1.26 s | |
+| 10 | (b) | direct-c `property_ledger_submit_trx_c` | GREEN | 1/1 | 5.65 s | |
+| 11 | (b) | routed-c `acceptance_routed_affinity_grouping` | **RED** | 2/4 | 1.13 s | `disjoint_submissions_group_independently` (1≠3 groups) + `transitive_overlap_merges_into_one_component` (1≠2 groups). **Re-run byte-identical → deterministic, NOT a flake.** → C4 |
+| 12 | (b) | routed-c `acceptance_routed_committer` | GREEN | 8/8 | 7.95 s | |
+| 13 | (b) | routed-c `acceptance_routed_enqueue` | GREEN | 5/5 | 0.47 s | |
+| 14 | (b) | routed-c `acceptance_routed_orphan_recovery` | GREEN | 4/4 | 2.13 s | |
+| 15 | (b) | routed-c `property_ledger_enqueue_trx_c` | GREEN | 3/3 | 78.83 s | the suite's long pole |
+| 16 | (c) | direct-c `cargo pgrx test pg18` | **ENV-BLOCKED** | 0/1 ran | 33.99 s to fail | framework-init failure at the extension-install step → C5; not attempted for routed-c (same blocker) |
+| 17 | (c′) | routed-c `--lib` recovery run (`--skip '::pg_'`) | GREEN | 71/71 | 3.53 s | the class-(c) unit population recovered offline; 2 pg_ tests filtered as intended |
+| 18 | (d) | harness `smoke_measure::collector_captures_nonzero_deltas` | GREEN | 1/1 | 2.32 s | self-seeded (TRUNCATE + fixture) |
+| 19 | (d) | harness `smoke_sampler::sampler_captures_ticks` | GREEN | 1/1 | 1.14 s | |
+
+run-tests.sh overhead: 8 per-binary `docker restart` + 5 s RESTART_WAIT each, plus the two
+WITH_TEST_HOOKS installs (warm builds, ~9 s pre-build per path).
+
+### C-ii.2 Red analysis (→ C4)
+
+Both failures are **exactly `router_pack_disjoint=on` behavior**: 3 disjoint singleton
+components co-packed into one bin (`(cg 1, 3 subs, [5101,5102,5103])`), and the merged
+3-submission component + singleton co-packed into one bin of 4. The two tests hard-assert the
+pre-`acct-p1al` formation contract (pack off — each affinity component → its own commit_group);
+no test in the binary pins the GUC, so they run at the shipped default (pack on, flipped by
+p1al) and fail deterministically. Cross-layer inconsistency: the router's own pack unit tests
+(`pack_combines_small_disjoint_components_into_one_bin`, …) assert the pack-ON shapes — the
+suite disagrees with itself across layers. The two sibling tests in the same binary pass
+because they are pack-insensitive (`overlapping…one_commit_group`: union-find merges
+regardless; `oversized…splits…chunks`: reads the live `batch_size_max` GUC and adapts — the
+model the failing pair should follow). **Not a code defect**; the regression net is what's
+broken. Test-side sibling of A2/`acct-mvq4.10` (the p1al flips reached no normative doc — and
+no acceptance test). Does NOT contradict POC-REPORT (g) `errors=0` (a bench-cell claim, and
+re-verified: every bench-driven class ran green).
+
+### C-ii.3 Env-blocked analysis (→ C5)
+
+`cargo pgrx test pg18` fails at framework init in the extension-install step:
+`cargo-pgrx install --test --pg-config /usr/bin/pg_config` must write
+`/usr/lib/postgresql/18/lib` + `/usr/share/postgresql/18/extension` — both root-owned
+(`drwxr-xr-x root root`). Isolated from code: `cargo check --features "pg18 pg_test"
+--no-default-features` is CLEAN (0.26 s warm). `~/.pgrx/config.toml` points pg18 at the system
+PostgreSQL; `data-18` exists but the binary install target follows pg_config. The audit did
+not mutate the environment (no sudo install into the host PG, no `cargo pgrx init` repoint) —
+the 3 `#[pg_test]` fns are recorded skipped-env, and the 71 routed src units that C-i mapped
+onto class (c) were recovered via row 17.
+
+### C-ii.4 Reconciliation vs the C-i map
+
+- **Mapped population 193**: ran-GREEN **188** (79 class-a + 36 class-b + 71 class-c′ + 2
+  class-d), ran-RED **2** (the C4 pair), skipped-env **3** (pg_test hellos, C5 — skipped-why
+  documented). **No mapped test silently unrun.**
+- **Unmapped executions**: +3 (row 5 — smoke_measure's `#[path]` include duplicates measure.rs
+  units into the smoke binary; harmless, noted for the map's accuracy ledger). The flake
+  re-run (row 11) repeated 4 tests as an audit action, not a population change.
+- **Expected-vs-actual per class**: (a) 79 expected → 79 mapped ran + 3 dup = 82 executions ✓;
+  (b) 38 expected → 38 ran ✓; (c) 74 expected → 71 ran + 3 env-blocked ✓; (d) 2 → 2 ✓.
+- **Docs-claims check**: the reds contradict no results-doc headline (POC-REPORT `errors=0`
+  is about bench cells; all bench-driven paths green). They DO break the §9.3 "routed
+  integration suite" regression-net implication — captured as C4, x-ref A2.
+
+### C-ii.5 Restore verification (no drift)
+
+Post-run, production `.so` (no test_hooks) reinstalled for both crates; `docker restart`;
+verified: **GUCs byte-identical** to the pre-run snapshot (bsm 200 / win 500 / cc 4 / pack on /
+rws 1000 / affinity 0); `shared_preload_libraries` unchanged
+(`pg_stat_statements, pg_cron, ledger_routed_c` — the install script's already-preloaded guard
+held, no duplication); **5 BGWorkers resident** (router + 4 committers);
+`ledger_routed_c_test_router_pid()` → `does not exist` (test hooks absent from catalog and
+.so); `ledger_routed_c_hello()` live. poc_v3_1 left migrated with smoke-fixture content
+(bench-scratch by convention; every bench reseeds).
+
+### C-ii.6 Findings
+
+| ID | Sev | Verdict | Finding |
+|---|---|---|---|
+| C4 | **P2** | TEST-stale (suite-red) | **The routed acceptance suite is RED at production defaults**: `acceptance_routed_affinity_grouping` 2/4 fail deterministically because they hard-assert the pre-p1al pack-off formation contract (3 groups / 2 groups) while the shipped default (`router_pack_disjoint=on`, acct-p1al) co-packs those components into one bin — the exact shapes observed. Behavior is correct-by-design (matches the pack unit tests); the regression net is broken: any run of the canonical runner reds, masking real regressions. Fix shapes: adapt assertions to the live GUC (the in-binary `oversized…` test is the model), pin pack=off for the two cases, or assert pack-on shapes + add pack-off variants. Filed `acct-mvq4.39`; x-ref `acct-mvq4.10` (A2 — doc-side of the same flip). |
+| C5 | P3 | ENV-blocked (infra) | **Matrix class (c) is unrunnable on this host**: pgrx test-framework install targets the system PostgreSQL's root-owned dirs (`/usr/lib/postgresql/18/lib`, `…/extension`); the pg18+pg_test combo compiles clean, so the 3 `#[pg_test]` fns have no execution path here. The §0.3 matrix silently assumed a writable pg install. Unit population recovered via `--lib --skip '::pg_'` (71/71 green). Fix shapes: `cargo pgrx init --pg18 download` (managed install), documented sudo path, or retire the near-redundant pg_test layer and fold the matrix to 3 classes + the `--lib` run. Filed `acct-mvq4.40`. |
+
+**C-ii summary.** The 4-way matrix executed once under cluster discipline: **188/193 green,
+2 red, 3 env-blocked** — every mapped test accounted for. The reds are deterministic
+test-staleness against the acct-p1al default flip (C4, P2 — the suite's first red at shipped
+defaults, and the audit's first finding that an operator would hit on day one); the blocked
+class is host-infra (C5, P3). Every code-behavior surface that ran, ran green — including all
+8 committer-pipeline acceptance tests, orphan recovery, both property suites (78.8 s
+routed-equivalence run clean), and both live smokes. Cluster restored: GUC snapshot
+byte-identical, preload list unchanged, production .so verified, 5 workers resident.
 
 ## D. complexity disposition (acct-mvq4.7 — pending)
 
@@ -858,3 +964,5 @@ The §0.3 matrix is runnable for C-ii with two corrections: class (a) extends to
 | C1 | P3 | COVERAGE-gap | `ledger_enqueue_trx_batch_c` suite-dark — zero test coverage on a production SPI entry point | `acct-mvq4.36` |
 | C2 | P3 | COVERAGE-gap | Enqueue backpressure failure arms test-dark — queue-full timeout error + arena-full deadline never executed | `acct-mvq4.37` (x-ref acct-mvq4.18/A10) |
 | C3 | P3 | COVERAGE-gap | Retry-path re-dedup deferral untested — no deadlock-retry × duplicate combination case | `acct-mvq4.38` (x-ref acct-mvq4.17/A9) |
+| C4 | P2 | TEST-stale (suite-red) | Routed acceptance suite RED at production defaults — 2 affinity-grouping tests encode the pre-p1al pack-off contract | `acct-mvq4.39` (x-ref acct-mvq4.10/A2) |
+| C5 | P3 | ENV-blocked (infra) | Matrix class (c) unrunnable on this host — pg_test framework install targets root-owned system pg dirs | `acct-mvq4.40` |
