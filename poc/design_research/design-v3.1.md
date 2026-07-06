@@ -128,6 +128,7 @@ CREATE TABLE pool_state (
     layer_id    BIGINT NOT NULL,
     qty         BIGINT NOT NULL,
     unit_cost   BIGINT NOT NULL,
+    value_sum   BIGINT NOT NULL,           -- cumulative book value; unit_cost is DERIVED as banker_div(value_sum, qty) (§3.0/§3.1)
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (pool_id, layer_id)
 );
@@ -1186,10 +1187,13 @@ dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
 - **Harness seeds `standard_cost`** (§10.4): the pool seeder must populate `standard_cost` for
   every std-method / standard-basis pool, else those pools abort with MissingStandardCost and
   confound mixed-method scenarios.
-- **`qty >= 0` CHECK on `pool_state`** (§2.2/§3.6): no-negative-inventory began as a
-  `ledger-core`-only code invariant; migration `0006` added `CHECK (layer_id <> 0 OR qty >= 0)` as a
-  schema-level defense-in-depth backstop on the aggregate row (scoped to `layer_id = 0` so it never
-  constrains strict-method layer rows, which Path C does not materialize on the hot path).
+- **`qty >= 0` and `value_sum >= 0` CHECKs on `pool_state`** (§2.2/§3.6): no-negative-inventory began
+  as a `ledger-core`-only code invariant; migration `0006` added `CHECK (layer_id <> 0 OR qty >= 0)`
+  (`pool_state_aggregate_qty_nonneg`) and migration `0007` added the sibling `CHECK (layer_id <> 0 OR
+  value_sum >= 0)` (`pool_state_aggregate_value_sum_nonneg`) — both schema-level defense-in-depth
+  backstops on the aggregate row (scoped to `layer_id = 0` so they never constrain strict-method
+  layer rows, which Path C does not materialize on the hot path). The `value_sum` column the second
+  CHECK guards is a core storage column (migration `0007`, `NOT NULL`) carried in the §2.2 DDL.
 - **Cross-chunk ordering is not guaranteed** (§14.2/§11.1): when a connected component is split
   across commit_groups by `batch_size_max`, the split chunks are independent commit_groups claimed
   concurrently by different committers with no predecessor-wait (`ledger-routed-c/src/router.rs`,
