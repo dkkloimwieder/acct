@@ -546,7 +546,7 @@ Caller invokes inside their own user-tx, alongside whatever other work they're d
    - `method = 'specific'`: plan_apply_specific (strict; consumes the one layer row).
    - `method = 'fifo'` or `'lifo'`: plan_apply_provisional. Receipts update aggregate per the §3.1 WAC formula (with §3.1 divide-by-zero guard and §3.0 banker's rounding on the division). Depletions get applied_unit_cost from either `aggregate.unit_cost` (if provisional_basis = 'running_avg') or `standard_unit_cost` (if provisional_basis = 'standard'). new_qty = old_qty - Q on aggregate. trx_line.source_trx_line_id = NULL.
 
-7. On error (insufficient inventory for any pool — checked against aggregate.qty for WAC/FIFO/LIFO provisional, against the one layer for specific, against no inventory for STD since STD pools don't track on-hand qty in pool_state): RAISE EXCEPTION, caller's tx aborts.
+7. On error (insufficient inventory for any pool — checked against aggregate.qty for WAC/FIFO/LIFO provisional **and STD** (STD maintains the aggregate row for qty tracking per §3.3, so the no-negative-inventory invariant of §3.6 applies to every method), against the one layer for specific): RAISE EXCEPTION, caller's tx aborts.
 
 8. Apply PlanResult:
    - INSERT trx ... RETURNING id (PG auto-allocates the trx.id via the IDENTITY column; capture it for use in trx_line.trx_id below and for the return value).
