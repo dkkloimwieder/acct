@@ -649,15 +649,16 @@ Transitions: router `empty → ready`; committer `ready → in_flight`; committe
 
 ### 6.3 Router
 
-Background worker that scans the staging window every `batch_window_us` (default 500μs):
+Background worker on a latch loop with a 50ms timeout (`wait_latch(Some(50ms))`, `ledger-routed-c/src/router.rs`) — the 50ms tick, **not** `batch_window_us`, is the scan cadence. Each tick:
 
-1. Read up to `router_window_size` (default 1000) pending entries from staging queue head.
-2. Skip entries whose `eject_count > 0 AND now - last_eject_at_ns < eject_cooldown_ms` (default 10ms cooldown).
+1. Head-scan up to `router_window_size` (default 1000) pending entries from the staging queue, skipping entries in eject cooldown (`eject_count > 0 AND now - last_eject_at_ns < eject_cooldown_ms`, default 10ms).
+2. **Time-coalesce gate** (`batch_window_us`, default 500μs). If the oldest scanned candidate has been pending for less than `batch_window_us`, defer the whole tick (emit nothing) so more submissions accumulate before grouping; `batch_window_us = 0` disables the gate. This is a coalesce *dwell* applied per tick — not the scan cadence.
 3. Build union-find by pool_id overlap. Each connected component becomes a candidate commit_group.
-4. For components exceeding `batch_size_max` (default 50 submissions): split into chunks.
-5. For each commit_group: CAS staging entries `pending → processing → routed`; push commit_group to committer queue.
+4. **Disjoint-packing pass** (`router_pack_disjoint`, production default ON — acct-p1al). Greedily first-fit the disjoint components (those sharing no pool_id) into commit_groups of up to `batch_size_max`, so a spread/Pareto tick emits a few fuller groups instead of many tiny one-component groups, amortizing per-group commit/fsync. Disjoint pools share no row lock, so this adds no cross-pool `FOR UPDATE` contention. Off → one commit_group per component.
+5. Chunk any group exceeding `batch_size_max` (default 200 submissions) into batch-sized chunks (cross-chunk ordering posture: §14.2).
+6. For each commit_group: CAS staging entries `pending → processing → routed`; push the commit_group to the committer queue.
 
-Affinity grouping ensures overlapping submissions go to the same committer (avoids committer-vs-committer lock contention on hot pools).
+Affinity grouping ensures overlapping submissions go to the same committer — one connected component becomes one commit_group claimed by one committer, avoiding committer-vs-committer lock contention on hot pools. (This routing-level grouping is separate from the experimental `affinity_scheme` committer-pinning dial, default off — acct-0usf.)
 
 ### 6.4 Committer
 
@@ -1199,3 +1200,11 @@ dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
   orderings and between repeat runs. This is within Path C's accepted semantics (provisional updates
   may differ across orderings) and is unobserved in all measured scenarios; the strict "identical to
   single-chunk" reading of the §11.1 qty-equality criterion holds within a commit_group only.
+- **Router defaults tuned by acct-p1al** (§6.3): the production defaults are `batch_size_max` = 200
+  and `router_pack_disjoint` = ON, set by the acct-p1al batch-formation sweep (measured
+  win-or-neutral: spread 2×, deep-zipf +170%, mixed neutral, single-hot-pool inert). The
+  disjoint-packing pass (acct-xdwk lever 1b) first-fit-bin-packs disjoint affinity components up to
+  `batch_size_max` to amortize per-group commit/fsync on spread/Pareto workloads; off preserves
+  one-commit_group-per-component. Separately, `batch_window_us` (default 500μs) is an
+  oldest-candidate coalesce *dwell* evaluated once per tick, not the scan cadence — the router scans
+  on a 50ms `wait_latch` loop.

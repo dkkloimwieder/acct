@@ -55,8 +55,10 @@ allocator, the payload codec, GUCs (`ledger_routed_c.*`), and BGWorker registrat
 
 P3.2 implements the **router** BGWorker (§6.3): each tick head-scans the staging queue up to
 `router_window_size` (skipping eject-cooldown slots), gates on `batch_window_us`, union-finds
-candidates by pool overlap into connected components, chunks any component over `batch_size_max`
-preserving enqueue order, and emits each chunk as a commit_group (CAS staging `pending→processing
+candidates by pool overlap into connected components, greedily bin-packs disjoint components into
+fuller commit_groups when `router_pack_disjoint` is on (production default; acct-p1al), chunks any
+component over `batch_size_max` (default 200) preserving enqueue order, and emits each chunk as a
+commit_group (CAS staging `pending→processing
 →routed`, push a committer-queue entry `empty→ready`). There is **no PoolSeqTable and no
 order-sensitive no-split case** — Path C records provisional aggregate updates, so any component
 may be split across commit_groups and provisional unit_costs are allowed to differ across
