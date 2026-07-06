@@ -486,8 +486,10 @@ ledger_enqueue_trx_c(
 ```
 
 > **Implementation note (v3.1 PoC — AUDIT.md D1.1/D1.2).** The shipped SPIs take `lines` as
-> **JSONB** (an array of objects), not the SQL composite ARRAY sketched above — pgrx ergonomics;
-> behaviorally equivalent.
+> **JSONB** (an array of objects), not the SQL composite ARRAY sketched above; `trx_type` and
+> `posted_at` ship as **TEXT** (not the `trx_type` enum / `TIMESTAMPTZ` shown above), with
+> `posted_at` parsed as an RFC3339 string (malformed → `ERRCODE_INVALID_DATETIME_FORMAT`) — pgrx
+> ergonomics; behaviorally equivalent.
 
 > **v3.2 — posting accounts are resolved ledger-side (§3.7), not on the line.** The original
 > v3.1 line tuple carried `debit_account`, `credit_account` (and an optional `variance_account`)
@@ -1169,10 +1171,11 @@ correctness defect. This section lists only **spec-relevant** divergences; per-f
 dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
 `poc/ledger-v3.1/README.md`.
 
-- **SPI line shape** (§4): `lines` is a JSONB array-of-objects, not a SQL composite ARRAY; each
-  object carries `(line_type, source_id?, pool_id, qty, unit_cost)`. Posting accounts (debit /
-  credit, and the variance account for §3.3 STD receipts) are NOT on the wire — they are resolved
-  ledger-side from `posting_account_map` per §3.7. Annotated inline at §4.
+- **SPI wire shape** (§4): `lines` is a JSONB array-of-objects, not a SQL composite ARRAY; each
+  object carries `(line_type, source_id?, pool_id, qty, unit_cost)`. `trx_type` and `posted_at` ship
+  as TEXT (not the `trx_type` enum / `TIMESTAMPTZ` sketched in §4); `posted_at` is parsed as RFC3339.
+  Posting accounts (debit / credit, and the variance account for §3.3 STD receipts) are NOT on the
+  wire — they are resolved ledger-side from `posting_account_map` per §3.7. Annotated inline at §4.
 - **Aggregate-mutation coalescing** (§5.1 step 8 / §8): `ledger-core`'s
   `PlanResult::coalesce_aggregates` collapses per-pool aggregate upserts to one (keep-last) so a
   single submission touching a pool twice writes one `(pool_id, layer_id=0)` row (the direct
