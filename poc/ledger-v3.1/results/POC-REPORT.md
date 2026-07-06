@@ -384,7 +384,7 @@ not develop new failure modes with duration (their verdicts live in artifact (b)
 
 **Method.** `ledger-harness/bench/run-routed-longdur.sh` with `DURATIONS=120` — one **2-minute**
 load-gated run per scenario, clean DB each (21 routed cells). Clean = **DROP/CREATE `poc_v3_1` +
-re-run the 16 sqlx migrations + `CREATE EXTENSION` + postmaster restart** (clean-DB option a2 — the
+re-run the 9 sqlx migrations + `CREATE EXTENSION` + postmaster restart** (clean-DB option a2 — the
 more aggressive choice over a1's restart-and-reset, because it surfaces migration / extension-init
 bugs). Seed depth follows the artifact-(b) crossover depths (s5/s6 = 10, s7/s8/s9 = 1000,
 s11/s15/s19 = 100, the remaining deplete scenarios = 10, receipts = 0). A committer-readiness canary

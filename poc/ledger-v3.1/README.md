@@ -29,7 +29,7 @@ skeleton (schema, ledger-core dispatch, shmem/router/committer stack).
 ## Setup
 ```bash
 bash scripts/create-poc-v3-1-db.sh    # create poc_v3_1 (idempotent)
-bash scripts/run-migrations.sh        # apply migrations 0001-0005
+bash scripts/run-migrations.sh        # apply migrations 0001-0009
 cargo build                           # workspace builds
 ```
 
@@ -145,9 +145,10 @@ ledger-harness equivalence --scenario s7 --callers 8 --submissions-per-caller 50
   `ledger_submit_trx_c`), `direct-batched` (N calls in one user-tx, §5.5
   commit/lock amortization), `routed` (`ledger_enqueue_trx_c` → committer pool,
   §6 cross-caller aggregation).
-- **Scenarios S1–S8** (§10.6): S1–S4 shallow receipt workloads (baseline,
+- **Scenarios S1–S21** (§10.6): S1–S4 shallow receipt workloads (baseline,
   routing amortization, complexity); S5/S6 1000-caller shallow FIFO (hot-pool vs
-  disjoint); **S7/S8 deep-pool FIFO depletions — Path C's home field** (§11.2).
+  disjoint); **S7/S8 deep-pool FIFO depletions — Path C's home field** (§11.2);
+  S9 FIFO multi-touch; S10–S21 the Pareto receipts/builds/mixed family (`acct-s90k`).
 - **Headline metric**: per-trx ack latency captured per seeded `--depth`. The
   in-function critical section is dominated by pool_lock hold time and depth is
   the only thing varying across a seed sweep, so flat latency across depths
@@ -163,9 +164,11 @@ ledger-harness equivalence --scenario s7 --callers 8 --submissions-per-caller 50
   io_uring memlock ceiling can't hold 1000 direct backends (`acct-8cn2`); the
   bench runners point `--dsn` at the pooler for those scenarios. `--max-callers`
   caps concurrency for pooler-less smoke runs (the cap is recorded in the report).
-- `bench/`: `run-lockhold-sweep.sh` (§11.2), `run-crossover.sh` (§11.4 mode ×
-  scenario matrix), `run-equivalence.sh` (§11.1), `setup-pgbouncer.sh`. Every
-  harness invocation is hard-`timeout`-wrapped. **The actual bake-off RESULTS +
+- `bench/` holds 26 runner scripts; the load-bearing ones: `run-lockhold-sweep.sh`
+  (§11.2), `run-crossover.sh` (§11.4 mode × scenario matrix), `run-equivalence.sh`
+  (§11.1), `setup-pgbouncer.sh`. The rest are per-sweep drivers (batch-size /
+  batch-window / committer-count / affinity / latency-vs-load / p1al / hh7b /
+  sustained-5min, etc.). Every harness invocation is hard-`timeout`-wrapped. **The actual bake-off RESULTS +
   PoC report are P5 (`acct-2ttr.9`)**; P4 delivers the machinery.
 
 > Known limitation: `ledger_submit_trx_c` (direct) emits one aggregate UPSERT row
