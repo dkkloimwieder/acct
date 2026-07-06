@@ -391,7 +391,9 @@ Each unit is its own pool (pool.identity_key = unit_id, pool.method = 'specific'
 
 **Specific-id pools always use strict mode, even on Path C.** Provisional mode exists to avoid layer iteration on layer-tracked methods; with K=1 there's only one layer to read, and the choice of which layer to consume is uniquely determined by the caller-provided identity_key (not by FIFO/LIFO ordering). The lock-hold reduction Path C exists to deliver doesn't apply — there's nothing to defer. The hot path under Path C for a specific pool runs identical SQL to a strict implementation: read the one layer, deplete it, INSERT trx_line with source_trx_line_id pointing at the receipt, DELETE the layer row. pool.provisional_basis is ignored for specific pools.
 
-Application code must ensure specific pools receive exactly one receipt of qty=1 and never receive additional inflows. The schema enforces one piece of this invariant — `CHECK (method != 'specific' OR identity_key != 0)` on the pool table rejects specific pools with default identity_key, catching the configuration error where a caller forgot to supply a serial number. The schema does NOT enforce single-receipt or no-additional-inflow invariants; those remain application-layer responsibilities. Violation of the application-layer invariant produces undefined behavior under FIFO-with-K=1 semantics.
+Application code must ensure each specific pool receives exactly one receipt of qty=1. The **no-additional-inflow** half is engine-enforced: a receipt to a specific pool that already holds `qty > 0` raises `SpecificPoolOccupied` (`specific.rs`), whether the prior receipt was hydrated from an earlier tx or arrived earlier in the same batch (a second co-existing layer would break the single-layer `deplete`, which consumes the lowest layer_id). The schema adds `CHECK (method != 'specific' OR identity_key != 0)` on the pool table, rejecting specific pools with a default identity_key — the configuration error of a forgotten serial number.
+
+The **qty=1** half remains a caller contract: the engine does not force a single receipt to have qty=1. If a caller receipts an oversized layer (qty > 1) to an empty pool, a subsequent depletion consumes the whole layer (K=1 full-layer delete) but decrements the aggregate by only the depleted qty — so a *partial* deplete of that layer deletes the layer row while leaving `aggregate.qty > 0` (the layer is gone but the aggregate still reads stocked). The states stay well-defined; the caller is responsible for supplying qty=1 to avoid the mismatch.
 
 ### 3.5 Provisional cost mode (Path C divergence for FIFO/LIFO)
 
@@ -1215,3 +1217,10 @@ dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
   one-commit_group-per-component. Separately, `batch_window_us` (default 500μs) is an
   oldest-candidate coalesce *dwell* evaluated once per tick, not the scan cadence — the router scans
   on a 50ms `wait_latch` loop.
+- **Specific-pool K=1 is engine-enforced** (§3.4): a receipt to a specific pool already holding
+  `qty > 0` raises `SpecificPoolOccupied` (`specific.rs`) rather than being an unchecked caller
+  invariant. The residual caller contract is qty=1 per receipt — the engine permits an oversized
+  receipt (qty > 1) to an empty pool, and a partial depletion of such a layer deletes the layer
+  (K=1 full-layer delete) while decrementing the aggregate by only the depleted qty, leaving
+  `aggregate.qty > 0` (AUDIT.md D3.2). States stay well-defined; the caller supplies qty=1 to avoid
+  the mismatch.
