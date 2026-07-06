@@ -526,6 +526,8 @@ Caller invokes inside their own user-tx, alongside whatever other work they're d
    ```
    LEFT JOIN because a brand-new pool may not yet have a pool_state aggregate row (created lazily on first receipt). The aggregate's qty/unit_cost are NULL for an unwritten pool; ledger-core treats NULL as "fresh, no prior state."
 
+   > **Implementation note.** The shipped hydration (`ledger-spi-common/hydration.rs`) issues this as **two** SELECTs — pool routing (`method`, `provisional_basis`, `sku_id`, `location_id`) then the `layer_id = 0` aggregate row per pool — rather than one LEFT JOIN; equivalent semantics, one extra SPI. Hydration also seeks `posting_account_map` per §3.7 for every touched pool (an additional read not shown in the step list) so the journal legs can be resolved ledger-side.
+
 4. For any pool with `method = 'std'` OR (`method IN ('fifo','lifo')` AND `provisional_basis = 'standard'`), bulk-read standard_cost:
    ```sql
    SELECT p.id AS pool_id, sc.unit_cost AS standard_unit_cost
@@ -533,7 +535,7 @@ Caller invokes inside their own user-tx, alongside whatever other work they're d
      JOIN standard_cost sc ON sc.sku_id = p.sku_id AND sc.location_id = p.location_id
     WHERE p.id = ANY($2::bigint[])  -- subset that needs standard cost
    ```
-   If a pool in the subset has no matching standard_cost row, RAISE EXCEPTION (configuration error).
+   If a pool in the subset has no matching standard_cost row, hydration records no entry for it and ledger-core raises `MissingStandardCost` when — and only when — a line actually uses it (**lazy resolution**, `hydration.rs`), not at hydration time. The `posting_account_map` seek behaves the same way: a missing mapping surfaces at line-processing (§3.7), not at hydration. The distinction is observable only for qty=0 lines or receipt-only standard-basis batches on a misconfigured pool.
 
 5. For any pool with `method = 'specific'`, bulk-read its single layer row:
    ```sql
@@ -572,14 +574,15 @@ For WAC, STD, and specific pools, Path C's lock-hold characteristics match a str
 Per-trx SPI count for Path C direct, dominant case (FIFO/LIFO pool, P deduped pools, all pool_locks already created):
 - 1 INSERT trx (with RETURNING id).
 - P `SELECT 1 FROM pool_lock WHERE pool_id = $1 FOR UPDATE` (one per pool, steady state).
-- 1 SELECT pool + pool_state aggregate join.
+- 2 SELECT: pool routing + `pool_state` aggregate row (shipped as two statements, not one LEFT JOIN).
+- 1 SELECT posting_account_map (§3.7 journal-leg resolution; one per hydration, all touched pools).
 - 0-1 SELECT standard_cost (only if any 'standard'-basis or STD pools are touched).
 - 0-1 SELECT pool_state layer rows (only if any specific pools are touched).
 - 1 bulk INSERT trx_line (with RETURNING id if posting_line needs it).
 - 1 bulk UPSERT pool_state.
 - 1 bulk INSERT posting_line.
 
-Total steady state: ~5-7 bulk SPI + P singleton. For P=1: ~6-8 SPI. The throughput difference vs strict-mode comes from reduced lock-hold time on FIFO/LIFO depletions, not from reduced SPI count.
+Total steady state: ~7-9 bulk SPI + P singleton. For P=1: ~8-10 SPI. The throughput difference vs strict-mode comes from reduced lock-hold time on FIFO/LIFO depletions, not from reduced SPI count.
 
 First-time-pool overhead: +2 SPI per pool that hasn't been locked before in its lifetime (INSERT ON CONFLICT + re-SELECT FOR UPDATE). Amortized to zero in steady state.
 
@@ -720,12 +723,13 @@ One fsync per commit_group. With N submissions per commit_group, fsync cost amor
 For a commit_group with N submissions touching P deduped pools (steady state, all pool_locks pre-existing):
 - 1 pre-flight dedup SELECT against trx.
 - P `SELECT 1 FROM pool_lock WHERE pool_id = $1 FOR UPDATE` (one per pool).
-- 1 bulk pool+pool_state aggregate read.
+- 2 bulk reads: pool routing + `pool_state` aggregate row (two statements, not one LEFT JOIN).
+- 1 bulk posting_account_map read (§3.7 journal-leg resolution, all touched pools).
 - 0-1 bulk standard_cost read.
 - 0-1 bulk pool_state layer-row read (specific pools only).
 - 1 bulk INSERT trx, 1 bulk INSERT trx_line, 1 bulk UPSERT pool_state, 1 bulk INSERT posting_line.
 
-Total steady state: ~9 bulk + P singleton. For N=50 submissions at P=50 deduped pools: ~59 SPI per commit_group, amortizing to ~1.18 SPI/submission. The architectural win vs direct flavor: at high concurrency on overlapping pools, the per-batch pool_lock acquisition and aggregate UPDATE replace what direct flavor would do per-trx — a 1000:1 reduction in pool_lock acquisitions for the hot-pool worst case.
+Total steady state: ~11 bulk + P singleton. For N=50 submissions at P=50 deduped pools: ~61 SPI per commit_group, amortizing to ~1.22 SPI/submission. The architectural win vs direct flavor: at high concurrency on overlapping pools, the per-batch pool_lock acquisition and aggregate UPDATE replace what direct flavor would do per-trx — a 1000:1 reduction in pool_lock acquisitions for the hot-pool worst case.
 
 First-time-pool overhead: +2 SPI per pool that hasn't been locked before in its lifetime (lazy-create path, §5.1 step 2). Amortized to zero in steady state.
 
