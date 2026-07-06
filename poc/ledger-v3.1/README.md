@@ -90,6 +90,38 @@ and `ledger_routed_c_committer_queue_state_counts()` (now incl. `poisoned`) /
 > workers needs headroom: the dev container's `max_worker_processes` was raised to 32 so the full
 > 4-committer pool starts (see `acct-8cn2`).
 
+## GUCs (`ledger_routed_c.*`)
+
+Routed-path tunables (all prefixed `ledger_routed_c.`). **Scope** `Sighup` = reloadable via
+`SELECT pg_reload_conf()`; `Postmaster` = fixed at server start. Defaults are the production values
+(`batch_size_max` and `router_pack_disjoint` were flipped by `acct-p1al` — see design-v3.1 §6.3).
+
+| GUC | Default | Scope | What it does |
+|---|---|---|---|
+| `staging_queue_size` | 16384 | Postmaster | Documents/bounds only — see the sizing caveat below. |
+| `committer_queue_size` | 2048 | Postmaster | Documents/bounds only — see the sizing caveat below. |
+| `spillover_arena_mb` | 128 | Postmaster | Documents/bounds only — see the sizing caveat below. |
+| `queue_full_timeout_ms` | 5000 | Sighup | Enqueue backpressure deadline: how long `ledger_enqueue_trx_c` CV-waits on a full staging ring / exhausted arena before raising `ERRCODE_INSUFFICIENT_RESOURCES` (§6.1). |
+| `router_window_size` | 1000 | Sighup | Max pending staging entries the router scans per tick (§6.3). |
+| `batch_size_max` | 200 | Sighup | Hard cap on submissions per commit_group; bounds committer lock-hold on contended pool tails (§6.3, `acct-p1al`). |
+| `batch_window_us` | 500 | Sighup | Oldest-candidate coalesce dwell evaluated per tick; `0` disables the gate (§6.3). Not the scan cadence. |
+| `max_eject_count` | 10000 | Sighup | Terminal eject-loop bound for a submission whose caller tx stays in-progress (§6.4). |
+| `caller_tx_timeout_ms` | 30000 | Sighup | Caller user-tx total timeout — the wall-clock bound on the eject budget (§6.4). |
+| `committer_count` | 4 | Sighup† | Committer BGWorker pool size. †Read once at pool init; a reload does not respawn workers. |
+| `eject_cooldown_ms` | 10 | Sighup | Router skip window for a recently-ejected staging entry, preventing tight re-scan cycling (§6.3). |
+| `affinity_scheme` | 0 (off) | Sighup | Experimental committer→pool affinity (`acct-0usf`); `0` = off. Distinct from the routing-level grouping in §6.3. |
+| `affinity_steal_ms` | 5 | Sighup | Experimental: age after which a non-owner committer may steal a group (`acct-0usf`). |
+| `router_pack_disjoint` | true | Sighup | Bin-pack disjoint pool-components into one commit_group (§6.3, `acct-p1al`). |
+| `target_database` | `poc_v3_1` | Postmaster | Database the router + committer BGWorkers attach to via SPI. Set to the DB created by `scripts/create-poc-v3-1-db.sh`. |
+
+> **Sizing caveat (operator trap).** The three `Postmaster`-scope sizing GUCs —
+> `staging_queue_size`, `committer_queue_size`, `spillover_arena_mb` — **document and bound the
+> ranges but do NOT drive the shmem allocation.** The actual sizes are compile-time constants in
+> `shmem.rs` (16384 / 2048 / 128 MB). A GUC value that differs from the compiled constant is reported
+> as a `NOTICE` at `_PG_init` and otherwise ignored; genuinely resizing shmem requires editing the
+> constants and recompiling. The `shmem_sizing_gucs_honored` test pins the GUC defaults equal to the
+> constants so the two never silently diverge.
+
 ## Harness (P4) — measurement binary
 
 A plain `sqlx` + `tokio` client (not pgrx) that drives the installed extensions
