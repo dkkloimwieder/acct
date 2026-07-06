@@ -1,9 +1,12 @@
 //! WAC method — running-average aggregate (design-v3.1 §3.1).
 //!
 //! pool_state has exactly one row per pool at `layer_id = 0` carrying total
-//! `qty` and the running average `unit_cost`. v3.1 stores the average directly
-//! (not a cumulative value_sum); the WAC formula reads it back on each receipt
-//! and re-rounds via `banker_div`.
+//! `qty`, the cumulative book value `value_sum`, and the running-average
+//! `unit_cost` derived from them as `banker_div(value_sum, qty)`. Receipts
+//! accumulate `value_sum += qty × unit_cost` exactly (i128 product, no
+//! intermediate rounding); the average is a rounded view of `value_sum`, not an
+//! independent accumulator, so a receipts-only pool's final unit_cost is exactly
+//! `banker_div(Σ qty×cost, Σ qty)` and order-independent (§3.0/§3.1).
 //!
 //! The `aggregate_receipt` / `aggregate_deplete` helpers are shared with Path C's
 //! provisional FIFO/LIFO mode (§3.5: "Receipts behave identically to WAC's
