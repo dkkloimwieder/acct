@@ -669,8 +669,8 @@ Affinity grouping ensures overlapping submissions go to the same committer — o
 
 Pool of BGWorkers (default 4). Each:
 
-1. Claim a commit_group via CAS on committer queue entry (`ready → in_flight`). The shmem entry records the claiming committer's identity (slot + token from CommitterIdentityRegistry, see §6.5).
-2. Open a PG tx (top-level, READ COMMITTED).
+1. Claim a commit_group via CAS on committer queue entry (`ready → in_flight`). The shmem entry records the claiming committer's identity (`(slot_idx, generation)` from the committer identity registry, see §6.5).
+2. Open the committer's top-level PG tx (READ COMMITTED). The lock → hydrate → apply → write phase (steps 7-10) later runs inside a nested subtransaction so a transient failure can roll it back and re-attempt without abandoning the top-level tx (§6.8).
 3. Read the commit_group's submissions and lines from shmem.
 4. Check pg_xact_status for each submission's caller user_tx_xid. `pg_xact_status(xid)` is a PG system function that returns `'committed'`, `'aborted'`, or `'in progress'` for a given transaction id; it reads from PG's clog (transaction commit log, persistent and always available — independent of `track_commit_timestamp`):
    - 'committed': keep.
@@ -737,13 +737,13 @@ For `'standard'`-basis FIFO/LIFO pools, batching is even cleaner — standard_co
 
 The committer's PG tx can fail mid-flight from causes other than per-submission plan_apply errors. Per-submission errors (e.g., InsufficientInventory, MissingStandardCost) are handled in step 9 by dropping the offending submission from the working snapshot and continuing — these don't abort the tx. SQL-level errors do abort the tx and must be classified into transient (retry) vs fatal (poison):
 
-**Transient errors — abort tx, retry the commit_group.**
-- Deadlock (SQLSTATE 40P01): PG detected a deadlock and aborted this tx. Retry the commit_group with exponential backoff. The pool_lock acquisition order (sorted by pool_id) makes deadlocks unlikely between committers, but cross-tx interactions (e.g., a vacuum holding a relation lock) can still produce them.
-- Serialization failure (SQLSTATE 40001): if a deployment runs committers under SERIALIZABLE isolation (the PoC uses READ COMMITTED, so this shouldn't fire), PG may abort with a serialization conflict. Retry.
-- Lock-wait timeout: the committer's `SELECT FOR UPDATE` on pool_lock blocked too long. Retry after backoff.
-- Connection drop / network blip during PG roundtrip: retry after re-establishing the connection.
+**Transient errors — roll back the write phase, retry the commit_group.** The shipped classifier (`committer.rs` `classify_phase_error`) treats exactly two SQLSTATEs as retryable:
+- Deadlock (SQLSTATE 40P01): PG detected a deadlock and aborted the subtx. Retry the commit_group with exponential backoff. The pool_lock acquisition order (sorted by pool_id) makes deadlocks unlikely between committers, but cross-tx interactions (e.g., a vacuum holding a relation lock) can still produce them.
+- Serialization failure (SQLSTATE 40001): under SERIALIZABLE isolation PG may abort with a serialization conflict (the PoC runs READ COMMITTED, so this shouldn't fire). Retry.
 
-Retry mechanics: the committer leaves the commit_group entry in shmem at `in_flight` with its own (slot, token), backs off (start 10ms, exponential up to 1s, max 5 retries), and resumes from §6.4 step 2 (open new PG tx, repeat pg_xact check, repeat dedup, etc.). Pre-flight dedup catches any work that other committers may have completed in the interim. After max retries with no progress, the commit_group is marked poisoned (see below).
+Two transient classes named in earlier drafts are NOT retryable in the PoC: a **lock-wait timeout** would be `55P03`, which the classifier routes to poison — and `lock_timeout` is unset, so `SELECT FOR UPDATE` on pool_lock blocks indefinitely rather than raising it; a **connection drop** does not apply because the committer is an in-process BGWorker using SPI, with no network connection to lose. Any SQLSTATE other than 40P01 / 40001 / 23505 is fatal (poison).
+
+Retry mechanics: the whole lock → hydrate → apply → write phase (steps 7-10) runs inside a nested subtransaction (a savepoint on the committer's top-level tx). A retryable SQLSTATE rolls that subtransaction back and re-attempts the same phase after backoff (start 10ms, exponential up to 1s, max 5 retries), re-acquiring pool_locks and re-hydrating a fresh snapshot each attempt. The step-4 pg_xact triage and step-5 pre-flight dedup are **not** repeated per retry — they ran once before the loop, and nothing is lost by not repeating them: a kept caller is already `committed` or `unknown`, and any key a racing committer wrote in the interim resurfaces as the 23505 → DuplicateRace re-drive below (backstopped by the trx UNIQUE constraint). The commit_group entry stays at `in_flight` with the committer's own `(slot_idx, generation)` throughout. After max retries with no progress, the commit_group is poisoned (below).
 
 **Unique-violation that survives pre-flight dedup — re-drive the group minus the offender.** A 23505 on `trx(trx_type, source_id)` at INSERT time means a racing committer committed one of this group's keys between our pre-flight dedup and our write (two duplicate submissions that landed in different commit_groups — different pools — and so weren't caught by within-batch dedup). The offending key is now visible in `trx`, so the committer re-runs dedup against `trx`, drops the now-resolvable duplicate(s), and re-drives the rest of the group through the retry loop (a fresh hydrate + replan recomputes the aggregate without the offender). This avoids dead-lettering the group's innocent siblings alongside the one duplicate. If the re-dedup resolves no offender (a UNIQUE other than `(trx_type, source_id)`, or no duplicate is actually present), re-driving can't make progress and the group is poisoned as a genuine fatal. (Implemented: `committer.rs` `PhaseOutcome::DuplicateRace`; the re-drive count and the irresolvable-poison are both counted under `committer_duplicate_redrives_total`. acct-yojk.9.)
 
@@ -990,7 +990,7 @@ The PoC characterizes the crossover surface empirically.
 
 **Routed flavor** failure scenarios (invariant: trx exists iff successfully recorded):
 - Failed submission within a commit_group: excluded from the working snapshot, no trx row, remaining submissions in the group continue and produce their trx rows normally.
-- Committer death: identity registry detects via dead pid; next committer reclaims the commit_group via CAS that swaps the (slot, token) on the queue entry; reclaiming committer reprocesses unconditionally and relies on §6.4 step 5's pre-flight dedup against trx (plus the trx UNIQUE constraint as backstop) to skip any submissions the dead committer already wrote.
+- Committer death: identity registry detects via dead pid; next committer reclaims the commit_group via CAS that swaps the `(slot_idx, generation)` on the queue entry; reclaiming committer reprocesses unconditionally and relies on §6.4 step 5's pre-flight dedup against trx (plus the trx UNIQUE constraint as backstop) to skip any submissions the dead committer already wrote.
 - Router death: shmem boot sweep reverts in-flight staging entries to pending.
 - Postmaster crash: shmem lost; in-flight submissions are lost; no DB cleanup needed because in-flight submissions never wrote trx rows.
 
