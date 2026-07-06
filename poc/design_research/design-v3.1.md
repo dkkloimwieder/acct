@@ -630,24 +630,24 @@ Caller observability (polling for completion, knowing trx.id, error reporting) i
 
 The routed path needs shmem for the router and committer coordination:
 
-- `staging_queue`: ring buffer of StagingEntry structs. Each entry holds trx_type, source_id, posted_at, caller user_tx_xid, pool_id list, line payload (variable-length, in arena).
+- `staging_queue`: ring buffer of StagingEntry structs. Each entry holds trx_type, source_id, posted_at, caller user_tx_xid, a 16-byte `correlation_id`, pool_id list, line payload (variable-length, in arena).
 - `committer_queue`: ring buffer of CommitterQueueEntry structs. Each entry represents a commit_group: a list of staging entries grouped by pool overlap.
 - `spillover_arena`: variable-length payload storage (line arrays, pool_id arrays).
-- `committer_identity_registry`: extension-owned shmem array tracking active committer BGWorkers. Each slot in the array holds: (a) the committer's claim token, a monotonically-increasing uint64 incremented on every committer startup, (b) the committer's BGWorker pid, (c) status flag (active/dead/empty). On startup, a committer atomically claims a free slot via CAS and writes its (token, pid). When other workers need to check committer liveness, they look up the registered pid and probe it (via `kill(pid, 0)` or PG's `pg_stat_activity` for the worker's backend); a dead pid means the committer crashed. The (slot, token) tuple is recorded in each `CommitterQueueEntry` that the committer claims, so recovery can identify which committer was working on which commit_group. Slot reuse is safe because the monotonic token differentiates restarts — a recovering worker that sees an old (slot, token) in a queue entry knows it belongs to a now-dead committer instance even if the slot has been reclaimed by a new live committer.
+- `committer_identity_registry`: extension-owned shmem array tracking active committer BGWorkers (`identity.rs`). Each slot holds (a) a per-slot `generation` counter (u32), bumped on every claim and every release, with `generation == 0` marking the slot unclaimed, (b) the committer's BGWorker pid. On startup a committer claims a free or reclaimable slot and bumps its generation, recording its identity as the pair `(slot_idx, generation)` — both u32. A stored `(slot_idx, generation)` is alive iff the slot's pid is non-zero, its generation still matches, and `kill(pid, 0)` succeeds. That pair is recorded in each `CommitterQueueEntry` the committer claims, so recovery can identify which committer was working on which commit_group. Slot reuse is safe because the generation differentiates restarts — a recovering worker that sees a stale `(slot_idx, generation)` in a queue entry knows it belongs to a now-dead instance even after the slot has been reclaimed by a live committer whose generation has advanced. PID-recycling-safe: a matching generation **and** a live `kill(pid, 0)` are both required to treat a slot as the same committer instance.
 
 State machines and CAS ordering for staging entries:
 - `empty` (0): slot is free.
 - `pending` (1): submitted, awaiting routing.
 - `processing` (2): router has claimed; in the middle of being stamped into a commit_group.
 - `routed` (3): router has committed the entry to a commit_group; committer can claim.
-- `in_flight` (4): committer has claimed the commit_group and is processing.
+- `abandoned` (4): reserved label for a staging slot whose submission was dropped without producing a trx (the observability decoder in `enqueue.rs` maps 4 → `abandoned`). The steady-state cycle below does not enter it; commit and drop paths both release the slot to `empty`.
 
 Transitions: caller `empty → pending`; router `pending → processing → routed`; committer reads `routed` entries via its commit_group claim; on successful commit, committer transitions entries `routed → empty` and frees arena space.
 
 State machine for committer_queue entries (each entry represents one commit_group):
 - `empty` (0): slot is free.
 - `ready` (1): router has assembled the commit_group and pushed it here; awaiting committer claim.
-- `in_flight` (2): a committer has claimed (CAS ready → in_flight) and is processing; the entry records the claiming committer's (slot, token) for recovery.
+- `in_flight` (2): a committer has claimed (CAS ready → in_flight) and is processing; the entry records the claiming committer's `(slot_idx, generation)` for recovery.
 - `done` (3): committer's PG tx committed successfully; awaiting cleanup.
 
 Transitions: router `empty → ready`; committer `ready → in_flight`; committer (on successful commit) `in_flight → done → empty` (the last transition runs in cleanup step §6.4 step 12). On committer death, recovery walks the queue looking for `in_flight` entries whose claiming committer is no longer alive, and reclaims them via CAS to a new live committer.
@@ -708,8 +708,9 @@ One fsync per commit_group. With N submissions per commit_group, fsync cost amor
 
 ### 6.5 Recovery
 
+- **Boot barrier (recovery worker)**: a dedicated BGWorker (`recovery.rs`) runs once at postmaster start and stores `recovery_complete = 1`; the router and committers wait on this flag before opening for steady-state work. Its role is to own the `recovery_complete` 0→1 lifecycle — the actual reconciliation runs in the router's own boot sweep and on the live committers (both below).
 - **Router death**: shmem boot sweep on router restart. Staging entries at `processing` get inspected: if their CommitterQueueEntry doesn't exist or is at empty, revert to `pending` via CAS.
-- **Committer death**: CommitterIdentityRegistry tracks active committers via (slot, token); liveness is checked by probing the registered pid. When a committer's pid is dead, any committer_queue entry it claimed (state = `in_flight`, slot/token matching the dead committer's registration) is reclaimable. A live committer reclaims via CAS that swaps the entry's (slot, token) for its own, leaving state at `in_flight`. The reclaiming committer then runs §6.4 from step 2 normally. Step 5's pre-flight dedup against trx (`SELECT trx_type, source_id FROM trx WHERE (trx_type, source_id) IN (...)`) serves as the recovery source of truth: any submissions the dead committer already wrote to trx are skipped via this dedup; remaining submissions are processed fresh. The trx UNIQUE constraint guarantees no duplicate trx rows can be created even if the dead committer's PG tx committed and the recovery committer raced concurrently.
+- **Committer death**: the identity registry tracks active committers via `(slot_idx, generation)`; liveness is a generation match plus `kill(pid, 0)` on the registered pid. When a committer's pid is dead (or its generation has advanced), any committer_queue entry it claimed (state = `in_flight`, its stored `(slot_idx, generation)` matching the dead committer's registration) is reclaimable. A live committer reclaims via CAS that swaps the entry's `(slot_idx, generation)` for its own, leaving state at `in_flight`. The reclaiming committer then runs §6.4 from step 2 normally. Step 5's pre-flight dedup against trx (`SELECT trx_type, source_id FROM trx WHERE (trx_type, source_id) IN (...)`) serves as the recovery source of truth: any submissions the dead committer already wrote to trx are skipped via this dedup; remaining submissions are processed fresh. The trx UNIQUE constraint guarantees no duplicate trx rows can be created even if the dead committer's PG tx committed and the recovery committer raced concurrently.
 - **Postmaster crash**: shmem is gone. All in-flight submissions are lost. No trx rows exist for them. Callers observe the loss (their polling never sees a trx for that source) and resubmit.
 
 ### 6.6 Per-commit_group SPI count
