@@ -86,14 +86,39 @@ async fn disjoint_submissions_group_independently() {
     )
     .await;
 
-    assert_eq!(groups.len(), 3, "disjoint pools → independent groups: {groups:?}");
-    for g in &groups {
-        assert_eq!(g.1, 1, "each disjoint group holds a single submission");
-        assert_eq!(g.2.len(), 1, "each group owns exactly one pool");
+    // The grouping the router emits depends on the live formation contract:
+    // with `router_pack_disjoint` on (production default) it first-fits the
+    // three disjoint singleton components into a single commit_group when they
+    // fit under `batch_size_max`; with it off, each component stands alone.
+    let pack = router_pack_disjoint(&pool).await;
+    let bsm = batch_size_max(&pool).await;
+    if pack && bsm >= 3 {
+        assert_eq!(
+            groups.len(),
+            1,
+            "pack=on co-packs the 3 disjoint singletons into one commit_group: {groups:?}"
+        );
+        assert_eq!(groups[0].1, 3, "the packed bin holds all 3 submissions");
+        let mut owned = groups[0].2.clone();
+        owned.sort();
+        assert_eq!(owned, vec![5101, 5102, 5103], "the bin owns all three disjoint pools");
+    } else if !pack {
+        // pack=off: each disjoint (single-submission) component is its own
+        // commit_group at any batch_size_max — a len-1 component never chunks.
+        assert_eq!(groups.len(), 3, "pack=off → independent groups: {groups:?}");
+        for g in &groups {
+            assert_eq!(g.1, 1, "each disjoint group holds a single submission");
+            assert_eq!(g.2.len(), 1, "each group owns exactly one pool");
+        }
+        let mut owned: Vec<i64> = groups.iter().flat_map(|g| g.2.clone()).collect();
+        owned.sort();
+        assert_eq!(owned, vec![5101, 5102, 5103]);
+    } else {
+        // pack=on with batch_size_max < 3 only partially fills a bin — not a
+        // shipped config (production bsm=200). Fail loudly rather than pin a
+        // partial-fit shape the router's unit tests already cover.
+        panic!("unsupported acceptance config: router_pack_disjoint=on with batch_size_max={bsm} (<3)");
     }
-    let mut owned: Vec<i64> = groups.iter().flat_map(|g| g.2.clone()).collect();
-    owned.sort();
-    assert_eq!(owned, vec![5101, 5102, 5103]);
 }
 
 #[tokio::test]
@@ -111,16 +136,46 @@ async fn transitive_overlap_merges_into_one_component() {
     )
     .await;
 
-    assert_eq!(groups.len(), 2, "one merged component + one singleton: {groups:?}");
-    let mut sizes: Vec<i64> = groups.iter().map(|g| g.1).collect();
-    sizes.sort();
-    assert_eq!(sizes, vec![1, 2], "merged group of 2, singleton of 1");
+    // Affinity always merges A+B (they share 5202); what happens to the
+    // disjoint singleton C depends on the live formation contract. With
+    // `router_pack_disjoint` on (production default), the router first-fits the
+    // merged 2-submission component and the singleton C into one commit_group
+    // when they fit under `batch_size_max`; with it off, they stay separate.
+    let pack = router_pack_disjoint(&pool).await;
+    let bsm = batch_size_max(&pool).await;
+    if pack && bsm >= 3 {
+        assert_eq!(
+            groups.len(),
+            1,
+            "pack=on co-packs the merged component and singleton C into one group: {groups:?}"
+        );
+        assert_eq!(groups[0].1, 3, "the packed bin holds all 3 submissions");
+        assert_eq!(
+            groups[0].2,
+            vec![5201, 5202, 5203, 5204],
+            "the bin owns the transitive closure plus C's pool"
+        );
+    } else if !pack && bsm >= 2 {
+        // pack=off (with batch_size_max large enough to hold the merged pair):
+        // the merged 2-submission component and the singleton stay separate.
+        assert_eq!(groups.len(), 2, "one merged component + one singleton: {groups:?}");
+        let mut sizes: Vec<i64> = groups.iter().map(|g| g.1).collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![1, 2], "merged group of 2, singleton of 1");
 
-    // The 2-submission group owns the transitive pool closure {5201,5202,5203}.
-    let merged = groups.iter().find(|g| g.1 == 2).expect("merged group");
-    assert_eq!(merged.2, vec![5201, 5202, 5203]);
-    let solo = groups.iter().find(|g| g.1 == 1).expect("solo group");
-    assert_eq!(solo.2, vec![5204]);
+        // The 2-submission group owns the transitive pool closure {5201,5202,5203}.
+        let merged = groups.iter().find(|g| g.1 == 2).expect("merged group");
+        assert_eq!(merged.2, vec![5201, 5202, 5203]);
+        let solo = groups.iter().find(|g| g.1 == 1).expect("solo group");
+        assert_eq!(solo.2, vec![5204]);
+    } else {
+        // pack=on with bsm<3 (partial fill) or bsm==1 (the merged pair itself
+        // chunks) — neither is a shipped config (production bsm=200). Fail
+        // loudly rather than pin a shape the router's unit tests already cover.
+        panic!(
+            "unsupported acceptance config: router_pack_disjoint={pack} with batch_size_max={bsm}"
+        );
+    }
 }
 
 #[tokio::test]

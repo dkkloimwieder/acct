@@ -200,6 +200,17 @@ pub async fn batch_size_max(pool: &PgPool) -> i64 {
     s.parse().expect("batch_size_max int")
 }
 
+/// The live `router_pack_disjoint` GUC (production default: on). When on, the
+/// router first-fits disjoint affinity components into one commit_group up to
+/// `batch_size_max`; when off, each component becomes its own commit_group.
+pub async fn router_pack_disjoint(pool: &PgPool) -> bool {
+    let s: String = sqlx::query_scalar("SHOW ledger_routed_c.router_pack_disjoint")
+        .fetch_one(pool)
+        .await
+        .expect("show router_pack_disjoint");
+    s == "on"
+}
+
 /// Ready (valid==1) commit_groups whose pool_keys intersect `mine`,
 /// as (commit_group_id, submission_count, sorted pool_keys). Filtering by
 /// the caller's own pool_ids isolates the assertion from groups other
