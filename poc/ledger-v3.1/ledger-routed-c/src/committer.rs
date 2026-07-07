@@ -660,15 +660,21 @@ fn attempt_commit_phase(pool_ids: &[i64], prepared: &[Prepared]) -> PhaseOutcome
         // Scoped wall-time spans (acct-0usf STEP 1): decompose the committer
         // pipeline into pool_lock / hydrate / apply so the affinity question can be
         // answered from a *measured* per-span breakdown rather than inferred from
-        // throughput. fetch_add is plain shmem-atomic work — it never longjmps, so
-        // it is safe inside the catch closure; on an early `?` or a caught Postgres
-        // ERROR the post-span add is simply skipped (a failed attempt contributes
-        // no span, which is what we want).
-        let cq = COMMITTER_QUEUE.share();
+        // throughput. Each span counter takes COMMITTER_QUEUE.share() for just its
+        // fetch_add (statement-scoped, matching the pipeline-span counters above) —
+        // the guard is never held across acquire_pool_locks / hydrate / plan_and_write,
+        // so an in-flight write phase (up to a deadlock_timeout FOR UPDATE wait plus
+        // the full batched write) cannot park a long-lived sharer in front of the
+        // router's exclusive CQ claim and starve emission (acct-mvq4.33). fetch_add is
+        // plain shmem-atomic work that never longjmps, so it is safe inside the catch
+        // closure; on an early `?` or a caught Postgres ERROR the post-span add is
+        // simply skipped (a failed attempt contributes no span, which is what we want).
         let t_lock0 = now_ns();
         pool_lock::acquire_pool_locks(pool_ids)?;
         let t_lock1 = now_ns();
-        cq.committer_pool_lock_ns_total
+        COMMITTER_QUEUE
+            .share()
+            .committer_pool_lock_ns_total
             .fetch_add(t_lock1.saturating_sub(t_lock0), Relaxed);
         // Test-only injection sites — compiled out of production builds entirely
         // (acct-yojk.11); only test_hooks builds carry them and can arm them.
@@ -681,10 +687,14 @@ fn attempt_commit_phase(pool_ids: &[i64], prepared: &[Prepared]) -> PhaseOutcome
         }
         let snapshot = hydration::hydrate_snapshot(pool_ids)?;
         let t_hyd = now_ns();
-        cq.committer_hydrate_ns_total
+        COMMITTER_QUEUE
+            .share()
+            .committer_hydrate_ns_total
             .fetch_add(t_hyd.saturating_sub(t_lock1), Relaxed);
         let summary = plan_and_write(snapshot, prepared)?;
-        cq.committer_apply_ns_total
+        COMMITTER_QUEUE
+            .share()
+            .committer_apply_ns_total
             .fetch_add(now_ns().saturating_sub(t_hyd), Relaxed);
         Ok(PhaseStep::Wrote(summary))
     }))
