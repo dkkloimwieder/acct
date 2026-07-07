@@ -589,6 +589,54 @@ pub async fn set_inject_xact_probe_fail(pool: &PgPool, on: bool) {
         .expect("set_inject_xact_probe_fail (needs test_hooks build)");
 }
 
+// ── Enqueue backpressure force-fail hooks (acct-mvq4.37) ─────────────
+
+/// The SQLSTATE of a sqlx error (e.g. "53000"), or "" if it is not a DB error.
+pub fn pgcode(err: &sqlx::Error) -> String {
+    err.as_database_error()
+        .and_then(|e| e.code())
+        .map(|c| c.into_owned())
+        .unwrap_or_default()
+}
+
+/// Force every staging push to report the ring full (or clear). `test_hooks`.
+pub async fn set_force_queue_full(pool: &PgPool, on: bool) {
+    sqlx::query("SELECT ledger_routed_c_test_set_force_queue_full($1)")
+        .bind(on)
+        .execute(pool)
+        .await
+        .expect("set_force_queue_full (needs test_hooks build)");
+}
+
+/// Allow `k` staging pushes then report the ring full for the rest (batch
+/// partial-push). `k < 0` disables the countdown. `test_hooks`.
+pub async fn set_queue_full_after(pool: &PgPool, k: i32) {
+    sqlx::query("SELECT ledger_routed_c_test_set_queue_full_after($1)")
+        .bind(k)
+        .execute(pool)
+        .await
+        .expect("set_queue_full_after (needs test_hooks build)");
+}
+
+/// Force the backpressure deadline to read elapsed (or clear) so a wait loop
+/// raises immediately instead of sleeping the timeout. `test_hooks`.
+pub async fn set_deadline_expired(pool: &PgPool, on: bool) {
+    sqlx::query("SELECT ledger_routed_c_test_set_deadline_expired($1)")
+        .bind(on)
+        .execute(pool)
+        .await
+        .expect("set_deadline_expired (needs test_hooks build)");
+}
+
+/// Force `try_alloc_blocks` to report the arena exhausted (or clear). `test_hooks`.
+pub async fn set_force_arena_full(pool: &PgPool, on: bool) {
+    sqlx::query("SELECT ledger_routed_c_test_set_force_arena_full($1)")
+        .bind(on)
+        .execute(pool)
+        .await
+        .expect("set_force_arena_full (needs test_hooks build)");
+}
+
 /// Pause both BGWorkers, stage `stage`, unpause ONLY the router, and wait until
 /// at least one commit_group is `ready` — leaving the committer paused so a test
 /// can arm an injection before the group drains. Returns once routing settled.

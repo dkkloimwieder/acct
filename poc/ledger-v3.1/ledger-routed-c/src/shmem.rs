@@ -100,6 +100,25 @@ pub struct StagingQueue {
     pub _pad_cv_init: [u8; 7],
     pub backpressure_cv: pg_sys::ConditionVariable,
     pub _pad_cv: [u8; 8],
+    /// Test-only backpressure force-fail hooks (acct-mvq4.37). They drive the two
+    /// enqueue ERROR exits (queue-full timeout, arena-full deadline) that no test
+    /// or bench ever executes, without filling the 16384-slot ring or waiting the
+    /// 5 s `queue_full_timeout_ms` (a Sighup GUC with no per-session SET). All
+    /// zero-init = disabled; production (non-`test_hooks`) builds never read them.
+    /// Read under the `STAGING_QUEUE` guard already held on the push path (or via
+    /// `.share()` in `past_deadline`), so no nested LWLock is introduced.
+    ///
+    /// When 1, every `push_entry_into_queue` returns `PushError::QueueFull`.
+    pub test_force_queue_full: AtomicU8,
+    /// When 1, `past_deadline` reports the backpressure deadline elapsed, so the
+    /// wait loop raises immediately rather than CV-waiting the full timeout.
+    pub test_deadline_expired: AtomicU8,
+    pub _pad_test: [u8; 2],
+    /// Countdown for the batch PARTIAL-push case, +1-encoded: 0 = disabled;
+    /// value N (N>=1) allows N-1 pushes to succeed then fails the rest. The setter
+    /// stores k+1 so a zero-init field reads as disabled. Decremented once per
+    /// allowed push under the exclusive guard (single writer).
+    pub test_queue_full_after: AtomicU32,
     pub entries: [StagingEntry; LEDGER_V3_STAGING_QUEUE_SIZE],
 }
 
@@ -356,6 +375,12 @@ pub struct SpilloverArena {
     pub bump_offset: AtomicU32,
     pub total_allocs: AtomicU64,
     pub total_frees: AtomicU64,
+    /// Test-only (acct-mvq4.37): when 1, `try_alloc_blocks` reports `ArenaFull`
+    /// without allocating — drives the arena-exhaustion ERROR exits. Zero-init =
+    /// disabled; production (non-`test_hooks`) builds never read it. Read under the
+    /// `SPILLOVER_ARENA` guard already held in `try_alloc_blocks`.
+    pub test_force_arena_full: AtomicU8,
+    pub _pad_test: [u8; 7],
     pub bytes: [u8; LEDGER_V3_SPILLOVER_ARENA_BYTES],
 }
 

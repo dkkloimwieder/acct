@@ -472,6 +472,11 @@ fn try_alloc_blocks(
     line_vec: &[PocV3Line],
     pool_ids: &[i64],
 ) -> AllocOutcome {
+    // acct-mvq4.37: drive the arena-exhaustion ERROR exits without a 128 MB fill.
+    #[cfg(feature = "test_hooks")]
+    if arena.test_force_arena_full.load(Relaxed) != 0 {
+        return AllocOutcome::ArenaFull;
+    }
     let (payload_offset, payload_length) = match payload::encode_submission(arena, sub, line_vec) {
         Ok(t) => t,
         Err(payload::PayloadError::ArenaAllocFailed { .. }) => return AllocOutcome::ArenaFull,
@@ -507,6 +512,24 @@ fn push_entry_into_queue(
     trx_type_id: u16,
     user_tx_xid: u64,
 ) -> Result<(u32, u64), PushError> {
+    // acct-mvq4.37: drive the queue-full ERROR exits without filling the ring.
+    // Checked before the free-slot scan so a forced failure consumes neither a
+    // slot nor a request_seq — faithful to a real ring-full push.
+    #[cfg(feature = "test_hooks")]
+    {
+        if queue.test_force_queue_full.load(Relaxed) != 0 {
+            return Err(PushError::QueueFull);
+        }
+        // +1-encoded countdown (0 = disabled): allow N-1 pushes then fail the
+        // rest. Single writer (the exclusive queue guard), so plain load/store.
+        let cd = queue.test_queue_full_after.load(Relaxed);
+        if cd != 0 {
+            if cd == 1 {
+                return Err(PushError::QueueFull);
+            }
+            queue.test_queue_full_after.store(cd - 1, Relaxed);
+        }
+    }
     let capacity = LEDGER_V3_STAGING_QUEUE_SIZE as u32;
     let tail = queue.tail.load(Relaxed);
     let backend_pid = unsafe { pg_sys::MyProcPid };
@@ -579,6 +602,13 @@ fn cv_wait_for_slot(cv: *mut pg_sys::ConditionVariable, deadline_micros: i128) -
 }
 
 fn past_deadline(deadline_micros: i128) -> bool {
+    // acct-mvq4.37: report the deadline elapsed on demand so a forced-full wait
+    // loop raises immediately instead of sleeping the 5 s timeout. Every call site
+    // holds no LWLock, so this `.share()` introduces no nesting.
+    #[cfg(feature = "test_hooks")]
+    if STAGING_QUEUE.share().test_deadline_expired.load(Relaxed) != 0 {
+        return true;
+    }
     (now_us() as i128) >= deadline_micros
 }
 
@@ -592,6 +622,62 @@ fn ereport_invalid_arg(code: PgSqlErrorCode, msg: String, hint: &str) -> ! {
 fn ereport_internal(msg: String) -> ! {
     ereport!(ERROR, PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, msg);
     unreachable!()
+}
+
+// ── Test-only backpressure force-fail hooks (acct-mvq4.37) ──────────
+//
+// These arm the flags read behind `#[cfg(feature = "test_hooks")]` in
+// try_alloc_blocks / push_entry_into_queue / past_deadline, so an acceptance
+// test can reach enqueue's two never-executed ERROR exits (queue-full timeout,
+// arena-full deadline -> ERRCODE_INSUFFICIENT_RESOURCES) with zero ring/arena
+// fill and no multi-second wait. Compiled only under `test_hooks`; production
+// builds carry neither the setters nor the reads. Stores are `Release` (paired
+// with the `Relaxed` reads on the push path) via `.share()`, matching the other
+// test-injection setters — the LWLock guards field existence, the atomic carries
+// the value.
+
+/// Force every staging push to report the ring full (`on = false` clears it).
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_set_force_queue_full(on: bool) {
+    STAGING_QUEUE
+        .share()
+        .test_force_queue_full
+        .store(u8::from(on), Release);
+}
+
+/// Allow `k` staging pushes to succeed, then report the ring full for the rest
+/// (drives the batch PARTIAL-push remainder-free path). `k < 0` disables the
+/// countdown. Stored +1-encoded so a zero-init field reads as disabled.
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_set_queue_full_after(k: i32) {
+    let v = if k < 0 { 0 } else { (k as u32).saturating_add(1) };
+    STAGING_QUEUE
+        .share()
+        .test_queue_full_after
+        .store(v, Release);
+}
+
+/// Force the backpressure deadline to read elapsed (`on = false` clears it) so a
+/// wait loop raises immediately instead of sleeping the full timeout.
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_set_deadline_expired(on: bool) {
+    STAGING_QUEUE
+        .share()
+        .test_deadline_expired
+        .store(u8::from(on), Release);
+}
+
+/// Force `try_alloc_blocks` to report the arena exhausted (`on = false` clears it).
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_set_force_arena_full(on: bool) {
+    SPILLOVER_ARENA
+        .share()
+        .test_force_arena_full
+        .store(u8::from(on), Release);
 }
 
 // ── Unit tests for pure helpers ─────────────────────────────────────
