@@ -41,14 +41,7 @@ pub struct StagingEntry {
     pub valid: AtomicU8,
     pub _pad: [u8; 7],
     pub request_seq: u64,
-    pub correlation_id: [u8; 16],
     pub user_tx_xid: u64,
-    /// Index into a per-extension trx-type table the caller maps the
-    /// SQL `trx_type` enum into at enqueue time. The shmem layer is
-    /// enum-agnostic; the dispatch per-trx-type lives in the committer
-    /// (routed) / SPI surface (direct).
-    pub trx_type_id: u16,
-    pub _pad_trx: [u8; 2],
     pub payload_offset: u32,
     pub payload_length: u32,
     /// Arena offset of the lines blob — `encode_submission`'s first
@@ -61,9 +54,8 @@ pub struct StagingEntry {
     pub pool_count: u16,
     pub _pad_pool: [u8; 2],
     pub pool_keys_offset: u32,
+    pub _pad_pk: [u8; 4],
     pub enqueued_at_micros: u64,
-    pub backend_pid: i32,
-    pub _pad_pid: [u8; 4],
     pub commit_group_id: AtomicU64,
     pub eject_count: AtomicU32,
     pub _pad2: [u8; 4],
@@ -86,8 +78,10 @@ pub struct StagingQueue {
     pub next_request_seq: AtomicU64,
     pub backpressure_cv_tranche_id: u32,
     pub _pad2: [u8; 4],
-    /// Cumulative count of `signal_staging_slot_freed` calls — tests
-    /// assert this grew during a drain to confirm the signal fired.
+    /// Cumulative count of `signal_staging_slot_freed` calls (one per staged-slot
+    /// free broadcast). Incremented for observability but not currently read —
+    /// reserved for a future SQL getter, like the router/committer stat counters
+    /// that grew accessors as a measurement need arose.
     pub free_slot_wake_count: AtomicU64,
     /// 3-state CAS gate for lazy `ConditionVariableInit`. 0=uninit,
     /// 1=init-in-progress, 2=initialized. The CV's `wakeup` field
@@ -164,7 +158,6 @@ pub struct CommitterQueueEntry {
     /// to detect a recycled slot (PID-recycling-safe).
     pub committer_bgw_generation: AtomicU32,
     pub committer_acquired_at_ns: AtomicU64,
-    pub committer_tx_id: AtomicU64,
     pub enqueued_at_micros: u64,
 }
 
@@ -249,7 +242,6 @@ pub struct CommitterQueue {
     pub _pad_test: [u8; 0],
 
     // ── Committer pool counters ────────────────────────────────────
-    pub committer_claim_count: AtomicU64,
     pub committer_takeover_count: AtomicU64,
     pub committer_tx_failures: AtomicU64,
     /// commit_groups moved to the terminal `poisoned` state (valid==4) after a

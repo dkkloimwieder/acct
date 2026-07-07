@@ -120,7 +120,6 @@ pub(crate) fn finalize_committer_queue_slot(committer_queue: &CommitterQueue, cq
     slot.committer_bgw_slot.store(u32::MAX, Relaxed);
     slot.committer_bgw_generation.store(0, Relaxed);
     slot.committer_acquired_at_ns.store(0, Relaxed);
-    slot.committer_tx_id.store(0, Relaxed);
 }
 
 /// Move a CommitterQueueEntry to the terminal `poisoned` state (valid==4) and
@@ -133,7 +132,6 @@ pub(crate) fn mark_committer_queue_slot_poisoned(committer_queue: &CommitterQueu
     slot.committer_bgw_slot.store(u32::MAX, Relaxed);
     slot.committer_bgw_generation.store(0, Relaxed);
     slot.committer_acquired_at_ns.store(0, Relaxed);
-    slot.committer_tx_id.store(0, Relaxed);
 }
 
 /// Live wrapper: called by the committer after the commit_group's PG tx ends.
@@ -356,7 +354,6 @@ mod tests {
             slot.committer_bgw_slot = AtomicU32::new(5);
             slot.committer_bgw_generation = AtomicU32::new(17);
             slot.committer_acquired_at_ns = AtomicU64::new(12345);
-            slot.committer_tx_id = AtomicU64::new(99);
         }
 
         finalize_committer_queue_slot(&committer, cq_idx);
@@ -366,6 +363,5 @@ mod tests {
         assert_eq!(slot.committer_bgw_slot.load(Relaxed), u32::MAX);
         assert_eq!(slot.committer_bgw_generation.load(Relaxed), 0);
         assert_eq!(slot.committer_acquired_at_ns.load(Relaxed), 0);
-        assert_eq!(slot.committer_tx_id.load(Relaxed), 0);
     }
 }

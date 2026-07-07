@@ -101,7 +101,6 @@ fn ledger_enqueue_trx_c(
     // CallerTxStatus::Unknown → wrongly kept, committing in-progress caller work
     // (acct-mvq4.34). Same assign-if-none semantics as GetCurrentTransactionId.
     let user_tx_xid: u64 = unsafe { pg_sys::GetCurrentFullTransactionId() }.value;
-    let trx_type_id = trx_type_to_id(trx_type);
 
     let mut sub_shell = PocV3Submission {
         trx_type: trx_type.to_string(),
@@ -157,7 +156,6 @@ fn ledger_enqueue_trx_c(
                 sub_shell.line_offset,
                 pool_count,
                 pool_keys_offset,
-                trx_type_id,
                 user_tx_xid,
             )
         };
@@ -260,7 +258,6 @@ fn ledger_enqueue_trx_batch_c(trxs: pgrx::JsonB) -> i64 {
         line_vec: Vec<PocV3Line>,
         pool_ids: Vec<i64>,
         pool_count: u16,
-        trx_type_id: u16,
     }
     let mut prepared: Vec<Prepared> = Vec::with_capacity(envelopes.len());
     for env in envelopes {
@@ -299,13 +296,11 @@ fn ledger_enqueue_trx_batch_c(trxs: pgrx::JsonB) -> i64 {
             line_count: 0,
             line_offset: 0,
         };
-        let trx_type_id = trx_type_to_id(&env.trx_type);
         prepared.push(Prepared {
             sub_shell,
             line_vec: env.lines,
             pool_ids,
             pool_count,
-            trx_type_id,
         });
     }
 
@@ -316,7 +311,6 @@ fn ledger_enqueue_trx_batch_c(trxs: pgrx::JsonB) -> i64 {
         line_offset: u32,
         pool_keys_offset: u32,
         pool_count: u16,
-        trx_type_id: u16,
     }
     let free_alloced = |arena: &mut SpilloverArena, items: &[Alloced]| {
         for a in items {
@@ -338,7 +332,6 @@ fn ledger_enqueue_trx_batch_c(trxs: pgrx::JsonB) -> i64 {
                         line_offset: p.sub_shell.line_offset,
                         pool_keys_offset,
                         pool_count: p.pool_count,
-                        trx_type_id: p.trx_type_id,
                     });
                 }
                 AllocOutcome::ArenaFull => {
@@ -387,7 +380,6 @@ fn ledger_enqueue_trx_batch_c(trxs: pgrx::JsonB) -> i64 {
                     a.line_offset,
                     a.pool_count,
                     a.pool_keys_offset,
-                    a.trx_type_id,
                     user_tx_xid,
                 ) {
                     Ok(_) => pushed += 1,
@@ -509,7 +501,6 @@ fn push_entry_into_queue(
     line_offset: u32,
     pool_count: u16,
     pool_keys_offset: u32,
-    trx_type_id: u16,
     user_tx_xid: u64,
 ) -> Result<(u32, u64), PushError> {
     // acct-mvq4.37: drive the queue-full ERROR exits without filling the ring.
@@ -532,7 +523,6 @@ fn push_entry_into_queue(
     }
     let capacity = LEDGER_V3_STAGING_QUEUE_SIZE as u32;
     let tail = queue.tail.load(Relaxed);
-    let backend_pid = unsafe { pg_sys::MyProcPid };
     let enqueued_at_micros = now_us();
 
     for i in 0..capacity {
@@ -543,16 +533,13 @@ fn push_entry_into_queue(
         }
         let request_seq = queue.next_request_seq.fetch_add(1, Relaxed);
         slot.request_seq = request_seq;
-        slot.correlation_id = [0u8; 16];
         slot.user_tx_xid = user_tx_xid;
-        slot.trx_type_id = trx_type_id;
         slot.payload_offset = payload_offset;
         slot.payload_length = payload_length;
         slot.line_offset = line_offset;
         slot.pool_count = pool_count;
         slot.pool_keys_offset = pool_keys_offset;
         slot.enqueued_at_micros = enqueued_at_micros;
-        slot.backend_pid = backend_pid;
         slot.commit_group_id.store(0, Relaxed);
         slot.eject_count.store(0, Relaxed);
 
@@ -578,19 +565,6 @@ fn pool_ids_to_le_bytes(pool_ids: &[i64]) -> Vec<u8> {
         out.extend_from_slice(&id.to_le_bytes());
     }
     out
-}
-
-fn trx_type_to_id(trx_type: &str) -> u16 {
-    match trx_type {
-        "po_receipt" => 1,
-        "wo_completion" => 2,
-        "inv_adjustment" => 3,
-        "transfer_shipment" => 4,
-        "transfer_receipt" => 5,
-        "manual_adjustment" => 6,
-        "revaluation_run" => 7,
-        _ => 0,
-    }
 }
 
 fn cv_wait_for_slot(cv: *mut pg_sys::ConditionVariable, deadline_micros: i128) -> bool {
@@ -724,23 +698,5 @@ mod tests {
     #[test]
     fn pool_ids_to_le_bytes_empty_is_empty() {
         assert!(pool_ids_to_le_bytes(&[]).is_empty());
-    }
-
-    #[test]
-    fn trx_type_to_id_covers_all_known_variants() {
-        assert_eq!(trx_type_to_id("po_receipt"), 1);
-        assert_eq!(trx_type_to_id("wo_completion"), 2);
-        assert_eq!(trx_type_to_id("inv_adjustment"), 3);
-        assert_eq!(trx_type_to_id("transfer_shipment"), 4);
-        assert_eq!(trx_type_to_id("transfer_receipt"), 5);
-        assert_eq!(trx_type_to_id("manual_adjustment"), 6);
-        assert_eq!(trx_type_to_id("revaluation_run"), 7);
-    }
-
-    #[test]
-    fn trx_type_to_id_unknown_is_zero() {
-        assert_eq!(trx_type_to_id(""), 0);
-        assert_eq!(trx_type_to_id("revaluation"), 0);
-        assert_eq!(trx_type_to_id("PO_RECEIPT"), 0);
     }
 }

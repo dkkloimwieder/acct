@@ -7,7 +7,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/enqueue.rs:223
+-- ledger-routed-c/src/enqueue.rs:221
 -- ledger_routed_c::enqueue::ledger_enqueue_trx_batch_c
 CREATE  FUNCTION "ledger_enqueue_trx_batch_c"(
 	"trxs" jsonb /* pgrx :: JsonB */
@@ -104,7 +104,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_aggregate_upserts_total_wrapper
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:564
+-- ledger-routed-c/src/lib.rs:577
 -- ledger_routed_c::ledger_routed_c_committer_apply_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_apply_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -122,7 +122,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_deadlock_retries_total_wrapper'
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:581
+-- ledger-routed-c/src/lib.rs:594
 -- ledger_routed_c::ledger_routed_c_committer_decode_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_decode_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -131,7 +131,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_decode_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:591
+-- ledger-routed-c/src/lib.rs:604
 -- ledger_routed_c::ledger_routed_c_committer_dedup_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_dedup_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -185,7 +185,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_eject_total_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:559
+-- ledger-routed-c/src/lib.rs:572
 -- ledger_routed_c::ledger_routed_c_committer_hydrate_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_hydrate_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -194,7 +194,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_hydrate_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:540
+-- ledger-routed-c/src/lib.rs:553
 -- ledger_routed_c::ledger_routed_c_committer_pipeline_count
 CREATE  FUNCTION "ledger_routed_c_committer_pipeline_count"() RETURNS bigint /* i64 */
 STRICT
@@ -203,7 +203,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pipeline_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:535
+-- ledger-routed-c/src/lib.rs:548
 -- ledger_routed_c::ledger_routed_c_committer_pipeline_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_pipeline_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -230,7 +230,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pool_lock_acquisitions_total_wr
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:554
+-- ledger-routed-c/src/lib.rs:567
 -- ledger_routed_c::ledger_routed_c_committer_pool_lock_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_pool_lock_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -239,7 +239,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_pool_lock_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:733
+-- ledger-routed-c/src/router.rs:732
 -- ledger_routed_c::router::ledger_routed_c_committer_queue_state_counts
 CREATE  FUNCTION "ledger_routed_c_committer_queue_state_counts"() RETURNS TABLE (
 	"state" TEXT,  /* String */
@@ -278,7 +278,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_tx_failures_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:569
+-- ledger-routed-c/src/lib.rs:582
 -- ledger_routed_c::ledger_routed_c_committer_txn_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_txn_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -287,7 +287,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_txn_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:586
+-- ledger-routed-c/src/lib.rs:599
 -- ledger_routed_c::ledger_routed_c_committer_xact_ns_total
 CREATE  FUNCTION "ledger_routed_c_committer_xact_ns_total"() RETURNS bigint /* i64 */
 STRICT
@@ -296,7 +296,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_committer_xact_ns_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:598
+-- ledger-routed-c/src/lib.rs:611
 -- ledger_routed_c::ledger_routed_c_hello
 CREATE  FUNCTION "ledger_routed_c_hello"() RETURNS TEXT /* String */
 STRICT
@@ -305,7 +305,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_hello_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/router.rs:760
+-- ledger-routed-c/src/router.rs:759
 -- ledger_routed_c::router::ledger_routed_c_ready_commit_groups
 CREATE  FUNCTION "ledger_routed_c_ready_commit_groups"() RETURNS TABLE (
 	"commit_group_id" bigint,  /* i64 */
@@ -336,6 +336,15 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_router_commit_group_count_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- ledger-routed-c/src/lib.rs:511
+-- ledger_routed_c::ledger_routed_c_router_cross_commit_group_for_update_waits
+CREATE  FUNCTION "ledger_routed_c_router_cross_commit_group_for_update_waits"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_router_cross_commit_group_for_update_waits_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- ledger-routed-c/src/lib.rs:494
 -- ledger_routed_c::ledger_routed_c_router_entries_scanned_total
 CREATE  FUNCTION "ledger_routed_c_router_entries_scanned_total"() RETURNS bigint /* i64 */
@@ -345,7 +354,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_router_entries_scanned_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:510
+-- ledger-routed-c/src/lib.rs:523
 -- ledger_routed_c::ledger_routed_c_router_max_group_size
 CREATE  FUNCTION "ledger_routed_c_router_max_group_size"() RETURNS bigint /* i64 */
 STRICT
@@ -354,7 +363,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_router_max_group_size_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/lib.rs:521
+-- ledger-routed-c/src/lib.rs:534
 -- ledger_routed_c::ledger_routed_c_router_submission_histogram
 CREATE  FUNCTION "ledger_routed_c_router_submission_histogram"() RETURNS TEXT /* String */
 STRICT
@@ -390,7 +399,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_router_window_defers_total_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/enqueue.rs:450
+-- ledger-routed-c/src/enqueue.rs:442
 -- ledger_routed_c::enqueue::ledger_routed_c_staging_request_seq_max
 CREATE  FUNCTION "ledger_routed_c_staging_request_seq_max"() RETURNS bigint /* i64 */
 STRICT
@@ -399,7 +408,7 @@ AS 'MODULE_PATHNAME', 'ledger_routed_c_staging_request_seq_max_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-routed-c/src/enqueue.rs:426
+-- ledger-routed-c/src/enqueue.rs:418
 -- ledger_routed_c::enqueue::ledger_routed_c_staging_state_counts
 CREATE  FUNCTION "ledger_routed_c_staging_state_counts"() RETURNS TABLE (
 	"state" TEXT,  /* String */
@@ -408,5 +417,171 @@ CREATE  FUNCTION "ledger_routed_c_staging_state_counts"() RETURNS TABLE (
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_routed_c_staging_state_counts_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1113
+-- ledger_routed_c::router::ledger_routed_c_test_committer_stall_hits
+CREATE  FUNCTION "ledger_routed_c_test_committer_stall_hits"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_committer_stall_hits_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1191
+-- ledger_routed_c::router::ledger_routed_c_test_inject_orphan_cq
+CREATE  FUNCTION "ledger_routed_c_test_inject_orphan_cq"() RETURNS INT /* i32 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_inject_orphan_cq_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1178
+-- ledger_routed_c::router::ledger_routed_c_test_reclaim_dead_committers
+CREATE  FUNCTION "ledger_routed_c_test_reclaim_dead_committers"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_reclaim_dead_committers_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1093
+-- ledger_routed_c::router::ledger_routed_c_test_router_pid
+CREATE  FUNCTION "ledger_routed_c_test_router_pid"() RETURNS INT /* i32 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_router_pid_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1168
+-- ledger_routed_c::router::ledger_routed_c_test_run_router_recovery_sweep
+CREATE  FUNCTION "ledger_routed_c_test_run_router_recovery_sweep"() RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_run_router_recovery_sweep_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1070
+-- ledger_routed_c::router::ledger_routed_c_test_set_bgworker_paused
+CREATE  FUNCTION "ledger_routed_c_test_set_bgworker_paused"(
+	"paused" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_bgworker_paused_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1082
+-- ledger_routed_c::router::ledger_routed_c_test_set_committer_paused
+CREATE  FUNCTION "ledger_routed_c_test_set_committer_paused"(
+	"paused" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_committer_paused_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1102
+-- ledger_routed_c::router::ledger_routed_c_test_set_committer_stall_us
+CREATE  FUNCTION "ledger_routed_c_test_set_committer_stall_us"(
+	"us" INT /* i32 */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_committer_stall_us_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/enqueue.rs:639
+-- ledger_routed_c::enqueue::ledger_routed_c_test_set_deadline_expired
+CREATE  FUNCTION "ledger_routed_c_test_set_deadline_expired"(
+	"on" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_deadline_expired_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/enqueue.rs:649
+-- ledger_routed_c::enqueue::ledger_routed_c_test_set_force_arena_full
+CREATE  FUNCTION "ledger_routed_c_test_set_force_arena_full"(
+	"on" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_force_arena_full_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/enqueue.rs:615
+-- ledger_routed_c::enqueue::ledger_routed_c_test_set_force_queue_full
+CREATE  FUNCTION "ledger_routed_c_test_set_force_queue_full"(
+	"on" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_force_queue_full_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1121
+-- ledger_routed_c::router::ledger_routed_c_test_set_inject_deadlock_count
+CREATE  FUNCTION "ledger_routed_c_test_set_inject_deadlock_count"(
+	"n" INT /* i32 */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_inject_deadlock_count_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1133
+-- ledger_routed_c::router::ledger_routed_c_test_set_inject_fatal
+CREATE  FUNCTION "ledger_routed_c_test_set_inject_fatal"(
+	"on" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_inject_fatal_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1156
+-- ledger_routed_c::router::ledger_routed_c_test_set_inject_unique
+CREATE  FUNCTION "ledger_routed_c_test_set_inject_unique"(
+	"on" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_inject_unique_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/router.rs:1144
+-- ledger_routed_c::router::ledger_routed_c_test_set_inject_xact_probe_fail
+CREATE  FUNCTION "ledger_routed_c_test_set_inject_xact_probe_fail"(
+	"on" bool /* bool */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_inject_xact_probe_fail_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-routed-c/src/enqueue.rs:627
+-- ledger_routed_c::enqueue::ledger_routed_c_test_set_queue_full_after
+CREATE  FUNCTION "ledger_routed_c_test_set_queue_full_after"(
+	"k" INT /* i32 */
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_routed_c_test_set_queue_full_after_wrapper';
 /* </end connected objects> */
 

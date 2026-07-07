@@ -297,7 +297,6 @@ fn claim_next_committer_entry() -> Option<u32> {
             if slot.valid.compare_exchange(1, 2, AcqRel, Relaxed).is_ok() {
                 slot.committer_acquired_at_ns.store(now_ns(), Relaxed);
                 queue.head.store((head + i + 1) % capacity, Relaxed);
-                queue.committer_claim_count.fetch_add(1, Relaxed);
                 // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
                 if aff_scheme != crate::affinity::SCHEME_OFF {
                     if claim_was_steal {

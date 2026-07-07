@@ -320,7 +320,6 @@ fn emit_commit_group(chunk: Vec<Candidate>, committer_capacity: u32) -> EmitOutc
             slot.committer_bgw_slot.store(u32::MAX, Relaxed);
             slot.committer_bgw_generation.store(0, Relaxed);
             slot.committer_acquired_at_ns.store(0, Relaxed);
-            slot.committer_tx_id.store(0, Relaxed);
             slot.enqueued_at_micros = now_micros;
             let _ = slot.valid.compare_exchange(0, 1, Release, Relaxed);
             queue.tail.store((tail + 1) % committer_capacity, Relaxed);
@@ -967,7 +966,6 @@ fn try_reclaim_dead_committer_entry(q_idx: u32) -> bool {
     slot.committer_bgw_slot.store(u32::MAX, Relaxed);
     slot.committer_bgw_generation.store(0, Relaxed);
     slot.committer_acquired_at_ns.store(0, Relaxed);
-    slot.committer_tx_id.store(0, Relaxed);
     if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
         queue.committer_takeover_count.fetch_add(1, Relaxed);
         return true;

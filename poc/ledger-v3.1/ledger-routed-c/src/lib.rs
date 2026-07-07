@@ -503,6 +503,19 @@ fn ledger_routed_c_router_window_defers_total() -> i64 {
     COMMITTER_QUEUE.share().router_window_defers_total.load(Relaxed) as i64
 }
 
+/// Chunk-split events where the router carved a large affinity component across
+/// multiple commit_groups, so one pool's FOR UPDATE handoff crosses commit_group
+/// boundaries. Sampled as a delta over a timed load, this is the direct rate of
+/// the cross-group provisional-cost order divergence characterized in §14.2 / A1
+/// — the observability the order-divergence story otherwise had to infer.
+#[pg_extern]
+fn ledger_routed_c_router_cross_commit_group_for_update_waits() -> i64 {
+    COMMITTER_QUEUE
+        .share()
+        .router_cross_commit_group_for_update_waits
+        .load(Relaxed) as i64
+}
+
 /// High-water mark: the largest submission count any single CommitGroup reached
 /// since cluster start. With batch_size_max held non-binding, this is the
 /// time-window-only formation's worst-case group size — the tell for whether a
