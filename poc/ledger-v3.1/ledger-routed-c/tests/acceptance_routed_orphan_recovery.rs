@@ -14,6 +14,14 @@
 //!       `recovery_complete` at boot, no in_flight entry is stuck at rest, and the
 //!       system processes fresh submissions.
 //!
+//! Plus (acct-mvq4.31 §6.5 Q10) two reclaim-TRIGGER tests — (a)–(d) above drive
+//! the sweep MECHANISM via a manually-invoked sweep, which left the missing
+//! trigger invisible. These prove the trigger fires without a router restart:
+//!   (e) the Phase-2-only reclaim entry point (the committer-startup path)
+//!       recovers an injected orphan on its own.
+//!   (f) the router's periodic sweep reclaims an injected orphan autonomously —
+//!       no manual sweep, no router restart.
+//!
 //! Why a SYNTHETIC orphan and not a real committer SIGKILL (scenario a): PG's
 //! crash-recovery contract restarts ALL backends if a BGW exits unclean
 //! (SIGSEGV/SIGKILL) — shmem may be corrupt — which is indistinguishable from a
@@ -246,4 +254,90 @@ async fn recovery_complete_at_boot_and_system_operational() {
         .expect("post-boot enqueue");
     await_trx_count(&pool, 1).await;
     assert_eq!(trx_count_for_source(&pool, 7_301).await, 1);
+}
+
+/// (e) acct-mvq4.31 §6.5 Q10: the Phase-2-only reclaim — the call a committer
+/// makes at startup after claiming its identity — recovers an orphaned
+/// commit_group without the full router boot sweep. Both BGWorkers parked so the
+/// synchronous reclaim is the only actor.
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn phase2_reclaim_entry_point_recovers_orphan() {
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    assert!(
+        await_recovery_complete(&pool, Duration::from_secs(10)).await,
+        "recovery_complete must signal at boot"
+    );
+
+    set_router_paused(&pool, true).await;
+    set_committer_paused(&pool, true).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base_takeovers = committer_stat(&pool, "takeover_count").await;
+    let cq_idx = inject_orphan_cq(&pool).await;
+    assert!(cq_idx >= 0, "must find a free CQ slot to mark as orphan");
+
+    // The committer-startup path (Phase-2 only, never touches staging) must
+    // reclaim the orphan — CQ valid 2→1 — same net effect as the full boot sweep.
+    let reclaimed = reclaim_dead_committers(&pool).await;
+    assert!(
+        reclaimed >= 1,
+        "Phase-2 reclaim must reconcile the injected orphan: got {reclaimed}"
+    );
+    assert!(
+        committer_stat(&pool, "takeover_count").await - base_takeovers >= 1,
+        "committer_takeover_count must register the reclaim"
+    );
+
+    // Idempotent: a second call finds nothing more.
+    assert_eq!(
+        reclaim_dead_committers(&pool).await,
+        0,
+        "Phase-2 reclaim is idempotent"
+    );
+
+    set_committer_paused(&pool, false).await;
+    set_router_paused(&pool, false).await;
+}
+
+/// (f) acct-mvq4.31 §6.5 Q10: the router's PERIODIC sweep reclaims an orphan on
+/// its own — no manual sweep, no router restart. This is the trigger the audit
+/// found missing (reclaim previously fired only at router boot). Only the
+/// committer is parked (so the reverted slot stays put for a stable assertion);
+/// the router runs and its periodic sweep must take the orphan over.
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn router_periodic_sweep_reclaims_orphan_without_manual_trigger() {
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    assert!(
+        await_recovery_complete(&pool, Duration::from_secs(10)).await,
+        "recovery_complete must signal at boot"
+    );
+
+    // Park ONLY the committer: the router keeps running so its periodic reclaim
+    // fires. inject_orphan_cq mutates under COMMITTER_QUEUE.exclusive(), which the
+    // running router's share() access serializes against, so the plant is atomic.
+    set_committer_paused(&pool, true).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base_takeovers = committer_stat(&pool, "takeover_count").await;
+    let cq_idx = inject_orphan_cq(&pool).await;
+    assert!(cq_idx >= 0, "must find a free CQ slot to mark as orphan");
+
+    // No manual sweep and no restart: the router's periodic reclaim
+    // (RECLAIM_SWEEP_INTERVAL_NS ≈ 2 s) must take the orphan over autonomously.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if committer_stat(&pool, "takeover_count").await - base_takeovers >= 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("router periodic sweep did not reclaim the injected orphan within 30s");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    set_committer_paused(&pool, false).await;
 }

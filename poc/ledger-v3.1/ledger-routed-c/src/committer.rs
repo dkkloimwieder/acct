@@ -135,6 +135,16 @@ pub extern "C-unwind" fn ledger_routed_c_committer_main(_arg: pg_sys::Datum) {
     let (slot, generation) = claim_committer_identity();
     set_my_committer_identity(slot, generation);
 
+    // Startup dead-committer reclaim (§6.5 Q10): a clean-FATAL predecessor
+    // (uncaught tick error → FATAL → exit(1), or operator pg_terminate_backend
+    // mid-pipeline) leaves its in-flight commit_group at CQ valid==2 with a now-
+    // dead identity, and the boot sweep only runs at ROUTER restart. Reclaim it
+    // now — after claiming our own identity, so the just-bumped generation makes
+    // the stale entry read as dead. Phase-2 only (never touches staging), so it
+    // cannot race the live router's emit. The router also sweeps periodically;
+    // whichever fires first wins the CAS, the other no-ops.
+    router::reclaim_dead_committers();
+
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
         if BackgroundWorker::sighup_received() {
             unsafe {

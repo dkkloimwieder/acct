@@ -517,6 +517,16 @@ pub async fn run_router_recovery_sweep(pool: &PgPool) -> i64 {
         .expect("run_router_recovery_sweep (needs test_hooks build)")
 }
 
+/// Invoke the Phase-2-only dead-committer reclaim synchronously — the exact call
+/// a committer makes at startup (§6.5 Q10). Returns the number of orphaned
+/// commit_groups reclaimed. Pause the BGWorkers first.
+pub async fn reclaim_dead_committers(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT ledger_routed_c_test_reclaim_dead_committers()")
+        .fetch_one(pool)
+        .await
+        .expect("reclaim_dead_committers (needs test_hooks build)")
+}
+
 /// Inject a synthetic orphaned CommitterQueueEntry (valid==2, dead owner). Returns
 /// the CQ index, or -1 if no free slot. Pause the BGWorkers first.
 pub async fn inject_orphan_cq(pool: &PgPool) -> i32 {

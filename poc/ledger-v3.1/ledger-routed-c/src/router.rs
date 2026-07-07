@@ -68,6 +68,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::time::Duration;
 
+/// Cadence for the router's periodic dead-committer reclaim (§6.5 Q10). The boot
+/// sweep only runs at router (re)start, so a committer that exits clean-FATAL
+/// mid-pipeline would otherwise orphan its in-flight commit_group (CQ valid==2,
+/// dead identity) until the next router restart. Re-running the idempotent sweep
+/// on this coarse interval bounds reclaim latency while the router stays up. The
+/// sweep is a cheap shmem scan; a few-second cadence adds no meaningful overhead
+/// and is comparable to the 5 s BGWorker restart_time.
+const RECLAIM_SWEEP_INTERVAL_NS: u64 = 2_000_000_000;
+
 /// Block until the recovery worker has flipped `recovery_complete` 0→1, or until
 /// a SIGTERM ends the latch wait. design-v3.1 §6.5. Lives here because the
 /// committer depends on it too (mirrors the v3 layout).
@@ -103,6 +112,7 @@ pub extern "C-unwind" fn ledger_routed_c_router_main(_arg: pg_sys::Datum) {
     // committer left mid-operation before opening for steady-state routing.
     // Phase ordering is load-bearing (see try_recover_router_orphan).
     try_recover_router_orphan();
+    let mut last_reclaim_sweep_ns = crate::shmem::now_ns();
 
     while BackgroundWorker::wait_latch(Some(Duration::from_millis(50))) {
         if BackgroundWorker::sighup_received() {
@@ -113,10 +123,21 @@ pub extern "C-unwind" fn ledger_routed_c_router_main(_arg: pg_sys::Datum) {
         // Test-only pause hook: a test backend flips `test_bgworker_paused` to
         // 1 to suspend ticking while synchronous test SQL inspects slot state
         // without racing this worker. Compiled out of production (acct-yojk.11);
-        // only test_hooks builds carry the read and can arm it.
+        // only test_hooks builds carry the read and can arm it. The periodic
+        // reclaim below is gated behind this too, so a parked router never
+        // autonomously sweeps under a test's feet.
         #[cfg(feature = "test_hooks")]
         if COMMITTER_QUEUE.share().test_bgworker_paused.load(Acquire) == 1 {
             continue;
+        }
+        // Periodic dead-committer reclaim (§6.5 Q10). Runs at the TOP of the
+        // wake loop, before this wake's emits, so it never races our own tick;
+        // the full sweep is idempotent and, in steady state (no router crash),
+        // does real work only in its Phase-2 dead-committer branch.
+        let now = crate::shmem::now_ns();
+        if now.saturating_sub(last_reclaim_sweep_ns) >= RECLAIM_SWEEP_INTERVAL_NS {
+            try_recover_router_orphan();
+            last_reclaim_sweep_ns = now;
         }
         while router_tick() > 0 {}
     }
@@ -849,17 +870,14 @@ fn sweep_queue_phase() -> u64 {
     let queue_capacity = LEDGER_V3_COMMITTER_QUEUE_SIZE as u32;
 
     for q_idx in 0..queue_capacity {
-        let (q_valid, q_cg_id, q_submission_count, q_so_off, q_owner_slot, q_owner_gen) = {
+        let (q_valid, q_cg_id, q_submission_count, q_so_off) = {
             let queue = COMMITTER_QUEUE.share();
             let slot = &queue.entries[q_idx as usize];
-            let v = slot.valid.load(Acquire);
             (
-                v,
+                slot.valid.load(Acquire),
                 slot.commit_group_id,
                 slot.submission_count,
                 slot.staging_entry_offsets,
-                slot.committer_bgw_slot.load(Acquire),
-                slot.committer_bgw_generation.load(Acquire),
             )
         };
 
@@ -879,27 +897,8 @@ fn sweep_queue_phase() -> u64 {
                 }
             }
             2 => {
-                // Phase 2: in-flight with a possibly-dead committer. Unclaimed
-                // sentinel (generation == 0) means there was never an owner.
-                if q_owner_gen == 0 {
-                    continue;
-                }
-                if is_committer_alive(q_owner_slot, q_owner_gen) {
-                    continue;
-                }
-                // Revert CQ valid 2→1 + clear identity so the next committer's
-                // claim_next_committer_entry can take over. Staging entries stay
-                // at valid==3; the new committer re-decodes via the CQ payload and
-                // re-runs the pipeline — pre-flight dedup (dedup_against_trx) skips
-                // anything the dead committer's tx committed before dying.
-                let queue = COMMITTER_QUEUE.share();
-                let slot = &queue.entries[q_idx as usize];
-                if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
-                    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
-                    slot.committer_bgw_generation.store(0, Relaxed);
-                    slot.committer_acquired_at_ns.store(0, Relaxed);
-                    slot.committer_tx_id.store(0, Relaxed);
-                    queue.committer_takeover_count.fetch_add(1, Relaxed);
+                // Phase 2: in-flight with a possibly-dead committer.
+                if try_reclaim_dead_committer_entry(q_idx) {
                     recovered += 1;
                 }
             }
@@ -908,6 +907,60 @@ fn sweep_queue_phase() -> u64 {
     }
 
     recovered
+}
+
+/// Phase-2-only reclaim: scan the committer queue and revert every entry at
+/// valid==2 whose owning committer is dead. Unlike `try_recover_router_orphan`
+/// this touches ONLY the committer queue (never staging), so it is safe to run
+/// concurrently with a live router's emit — a committer calls it at startup to
+/// reclaim an orphan a clean-FATAL predecessor left in-flight (§6.5 Q10), rather
+/// than waiting for a router restart. Idempotent; returns the count reclaimed.
+pub(crate) fn reclaim_dead_committers() -> u64 {
+    let mut reclaimed: u64 = 0;
+    let queue_capacity = LEDGER_V3_COMMITTER_QUEUE_SIZE as u32;
+    for q_idx in 0..queue_capacity {
+        if try_reclaim_dead_committer_entry(q_idx) {
+            reclaimed += 1;
+        }
+    }
+    reclaimed
+}
+
+/// Phase-2 per-entry helper: if CQ[`q_idx`] is at valid==2 with a dead owning
+/// committer identity, CAS-revert it to valid==1 and clear the identity so the
+/// next `claim_next_committer_entry` takes over. Returns true on reclaim. The
+/// unclaimed sentinel (generation == 0) is skipped — it was never owned. Staging
+/// entries stay at valid==3; the re-claiming committer re-decodes from the CQ
+/// payload and re-runs the pipeline, with pre-flight dedup (`dedup_against_trx`)
+/// skipping anything the dead committer's tx committed before dying. CAS-elected,
+/// so concurrent sweepers (router + committers) race safely — the loser no-ops.
+fn try_reclaim_dead_committer_entry(q_idx: u32) -> bool {
+    let (q_valid, q_owner_slot, q_owner_gen) = {
+        let queue = COMMITTER_QUEUE.share();
+        let slot = &queue.entries[q_idx as usize];
+        (
+            slot.valid.load(Acquire),
+            slot.committer_bgw_slot.load(Acquire),
+            slot.committer_bgw_generation.load(Acquire),
+        )
+    };
+    if q_valid != 2 || q_owner_gen == 0 {
+        return false;
+    }
+    if is_committer_alive(q_owner_slot, q_owner_gen) {
+        return false;
+    }
+    let queue = COMMITTER_QUEUE.share();
+    let slot = &queue.entries[q_idx as usize];
+    if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
+        slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+        slot.committer_bgw_generation.store(0, Relaxed);
+        slot.committer_acquired_at_ns.store(0, Relaxed);
+        slot.committer_tx_id.store(0, Relaxed);
+        queue.committer_takeover_count.fetch_add(1, Relaxed);
+        return true;
+    }
+    false
 }
 
 fn sweep_staging_phase() -> u64 {
@@ -1094,6 +1147,16 @@ fn ledger_routed_c_test_set_inject_unique(on: bool) {
 #[pg_extern]
 fn ledger_routed_c_test_run_router_recovery_sweep() -> i64 {
     try_recover_router_orphan() as i64
+}
+
+/// Invoke the Phase-2-only dead-committer reclaim synchronously — the exact call
+/// a committer makes at startup (§6.5 Q10). Returns the number of orphaned
+/// commit_groups reclaimed. Pause the BGWorkers first so nothing race-claims the
+/// reverted slot.
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_reclaim_dead_committers() -> i64 {
+    reclaim_dead_committers() as i64
 }
 
 /// Inject a synthetic orphaned CommitterQueueEntry: find the first CQ slot at
