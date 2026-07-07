@@ -83,7 +83,8 @@ use crate::router;
 use ledger_spi_common::line_type::decode_line_type;
 use ledger_spi_common::{bulk_write, hydration, pool_lock};
 use crate::shmem::{
-    COMMITTER_QUEUE, LEDGER_V3_COMMITTER_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE, now_ns, now_us,
+    COMMITTER_QUEUE, LEDGER_V3_COMMITTER_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE, StagingEntry,
+    now_ns, now_us,
 };
 
 // ── Per-process identity (thread-local) ─────────────────────────────
@@ -1124,12 +1125,53 @@ fn probe_xid_statuses(xid_strs: Vec<String>) -> Option<Vec<(String, Option<Strin
     })
 }
 
+/// Move an ejected staging slot back to `pending` (valid==1) from whichever live
+/// pre-commit state the router left it in. `emit_commit_group` publishes the CQ
+/// entry (valid 0→1) BEFORE stamping its staging entries 2→3 (the data-before-flag
+/// block), so a committer can claim, decode, and reach an eject with the slot
+/// still at valid==2. A bare `CAS 3→1` no-ops there while the caller's metadata
+/// writes (cg_id=0, last_eject_at_ns, and — on the budget path — eject_count) have
+/// already landed, corrupting the slot: the router's late 2→3 stamp then either
+/// releases it as committed (silent submission loss) or leaves it at cg==0/valid==3
+/// (stuck slot, arena held) — acct-mvq4.28 interleavings (a)/(b). Looping over
+/// {3,2}→1 makes the transition atomic w.r.t. the router's stamp: `valid` is only
+/// ever 2 or 3 here and the router only advances it 2→3, so this converges in at
+/// most one extra spin. If the router wins the 2→3 between our two attempts, its
+/// paired `CAS 2→3` in emit still fails once we land 1, so the slot ends cleanly
+/// pending regardless of interleaving. Callers MUST write their eject metadata
+/// (Release) BEFORE calling this; the successful CAS is the release point that
+/// publishes those writes ahead of any Acquire-read of valid==1.
+#[inline]
+fn eject_staging_slot_to_pending(slot: &StagingEntry) {
+    loop {
+        match slot.valid.load(Acquire) {
+            3 => {
+                if slot.valid.compare_exchange(3, 1, Release, Relaxed).is_ok() {
+                    return;
+                }
+            }
+            2 => {
+                if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
+                    return;
+                }
+            }
+            // Already out of the pre-commit window (pending/freed/poisoned). Only
+            // the router writes this slot's valid while we own its CQ entry, and
+            // only 2→3, so this is unreachable in the intended flow; return rather
+            // than spin to guarantee forward progress if an invariant is violated.
+            _ => return,
+        }
+        std::hint::spin_loop();
+    }
+}
+
 /// Batched pg_xact_status lookup over the unique XIDs, then per-submission
 /// classification. In-progress callers are ejected (eject_count +
-/// last_eject_at_ns bumped, cg_id reset, staging CAS 3→1 so the router re-packs
-/// after cooldown); aborted callers are dropped silently; a NULL status (frozen
-/// xid = committed) is kept; an unrecognized non-null status (pg_xact_status
-/// wording drift) is logged and ejected, never kept. Returns the kept set.
+/// last_eject_at_ns bumped, cg_id reset, staging moved to pending via
+/// `eject_staging_slot_to_pending` so the router re-packs after cooldown);
+/// aborted callers are dropped silently; a NULL status (frozen xid = committed)
+/// is kept; an unrecognized non-null status (pg_xact_status wording drift) is
+/// logged and ejected, never kept. Returns the kept set.
 fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Error> {
     let mut unique_xids: HashSet<u64> = HashSet::new();
     for d in decoded {
@@ -1180,7 +1222,7 @@ fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Er
                     let slot = &queue.entries[d.staging_idx as usize];
                     slot.last_eject_at_ns.store(now_n, Release);
                     slot.commit_group_id.store(0, Release);
-                    let _ = slot.valid.compare_exchange(3, 1, Release, Relaxed);
+                    eject_staging_slot_to_pending(slot);
                 }
                 COMMITTER_QUEUE
                     .share()
@@ -1234,7 +1276,7 @@ fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Er
             slot.eject_count.fetch_add(1, Release);
             slot.last_eject_at_ns.store(now_n, Release);
             slot.commit_group_id.store(0, Release);
-            let _ = slot.valid.compare_exchange(3, 1, Release, Relaxed);
+            eject_staging_slot_to_pending(slot);
         }
         COMMITTER_QUEUE
             .share()
@@ -1547,5 +1589,99 @@ mod tests {
         assert_eq!(my_committer_identity(), Some((7, 42)));
         clear_my_committer_identity();
         assert_eq!(my_committer_identity(), None);
+    }
+
+    // ── acct-mvq4.28 eject-vs-stamp race regression ─────────────────────
+
+    use crate::shmem::StagingQueue;
+    use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
+
+    fn fresh_staging_queue() -> Box<StagingQueue> {
+        unsafe { Box::<StagingQueue>::new_zeroed().assume_init() }
+    }
+
+    fn set_slot(sq: &mut StagingQueue, idx: usize, valid: u8, cg: u64, eject: u32) {
+        let slot = &mut sq.entries[idx];
+        slot.valid = AtomicU8::new(valid);
+        slot.commit_group_id = AtomicU64::new(cg);
+        slot.eject_count = AtomicU32::new(eject);
+    }
+
+    #[test]
+    fn eject_helper_moves_valid3_slot_to_pending() {
+        // Normal (unraced) eject: router already stamped staging to valid==3.
+        let mut sq = fresh_staging_queue();
+        set_slot(&mut sq, 3, 3, 99, 0);
+        let slot = &sq.entries[3];
+        slot.eject_count.fetch_add(1, Release);
+        slot.commit_group_id.store(0, Release);
+        eject_staging_slot_to_pending(slot);
+        assert_eq!(slot.valid.load(Acquire), 1);
+        assert_eq!(slot.commit_group_id.load(Acquire), 0);
+        assert_eq!(slot.eject_count.load(Acquire), 1);
+    }
+
+    #[test]
+    fn eject_helper_interleaving_a_no_silent_loss() {
+        // Q7 (a): committer reaches the eject while staging is still at valid==2
+        // (router published the CQ entry but hasn't run its 2→3 stamp yet), then
+        // the router resumes and tries to stamp. The eject must win: the in-progress
+        // submission must NOT be released as committed by the later cleanup.
+        const CG: u64 = 77;
+        let mut sq = fresh_staging_queue();
+        set_slot(&mut sq, 5, 2, CG, 0);
+        // Committer ejects an in-progress caller: metadata (Release) then move-to-pending.
+        {
+            let slot = &sq.entries[5];
+            slot.eject_count.fetch_add(1, Release);
+            slot.commit_group_id.store(0, Release);
+            eject_staging_slot_to_pending(slot);
+            assert_eq!(slot.valid.load(Acquire), 1, "eject must move a valid==2 slot to pending");
+        }
+        // Router resumes its interrupted per-entry stamp for this slot.
+        {
+            let slot = &sq.entries[5];
+            slot.commit_group_id.store(CG, Release);
+            let stamped = slot.valid.compare_exchange(2, 3, Release, Relaxed).is_ok();
+            assert!(!stamped, "router's late 2→3 stamp must fail once the eject landed valid==1");
+            assert_eq!(slot.valid.load(Acquire), 1, "slot stays pending after the failed stamp");
+        }
+        // Cleanup for the original cg must NOT free the slot as committed.
+        let released = crate::cleanup::try_release_staging_slot(&sq, 5, CG);
+        assert!(released.is_none(), "ejected slot must not be freed as committed (no silent loss)");
+    }
+
+    #[test]
+    fn eject_helper_interleaving_b_no_stuck_slot() {
+        // Q7 (b): router stored cg, committer overwrites cg=0 + moves to pending,
+        // router's CAS 2→3 then fails → clean pending, NOT a stuck valid==3/cg==0
+        // slot that both cleanup and the sweeps skip (arena held to restart).
+        const CG: u64 = 88;
+        let mut sq = fresh_staging_queue();
+        set_slot(&mut sq, 6, 2, 0, 0);
+        let slot = &sq.entries[6];
+        slot.commit_group_id.store(CG, Release); // router step 4a: store cg
+        // committer eject overlaps:
+        slot.eject_count.fetch_add(1, Release);
+        slot.commit_group_id.store(0, Release);
+        eject_staging_slot_to_pending(slot);
+        // router step 4b: paired CAS 2→3
+        let stamped = slot.valid.compare_exchange(2, 3, Release, Relaxed).is_ok();
+        assert!(!stamped, "router's paired 2→3 must fail after the eject landed valid==1");
+        assert_eq!(slot.valid.load(Acquire), 1, "clean pending, not stuck");
+        assert_eq!(slot.commit_group_id.load(Acquire), 0, "cg cleared, not stuck at cg==0/valid==3");
+    }
+
+    #[test]
+    fn eject_helper_terminates_on_non_precommit_state() {
+        // Defensive: outside the {2,3} pre-commit window the helper returns rather
+        // than spin forever (guards against a hang if an invariant is violated).
+        let mut sq = fresh_staging_queue();
+        for (idx, v) in [(0usize, 0u8), (1, 1), (2, 4)] {
+            set_slot(&mut sq, idx, v, 0, 0);
+            let slot = &sq.entries[idx];
+            eject_staging_slot_to_pending(slot);
+            assert_eq!(slot.valid.load(Acquire), v, "non-precommit valid must be left unchanged");
+        }
     }
 }
