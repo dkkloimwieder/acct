@@ -463,3 +463,109 @@ async fn irresolvable_unique_poisons_group() {
         "aggregate untouched by the poisoned group"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn deadlock_retry_then_racing_duplicate_drops_offender_survivor_commits() {
+    // acct-mvq4.38 (Pass-3 C3): the §6.8 retry shape re-attempts a deadlocked
+    // write WITHOUT re-triage or re-dedup; its safety rests on the UNIQUE backstop
+    // turning a duplicate that arrives during the retry into a 23505 -> re-drive.
+    // deadlock_during_write_retries_then_commits proves retry-then-commit alone;
+    // racing_duplicate_redrives_group_minus_offender proves the re-drive alone. The
+    // specific interleaving — a duplicate lands between attempt N's rollback and
+    // attempt N+1's write — had never executed. This drives exactly that.
+    //
+    // Determinism rests on the injection order inside attempt_commit_phase:
+    // maybe_inject_deadlock() raises BEFORE maybe_stall(), so
+    //   attempt 1: pool_lock -> injected 40P01 -> rollback + backoff (no stall), and
+    //   attempt 2: pool_lock -> (deadlock budget spent) -> STALL.
+    // The stall is the window strictly AFTER attempt 1's rollback. We insert the
+    // racer there; attempt 2's own INSERT then hits a real 23505, the re-drive drops
+    // the offender, and attempt 3 commits the innocent survivor.
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let f = seed_pool(&pool, 1, 1, 1, "fifo", "running_avg").await;
+    seed_aggregate(&pool, f.pool_id, 0, 0).await;
+
+    let base_retries = committer_stat(&pool, "deadlock_retries_total").await;
+    let base_redrives = committer_stat(&pool, "duplicate_redrives_total").await;
+    let base_skips = committer_stat(&pool, "dedup_skips_total").await;
+    let base_poisoned = committer_stat(&pool, "poisoned_total").await;
+    let base_committed = committer_stat(&pool, "trx_committed_total").await;
+    let base_stall = committer_stall_hits(&pool).await;
+
+    // Innocent survivor 7401 + soon-to-race offender 7402, one commit_group (same
+    // pool -> same affinity component). Route with the committer parked so the
+    // injections land on exactly this group's write phase.
+    route_with_committer_paused(&pool, || async {
+        enqueue(&pool, "po_receipt", 7_401, vec![receipt_line_for(&f, 10, 100)])
+            .await
+            .expect("enqueue innocent survivor");
+        enqueue(&pool, "po_receipt", 7_402, vec![receipt_line_for(&f, 20, 100)])
+            .await
+            .expect("enqueue soon-to-race offender");
+    })
+    .await;
+
+    // One deadlock (consumed by attempt 1) and a long stall (reached only on
+    // attempt 2, once the deadlock budget is spent).
+    set_inject_deadlock_count(&pool, 1).await;
+    set_committer_stall_us(&pool, 3_000_000).await;
+    set_committer_paused(&pool, false).await;
+
+    // Attempt 1 has already deadlocked + rolled back; the committer is now parked in
+    // attempt 2's stall — strictly between the rollback and attempt 2's write. Clear
+    // the stall so the re-drive attempt (3) won't stall, then commit the racer's trx
+    // for 7402 on this connection.
+    await_stall_hit(&pool, base_stall).await;
+    set_committer_stall_us(&pool, 0).await;
+    sqlx::query("INSERT INTO trx (trx_type, source_id, posted_at) VALUES ('po_receipt'::trx_type, 7402, now())")
+        .execute(&pool)
+        .await
+        .expect("insert racing trx for 7402");
+
+    // Final trx set: 7401 (committer) + 7402 (racer) = 2.
+    await_trx_count(&pool, 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        trx_count_for_source(&pool, 7_401).await,
+        1,
+        "the innocent survivor commits exactly once — not dead-lettered with the offender"
+    );
+    assert_eq!(
+        trx_count_for_source(&pool, 7_402).await,
+        1,
+        "exactly one trx for the offender key (the racer's; the committer dropped its own)"
+    );
+    assert_eq!(
+        committer_stat(&pool, "deadlock_retries_total").await - base_retries,
+        1,
+        "the injected deadlock forced exactly one retry"
+    );
+    assert_eq!(
+        committer_stat(&pool, "duplicate_redrives_total").await - base_redrives,
+        1,
+        "the duplicate that arrived across the retry boundary forced exactly one re-drive"
+    );
+    assert_eq!(
+        committer_stat(&pool, "dedup_skips_total").await - base_skips,
+        1,
+        "the offender was re-dedup'd out on the re-drive"
+    );
+    assert_eq!(
+        committer_stat(&pool, "trx_committed_total").await - base_committed,
+        1,
+        "the committer wrote exactly one trx (the survivor 7401), not the duplicate"
+    );
+    assert_eq!(
+        committer_stat(&pool, "poisoned_total").await - base_poisoned,
+        0,
+        "deadlock-retry composed with duplicate-re-drive does NOT poison the group"
+    );
+    assert_eq!(
+        aggregate(&pool, f.pool_id).await,
+        Some((10, 100)),
+        "aggregate reflects only the survivor (the raced 7402 wrote no lines)"
+    );
+}
