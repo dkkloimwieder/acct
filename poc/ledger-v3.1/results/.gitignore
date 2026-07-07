@@ -3,4 +3,9 @@
 *.json
 *.sampler.txt
 *.log
+# Sustained-run scratch: per-run logs, per-second rate samples, and interim
+# snapshot files. The reconciled .md/.csv/.svg deliverables are tracked.
+*.runlog
+*.samples
+.sustained_*snap*
 !.gitignore
