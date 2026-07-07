@@ -94,7 +94,13 @@ fn ledger_enqueue_trx_c(
         ),
     };
 
-    let user_tx_xid: u64 = unsafe { pg_sys::GetCurrentTransactionId().into_inner() } as u64;
+    // Full (epoch-qualified) xid: classify_and_eject feeds this to
+    // pg_xact_status(x::xid8), which needs a 64-bit FullTransactionId. A bare
+    // 32-bit TransactionId widened to u64 carries epoch 0, so once the xid epoch
+    // advances the staged value resolves to a too-old xid → pg_xact_status NULL →
+    // CallerTxStatus::Unknown → wrongly kept, committing in-progress caller work
+    // (acct-mvq4.34). Same assign-if-none semantics as GetCurrentTransactionId.
+    let user_tx_xid: u64 = unsafe { pg_sys::GetCurrentFullTransactionId() }.value;
     let trx_type_id = trx_type_to_id(trx_type);
 
     let mut sub_shell = PocV3Submission {
@@ -240,7 +246,13 @@ fn ledger_enqueue_trx_batch_c(trxs: pgrx::JsonB) -> i64 {
         );
     }
 
-    let user_tx_xid: u64 = unsafe { pg_sys::GetCurrentTransactionId().into_inner() } as u64;
+    // Full (epoch-qualified) xid: classify_and_eject feeds this to
+    // pg_xact_status(x::xid8), which needs a 64-bit FullTransactionId. A bare
+    // 32-bit TransactionId widened to u64 carries epoch 0, so once the xid epoch
+    // advances the staged value resolves to a too-old xid → pg_xact_status NULL →
+    // CallerTxStatus::Unknown → wrongly kept, committing in-progress caller work
+    // (acct-mvq4.34). Same assign-if-none semantics as GetCurrentTransactionId.
+    let user_tx_xid: u64 = unsafe { pg_sys::GetCurrentFullTransactionId() }.value;
 
     // Per-trx prep — parse + pool-id computation, no lock held.
     struct Prepared {
