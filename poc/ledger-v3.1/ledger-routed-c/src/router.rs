@@ -1128,6 +1128,17 @@ fn ledger_routed_c_test_set_inject_fatal(on: bool) {
         .store(u8::from(on), Release);
 }
 
+/// Arm a one-shot pg_xact_status triage-probe failure for the next committer
+/// drain (forces the fail-closed eject-all path, acct-mvq4.30).
+#[cfg(feature = "test_hooks")]
+#[pg_extern]
+fn ledger_routed_c_test_set_inject_xact_probe_fail(on: bool) {
+    COMMITTER_QUEUE
+        .share()
+        .test_inject_xact_probe_fail
+        .store(u8::from(on), Release);
+}
+
 /// Arm a one-shot raw 23505 (UNIQUE) in the next committer write phase with no
 /// real duplicate behind it. Drives the §6.8 re-drive safety valve: a 23505 whose
 /// offender isn't resolvable in `trx` must poison rather than loop.

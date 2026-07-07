@@ -554,6 +554,16 @@ pub async fn set_inject_fatal(pool: &PgPool, on: bool) {
         .expect("set_inject_fatal (needs test_hooks build)");
 }
 
+/// Arm a one-shot pg_xact_status triage-probe failure for the next committer
+/// drain (forces the fail-closed eject-all path, acct-mvq4.30).
+pub async fn set_inject_xact_probe_fail(pool: &PgPool, on: bool) {
+    sqlx::query("SELECT ledger_routed_c_test_set_inject_xact_probe_fail($1)")
+        .bind(on)
+        .execute(pool)
+        .await
+        .expect("set_inject_xact_probe_fail (needs test_hooks build)");
+}
+
 /// Pause both BGWorkers, stage `stage`, unpause ONLY the router, and wait until
 /// at least one commit_group is `ready` — leaving the committer paused so a test
 /// can arm an injection before the group drains. Returns once routing settled.

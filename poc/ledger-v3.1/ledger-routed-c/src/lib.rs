@@ -447,6 +447,15 @@ fn ledger_routed_c_committer_takeover_count() -> i64 {
     COMMITTER_QUEUE.share().committer_takeover_count.load(Relaxed) as i64
 }
 
+/// Staging entries ejected back to pending (valid 3→1) by committer triage: an
+/// in-progress caller re-checked after cooldown, or (acct-mvq4.30) every
+/// submission of a group whose `pg_xact_status` probe failed — fail-closed, so
+/// the next tick re-triages rather than committing unconfirmed work.
+#[pg_extern]
+fn ledger_routed_c_committer_eject_total_count() -> i64 {
+    COMMITTER_QUEUE.share().eject_total_count.load(Relaxed) as i64
+}
+
 /// Whether the postmaster-startup recovery sweep has completed (§6.5). Router +
 /// committers block until this is set; tests poll it before driving traffic.
 #[pg_extern]

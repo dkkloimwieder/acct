@@ -215,6 +215,12 @@ pub struct CommitterQueue {
     /// duplicate is not resolvable in `trx` poisons rather than looping. Production
     /// builds never set it nonzero.
     pub test_inject_committer_unique: AtomicU8,
+    /// Test-only one-shot: when 1, the next committer triage (classify_and_eject)
+    /// treats its `pg_xact_status` probe as failed — skips the real query and takes
+    /// the fail-closed eject-all path (acct-mvq4.30) — then clears the flag
+    /// (swap-to-0). Lets a test reach the probe-failure branch without a real
+    /// OOM/interrupt. Production builds never set it nonzero.
+    pub test_inject_xact_probe_fail: AtomicU8,
     /// Postmaster-startup recovery flag. 0 = recovery not yet
     /// complete; router + committer BGWorkers spin at startup until
     /// set. 1 = recovery sweep finished (Release stored by the

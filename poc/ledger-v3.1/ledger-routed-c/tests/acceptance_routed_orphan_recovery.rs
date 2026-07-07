@@ -22,6 +22,11 @@
 //!   (f) the router's periodic sweep reclaims an injected orphan autonomously —
 //!       no manual sweep, no router restart.
 //!
+//! Plus (acct-mvq4.30 §6.5) one triage-failure test:
+//!   (g) a pg_xact_status triage-probe failure fails CLOSED — every submission is
+//!       ejected back to pending (not kept: fail-open, not Err→dropped), and the
+//!       next tick's real probe commits it exactly once.
+//!
 //! Why a SYNTHETIC orphan and not a real committer SIGKILL (scenario a): PG's
 //! crash-recovery contract restarts ALL backends if a BGW exits unclean
 //! (SIGSEGV/SIGKILL) — shmem may be corrupt — which is indistinguishable from a
@@ -340,4 +345,66 @@ async fn router_periodic_sweep_reclaims_orphan_without_manual_trigger() {
     }
 
     set_committer_paused(&pool, false).await;
+}
+
+/// (g) acct-mvq4.30 §6.5: a pg_xact_status triage-probe failure must fail CLOSED.
+/// Before the fix an SPI error emptied the status map → every submission missed →
+/// Unknown → KEPT, committing work for callers that may be in-progress or aborted.
+/// The probe failure now ejects ALL submissions back to pending (not kept, not
+/// Err→dropped), and the next tick's real probe commits the group exactly once.
+#[tokio::test]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn xact_probe_failure_ejects_all_then_retries() {
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+
+    let f = seed_pool(&pool, 1, 1, 1, "fifo", "running_avg").await;
+    seed_aggregate(&pool, f.pool_id, 0, 0).await;
+
+    let base_ejects = committer_stat(&pool, "eject_total_count").await;
+    let base_drops = committer_stat(&pool, "dropped_submissions_total").await;
+    let base_txfail = committer_stat(&pool, "tx_failures_total").await;
+
+    // Route the group with the committer parked, THEN arm a one-shot probe failure
+    // so it lands on exactly this group's first triage.
+    route_with_committer_paused(&pool, || async {
+        enqueue(&pool, "po_receipt", 7_401, vec![receipt_line_for(&f, 6, 300)])
+            .await
+            .expect("enqueue receipt");
+    })
+    .await;
+
+    set_inject_xact_probe_fail(&pool, true).await;
+    set_committer_paused(&pool, false).await;
+
+    // The first triage fails closed → the submission is ejected back to pending,
+    // NOT committed and NOT lost. The router re-packs it (10 ms cooldown) and the
+    // next real triage commits it exactly once.
+    await_trx_count(&pool, 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        trx_count_for_source(&pool, 7_401).await,
+        1,
+        "the submission commits exactly once after the eject-and-retry"
+    );
+    assert!(
+        committer_stat(&pool, "eject_total_count").await - base_ejects >= 1,
+        "the probe failure ejected the submission back to pending (fail-closed)"
+    );
+    assert_eq!(
+        committer_stat(&pool, "dropped_submissions_total").await - base_drops,
+        0,
+        "fail-closed eject must not drop/lose the submission"
+    );
+    assert_eq!(
+        committer_stat(&pool, "tx_failures_total").await - base_txfail,
+        0,
+        "a probe failure is NOT a TxError (no Err→drop path)"
+    );
+    assert_eq!(
+        aggregate(&pool, f.pool_id).await,
+        Some((6, 300)),
+        "the receipt applied exactly once — no double-apply, no loss"
+    );
 }

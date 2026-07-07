@@ -1089,6 +1089,41 @@ fn drop_prepared_already_in_trx(prepared: &mut Vec<Prepared>) -> Result<u64, Str
 
 // ── Caller user-tx classification + eject ───────────────────────────
 
+/// Run the batched `pg_xact_status` probe over the unique caller XIDs, returning
+/// `(xid_text, status_text_or_null)` rows — or `None` if the SPI probe itself
+/// failed. `classify_and_eject` treats `None` as fail-closed (eject all, re-
+/// triage next tick), so this never fabricates a status from a failed query. A
+/// one-shot `test_inject_xact_probe_fail` flag (test_hooks only) forces the
+/// `None` branch so it is reachable without a real OOM/interrupt.
+fn probe_xid_statuses(xid_strs: Vec<String>) -> Option<Vec<(String, Option<String>)>> {
+    #[cfg(feature = "test_hooks")]
+    if COMMITTER_QUEUE
+        .share()
+        .test_inject_xact_probe_fail
+        .swap(0, AcqRel)
+        == 1
+    {
+        return None;
+    }
+    Spi::connect(|client| {
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
+        let mut t = client
+            .select(
+                "SELECT x.s::xid8::text, pg_xact_status(x.s::xid8) \
+                   FROM UNNEST($1::text[]) AS x(s)",
+                None,
+                &[xid_strs.into()],
+            )
+            .ok()?;
+        while let Some(row) = t.next() {
+            let x: String = row.get::<String>(1).ok()??;
+            let s: Option<String> = row.get::<String>(2).ok()?;
+            out.push((x, s));
+        }
+        Some(out)
+    })
+}
+
 /// Batched pg_xact_status lookup over the unique XIDs, then per-submission
 /// classification. In-progress callers are ejected (eject_count +
 /// last_eject_at_ns bumped, cg_id reset, staging CAS 3→1 so the router re-packs
@@ -1104,37 +1139,55 @@ fn classify_and_eject(decoded: &[Decoded]) -> Result<Vec<Decoded>, pgrx::spi::Er
 
     let mut xid_status: HashMap<u64, CallerTxStatus> = HashMap::new();
     if !xid_strs.is_empty() {
-        let rows: Vec<(String, Option<String>)> = Spi::connect(|client| {
-            let mut out: Vec<(String, Option<String>)> = Vec::new();
-            let mut t = client
-                .select(
-                    "SELECT x.s::xid8::text, pg_xact_status(x.s::xid8) \
-                       FROM UNNEST($1::text[]) AS x(s)",
-                    None,
-                    &[xid_strs.into()],
-                )
-                .ok()?;
-            while let Some(row) = t.next() {
-                let x: String = row.get::<String>(1).ok()??;
-                let s: Option<String> = row.get::<String>(2).ok()?;
-                out.push((x, s));
+        match probe_xid_statuses(xid_strs) {
+            Some(rows) => {
+                for (x, s) in rows {
+                    let xid: u64 = x.parse().unwrap_or(0);
+                    let status = parse_caller_status(s.as_deref());
+                    if status == CallerTxStatus::Unrecognized {
+                        // A pg_xact_status wording drift: surface it loudly. The
+                        // submission is treated as not-yet-committed below (never
+                        // kept), so this fails safe — it never commits work for a
+                        // possibly still-open caller tx.
+                        pgrx::warning!(
+                            "ledger_routed_c: unrecognized pg_xact_status {s:?} for caller xid \
+                             {xid}; treating as not-yet-committed (will not keep)"
+                        );
+                    }
+                    xid_status.insert(xid, status);
+                }
             }
-            Some(out)
-        })
-        .unwrap_or_default();
-        for (x, s) in rows {
-            let xid: u64 = x.parse().unwrap_or(0);
-            let status = parse_caller_status(s.as_deref());
-            if status == CallerTxStatus::Unrecognized {
-                // A pg_xact_status wording drift: surface it loudly. The submission
-                // is treated as not-yet-committed below (never kept), so this fails
-                // safe — it never commits work for a possibly still-open caller tx.
+            None => {
+                // The batched pg_xact_status probe failed (SPI error: OOM, query
+                // interrupt, ...). We cannot confirm ANY caller committed, so
+                // keeping would commit work for callers that may be in-progress or
+                // aborted — the exact atomicity this triage enforces (acct-mvq4.30).
+                // Fail CLOSED: eject EVERY submission back to pending so the next
+                // router tick re-triages once the (low-reachability, transient)
+                // fault clears. Not `Err`→TxError (that drops/loses the group), and
+                // not keep-all (the pre-fix fail-open). The probe failure is ours,
+                // not the caller's, so it does NOT consume the per-caller eject
+                // budget (no `eject_count` bump) — a transient fault must never risk
+                // terminal-dropping legitimately-committed work.
                 pgrx::warning!(
-                    "ledger_routed_c: unrecognized pg_xact_status {s:?} for caller xid {xid}; \
-                     treating as not-yet-committed (will not keep)"
+                    "ledger_routed_c: pg_xact_status triage probe failed; ejecting all {} \
+                     submissions back to pending for re-triage (fail-closed)",
+                    decoded.len()
                 );
+                let queue = STAGING_QUEUE.share();
+                let now_n = now_ns();
+                for d in decoded {
+                    let slot = &queue.entries[d.staging_idx as usize];
+                    slot.last_eject_at_ns.store(now_n, Release);
+                    slot.commit_group_id.store(0, Release);
+                    let _ = slot.valid.compare_exchange(3, 1, Release, Relaxed);
+                }
+                COMMITTER_QUEUE
+                    .share()
+                    .eject_total_count
+                    .fetch_add(decoded.len() as u64, Relaxed);
+                return Ok(Vec::new());
             }
-            xid_status.insert(xid, status);
         }
     }
 
