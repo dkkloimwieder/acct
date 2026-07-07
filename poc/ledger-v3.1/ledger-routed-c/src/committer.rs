@@ -288,7 +288,13 @@ fn claim_next_committer_entry() -> Option<u32> {
             .is_ok()
         {
             slot.committer_bgw_slot.store(my_slot, Release);
-            if slot.valid.compare_exchange(1, 2, Acquire, Relaxed).is_ok() {
+            // AcqRel (not Acquire): the Release half publishes our identity
+            // (generation from the CAS above, slot from the store above) BEFORE
+            // valid==2 becomes observable, so a sweep that Acquire-reads valid==2
+            // is guaranteed to see our slot/generation rather than a stale
+            // slot=MAX — otherwise it would judge this live claim dead and
+            // double-claim the group → double-free (acct-mvq4.32; ARM-only).
+            if slot.valid.compare_exchange(1, 2, AcqRel, Relaxed).is_ok() {
                 slot.committer_acquired_at_ns.store(now_ns(), Relaxed);
                 queue.head.store((head + i + 1) % capacity, Relaxed);
                 queue.committer_claim_count.fetch_add(1, Relaxed);
@@ -302,8 +308,13 @@ fn claim_next_committer_entry() -> Option<u32> {
                 }
                 return Some(idx as u32);
             } else {
+                // Rollback (unreachable while we hold this generation, but kept
+                // defensively): reset slot BEFORE re-opening election, and Release
+                // the generation=0 store so the slot=MAX is published ahead of the
+                // gen==0 flag a re-electing claimer AcqRel-observes — same
+                // clobber-avoidance as the reclaim path (acct-mvq4.32).
                 slot.committer_bgw_slot.store(u32::MAX, Relaxed);
-                slot.committer_bgw_generation.store(0, Relaxed);
+                slot.committer_bgw_generation.store(0, Release);
             }
         }
     }

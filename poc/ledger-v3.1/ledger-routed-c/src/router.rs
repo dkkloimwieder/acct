@@ -952,11 +952,23 @@ fn try_reclaim_dead_committer_entry(q_idx: u32) -> bool {
     }
     let queue = COMMITTER_QUEUE.share();
     let slot = &queue.entries[q_idx as usize];
+    // Clear the dead owner's identity BEFORE flipping valid 2→1, mirroring the
+    // data-before-flag order emit_commit_group uses (identity sentinels first,
+    // then the valid Release CAS). The Release on the 2→1 CAS publishes the
+    // cleared identity (slot=MAX, generation=0) ahead of the valid==1 flag a
+    // racing claimer Acquire-observes; the claimer then re-elects on gen==0 and
+    // stores its own slot strictly after ours. Clearing AFTER the CAS lets the
+    // Relaxed slot=MAX store reorder past the new owner's slot store on non-TSO
+    // hardware — a sweep would then read slot=MAX for a live claim, judge it dead,
+    // and double-claim the group → double-free (acct-mvq4.32; x86-TSO-immune,
+    // real on ARM). While valid is still 2 with generation==0, other sweepers hit
+    // the generation==0 guard above and skip, and claimers need valid==1, so the
+    // pre-CAS window is untouchable.
+    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+    slot.committer_bgw_generation.store(0, Relaxed);
+    slot.committer_acquired_at_ns.store(0, Relaxed);
+    slot.committer_tx_id.store(0, Relaxed);
     if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
-        slot.committer_bgw_slot.store(u32::MAX, Relaxed);
-        slot.committer_bgw_generation.store(0, Relaxed);
-        slot.committer_acquired_at_ns.store(0, Relaxed);
-        slot.committer_tx_id.store(0, Relaxed);
         queue.committer_takeover_count.fetch_add(1, Relaxed);
         return true;
     }
