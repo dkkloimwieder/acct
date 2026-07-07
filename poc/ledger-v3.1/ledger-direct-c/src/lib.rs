@@ -45,29 +45,3 @@ fn ledger_direct_c_hello() -> String {
         env!("CARGO_PKG_VERSION"),
     )
 }
-
-#[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
-mod tests {
-    use pgrx::prelude::*;
-
-    #[pg_test]
-    fn hello_pg_extern_reachable() {
-        let banner =
-            Spi::get_one::<String>("SELECT ledger_direct_c_hello()").expect("SPI call failed");
-        let banner = banner.expect("hello fn returned NULL");
-        assert!(banner.starts_with("ledger_direct_c "), "unexpected banner: {banner:?}");
-        assert!(banner.contains("Path C"), "banner missing path identifier: {banner:?}");
-    }
-}
-
-/// Required by `cargo pgrx test`. Empty for Path C direct — no GUCs, no
-/// shared_preload_libraries.
-#[cfg(test)]
-pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {}
-
-    pub fn postgresql_conf_options() -> Vec<&'static str> {
-        vec![]
-    }
-}

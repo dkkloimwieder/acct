@@ -83,20 +83,21 @@ family. Per-scenario params land in the .5 coverage map + .7 usage map.
 `equivalence` {`--scenario`, `--submissions-per-caller`, `--callers`, `--method-mix`,
 `--depth`}. Usage map at .7.
 
-### 0.3 Canonical-invocation matrix (4-way)
+### 0.3 Canonical-invocation matrix (3-way)
 
 `scripts/run-tests.sh` covers ONLY the acceptance/property binaries of the two `-c` crates
 (verified by reading: `set -uo pipefail`; `WITH_TEST_HOOKS=1` install per path; discovers
 `tests/{acceptance,property}_*.rs`; `docker restart` + `RESTART_WAIT`(5 s) per binary;
 `cargo test --features pg18,test_hooks --no-default-features --test <bin> -- --ignored
---test-threads=1 --nocapture`; `FAIL_FAST` default 1). Full coverage needs four classes:
+--test-threads=1 --nocapture`; `FAIL_FAST` default 1). Full coverage needs three classes:
 
 | # | Class | What runs | Command (from `poc/ledger-v3.1/`) | Needs cluster? |
 |---|---|---|---|---|
-| a | Pure units | ledger-core 38 `#[test]` (10+17 tests/, 11 numeric.rs) + spi-common 2 | `cargo test -p ledger-core -p ledger-spi-common` | no |
-| b | Integration (`--ignored`) | direct-c 3 binaries (14 `#[ignore]`, `#[tokio::test]`-style) + routed-c 5 binaries (24 `#[ignore]`) | `bash scripts/run-tests.sh --path both` | YES — installs test_hooks `.so`, restarts per binary |
-| c | `#[pg_test]` hellos | direct-c ×1, routed-c ×2 | `cargo pgrx test pg18` in each `-c` crate | pgrx-managed instance (not the shared cluster) |
+| a | Src-inline units | ledger-core 38 `#[test]` (10+17 tests/, 11 numeric.rs) + spi-common 2 + the two `-c` crates' src-inline units via `--lib` (routed-c across arena/payload/enqueue/cleanup/committer/router; direct-c 0) | `cargo test -p ledger-core -p ledger-spi-common` **and** `cargo test -p ledger-direct-c -p ledger-routed-c --lib --features pg18 --no-default-features` | no |
+| b | Integration (`--ignored`) | direct-c 3 binaries (14 `#[ignore]`, `#[tokio::test]`-style) + routed-c 6 binaries (`#[ignore]`) | `bash scripts/run-tests.sh --path both` | YES — installs test_hooks `.so`, restarts per binary |
 | d | Harness smokes | `smoke_measure.rs`, `smoke_sampler.rs` (both `#[ignore]`, DSN `localhost:5111/poc_v3_1`) | `cargo test -p ledger-harness -- --ignored` | YES — live seeded `poc_v3_1` + `ledger_direct_c` installed |
+
+> Former **class (c)** (`#[pg_test]` hellos — direct-c ×1, routed-c ×2) was **retired** (`acct-mvq4.40`, finding C5): `cargo pgrx test` must write into a pgrx-managed install and the host PG is root-owned (env-blocked), and the checks are coverage-redundant — the routed banner + sizing GUCs are asserted by `acceptance_routed_enqueue::shmem_sizing_gucs_honored` (class b), shmem-region visibility is transitive across every class-(b) test (the preloaded `.so` cannot boot without the regions), and the `-c` src-inline units the class carried now run explicitly under **class (a)** `--lib`. The letter `(c)` is left vacated so the historical class references in §C-i.3 / §C-ii below stay unambiguous.
 
 ### 0.4 Artifact census (live, 2026-06-05)
 

@@ -605,39 +605,3 @@ fn ledger_routed_c_hello() -> String {
         target_database_str(),
     )
 }
-
-#[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
-mod tests {
-    use super::*;
-
-    #[pg_test]
-    fn hello_pg_extern_reachable() {
-        let banner = ledger_routed_c_hello();
-        assert!(banner.starts_with("ledger_routed_c 0.0.1"));
-        assert!(banner.contains("staging=16384"));
-        assert!(banner.contains("arena_mb=128"));
-    }
-
-    #[pg_test]
-    fn shmem_regions_visible() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let staging = STAGING_QUEUE.share();
-        let _head: u32 = staging.head.load(Relaxed);
-        drop(staging);
-        let committer = COMMITTER_QUEUE.share();
-        let _commit_group_id: u64 = committer.next_commit_group_id.load(Relaxed);
-        drop(committer);
-        let arena = SPILLOVER_ARENA.share();
-        let _bump: u32 = arena.bump_offset.load(Relaxed);
-    }
-}
-
-#[cfg(test)]
-pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {}
-
-    pub fn postgresql_conf_options() -> Vec<&'static str> {
-        vec!["shared_preload_libraries='ledger_routed_c'"]
-    }
-}

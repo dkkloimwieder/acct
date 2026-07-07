@@ -13,7 +13,6 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["pg18"]
 pg18 = ["pgrx/pg18", "ledger-spi-common/pg18"]
-pg_test = []
 # Exposes test-only pg_externs; gated OUT of production .so builds so SQL callers
 # cannot reach state-mutating helpers. Mirrors ledger-v3's pattern.
 test_hooks = []
