@@ -73,6 +73,31 @@ pub async fn enqueue(
         .await
 }
 
+/// Call `ledger_enqueue_trx_batch_c` with a batch of `(trx_type, source_id,
+/// lines)` envelopes (all posted at `TS`), returning the count of submissions
+/// published (or the SQL error). The wire shape is a JSONB array of
+/// `{trx_type, source_id, posted_at, lines:[...]}`.
+pub async fn enqueue_batch(
+    pool: &PgPool,
+    envelopes: Vec<(&str, i64, Vec<Value>)>,
+) -> Result<i64, sqlx::Error> {
+    let arr: Vec<Value> = envelopes
+        .into_iter()
+        .map(|(trx_type, source_id, lines)| {
+            json!({
+                "trx_type": trx_type,
+                "source_id": source_id,
+                "posted_at": TS,
+                "lines": lines,
+            })
+        })
+        .collect();
+    sqlx::query_scalar("SELECT ledger_enqueue_trx_batch_c($1::jsonb)")
+        .bind(Value::Array(arr))
+        .fetch_one(pool)
+        .await
+}
+
 pub async fn staging_pending(pool: &PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT count FROM ledger_routed_c_staging_state_counts() WHERE state = 'pending'",
