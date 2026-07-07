@@ -250,6 +250,9 @@ if [ "$BUILD_EXT" = "1" ]; then
   "$WS_DIR/scripts/install-routed-c.sh" >&2 || log "WARN: install-routed-c failed"
 fi
 ensure_pgbouncer
+# Routed-only sweep that never SETs the committer GUCs itself; assert they're at
+# production defaults so a stale pin can't silently mislabel the 1m/10m cells.
+assert_routed_gucs
 
 FAILS=()
 for sid in "${SCENARIOS[@]}"; do

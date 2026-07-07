@@ -72,6 +72,9 @@ running_committers() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc \
   "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'ledger_routed_c_committer%'" 2>/dev/null | tr -d '[:space:]'; }
 
 build_harness
+# Fixed-config profile: assert the ambient regime IS the production default before
+# logging cc=4/affinity=OFF as fact — a stale pin would silently mislabel the CSV.
+assert_routed_gucs
 log "=== committer pipeline PROFILE sweep (acct-0usf STEP 1 deliverable) ==="
 log "scenarios=${SCENARIOS[*]} reps=$REPS dur=$DUR committer_count=4 affinity=OFF sampler=ON"
 # CSV: one row per (scenario, rep). Span fracs are of the whole committer txn;

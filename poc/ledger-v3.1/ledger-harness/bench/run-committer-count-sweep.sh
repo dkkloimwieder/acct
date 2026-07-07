@@ -21,7 +21,7 @@ CONTAINER="${CONTAINER:-acct-postgres}"
 DUR="${DUR:-30s}"
 COUNTS="${COUNTS:-2 4 8 16}"
 SCENARIOS=( ${CC_SCENARIOS:-s7 s10 s5} )   # s5 = single-pool control (should NOT scale)
-AFFINITY="${AFFINITY:-off}"   # committer_affinity: on pins a hot pool to one committer (acct-xdwk lever 2)
+AFFINITY="${AFFINITY:-off}"   # affinity_scheme label: on(=1,min_pool) pins a commit_group to mix(min pool_id)%committer_count; off(=0) is first-come (acct-xdwk lever 2, rebuilt under acct-0usf)
 SEED_SKUS="${SEED_SKUS:-1000}"; SEED_LOCS="${SEED_LOCS:-10}"; SEED_COUNT="${SEED_COUNT:-10000}"
 OUT="${RESULTS_DIR}/committer_count_sweep_aff${AFFINITY}.csv"
 SWEEP_LOG="${RESULTS_DIR}/committer_count_sweep.log"
@@ -30,10 +30,17 @@ depth_for() { case "$1" in s5|s6) echo 10 ;; s7|s8|s9) echo 1000 ;; s11|s15|s19)
 jget() { grep -oE "\"$2\"[[:space:]]*:[[:space:]]*[0-9.]+" "$1" | head -1 | grep -oE '[0-9.]+$'; }
 
 set_committers() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.committer_count = $1" >/dev/null; }
-set_affinity() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.committer_affinity = $1" >/dev/null; docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT pg_reload_conf()" >/dev/null; }
+# Map the human off/on label to affinity_scheme (0=off first-come, 1=min_pool; Sighup).
+set_affinity() {
+  local scheme; case "$1" in on|1) scheme=1 ;; *) scheme=0 ;; esac
+  docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.affinity_scheme = $scheme" >/dev/null
+  docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT pg_reload_conf()" >/dev/null
+}
+# acct-xdkd tracks the companion risk that this trap restores STALE defaults if the
+# ambient regime wasn't the boot default when the sweep started.
 restore_defaults() {
   docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.committer_count = 4" >/dev/null 2>&1 || true
-  docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.committer_affinity = off" >/dev/null 2>&1 || true
+  docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.affinity_scheme = 0" >/dev/null 2>&1 || true
   docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT pg_reload_conf()" >/dev/null 2>&1 || true
 }
 trap restore_defaults EXIT
@@ -64,6 +71,12 @@ running_committers() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc \
   "SELECT count(*) FROM pg_stat_activity WHERE backend_type LIKE 'ledger_routed_c_committer%'" 2>/dev/null | tr -d '[:space:]'; }
 
 build_harness
+# We pin committer_count + affinity_scheme per cell; assert the knobs held at their
+# defaults so a stale pin (e.g. setup-cc1's batch_window_us=20000) can't silently
+# break the "window=500 throughout" premise.
+assert_routed_gucs "ledger_routed_c.batch_window_us=500" \
+                   "ledger_routed_c.batch_size_max=200" \
+                   "ledger_routed_c.router_pack_disjoint=on"
 log "=== committer_count sweep (acct-235v follow-on; affinity=$AFFINITY acct-xdwk lever 2) ==="
 log "scenarios=${SCENARIOS[*]} counts=[$COUNTS] affinity=$AFFINITY dur=$DUR window=500us(default)"
 echo "scenario,affinity,committer_count,committers_seen,callers,depth,throughput_trx_s,commit_group_avg,commits_per_s,pool_lock_per_trx,trx_materialized,errors,ack_p50_us,ack_p95_us,ack_p99_us,load1_end" > "$OUT"
@@ -74,7 +87,7 @@ for sid in "${SCENARIOS[@]}"; do
     log "--- $sid committer_count=$n : set + clean + restart + seed ---"
     set_committers "$n"
     clean_seed "$sid"
-    # committer_affinity is Sighup (live); set it AFTER clean_seed's restart so
+    # affinity_scheme is Sighup (live); set it AFTER clean_seed's restart so
     # the freshly-respawned committer pool reads it (acct-xdwk lever 2).
     set_affinity "$AFFINITY"
     seen="$(running_committers)"; log "  committers running: $seen (requested $n)"

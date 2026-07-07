@@ -94,3 +94,47 @@ wait_for_quiet_host() {
         waited=$((waited + 5))
     done
 }
+
+# Boot defaults of the routed committer GUCs (ledger-routed-c/src/lib.rs _PG_init).
+# A no-pin measurement inherits whatever ALTER SYSTEM state is live; a stale pin —
+# e.g. setup-cc1-for-perf.sh leaves committer_count=1 / batch_window_us=20000, and
+# it survives docker restart via postgresql.auto.conf — would silently mislabel
+# every cell as if it ran at production defaults. Keep in sync with lib.rs.
+ROUTED_GUC_DEFAULTS=(
+    "ledger_routed_c.committer_count=4"
+    "ledger_routed_c.affinity_scheme=0"
+    "ledger_routed_c.batch_size_max=200"
+    "ledger_routed_c.batch_window_us=500"
+    "ledger_routed_c.router_pack_disjoint=on"
+)
+
+# assert_routed_gucs [key=value ...] — SHOW the live routed GUCs and abort loud on
+# any drift from expected. No args ⇒ assert the production defaults above; pass
+# explicit pairs to assert a specific expected regime (e.g. a script that pins only
+# some knobs asserts the ones it holds at default). Read-only — pins nothing. A
+# removed/renamed GUC makes SHOW error, so its output won't match and the assert
+# fails: this also catches the silent-placeholder-no-op class (a bare ALTER SYSTEM
+# on a dropped GUC name). Connects to the postgres DB (GUCs come from
+# shared_preload_libraries _PG_init, visible cluster-wide regardless of CREATE
+# EXTENSION), so it works even before a per-scenario DB is (re)created.
+# See acct-xdkd for the companion trap-restores-stale-defaults concern.
+assert_routed_gucs() {
+    local db="${GUC_ASSERT_DB:-postgres}"
+    local pairs=( "$@" )
+    [ "${#pairs[@]}" -eq 0 ] && pairs=( "${ROUTED_GUC_DEFAULTS[@]}" )
+    local drift=0 kv key want got
+    for kv in "${pairs[@]}"; do
+        key="${kv%%=*}"; want="${kv#*=}"
+        got="$(docker exec "$CONTAINER" psql -U acct -d "$db" -tAc "SHOW $key" 2>&1 | tr -d '[:space:]')" || true
+        if [ "$got" != "$want" ]; then
+            echo "    [guc-assert] DRIFT: $key = '$got' (expected '$want')" >&2
+            drift=1
+        fi
+    done
+    if [ "$drift" -ne 0 ]; then
+        echo "    [guc-assert] live ledger_routed_c GUCs differ from expected — refusing to run so cells aren't mislabeled." >&2
+        echo "    [guc-assert] undo a stale pin with: ALTER SYSTEM RESET ledger_routed_c.<name>; then restart the container (committer_count is read at _PG_init)." >&2
+        return 1
+    fi
+    echo "    [guc-assert] ok: ${pairs[*]}" >&2
+}

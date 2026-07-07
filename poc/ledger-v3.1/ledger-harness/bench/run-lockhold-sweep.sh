@@ -23,6 +23,10 @@ SCENARIO="${SCENARIO:-s7}"            # simple FIFO depletions, Zipfian overlap
 
 build_harness
 restart_db
+# This sweep is direct-per-call only, so the routed committer GUCs don't affect its
+# numbers — but assert them anyway to keep the whole bench suite's ambient regime
+# consistent and catch a stale pin left by a sibling script.
+assert_routed_gucs
 
 for depth in 10 100 1000; do
     ts="$(date -u +%Y-%m-%dT%H-%M-%S)"

@@ -23,6 +23,9 @@ DEPTH="${EQUIV_DEPTH:-5}"
 
 build_harness
 restart_db
+# The replay runs through routed-c; assert its GUCs are at production defaults so
+# the direct-vs-routed comparison isn't run against a stale committer regime.
+assert_routed_gucs
 
 fail=0
 for sc in "${SCENARIOS[@]}"; do

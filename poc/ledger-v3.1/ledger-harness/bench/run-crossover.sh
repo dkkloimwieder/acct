@@ -61,6 +61,8 @@ method_for() {
 
 build_harness
 restart_db
+# Routed cells assume production-default committer GUCs; fail loud on a stale pin.
+assert_routed_gucs
 
 for sc in "${SCENARIOS[@]}"; do
     depth="$(depth_for "$sc")"
