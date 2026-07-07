@@ -70,7 +70,7 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
         variance_account: pool_universe::VARIANCE_ACCOUNT,
     };
     let spec = scenarios::by_id(&opts.scenario, universe.clone())
-        .ok_or_else(|| format!("unknown scenario '{}' (try s1..s8)", opts.scenario))?;
+        .ok_or_else(|| format!("unknown scenario '{}' (try s1..s21)", opts.scenario))?;
     let submissions = generate(&spec.workload, opts.callers, opts.submissions_per_caller);
     eprintln!(
         "equivalence: scenario {} — {} submissions ({} callers × {}), method_mix={:?}, depth={}",

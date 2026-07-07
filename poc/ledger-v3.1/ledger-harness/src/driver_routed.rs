@@ -180,8 +180,14 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     observer_stop.store(true, Ordering::Relaxed);
-    let mut seen: HashMap<i64, Instant> =
+    let (mut seen, observer_poll_errors): (HashMap<i64, Instant>, u64) =
         observer_handle.await.map_err(|e| format!("observer join: {e}"))?;
+    if observer_poll_errors > 0 {
+        eprintln!(
+            "warn: observer had {observer_poll_errors} poll error(s); submitted_but_unseen \
+             may be inflated by missed reads rather than genuinely uncommitted trx"
+        );
+    }
 
     // Final reconciling sweep. The N concurrent committers allocate trx.id then
     // commit out of order, so the incremental (id > last_id) observer can skip a
@@ -281,7 +287,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     println!(
         "{{\"scenario\":\"{}\",\"mode\":\"routed\",\"depth\":{},\"throughput_trx_per_sec\":{:.1},\
         \"ack_p99_us\":{},\"committed_p99_us\":{},\"trx_materialized\":{},\"attempts\":{},\
-        \"enqueue_errors\":{},\"submitted_but_unseen\":{},\"drains\":{},\"commit_group_avg\":{:.2},\
+        \"enqueue_errors\":{},\"submitted_but_unseen\":{},\"observer_poll_errors\":{},\"drains\":{},\"commit_group_avg\":{:.2},\
         \"pool_lock_acq\":{},\"agg_upserts\":{},\"dropped\":{},\"poisoned\":{},\
         \"deadlock_retries\":{},\"takeovers\":{},\
         \"span_pool_lock_frac\":{:.3},\"span_hydrate_frac\":{:.3},\"span_apply_frac\":{:.3},\
@@ -298,6 +304,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         report.attempts_total,
         report.errors_total,
         submitted_but_unseen,
+        observer_poll_errors,
         routed.drains_total,
         routed.commit_group_size_avg,
         routed.pool_lock_acquisitions_total,
@@ -432,13 +439,14 @@ async fn observer_loop(
     run_lo: i64,
     run_hi: i64,
     stop: Arc<AtomicBool>,
-) -> HashMap<i64, Instant> {
+) -> (HashMap<i64, Instant>, u64) {
     let mut seen: HashMap<i64, Instant> = HashMap::with_capacity(65_536);
+    let mut poll_errors: u64 = 0;
     let mut last_id: i64 = 0;
     let tick = Duration::from_millis(10);
 
     loop {
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
+        let rows: Vec<(i64, i64)> = match sqlx::query_as(
             "SELECT id, source_id FROM trx \
               WHERE trx_type = 'po_receipt'::trx_type \
                 AND source_id BETWEEN $1 AND $2 \
@@ -450,7 +458,18 @@ async fn observer_loop(
         .bind(last_id)
         .fetch_all(&pool)
         .await
-        .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            // A transient poll failure (pool churn, a killed backend) is counted
+            // rather than swallowed by unwrap_or_default(): otherwise a failing
+            // observer surfaces only indirectly as inflated submitted_but_unseen,
+            // indistinguishable from genuinely uncommitted trx. Symmetric to the
+            // poll_errors counters in measure.rs / sampler.rs.
+            Err(_) => {
+                poll_errors += 1;
+                Vec::new()
+            }
+        };
         let now = Instant::now();
         for (id, sid) in &rows {
             seen.entry(*sid).or_insert(now);
@@ -463,7 +482,7 @@ async fn observer_loop(
         }
         tokio::time::sleep(tick).await;
     }
-    seen
+    (seen, poll_errors)
 }
 
 #[derive(Debug, Default, Clone)]

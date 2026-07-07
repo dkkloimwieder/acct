@@ -29,9 +29,14 @@ pub const UNIT_COST: i64 = 1_000_000;
 const SEED_POSTED_AT: &str = "2026-01-01T00:00:00+00:00";
 
 /// Deepen every pool in `pool_ids` to `depth` layer rows (+ matching aggregate
-/// and trx_line receipts). `depth == 0` is a no-op. Idempotent: if any
-/// pool_state rows already exist it assumes the universe is already seeded and
-/// returns without touching it.
+/// and trx_line receipts). `depth == 0` is a no-op. Count-exact idempotency: a
+/// fully seeded universe has exactly `pool_ids.len() × (depth + 1)` pool_state
+/// rows (`depth` layers + 1 aggregate per pool), so it is reused only on an exact
+/// match. A nonzero row count that does NOT match is a partially- or
+/// differently-seeded fixture and errors loud rather than being silently accepted
+/// (provisional-mode runs mutate the aggregate but never add/remove pool_state
+/// rows, so the count stays stable across runs for a given depth). Mirrors
+/// [`crate::pool_universe::seed`]'s existing-count-must-match contract.
 pub async fn deepen(pool: &PgPool, pool_ids: &[i64], depth: usize) -> Result<(), sqlx::Error> {
     if depth == 0 || pool_ids.is_empty() {
         return Ok(());
@@ -40,11 +45,24 @@ pub async fn deepen(pool: &PgPool, pool_ids: &[i64], depth: usize) -> Result<(),
     let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM pool_state")
         .fetch_one(pool)
         .await?;
-    if existing > 0 {
+    let expected = pool_ids.len() as i64 * (depth as i64 + 1);
+    if existing == expected {
         eprintln!(
-            "seed: pool_state already has {existing} rows; assuming deep-seeded, skipping deepen"
+            "seed: pool_state already has {existing} rows (= {} pools × (depth {} + 1 aggregate)); reusing",
+            pool_ids.len(),
+            depth
         );
         return Ok(());
+    }
+    if existing != 0 {
+        return Err(sqlx::Error::Protocol(format!(
+            "seed deepen: pool_state has {existing} rows but expected {expected} \
+             ({} pools × (depth {} + 1 aggregate)) — the universe is partially or differently \
+             seeded. Reset the fixture (reseed with --method-mix to TRUNCATE, or re-run at the \
+             depth it was seeded to).",
+            pool_ids.len(),
+            depth
+        )));
     }
 
     // One seed trx per pool (trx_line.trx_id is NOT NULL). Bulk-insert, then map
