@@ -170,9 +170,10 @@ impl SamplerReport {
     ///   ('Extension','Extension') → idle (parked on the latch between drains)
     ///   wait_event_type 'Lock'    → lock_wait (row-lock / transactionid handoff)
     ///   ('Running','Running')      → running (on-CPU, NULL wait_event)
-    ///   wait_event_type 'IO' | 'WALSync' | 'LWLock' → io_wait
-    /// Everything else still counts toward `total` but no sub-bucket (so the four
-    /// sub-buckets need not sum to total; `busy − lock − running − io` is "other").
+    ///   wait_event_type 'LWLock'   → lwlock_wait (shmem-region LWLock contention)
+    ///   wait_event_type 'IO' | 'WALSync' | 'IPC' → io_wait
+    /// Everything else still counts toward `total` but no sub-bucket (so the five
+    /// sub-buckets need not sum to total; `busy − lock − running − lwlock − io` is "other").
     pub fn committer_wait_summary(&self) -> CommitterWaitSummary {
         let mut s = CommitterWaitSummary::default();
         for ((wet, we), c) in &self.committer_wait_observations {
