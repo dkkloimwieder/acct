@@ -155,9 +155,10 @@ pub fn s5(u: PoolUniverse) -> ScenarioSpec {
 /// S6 — pathological for routed (no router benefit when pool sets are fully
 /// disjoint). stripe_size = universe / callers, floored at 1.
 pub fn s6(u: PoolUniverse) -> ScenarioSpec {
-    let stripe_size = u.pool_ids.len().checked_div(1000).unwrap_or(1).max(1);
+    let callers: usize = 1000;
+    let stripe_size = (u.pool_ids.len() / callers).max(1);
     spec("s6", "pathological for routed — 1000 callers, disjoint stripes, simple fifo depletions, shallow",
-        1000, u, OverlapMode::Disjoint { stripe_size }, Complexity::Simple, 100, MethodMix::AllFifo, 10)
+        callers, u, OverlapMode::Disjoint { stripe_size }, Complexity::Simple, 100, MethodMix::AllFifo, 10)
 }
 
 /// S7 — **Path C's home field** (§11.2). 1000 callers, Zipfian overlap, simple
