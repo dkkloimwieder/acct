@@ -1209,7 +1209,6 @@ name = "ledger-core"
 version = "0.0.1"
 dependencies = [
  "chrono",
- "proptest",
  "serde",
  "thiserror 1.0.69",
  "uuid",
