@@ -47,8 +47,6 @@
 //! pre-flight dedup is the recovery source of truth when a reclaimed group is
 //! reprocessed.
 
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::CString;
@@ -322,6 +320,12 @@ fn claim_next_committer_entry() -> Option<u32> {
 
 // ── Per-commit-group pipeline ───────────────────────────────────────
 
+// `committed_count` and the `message` strings are diagnostic context: the
+// consumer matches on the variant + `staging_indices` only, but the fields carry
+// the commit count and the failure/poison reason for `Debug` and a future
+// error-logging hook on the TxError / Poisoned arms. Scoped here rather than
+// under a module-wide dead-code blanket (acct-mvq4.41).
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum ProcessOutcome {
     Committed {

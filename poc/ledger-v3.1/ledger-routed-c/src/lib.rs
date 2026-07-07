@@ -63,7 +63,6 @@ static AFFINITY_STEAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
 static TARGET_DATABASE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"poc_v3_1"));
 
-#[allow(dead_code)]
 pub(crate) fn target_database_str() -> String {
     TARGET_DATABASE
         .get()
@@ -72,49 +71,38 @@ pub(crate) fn target_database_str() -> String {
         .unwrap_or_else(|| "poc_v3_1".to_string())
 }
 
-#[allow(dead_code)]
 pub(crate) fn queue_full_timeout_ms_now() -> i32 {
     QUEUE_FULL_TIMEOUT_MS.get()
 }
-#[allow(dead_code)]
 pub(crate) fn router_window_size_now() -> i32 {
     ROUTER_WINDOW_SIZE.get()
 }
-#[allow(dead_code)]
 pub(crate) fn batch_size_max_now() -> i32 {
     BATCH_SIZE_MAX.get()
 }
-#[allow(dead_code)]
 pub(crate) fn batch_window_us_now() -> i32 {
     BATCH_WINDOW_US.get()
 }
-#[allow(dead_code)]
 pub(crate) fn max_eject_count_now() -> i32 {
     MAX_EJECT_COUNT.get()
 }
-#[allow(dead_code)]
 pub(crate) fn caller_tx_timeout_ms_now() -> i32 {
     CALLER_TX_TIMEOUT_MS.get()
 }
-#[allow(dead_code)]
 pub(crate) fn committer_count_now() -> i32 {
     COMMITTER_COUNT.get().max(1)
 }
-#[allow(dead_code)]
 pub(crate) fn eject_cooldown_ms_now() -> i32 {
     EJECT_COOLDOWN_MS.get().max(0)
 }
-#[allow(dead_code)]
 pub(crate) fn router_pack_disjoint_now() -> bool {
     ROUTER_PACK_DISJOINT.get()
 }
 // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
-#[allow(dead_code)]
 pub(crate) fn affinity_scheme_now() -> i32 {
     AFFINITY_SCHEME.get()
 }
 // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
-#[allow(dead_code)]
 pub(crate) fn affinity_steal_ms_now() -> i32 {
     AFFINITY_STEAL_MS.get().max(0)
 }

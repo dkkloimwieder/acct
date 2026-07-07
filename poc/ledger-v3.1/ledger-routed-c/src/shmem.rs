@@ -205,9 +205,8 @@ pub struct CommitterQueue {
     /// the test_hooks `ledger_routed_test_committer_stall_hits` SPI.
     pub test_committer_stall_hits: AtomicU64,
     /// Router worker's OS PID, stored once at router_main startup.
-    /// 0 = router not yet started (or restarting). Read by the
-    /// test_hooks `ledger_routed_test_router_pid` SPI so tests can
-    /// pg_terminate_backend the router to trigger boot sweep on restart.
+    /// 0 = router not yet started (or restarting). Diagnostic state — the live
+    /// router PID is inspectable from shmem by an operator/debugger.
     pub router_pid: AtomicI32,
     pub test_reorder_router_stores: AtomicU8,
     /// Test-only: when 1, the router skips its tick body (stays parked on the
@@ -436,7 +435,6 @@ fn ensure_backpressure_cv_initialized(queue: &StagingQueue) {
 /// LWLock is NOT held while a backend is in
 /// `ConditionVariableTimedSleep` — otherwise the signaler would
 /// deadlock trying to free a slot).
-#[allow(dead_code)]
 pub(crate) fn backpressure_cv_ptr() -> *mut pg_sys::ConditionVariable {
     let queue = STAGING_QUEUE.share();
     ensure_backpressure_cv_initialized(&queue);
@@ -450,7 +448,6 @@ pub(crate) fn backpressure_cv_ptr() -> *mut pg_sys::ConditionVariable {
 /// or not any waiters are sleeping. Caller passes an already-held
 /// `&StagingQueue`; the function does NOT re-acquire the LWLock to
 /// avoid recursive-acquire deadlocks (CV has its own internal slock).
-#[allow(dead_code)]
 pub fn signal_staging_slot_freed(queue: &StagingQueue) {
     queue
         .free_slot_wake_count
@@ -471,7 +468,6 @@ pub fn signal_staging_slot_freed(queue: &StagingQueue) {
 /// every downstream arithmetic (lease windows, stale staging
 /// detection, etc.). Clamping keeps the invariant `now_us() >= 0`.
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn now_us() -> u64 {
     let t = unsafe { pg_sys::GetCurrentTimestamp() };
     t.max(0) as u64
@@ -480,7 +476,6 @@ pub(crate) fn now_us() -> u64 {
 /// Current PG timestamp in nanoseconds since 2000-01-01, clamped.
 /// Saturates at `u64::MAX` rather than wrapping.
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn now_ns() -> u64 {
     now_us().saturating_mul(1000)
 }

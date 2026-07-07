@@ -39,8 +39,6 @@
 //! independently. This avoids cross-lock deadlocks against any future caller
 //! that acquires arena.exclusive() outer (e.g. a recovery audit pass, P3.4).
 
-#![allow(dead_code)]
-
 use crate::shmem::{
     COMMITTER_QUEUE, CommitterQueue, SPILLOVER_ARENA, STAGING_QUEUE, SpilloverArena, StagingQueue,
     signal_staging_slot_freed,

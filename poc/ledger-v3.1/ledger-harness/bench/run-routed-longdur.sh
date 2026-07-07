@@ -108,8 +108,8 @@ depth_for() {
   echo "${!ov:-$d}"
 }
 
-# method_for <sid> — universe method assignment (run-crossover.sh method_for /
-# scenarios.rs expected_method_mix).
+# method_for <sid> — universe method assignment (mirrors run-crossover.sh
+# method_for; per-scenario method is documented in each scenarios.rs description).
 method_for() {
   case "$1" in
     s1|s2) echo all-wac ;;

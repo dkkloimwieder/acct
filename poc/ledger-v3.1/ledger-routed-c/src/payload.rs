@@ -21,9 +21,6 @@
 //! 5-field surface and keeps the lines blob self-describing for
 //! cleanup.
 
-// Used by enqueue / committer modules as they land.
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 use crate::shmem::SpilloverArena;

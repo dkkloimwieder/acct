@@ -157,14 +157,6 @@ impl SamplerReport {
         out
     }
 
-    #[allow(dead_code)]
-    pub fn top_wait_event(&self) -> Option<(String, String, i64)> {
-        self.wait_observations
-            .iter()
-            .max_by_key(|(_, c)| **c)
-            .map(|((wet, we), c)| (wet.clone(), we.clone(), *c))
-    }
-
     /// Bucket `committer_wait_observations` into the acct-0usf STEP 1b summary.
     /// Bucketing rules (by wait_event_type, then wait_event):
     ///   ('Extension','Extension') → idle (parked on the latch between drains)

@@ -43,9 +43,6 @@ pub enum OverlapMode {
 pub enum Complexity {
     /// 1 line per submission.
     Simple,
-    /// Uniform 2-5 lines.
-    #[allow(dead_code)]
-    Medium,
     /// Uniform 10-20 lines.
     Complex,
 }
@@ -194,7 +191,6 @@ impl Workload {
     pub fn next_lines<R: Rng + ?Sized>(&self, rng: &mut R, caller_id: usize) -> Vec<LineParam> {
         let n_lines = match self.complexity {
             Complexity::Simple => 1,
-            Complexity::Medium => rng.random_range(2..=5),
             Complexity::Complex => rng.random_range(10..=20),
         };
 

@@ -1087,14 +1087,6 @@ fn ledger_routed_c_test_set_committer_paused(paused: bool) {
         .store(u8::from(paused), Release);
 }
 
-/// The router worker's OS PID (published at `router_main` startup). Lets a test
-/// pg_terminate_backend the router to trigger the boot sweep on its restart.
-#[cfg(feature = "test_hooks")]
-#[pg_extern]
-fn ledger_routed_c_test_router_pid() -> i32 {
-    COMMITTER_QUEUE.share().router_pid.load(Acquire)
-}
-
 /// Set the committer stall (µs) the pipeline honors between pool_lock acquire and
 /// the write. Tests use it to keep the committer in flight long enough to act on
 /// it mid-pipeline (§6.8 / §9.3).

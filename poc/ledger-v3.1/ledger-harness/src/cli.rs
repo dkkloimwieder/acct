@@ -114,8 +114,8 @@ pub enum Cmd {
         /// Overlay multi-touch (same-pool-twice) generation onto ANY scenario
         /// (acct-34ce): the percent of submissions eligible to touch one pool
         /// more than once. Overrides the scenario's own value (s9 presets 40).
-        /// 0/unset keeps distinct-pool generation. Only multi-line (Medium/
-        /// Complex) submissions can repeat — Simple is always single-touch.
+        /// 0/unset keeps distinct-pool generation. Only multi-line (Complex)
+        /// submissions can repeat — Simple is always single-touch.
         #[arg(long)]
         multi_touch_pct: Option<u8>,
         /// Overlay the per-pool group-size distribution for multi-touch

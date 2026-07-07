@@ -47,7 +47,6 @@
 //! Any scenario can also be made multi-touch ad hoc via `run --multi-touch-pct`
 //! + `--touch-dist`.
 
-use crate::cli::MethodMix;
 use crate::pool_universe::PoolUniverse;
 use crate::workload::{Complexity, OverlapMode, TouchDistribution, Workload};
 
@@ -57,10 +56,6 @@ pub struct ScenarioSpec {
     pub description: &'static str,
     pub callers: usize,
     pub workload: Workload,
-    /// Method mix the universe is expected to have been seeded with (a label;
-    /// the workload is method-agnostic — per-pool method comes from seed-pools).
-    #[allow(dead_code)]
-    pub expected_method_mix: MethodMix,
     /// Pool depth the universe should be seeded to before driving this scenario
     /// (`seed-pools --depth`). 0 = shallow/receipt-only. Recorded in the report.
     pub depth_hint: usize,
@@ -103,7 +98,6 @@ fn spec(
     overlap: OverlapMode,
     complexity: Complexity,
     deplete_pct: u8,
-    method: MethodMix,
     depth_hint: usize,
 ) -> ScenarioSpec {
     ScenarioSpec {
@@ -119,29 +113,28 @@ fn spec(
             touch_dist: TouchDistribution::distinct(),
             caller_count: callers,
         },
-        expected_method_mix: method,
         depth_hint,
     }
 }
 
 pub fn s1(u: PoolUniverse) -> ScenarioSpec {
     spec("s1", "baseline — 10 callers, uniform, simple receipts, all-wac, shallow",
-        10, u, OverlapMode::Uniform, Complexity::Simple, 0, MethodMix::AllWac, 0)
+        10, u, OverlapMode::Uniform, Complexity::Simple, 0, 0)
 }
 
 pub fn s2(u: PoolUniverse) -> ScenarioSpec {
     spec("s2", "routing lock-amortization — 200 callers, zipf(1.5), simple receipts, all-wac, shallow",
-        200, u, OverlapMode::Zipf { exponent: 1.5 }, Complexity::Simple, 0, MethodMix::AllWac, 0)
+        200, u, OverlapMode::Zipf { exponent: 1.5 }, Complexity::Simple, 0, 0)
 }
 
 pub fn s3(u: PoolUniverse) -> ScenarioSpec {
     spec("s3", "per-trx work intensity — 10 callers, uniform, complex receipts, mixed, shallow",
-        10, u, OverlapMode::Uniform, Complexity::Complex, 0, MethodMix::Mixed, 0)
+        10, u, OverlapMode::Uniform, Complexity::Complex, 0, 0)
 }
 
 pub fn s4(u: PoolUniverse) -> ScenarioSpec {
     spec("s4", "production-like stress — 200 callers, zipf(1.2), complex receipts, mixed, shallow",
-        200, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 0, MethodMix::Mixed, 0)
+        200, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 0, 0)
 }
 
 /// S5 — pathological hot pool for direct (every caller depletes one pool).
@@ -149,7 +142,7 @@ pub fn s4(u: PoolUniverse) -> ScenarioSpec {
 /// shallow seed gives the hot pool depletion headroom.
 pub fn s5(u: PoolUniverse) -> ScenarioSpec {
     spec("s5", "pathological for direct — 1000 callers, single hot pool, simple fifo depletions, shallow",
-        1000, u, OverlapMode::Zipf { exponent: 100.0 }, Complexity::Simple, 100, MethodMix::AllFifo, 10)
+        1000, u, OverlapMode::Zipf { exponent: 100.0 }, Complexity::Simple, 100, 10)
 }
 
 /// S6 — pathological for routed (no router benefit when pool sets are fully
@@ -158,7 +151,7 @@ pub fn s6(u: PoolUniverse) -> ScenarioSpec {
     let callers: usize = 1000;
     let stripe_size = (u.pool_ids.len() / callers).max(1);
     spec("s6", "pathological for routed — 1000 callers, disjoint stripes, simple fifo depletions, shallow",
-        callers, u, OverlapMode::Disjoint { stripe_size }, Complexity::Simple, 100, MethodMix::AllFifo, 10)
+        callers, u, OverlapMode::Disjoint { stripe_size }, Complexity::Simple, 100, 10)
 }
 
 /// S7 — **Path C's home field** (§11.2). 1000 callers, Zipfian overlap, simple
@@ -167,14 +160,14 @@ pub fn s6(u: PoolUniverse) -> ScenarioSpec {
 /// concurrent depletions into one commit_group.
 pub fn s7(u: PoolUniverse) -> ScenarioSpec {
     spec("s7", "deep-pool home field — 1000 callers, zipf(1.2), simple fifo depletions, DEEP (1000 layers)",
-        1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Simple, 100, MethodMix::AllFifo, 1000)
+        1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Simple, 100, 1000)
 }
 
 /// S8 — production-realistic FIFO stress: 1000 callers, Zipfian, complex
 /// multi-line trxs mixing receipts and depletions, against deep pools.
 pub fn s8(u: PoolUniverse) -> ScenarioSpec {
     spec("s8", "deep-pool complex — 1000 callers, zipf(1.2), complex multi-line fifo, DEEP (1000 layers)",
-        1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 50, MethodMix::AllFifo, 1000)
+        1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 50, 1000)
 }
 
 /// S9 — WO-completion multi-touch mix (acct-34ce). S8's shape (1000 callers,
@@ -187,7 +180,7 @@ pub fn s9(u: PoolUniverse) -> ScenarioSpec {
     let mut s = spec(
         "s9",
         "WO-completion multi-touch — s8 shape + ~40% same-pool 2-3x (coalesce under load), DEEP",
-        1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 50, MethodMix::AllFifo, 1000,
+        1000, u, OverlapMode::Zipf { exponent: 1.2 }, Complexity::Complex, 50, 1000,
     );
     s.workload.multi_touch_pct = 40;
     s.workload.touch_dist =
@@ -218,22 +211,22 @@ fn pareto(hot_pool_pct: u8, hot_traffic_pct: u8) -> OverlapMode {
 
 pub fn s10(u: PoolUniverse) -> ScenarioSpec {
     spec("s10", "receipts mid-typ — 50 callers, Pareto 80/20, complex receipts, fifo, shallow",
-        50, u, pareto(20, 80), Complexity::Complex, 0, MethodMix::AllFifo, 0)
+        50, u, pareto(20, 80), Complexity::Complex, 0, 0)
 }
 
 pub fn s11(u: PoolUniverse) -> ScenarioSpec {
     spec("s11", "receipts high-vol — 200 callers, Pareto 80/20, complex receipts, fifo, depth 100",
-        200, u, pareto(20, 80), Complexity::Complex, 0, MethodMix::AllFifo, 100)
+        200, u, pareto(20, 80), Complexity::Complex, 0, 100)
 }
 
 pub fn s12(u: PoolUniverse) -> ScenarioSpec {
     spec("s12", "receipts long-tail — 50 callers, Pareto 90/10, complex receipts, fifo, shallow",
-        50, u, pareto(10, 90), Complexity::Complex, 0, MethodMix::AllFifo, 0)
+        50, u, pareto(10, 90), Complexity::Complex, 0, 0)
 }
 
 pub fn s13(u: PoolUniverse) -> ScenarioSpec {
     spec("s13", "receipts balanced — 50 callers, Pareto 50/50, complex receipts, fifo, shallow",
-        50, u, pareto(50, 50), Complexity::Complex, 0, MethodMix::AllFifo, 0)
+        50, u, pareto(50, 50), Complexity::Complex, 0, 0)
 }
 
 // BUILDS family — deplete=50, multi-touch 40% / 1:60,2:30,3:10. WO-completion
@@ -241,7 +234,7 @@ pub fn s13(u: PoolUniverse) -> ScenarioSpec {
 
 pub fn s14(u: PoolUniverse) -> ScenarioSpec {
     let mut s = spec("s14", "builds mid-typ — 50 callers, Pareto 80/20, complex mixed (WO shape), fifo, depth 10",
-        50, u, pareto(20, 80), Complexity::Complex, 50, MethodMix::AllFifo, 10);
+        50, u, pareto(20, 80), Complexity::Complex, 50, 10);
     s.workload.multi_touch_pct = 40;
     s.workload.touch_dist = builds_touch_dist();
     s
@@ -249,7 +242,7 @@ pub fn s14(u: PoolUniverse) -> ScenarioSpec {
 
 pub fn s15(u: PoolUniverse) -> ScenarioSpec {
     let mut s = spec("s15", "builds high-vol — 200 callers, Pareto 80/20, complex mixed (WO shape), fifo, depth 100",
-        200, u, pareto(20, 80), Complexity::Complex, 50, MethodMix::AllFifo, 100);
+        200, u, pareto(20, 80), Complexity::Complex, 50, 100);
     s.workload.multi_touch_pct = 40;
     s.workload.touch_dist = builds_touch_dist();
     s
@@ -257,7 +250,7 @@ pub fn s15(u: PoolUniverse) -> ScenarioSpec {
 
 pub fn s16(u: PoolUniverse) -> ScenarioSpec {
     let mut s = spec("s16", "builds long-tail — 50 callers, Pareto 90/10, complex mixed (WO shape), fifo, depth 10",
-        50, u, pareto(10, 90), Complexity::Complex, 50, MethodMix::AllFifo, 10);
+        50, u, pareto(10, 90), Complexity::Complex, 50, 10);
     s.workload.multi_touch_pct = 40;
     s.workload.touch_dist = builds_touch_dist();
     s
@@ -265,7 +258,7 @@ pub fn s16(u: PoolUniverse) -> ScenarioSpec {
 
 pub fn s17(u: PoolUniverse) -> ScenarioSpec {
     let mut s = spec("s17", "builds balanced — 50 callers, Pareto 50/50, complex mixed (WO shape), fifo, depth 10",
-        50, u, pareto(50, 50), Complexity::Complex, 50, MethodMix::AllFifo, 10);
+        50, u, pareto(50, 50), Complexity::Complex, 50, 10);
     s.workload.multi_touch_pct = 40;
     s.workload.touch_dist = builds_touch_dist();
     s
@@ -275,22 +268,22 @@ pub fn s17(u: PoolUniverse) -> ScenarioSpec {
 
 pub fn s18(u: PoolUniverse) -> ScenarioSpec {
     spec("s18", "mixed mid-typ — 50 callers, Pareto 80/20, complex deplete+receipt, fifo, depth 10",
-        50, u, pareto(20, 80), Complexity::Complex, 50, MethodMix::AllFifo, 10)
+        50, u, pareto(20, 80), Complexity::Complex, 50, 10)
 }
 
 pub fn s19(u: PoolUniverse) -> ScenarioSpec {
     spec("s19", "mixed high-vol — 200 callers, Pareto 80/20, complex deplete+receipt, fifo, depth 100",
-        200, u, pareto(20, 80), Complexity::Complex, 50, MethodMix::AllFifo, 100)
+        200, u, pareto(20, 80), Complexity::Complex, 50, 100)
 }
 
 pub fn s20(u: PoolUniverse) -> ScenarioSpec {
     spec("s20", "mixed long-tail — 50 callers, Pareto 90/10, complex deplete+receipt, fifo, depth 10",
-        50, u, pareto(10, 90), Complexity::Complex, 50, MethodMix::AllFifo, 10)
+        50, u, pareto(10, 90), Complexity::Complex, 50, 10)
 }
 
 pub fn s21(u: PoolUniverse) -> ScenarioSpec {
     spec("s21", "mixed balanced — 50 callers, Pareto 50/50, complex deplete+receipt, fifo, depth 10",
-        50, u, pareto(50, 50), Complexity::Complex, 50, MethodMix::AllFifo, 10)
+        50, u, pareto(50, 50), Complexity::Complex, 50, 10)
 }
 
 #[cfg(test)]

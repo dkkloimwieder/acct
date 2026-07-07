@@ -112,12 +112,3 @@ pub(crate) fn is_committer_alive(slot_idx: u32, expected_generation: u32) -> boo
         .unwrap_or(0);
     errno != libc::ESRCH
 }
-
-#[cfg(not(feature = "pg_test"))]
-#[allow(dead_code)]
-fn _silence_unused_warnings_when_no_callers_yet() {
-    let _ = claim_committer_identity;
-    let _ = release_committer_identity;
-    let _ = is_committer_alive;
-    let _ = Relaxed;
-}

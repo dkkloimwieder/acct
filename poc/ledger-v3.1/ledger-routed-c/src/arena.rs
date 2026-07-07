@@ -59,7 +59,6 @@ const BLOCK_HEADER_BYTES: u32 = 8;
 /// a u64-aligned block.
 const ALLOC_ALIGN: u32 = 8;
 
-#[allow(dead_code)] // Used by enqueue / router / committer modules as they land.
 impl SpilloverArena {
     /// Allocate `size` bytes from the arena. Returns offset of the
     /// PAYLOAD (not the header). `size` is rounded up to 8-byte
@@ -227,7 +226,6 @@ impl SpilloverArena {
     }
 }
 
-#[allow(dead_code)]
 fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
 }
