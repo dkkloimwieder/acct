@@ -7,12 +7,23 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-direct-c/src/lib.rs:41
+-- ledger-direct-c/src/lib.rs:48
 -- ledger_direct_c::ledger_direct_c_hello
 CREATE  FUNCTION "ledger_direct_c_hello"() RETURNS TEXT /* String */
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_direct_c_hello_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-direct-c/src/drain.rs:78
+-- ledger_direct_c::drain::ledger_staging_drain_c
+CREATE  FUNCTION "ledger_staging_drain_c"(
+	"p_limit" INT /* i32 */
+) RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_staging_drain_c_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */

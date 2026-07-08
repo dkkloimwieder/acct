@@ -249,6 +249,54 @@ impl RunReport {
         }
     }
 
+    /// Staging-mode constructor (SPIKE-A / acct-0at4.11.1). Like `new_routed`,
+    /// throughput derives from `trx_count` (rows the observer saw materialize) and
+    /// committed latency from the observer-timestamped `committed` histogram —
+    /// the caller's INSERT ack is decoupled from materialization by the drain. No
+    /// routed-committer counter block (that machinery is exactly what staging
+    /// deletes); `mode` is "staging".
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_staging(
+        scenario: impl Into<String>,
+        pool_depth: Option<usize>,
+        callers: usize,
+        duration_secs: f64,
+        trx_count: u64,
+        ack: &Histogram<u64>,
+        committed: &Histogram<u64>,
+        errors_total: u64,
+        measure: &MeasureReport,
+        sampler: &SamplerReport,
+        sampler_report_path: Option<String>,
+        started_at: DateTime<Utc>,
+    ) -> Self {
+        let attempts_total = ack.len() + errors_total;
+        Self {
+            scenario: scenario.into(),
+            mode: "staging".into(),
+            pool_depth,
+            multi_touch: None,
+            duration_secs,
+            callers,
+            throughput_trx_per_sec: if duration_secs > 0.0 {
+                trx_count as f64 / duration_secs
+            } else {
+                0.0
+            },
+            attempts_total,
+            errors_total,
+            ack_latency_us: LatencyPercentiles::from_ns_hist(ack),
+            committed_latency_us: LatencyPercentiles::from_ns_hist(committed),
+            commits_observed: measure.xact_commit_delta,
+            rollbacks_observed: measure.xact_rollback_delta,
+            wal_bytes_per_trx: measure.wal_bytes_per_commit(),
+            top_wait_events: top_wait_events(sampler, 5),
+            routed: None,
+            sampler_report_path,
+            started_at,
+        }
+    }
+
     /// Attach the multi-touch overlay parameters (acct-34ce). Pass None for a
     /// distinct-pool run.
     pub fn with_multi_touch(mut self, mt: Option<MultiTouchReport>) -> Self {

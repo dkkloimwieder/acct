@@ -90,6 +90,16 @@ pub enum Cmd {
         /// original behavior). Routed mode only.
         #[arg(long)]
         target_rate: Option<u64>,
+        /// Staging mode only (SPIKE-A): number of committer connections that loop
+        /// `ledger_staging_drain_c`. Defaults to routed's COMMITTER_COUNT (4) so
+        /// the drain-loop parallelism matches the shmem flavor's BGWorker pool.
+        #[arg(long, default_value_t = 4)]
+        committers: usize,
+        /// Staging mode only (SPIKE-A): rows claimed per `ledger_staging_drain_c`
+        /// call (the SKIP LOCKED `LIMIT`). Defaults to routed's batch_size_max
+        /// (200) so each drain commit group matches routed's chunk size.
+        #[arg(long, default_value_t = 200)]
+        drain_batch: usize,
         /// The pool depth the universe was seeded to (informational; recorded
         /// in the report so the §11.2 lock-hold-vs-depth sweep can label runs).
         /// Establish the depth itself with `seed-pools --depth`.
@@ -171,6 +181,11 @@ pub enum Mode {
     DirectBatched,
     /// Caller calls `ledger_enqueue_trx_c`; work batched across callers (§6).
     Routed,
+    /// SPIKE-A (acct-0at4.11.1): caller `INSERT`s into `ledger_inbox` in its own
+    /// tx; K committer connections drain it via `ledger_staging_drain_c` with
+    /// `FOR UPDATE SKIP LOCKED`. The staging-table alternative to routed's shmem
+    /// queue — same ledger-core apply, table transport instead of shmem.
+    Staging,
 }
 
 impl Mode {
@@ -180,6 +195,7 @@ impl Mode {
             Mode::DirectPerCall => "direct-per-call",
             Mode::DirectBatched => "direct-batched",
             Mode::Routed => "routed",
+            Mode::Staging => "staging",
         }
     }
 }

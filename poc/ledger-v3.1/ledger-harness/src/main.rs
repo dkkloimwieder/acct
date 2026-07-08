@@ -17,6 +17,7 @@ mod cli;
 mod driver_common;
 mod driver_direct;
 mod driver_routed;
+mod driver_staging;
 mod equivalence;
 mod measure;
 mod pool_universe;
@@ -77,6 +78,8 @@ async fn main() -> std::process::ExitCode {
             max_callers,
             batch_size,
             target_rate,
+            committers,
+            drain_batch,
             depth,
             method_mix,
             seed_count,
@@ -157,6 +160,25 @@ async fn main() -> std::process::ExitCode {
                         max_callers,
                         batch_size,
                         target_rate,
+                        drain_deadline: Duration::from_secs(30),
+                        multi_touch_pct,
+                        touch_dist,
+                        pareto_hot_pool_pct,
+                        pareto_hot_traffic_pct,
+                    })
+                    .await
+                }
+                Mode::Staging => {
+                    driver_staging::run(driver_staging::RunOptions {
+                        dsn: args.dsn,
+                        scenario,
+                        pool_depth: depth,
+                        duration: duration.into(),
+                        output,
+                        no_sampler,
+                        max_callers,
+                        committers,
+                        drain_batch,
                         drain_deadline: Duration::from_secs(30),
                         multi_touch_pct,
                         touch_dist,

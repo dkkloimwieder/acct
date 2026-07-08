@@ -12,12 +12,18 @@
 //! in the caller's backend, so `_PG_init` is a no-op beyond pgrx wiring. The routed
 //! flavor (ledger-routed-c) is the one that needs shmem regions.
 //!
+//! It also hosts `ledger_staging_drain_c` (SPIKE-A / acct-0at4.11.1): the
+//! staging-table alternative committer that draws pending work from a
+//! `ledger_inbox` table via `FOR UPDATE SKIP LOCKED` and applies it through the
+//! same ledger-core path — benchmarked against the shmem routed flavor.
+//!
 //! Module map:
 //! - `pool_lock`        — singleton-loop optimistic FOR UPDATE (§5.1 step 2)
 //! - `hydration`        — snapshot read: pool routing + aggregate + standard_cost (§5.1 steps 3-5)
 //! - `bulk_write`       — UNNEST INSERT/UPSERT/DELETE helpers (§5.1 step 8)
 //! - `ledger_error_map` — LedgerError → ereport!(ERROR, ...) at the SPI boundary
 //! - `submit`           — `ledger_submit_trx_c` orchestration (§5.1 steps 1-9)
+//! - `drain`            — `ledger_staging_drain_c` staging-table committer (SPIKE-A)
 
 #![allow(unexpected_cfgs)]
 
@@ -25,6 +31,7 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!();
 
+pub(crate) mod drain;
 pub(crate) mod ledger_error_map;
 pub(crate) mod submit;
 
