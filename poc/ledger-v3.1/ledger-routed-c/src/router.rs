@@ -57,15 +57,16 @@
 
 use crate::identity::is_committer_alive;
 use crate::shmem::{
-    COMMITTER_QUEUE, LEDGER_V3_COMMITTER_QUEUE_SIZE, LEDGER_V3_STAGING_QUEUE_SIZE, SPILLOVER_ARENA,
-    STAGING_QUEUE, StagingQueue, signal_staging_slot_freed,
+    COMMITTER_QUEUE, CommitterQueueEntry, LEDGER_V3_COMMITTER_QUEUE_SIZE,
+    LEDGER_V3_STAGING_QUEUE_SIZE, SPILLOVER_ARENA, STAGING_QUEUE, StagingQueue,
+    signal_staging_slot_freed,
 };
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_guard;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::time::Duration;
 
 /// Cadence for the router's periodic dead-committer reclaim (§6.5 Q10). The boot
@@ -951,26 +952,52 @@ fn try_reclaim_dead_committer_entry(q_idx: u32) -> bool {
     }
     let queue = COMMITTER_QUEUE.share();
     let slot = &queue.entries[q_idx as usize];
-    // Clear the dead owner's identity BEFORE flipping valid 2→1, mirroring the
-    // data-before-flag order emit_commit_group uses (identity sentinels first,
-    // then the valid Release CAS). The Release on the 2→1 CAS publishes the
-    // cleared identity (slot=MAX, generation=0) ahead of the valid==1 flag a
-    // racing claimer Acquire-observes; the claimer then re-elects on gen==0 and
-    // stores its own slot strictly after ours. Clearing AFTER the CAS lets the
-    // Relaxed slot=MAX store reorder past the new owner's slot store on non-TSO
-    // hardware — a sweep would then read slot=MAX for a live claim, judge it dead,
-    // and double-claim the group → double-free (acct-mvq4.32; x86-TSO-immune,
-    // real on ARM). While valid is still 2 with generation==0, other sweepers hit
-    // the generation==0 guard above and skip, and claimers need valid==1, so the
-    // pre-CAS window is untouchable.
-    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
-    slot.committer_bgw_generation.store(0, Relaxed);
-    slot.committer_acquired_at_ns.store(0, Relaxed);
-    if slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok() {
+    if commit_dead_committer_reclaim(slot, q_owner_gen) {
         queue.committer_takeover_count.fetch_add(1, Relaxed);
         return true;
     }
     false
+}
+
+/// Arbiter core of the dead-committer reclaim, split out so its ABA gating is
+/// deterministically unit-testable without a live committer. Given the dead
+/// generation observed by the caller, run the reclaim election and, on winning
+/// it, revert the entry to pending. Returns true iff this call performed the
+/// reclaim (won the generation election AND flipped valid 2→1).
+///
+/// The election is a `generation observed_gen→0` (AcqRel) CAS, symmetric to
+/// claim_next_committer_entry's `generation 0→my_gen`: it anchors the reclaim to
+/// the exact dead generation instead of arbitrating on a bare `valid 2→1`.
+/// Between the caller's (valid==2, gen=observed_gen) read and here,
+/// is_committer_alive's kill() syscall opens a wide window in which another
+/// reclaimer can fully revert this entry (valid 2→1, gen→0) AND a live committer
+/// can re-claim it (valid 1→2, gen=G_c). A bare `valid 2→1` would still see the
+/// re-claimer's valid==2 and succeed, yanking the live claim mid-flight →
+/// double-processing + arena use-after-free when the yanked owner finalizes and
+/// frees (acct-mvq4.44). Gating on the generation CAS instead: any intervening
+/// re-claim has already advanced the generation to G_c (or a rival reclaimer
+/// took it to 0), so the CAS fails and we abort WITHOUT touching valid.
+///
+/// Winning the CAS makes us the unique reclaimer — no claimer is mid-claim (they
+/// gate on valid==1, still 2 here) and no rival reclaimer holds it (they lost
+/// this CAS) — so the `valid 2→1` is guaranteed to find valid==2. Clearing the
+/// remaining identity (slot=MAX) BEFORE the valid Release CAS keeps that Relaxed
+/// store from reordering past a new owner's slot store on non-TSO hardware; the
+/// Release then publishes the cleared identity (slot=MAX plus generation=0)
+/// ahead of the valid==1 flag a racing claimer Acquire-observes, so a sweep
+/// never reads slot=MAX for a live claim and double-claims → double-free
+/// (acct-mvq4.32; x86-TSO-immune, real on ARM).
+fn commit_dead_committer_reclaim(slot: &CommitterQueueEntry, observed_gen: u32) -> bool {
+    if slot
+        .committer_bgw_generation
+        .compare_exchange(observed_gen, 0, AcqRel, Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    slot.committer_bgw_slot.store(u32::MAX, Relaxed);
+    slot.committer_acquired_at_ns.store(0, Relaxed);
+    slot.valid.compare_exchange(2, 1, Release, Relaxed).is_ok()
 }
 
 fn sweep_staging_phase() -> u64 {
@@ -1469,6 +1496,72 @@ mod tests {
         let active: HashSet<u64> = HashSet::new();
         assert!(try_revert_orphan_staging(&q, 3, &active));
         assert!(!try_revert_orphan_staging(&q, 3, &active));
+    }
+
+    // ── commit_dead_committer_reclaim: generation-CAS arbiter (acct-mvq4.44) ──
+
+    fn fresh_committer_queue() -> Box<crate::shmem::CommitterQueue> {
+        unsafe { Box::<crate::shmem::CommitterQueue>::new_zeroed().assume_init() }
+    }
+
+    fn set_cq_entry(
+        q: &mut crate::shmem::CommitterQueue,
+        idx: usize,
+        valid: u8,
+        owner_slot: u32,
+        owner_gen: u32,
+    ) {
+        let slot = &mut q.entries[idx];
+        slot.valid = std::sync::atomic::AtomicU8::new(valid);
+        slot.committer_bgw_slot = std::sync::atomic::AtomicU32::new(owner_slot);
+        slot.committer_bgw_generation = std::sync::atomic::AtomicU32::new(owner_gen);
+        slot.committer_acquired_at_ns = std::sync::atomic::AtomicU64::new(9_999);
+    }
+
+    #[test]
+    fn reclaim_arbiter_reverts_entry_when_generation_matches() {
+        // Dead owner (gen=17), observed generation still matches: the election
+        // CAS 17→0 wins, so the entry reverts to pending with a cleared identity
+        // and the re-claiming committer re-elects on generation==0.
+        let mut q = fresh_committer_queue();
+        set_cq_entry(&mut q, 4, 2, 5, 17);
+        assert!(commit_dead_committer_reclaim(&q.entries[4], 17));
+        let slot = &q.entries[4];
+        assert_eq!(slot.valid.load(Relaxed), 1);
+        assert_eq!(slot.committer_bgw_generation.load(Relaxed), 0);
+        assert_eq!(slot.committer_bgw_slot.load(Relaxed), u32::MAX);
+        assert_eq!(slot.committer_acquired_at_ns.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn reclaim_arbiter_aborts_when_generation_advanced_by_reclaim_race() {
+        // ABA regression (acct-mvq4.44): between the caller's read and here a
+        // rival reclaimer reverted the entry AND a live committer re-claimed it
+        // at generation 99 with valid back at 2. A stale reclaimer that observed
+        // generation 17 must NOT yank the live claim — the election CAS 17→0
+        // fails against the current generation 99, leaving valid==2 and the live
+        // owner (slot=8, gen=99) untouched.
+        let mut q = fresh_committer_queue();
+        set_cq_entry(&mut q, 4, 2, 8, 99);
+        assert!(!commit_dead_committer_reclaim(&q.entries[4], 17));
+        let slot = &q.entries[4];
+        assert_eq!(slot.valid.load(Relaxed), 2, "live claim must not be yanked");
+        assert_eq!(slot.committer_bgw_generation.load(Relaxed), 99);
+        assert_eq!(slot.committer_bgw_slot.load(Relaxed), 8);
+        assert_eq!(slot.committer_acquired_at_ns.load(Relaxed), 9_999);
+    }
+
+    #[test]
+    fn reclaim_arbiter_aborts_when_rival_already_reverted_to_zero() {
+        // A rival reclaimer already completed (generation cleared to 0). A stale
+        // reclaimer that observed generation 17 loses the election CAS 17→0
+        // (current is 0), leaving the entry for the re-claimer rather than
+        // reverting it a second time.
+        let mut q = fresh_committer_queue();
+        set_cq_entry(&mut q, 4, 2, u32::MAX, 0);
+        assert!(!commit_dead_committer_reclaim(&q.entries[4], 17));
+        assert_eq!(q.entries[4].valid.load(Relaxed), 2);
+        assert_eq!(q.entries[4].committer_bgw_generation.load(Relaxed), 0);
     }
 
     // ── pack_disjoint_components (acct-xdwk lever 1b) ────────────────
