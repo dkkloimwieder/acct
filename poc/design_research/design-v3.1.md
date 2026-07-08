@@ -1393,3 +1393,72 @@ commitment above; the plugin/transport choice is a recalc-implementation refinem
 `pgoutput` (built-in, no C plugin to maintain; the consumer filters to `trx_line` inserts and projects
 the columns recalc needs), move to a custom plugin only if consumer-side filtering/projection is
 measured to matter. Not decided here.
+
+## 18. Gate verdict (acct-0at4.11 — FEEDBACK-ARCH decision gate)
+
+> **Status: DISPOSITIONED 2026-07-08.** The synthesis point for the FEEDBACK-ARCH structural go/no-go.
+> All four gate inputs are in — SPIKE-A (`bench/spike-a-results.md`), SPIKE-B (`bench/spike-b-results.md`),
+> ARCH-POSTURE (§16), ARCH-RECALC-FEED (§17). This section records the verdict and re-triages the
+> downstream children; it closes epic acct-0at4.11 and unblocks the survivors.
+
+**The pre-registered bet (epic acct-0at4.11).** "If staging-table routed and single-statement direct
+land within noise of the shmem/pgrx numbers, most of the v3.1 codebase is complexity without yield, and
+that is the finding." Both spikes landed inside that band — SPIKE-A beyond it (the routed crate is
+deletable on throughput grounds with margin to spare, not merely within ~20%).
+
+**Spike deltas.**
+
+- **SPIKE-A (acct-0at4.11.1) — routed shmem stack deletable.** A staging-table outbox (`INSERT` inside
+  the caller's tx) drained by `SELECT … FOR UPDATE SKIP LOCKED ORDER BY id` committers matched or beat
+  shmem-routed throughput on the hot-pool scenarios, while delivering atomicity with the caller, per-pool
+  FIFO by construction, free observability (the row *is* the status), and WAL-as-recovery. The §6 shmem
+  apparatus — arena, identity registry, generation / pid-liveness, boot sweeps, eject / backpressure, xid
+  triage — buys enqueue latency and pays for it in everything else (FEEDBACK-ARCH #3).
+- **SPIKE-B (acct-0at4.11.2) — RMW / `pool_lock` deletable for the aggregate paths.** One commutative
+  `UPDATE … WHERE qty − Δ >= 0` (banker_div-in-SQL + PG 18 `RETURNING old.unit_cost` for the depletion
+  running-average) was byte-identical to the RMW baseline and ≥ its throughput in every regime (1.00×
+  uncontended, 1.37× moderate-contention, 0.98× saturated) at ~4–6 % less WAL. `pool_lock`, the
+  sorted-acquisition protocol, and the single-pool deadlock-ordering discipline delete for the aggregate
+  paths. RMW-across-SPI wasn't *costing* much (in-process SPI + kept plans are cheap; commit-fsync
+  dominates) — it simply wasn't *buying* anything.
+- **ARCH-POSTURE (§16) — everything-provisional (alt C).** Cost-less append-only hot path, single costing
+  plane, qty a flagged running signal, configurable recalc cadence. Removes the intrinsic per-pool ceiling
+  (#5).
+- **ARCH-RECALC-FEED (§17) — logical-decoding slot.** Commit-ordered, `confirmed_flush_lsn`-cursored feed;
+  deletes the §14.6 watermark problem in the substrate.
+
+**Verdict.** All four point the same way: the bespoke concurrency machinery — shmem routing (SPIKE-A)
+*and* the RMW / `pool_lock` protocol (SPIKE-B) — is complexity the measured numbers do not justify, and
+the incoherent cost-provisional / qty-strict / order-unordered posture is dominated by its coherent alt-C
+endpoint (§16). **The surviving v3.1 architecture is:** a single-statement direct hot path (SPIKE-B shape)
+for the aggregate paths; a staging-table outbox + `SKIP LOCKED` committers (SPIKE-A shape) where
+batching / coalescing is wanted, replacing the §6 shmem router / committer wholesale; everything-provisional
+recording (alt C) with quantity as a flagged running signal; and recalc as the *sole* costing engine, fed
+by a logical-decoding slot (§17), with cadence a configuration knob. `ledger-core` is retained for the
+genuinely stateful methods (specific-id; any future strict layer math). The `ledger-routed-c` shmem crate
+is characterized-but-superseded — physically deleting it (vs keeping it as a benched reference) is a
+recommended follow-up, tracked separately, not done here.
+
+**Downstream re-triage.** The ten canonical children are acct-0at4.1–.10; acct-0at4.12 / .13 are the ARCH
+children filed alongside the gate and are re-triaged here too.
+
+| issue | disposition | reason |
+|-------|-------------|--------|
+| acct-0at4.1 cross-chunk silent drop | **close-moot** | Double-dissolved: staging-table gives per-pool FIFO by construction (SPIKE-A) *and* alt C removes the synchronous qty gate (§16) — no spurious `InsufficientInventory` can occur. |
+| acct-0at4.2 forced-xid on enqueue | **close-moot** | Staging-table enqueue is an ordinary heap `INSERT` in the caller's tx — no xid escapes the tx; the eject / xid-triage / anti-wraparound-pressure apparatus evaporates (FEEDBACK-ARCH #3 / SPIKE-A). |
+| acct-0at4.3 smaller-items roll-up | **re-scope** | #6 (durability asymmetry), #7 (`pool_lock` vs advisory), #18 (shmem-only poison evidence) close moot — shmem / `pool_lock` deleted, #7 subsumed by SPIKE-B. Keep #10 (idempotency payload-hash), #16 (posting_line per-leg dimension), #17 (`trx_line (pool_id,id)` index — *more* relevant: recalc per-pool replay), #19 (input CHECKs) as architecture-agnostic survivors. |
+| acct-0at4.4 sequential reference oracle | **keep + unblock** | Architecture-agnostic correctness oracle; validates the alt-C provisional plane. |
+| acct-0at4.5 conservation-invariant sweep | **keep + unblock** | Architecture-agnostic post-condition; *more* central under alt C (negative qty allowed → conservation is the guard). |
+| acct-0at4.6 concurrency verification | **re-scope** | Drop shmem `loom` + shmem-protocol `stateright` + shmem-specific fault hooks (machinery deleted). Keep ledger-core proptest + kill-9-postmaster / conservation sweep (now against the staging table); a light `stateright` model of the `SKIP LOCKED` drain is optional. |
+| acct-0at4.7 offline strict-FIFO replay oracle | **keep + unblock + elevate** | Under alt C this sizes provisional-vs-true variance = the adjustment-storm magnitude acct-0at4.12 needs, and validates the alt-C premise (recalc as sole engine). |
+| acct-0at4.8 open-loop load gen / SLO | **keep + unblock** | Methodology, architecture-agnostic; applies to the surviving direct + staging paths. |
+| acct-0at4.9 baselines + ablations | **re-scope** | Keep + elevate strict-Path-A depth curve (the everything-strict comparison) and raw-`INSERT` ceiling (alt-C's insert-only upper bound). Drop advisory-vs-row (subsumed, SPIKE-B) and shmem-lever ablations (`router_pack_disjoint` / SetLatch-vs-tick); a staging-committer batch-size ablation survives. |
+| acct-0at4.10 confound control / soak / stats | **keep + unblock** | Methodology, architecture-agnostic. |
+| acct-0at4.12 recalc-risk | **keep + re-frame** | Recalc is the sole costing engine, not a corrective sidecar (§16): drop dual-bookkeeping / adjustment-storm, centralize the throughput-inequality / quiet-backlog risk, add the cadence-vs-load tradeoff. Now the hard half of the surviving design. |
+| acct-0at4.13 alt-catalog E + F | **keep + unblock** | Now writable: E (app-tier partitioned consumer) is *partially validated* by the shmem→staging pivot (PG-as-storage, ordinary service); F (TB split) is a sharper comparison under the insert-only alt-C hot path, recorded without reopening the parent repo's Postgres-native / no-TB commitment. |
+
+**Gate closure.** The four gate inputs (acct-0at4.11.1–.11.4) and the verdict task (acct-0at4.11.5) close;
+epic acct-0at4.11 closes; acct-0at4.1 and acct-0at4.2 close moot; the remaining children unblock against
+the surviving architecture above. The as-built §3–§6 / §14 continue to describe what the PoC shipped and
+measured; propagating the surviving architecture into a v3.2 implementation spec is downstream work, not
+part of this verdict.
