@@ -14,8 +14,10 @@ skeleton (schema, ledger-core dispatch, shmem/router/committer stack).
 ## What the PoC measures
 1. **Direct flavor** — per-trx lock-hold time for FIFO/LIFO is **constant w.r.t. pool depth**
    (validated at depths 10/100/1000). The architectural premise.
-2. **Routed flavor** — 1000 concurrent submissions to one hot FIFO pool collapse into one
-   commit_group → one `pool_lock` acquisition + one aggregate UPDATE.
+2. **Routed flavor** — 1000 concurrent submissions to one hot FIFO pool collapse from 1000
+   `pool_lock` acquisitions + aggregate UPDATEs down to ⌈1000 / `batch_size_max`⌉ commit_groups
+   (five at the shipped `batch_size_max`=200, one only uncapped), each one `pool_lock` acquisition +
+   one aggregate UPDATE, serialized on the pool's lock — a 200:1 reduction at the default.
 
 ## Posture
 - **Separate database**: `poc_v3_1` on `localhost:5111` (shares the dev container, own DB name).

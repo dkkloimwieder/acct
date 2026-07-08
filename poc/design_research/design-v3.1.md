@@ -604,7 +604,7 @@ What the caller still pays per-submission inside the tx:
 - Per-call hydration of pool/pool_state (each call reads state fresh from the database, not from a shared in-memory snapshot).
 - Per-call plan_apply_provisional invocation in ledger-core.
 
-The architectural distinction: caller-batched direct flavor amortizes commit cost (fsync, WAL) and within-tx lock-acquisition cost across N trxs, but it doesn't aggregate work across DIFFERENT callers. 1000 concurrent callers each batching 10 trxs of their own still produces 1000 user-txs hitting pool_lock serially. The routed flavor's distinct value is cross-caller aggregation — collapsing 1000 callers' work into one commit_group via shmem.
+The architectural distinction: caller-batched direct flavor amortizes commit cost (fsync, WAL) and within-tx lock-acquisition cost across N trxs, but it doesn't aggregate work across DIFFERENT callers. 1000 concurrent callers each batching 10 trxs of their own still produces 1000 user-txs hitting pool_lock serially. The routed flavor's distinct value is cross-caller aggregation — collapsing 1000 callers' work into shared commit_groups via shmem (bounded by `batch_size_max`, §15), which direct-batched cannot do across callers.
 
 The PoC measures both: per-call direct, caller-batched direct, and routed (§10.6, §11). The crossover analysis distinguishes how much of routed's win comes from batching mechanics vs from cross-caller aggregation.
 
@@ -729,13 +729,13 @@ For a commit_group with N submissions touching P deduped pools (steady state, al
 - 0-1 bulk pool_state layer-row read (specific pools only).
 - 1 bulk INSERT trx, 1 bulk INSERT trx_line, 1 bulk UPSERT pool_state, 1 bulk INSERT posting_line.
 
-Total steady state: ~11 bulk + P singleton. For N=50 submissions at P=50 deduped pools: ~61 SPI per commit_group, amortizing to ~1.22 SPI/submission. The architectural win vs direct flavor: at high concurrency on overlapping pools, the per-batch pool_lock acquisition and aggregate UPDATE replace what direct flavor would do per-trx — a 1000:1 reduction in pool_lock acquisitions for the hot-pool worst case.
+Total steady state: ~11 bulk + P singleton. For N=50 submissions at P=50 deduped pools: ~61 SPI per commit_group, amortizing to ~1.22 SPI/submission. The architectural win vs direct flavor: at high concurrency on overlapping pools, the per-batch pool_lock acquisition and aggregate UPDATE replace what direct flavor would do per-trx — up to a `batch_size_max`:1 reduction in pool_lock acquisitions for the hot-pool worst case (200:1 at the shipped default; a 1000-submission hot-pool component splits into ⌈1000 / 200⌉ = 5 serialized commit_groups, not one — §15).
 
 First-time-pool overhead: +2 SPI per pool that hasn't been locked before in its lifetime (lazy-create path, §5.1 step 2). Amortized to zero in steady state.
 
 ### 6.7 Batching benefit on hot pools
 
-The architectural win Path C routed provides over Path C direct: 1000 concurrent submissions to one hot FIFO pool become one commit_group, processed in one PG tx, with one pool_lock acquisition and one aggregate UPDATE encompassing the batch's combined delta. Direct flavor would serialize 1000 individual pool_lock acquisitions and 1000 individual aggregate UPDATEs.
+The architectural win Path C routed provides over Path C direct: concurrent submissions to one hot FIFO pool coalesce by routing affinity into commit_groups of up to `batch_size_max` submissions (default 200, §15), each processed in one PG tx with one pool_lock acquisition and one aggregate UPDATE encompassing that chunk's combined delta. 1000 concurrent submissions thus form ⌈1000 / 200⌉ = 5 commit_groups — serialized on the pool's lock (`pool_lock FOR UPDATE`, §14.2), so five sequential acquisitions and five aggregate UPDATEs — versus direct flavor's 1000 individual pool_lock acquisitions and 1000 individual aggregate UPDATEs. Raising `batch_size_max` toward ∞ collapses the five to one; the shipped default trades that last factor for bounded per-commit_group work (acct-p1al).
 
 For `'standard'`-basis FIFO/LIFO pools, batching is even cleaner — standard_cost is read once at hydration, every depletion in the batch uses it, no within-batch state evolution. Pure data shuffle. For `'running_avg'`-basis pools, the running average evolves through the batch as receipts arrive in the batch's processing order; the recorded provisional cost for a depletion thus depends on within-batch ordering. That's different from direct flavor's per-tx evolution but equally well-defined; any within-batch ordering "errors" are corrected by recalc/close.
 
@@ -866,7 +866,7 @@ Run against a real PostgreSQL with the schema installed.
 - Concurrent submissions to overlapping FIFO pools: verify affinity grouping (one commit_group handles all overlap; single committer per group).
 - Committer death mid-processing on a routed-c commit_group: verify orphan recovery picks up the commit_group; trx rows for submissions in the group either all exist (recovery committer's tx committed) or all don't (recovery committer reprocesses fresh).
 - Failed submission within a routed-c commit_group: verify the failed submission is excluded, remaining submissions process successfully in the same tx WITHOUT pristine-replay (§14.2). The aggregate's qty/unit_cost end at the correct value given only the successful submissions.
-- 'standard'-basis FIFO pool with 1000 concurrent submissions on one hot pool via ledger_enqueue_trx_c: verify the commit_group is processed in one PG tx with one pool_lock acquisition. **This is the second primary measurement Path C exists to validate — batching combined with provisional cost handling.**
+- 'standard'-basis FIFO pool with 1000 concurrent submissions on one hot pool via ledger_enqueue_trx_c: verify each commit_group is processed in one PG tx with one pool_lock acquisition, and that the 1000 submissions coalesce into ⌈1000 / batch_size_max⌉ commit_groups (five at the default 200, §15) serialized on the pool's lock — not 1000 individual acquisitions. **This is the second primary measurement Path C exists to validate — batching combined with provisional cost handling.**
 - Postmaster crash with routed-c submissions in-flight: shmem lost, no trx rows from in-flight work, system accepts new submissions normally.
 - Duplicate submission detection: same (trx_type, source_id) submitted twice via ledger_enqueue_trx_c. Pre-flight dedup (§6.4 step 5) catches it; no UNIQUE escapes.
 
@@ -937,7 +937,7 @@ For the bake-off: cross-product of caller concurrency × overlap × complexity �
 - **S4**: Heavy concurrency, Zipfian overlap, complex trxs, mixed methods, shallow pools. Stress-test, production-like.
 - **S5**: Pathological — 1000 callers, all hitting one hot pool, simple FIFO trxs, shallow pools. Routed-c should dominate; direct-c serializes despite microsecond-fast lock-hold.
 - **S6**: Pathological — 1000 callers, fully disjoint FIFO pools, simple trxs, shallow pools. Direct-c should win (no contention, lower overhead than router round-trip).
-- **S7**: Heavy concurrency, Zipfian overlap, simple FIFO trxs, **deep pools**. **Path C's home field.** A strict-mode implementation in this regime would bottleneck on layer iteration (this is the architectural motivation for Path C; not directly measured in v3.1 since strict-mode implementation lives in v3). Direct Path C reduces lock-hold time per trx to aggregate-row work (each caller serializes through a microsecond-per-trx critical section, independent of pool depth). Routed Path C reduces serialization itself (1000 concurrent submissions become one commit_group with one aggregate update). Routed-c should overtake direct-c at high concurrency on overlapping pools.
+- **S7**: Heavy concurrency, Zipfian overlap, simple FIFO trxs, **deep pools**. **Path C's home field.** A strict-mode implementation in this regime would bottleneck on layer iteration (this is the architectural motivation for Path C; not directly measured in v3.1 since strict-mode implementation lives in v3). Direct Path C reduces lock-hold time per trx to aggregate-row work (each caller serializes through a microsecond-per-trx critical section, independent of pool depth). Routed Path C reduces serialization itself (1000 concurrent submissions coalesce into ⌈1000 / batch_size_max⌉ commit_groups — five at the default 200, §15 — each one aggregate UPDATE, serialized on the pool's lock, rather than 1000 individual turns). Routed-c should overtake direct-c at high concurrency on overlapping pools.
 - **S8**: Heavy concurrency, Zipfian overlap, complex FIFO trxs (multi-line), deep pools. Production-realistic FIFO stress. Same hot-path properties as S7 with more complex per-trx work.
 - **S9**: S8's shape (1000 callers, Zipfian, complex deep-pool FIFO) with **multi-touch enabled** — a head-to-head against S8. ~40% of submissions touch one pool 2–3× (the WO-completion shape: backflush + scrap + output on one SKU/location), drawn from a weighted touch distribution (`1:60,2:30,3:10`) so the mix is realistic rather than a single synthetic worst case. Exercises `PlanResult::coalesce_aggregates` (§5.1, the keep-last collapse of same-pool aggregate mutations) under load, which S1–S8's distinct-pool generation never reaches.
 - **S10–S21 (Pareto 80/20 family block, `acct-s90k`)**: extremes-bracketed (S1–S9) cover 0% (S6 disjoint) and 100% (S5 single-hot-pool) overlap and approximate the mid-market region via Zipf(1.2) (~87/20 over 10000 pools, more concentrated than textbook Pareto 80/20). S10–S21 add a *discrete* two-population mixture — each submission rolls hot vs cold by `hot_traffic_fraction` then samples uniformly within that population — × three workload families × four variants. **Families:** RECEIPTS (S10–S13, deplete 0, distinct-pool), BUILDS (S14–S17, deplete 50, multi-touch ON with the S9 preset), MIXED (S18–S21, deplete 50, distinct-pool). **Variants per family:** mid-typ (50 callers, 80/20), high-vol (200 callers, 80/20, depth 100), long-tail (50 callers, 90/10), balanced (50 callers, 50/50). Coverage extension only — not a new architectural premise.
@@ -968,7 +968,7 @@ Hot-path throughput per caller session should be insensitive to pool depth as a 
 
 ### 11.3 Routed flavor demonstration
 
-Routed Path C under S5 and S7 demonstrates throughput that exceeds direct Path C on hot pools — the batched commit_group reduces 1000 individual pool_lock acquisitions to one. This is the answer to "what happens when 1000 callers hit one deep FIFO pool simultaneously": neither direct Path C (1000 serialized microsecond turns) nor any strict-mode implementation gives a satisfying answer at very high concurrency. Routed Path C does.
+Routed Path C under S5 and S7 demonstrates throughput that exceeds direct Path C on hot pools — the batched commit_group reduces 1000 individual pool_lock acquisitions to ⌈1000 / batch_size_max⌉ (five at the default 200, §15; one only uncapped). This is the answer to "what happens when 1000 callers hit one deep FIFO pool simultaneously": neither direct Path C (1000 serialized microsecond turns) nor any strict-mode implementation gives a satisfying answer at very high concurrency. Routed Path C does.
 
 ### 11.4 Crossover identification
 
@@ -1033,7 +1033,7 @@ Deliverable: direct flavor operational. Submitting a FIFO depletion via ledger_s
 - Failed-submission handling: drop from working snapshot and continue.
 - Recovery: router boot sweep, committer death handling via identity registry + pg_xact, postmaster restart (§6.5).
 
-Deliverable: routed flavor operational. 1000 concurrent ledger_enqueue_trx_c submissions to one hot FIFO pool become one commit_group processed in one PG tx with one pool_lock acquisition and one aggregate UPDATE. Integration tests (§9.3) pass.
+Deliverable: routed flavor operational. 1000 concurrent ledger_enqueue_trx_c submissions to one hot FIFO pool coalesce into ⌈1000 / batch_size_max⌉ commit_groups (five at the default 200, §15; one only uncapped), each processed in one PG tx with one pool_lock acquisition and one aggregate UPDATE and serialized on the pool's lock. Integration tests (§9.3) pass.
 
 ### Phase 4: ledger-harness
 
@@ -1078,7 +1078,7 @@ Recalc/close implementation is a separate future phase, outside this PoC's scope
 
 The pool_state aggregate (layer_id = 0) for a FIFO/LIFO pool under Path C carries qty (the running net) and unit_cost (the running average maintained per WAC formula on every receipt). The aggregate qty is the authoritative on-hand count. The aggregate unit_cost is a Path C-specific construct — strict-mode implementations don't maintain a running average for FIFO/LIFO pools.
 
-For pools with `provisional_basis = 'running_avg'`, this aggregate unit_cost IS the provisional cost basis used on depletions. For pools with `provisional_basis = 'standard'`, the aggregate unit_cost is still maintained (the WAC formula still runs on receipts) but is not used for depletions — depletions pull from standard_cost. The aggregate's running average remains useful for analytical queries even when not on the hot read path.
+For pools with `provisional_basis = 'running_avg'`, this aggregate unit_cost IS the provisional cost basis used on depletions, and `value_sum / qty` remains a genuine receipt running average — useful for analytical queries even when not on the hot read path. For pools with `provisional_basis = 'standard'`, the WAC formula still runs on receipts, but depletions subtract `qty × standard_cost` from `value_sum` (the posted provisional amount, §3.5), not `qty × running_avg`. Once any standard-basis depletion occurs, the derived aggregate unit_cost therefore drifts away from a pure receipt average by the accumulated standard-vs-actual delta spread over the remaining qty, and `value_sum` itself can go negative (there is no aggregate `value_sum` floor — §15). For standard-basis pools the aggregate unit_cost is thus a provisional analytic figure carrying that drift, not the receipt running average; recalc/close (§7) reconciles it. The aggregate qty is the authoritative on-hand count either way.
 
 If a query reads `pool_state` for a FIFO pool and finds layer_id=0 with unit_cost=X, that X is the running average, not the "current FIFO cost" (which doesn't have a single meaningful value for a multi-layer pool). Queries needing layer-specific costs must wait for recalc/close or replay trx_line directly.
 
@@ -1199,13 +1199,20 @@ dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
 - **Harness seeds `standard_cost`** (§10.4): the pool seeder must populate `standard_cost` for
   every std-method / standard-basis pool, else those pools abort with MissingStandardCost and
   confound mixed-method scenarios.
-- **`qty >= 0` and `value_sum >= 0` CHECKs on `pool_state`** (§2.2/§3.6): no-negative-inventory began
-  as a `ledger-core`-only code invariant; migration `0006` added `CHECK (layer_id <> 0 OR qty >= 0)`
-  (`pool_state_aggregate_qty_nonneg`) and migration `0007` added the sibling `CHECK (layer_id <> 0 OR
-  value_sum >= 0)` (`pool_state_aggregate_value_sum_nonneg`) — both schema-level defense-in-depth
-  backstops on the aggregate row (scoped to `layer_id = 0` so they never constrain strict-method
-  layer rows, which Path C does not materialize on the hot path). The `value_sum` column the second
-  CHECK guards is a core storage column (migration `0007`, `NOT NULL`) carried in the §2.2 DDL.
+- **`qty >= 0` CHECK on `pool_state`; no aggregate `value_sum` non-negativity CHECK** (§2.2/§3.5/§3.6):
+  no-negative-inventory began as a `ledger-core`-only code invariant; migration `0006` added
+  `CHECK (layer_id <> 0 OR qty >= 0)` (`pool_state_aggregate_qty_nonneg`), a schema-level
+  defense-in-depth backstop on the aggregate row (scoped to `layer_id = 0` so it never constrains
+  strict-method layer rows, which Path C does not materialize on the hot path). Migration `0007`
+  added a sibling `value_sum >= 0` CHECK (`pool_state_aggregate_value_sum_nonneg`); migration `0009`
+  (`acct-mvq4.22`) **dropped** it. Under a provisional standard-basis depletion (§3.5) the applied
+  cost is the SKU's `standard_cost`, decoupled from the pool's running average — so when the standard
+  exceeds the average, a legitimate partial depletion posts more book value out than the pool
+  currently carries and `value_sum` goes negative until the deferred recalc tier (§7) trues it up
+  (banker-rounded running-average depletions can do the same at ±1 micro-unit scale). The CHECK
+  contradicted `value_sum`'s own net-posted-amount semantics (§3.1); the qty invariant is unaffected
+  and stays. The `value_sum` column itself remains a core storage column (migration `0007`,
+  `NOT NULL`) carried in the §2.2 DDL.
 - **Cross-chunk ordering is not guaranteed** (§14.2/§11.1): when a connected component is split
   across commit_groups by `batch_size_max`, the split chunks are independent commit_groups claimed
   concurrently by different committers with no predecessor-wait (`ledger-routed-c/src/router.rs`,
