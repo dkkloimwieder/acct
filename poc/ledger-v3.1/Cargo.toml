@@ -7,6 +7,10 @@ members = [
     "ledger-routed-c",
     "ledger-harness",
 ]
+# Throwaway offline replay oracle (acct-0at4.7): a standalone bin that depends on
+# ledger-core (path) but must NOT pull the pgrx toolchain of the other members.
+# Excluded so `cargo build` inside it is self-contained.
+exclude = ["bench/replay-oracle"]
 
 [workspace.package]
 version = "0.0.1"

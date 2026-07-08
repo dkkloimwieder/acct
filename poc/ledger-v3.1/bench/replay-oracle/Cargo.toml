@@ -1,0 +1,24 @@
+# Throwaway offline strict-FIFO/LIFO replay oracle (acct-0at4.7).
+#
+# Standalone (workspace-excluded) so it builds without the pgrx toolchain. It
+# depends on the REAL ledger-core so the "recorded provisional" arm is the exact
+# shipped transform (plan_apply_provisional / banker_div), not a re-implementation.
+# The strict FIFO/LIFO oracle in main.rs IS the throwaway part — production
+# ledger-core has only MethodMismatch stubs for strict FIFO/LIFO (design §8).
+[package]
+name = "replay-oracle"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "replay-oracle"
+path = "src/main.rs"
+
+[dependencies]
+ledger-core = { path = "../../ledger-core" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rand = "0.9"
+
+[profile.release]
+opt-level = 3
