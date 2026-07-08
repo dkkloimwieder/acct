@@ -131,7 +131,7 @@ async fn main() -> std::process::ExitCode {
             }
 
             let result = match mode {
-                Mode::DirectPerCall | Mode::DirectBatched => {
+                Mode::DirectPerCall | Mode::DirectBatched | Mode::DirectSingle => {
                     driver_direct::run(driver_direct::RunOptions {
                         dsn: args.dsn,
                         scenario,

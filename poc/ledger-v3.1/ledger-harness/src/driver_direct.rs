@@ -99,6 +99,12 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let barrier = Arc::new(Barrier::new(spec.callers));
     let batched = opts.mode == Mode::DirectBatched;
     let batch_size = if batched { opts.batch_size.max(1) } else { 1 };
+    // SPIKE-B: direct-single dispatches to the single-statement commutative
+    // variant; the RMW baseline (per-call / batched) keeps ledger_submit_trx_c.
+    let submit_sql: &'static str = match opts.mode {
+        Mode::DirectSingle => "SELECT ledger_submit_trx_single_c($1, $2, $3, $4::jsonb)",
+        _ => "SELECT ledger_submit_trx_c($1, $2, $3, $4::jsonb)",
+    };
 
     let mut handles = Vec::with_capacity(spec.callers);
     for caller_id in 0..spec.callers {
@@ -106,8 +112,11 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         let workload = workload.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            caller_loop(pool, workload, barrier, caller_id, prefix, deadline, batched, batch_size)
-                .await
+            caller_loop(
+                pool, workload, barrier, caller_id, prefix, deadline, batched, batch_size,
+                submit_sql,
+            )
+            .await
         }));
     }
 
@@ -194,6 +203,7 @@ async fn caller_loop(
     deadline: Instant,
     batched: bool,
     batch_size: usize,
+    submit_sql: &'static str,
 ) -> (LatencyHistogram, u64) {
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
     let mut hist = LatencyHistogram::new();
@@ -228,7 +238,7 @@ async fn caller_loop(
                 let source_id = caller_base + tick;
                 tick += 1;
                 let started = Instant::now();
-                let res = sqlx::query("SELECT ledger_submit_trx_c($1, $2, $3, $4::jsonb)")
+                let res = sqlx::query(submit_sql)
                     .bind(TRX_TYPE)
                     .bind(source_id)
                     .bind(POSTED_AT)
@@ -265,7 +275,7 @@ async fn caller_loop(
             let source_id = caller_base + tick;
             tick += 1;
             let started = Instant::now();
-            let res = sqlx::query("SELECT ledger_submit_trx_c($1, $2, $3, $4::jsonb)")
+            let res = sqlx::query(submit_sql)
                 .bind(TRX_TYPE)
                 .bind(source_id)
                 .bind(POSTED_AT)

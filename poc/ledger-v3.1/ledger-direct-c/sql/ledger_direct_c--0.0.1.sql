@@ -7,7 +7,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- ledger-direct-c/src/lib.rs:48
+-- ledger-direct-c/src/lib.rs:50
 -- ledger_direct_c::ledger_direct_c_hello
 CREATE  FUNCTION "ledger_direct_c_hello"() RETURNS TEXT /* String */
 STRICT
@@ -38,5 +38,19 @@ CREATE  FUNCTION "ledger_submit_trx_c"(
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'ledger_submit_trx_c_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- ledger-direct-c/src/submit_single.rs:64
+-- ledger_direct_c::submit_single::ledger_submit_trx_single_c
+CREATE  FUNCTION "ledger_submit_trx_single_c"(
+	"trx_type" TEXT, /* & str */
+	"source_id" bigint, /* i64 */
+	"posted_at" TEXT, /* & str */
+	"lines" jsonb /* pgrx :: JsonB */
+) RETURNS bigint /* i64 */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ledger_submit_trx_single_c_wrapper';
 /* </end connected objects> */
 

@@ -179,6 +179,12 @@ pub enum Mode {
     DirectPerCall,
     /// Caller wraps N `ledger_submit_trx_c` calls in one user-tx (§5.5).
     DirectBatched,
+    /// SPIKE-B (acct-0at4.11.2): each `ledger_submit_trx_single_c` in its own
+    /// user-tx. Same direct autocommit shape as DirectPerCall, but the aggregate
+    /// read-modify-write is a single commutative SQL statement under PG's own row
+    /// lock (no pool_lock table, no Rust round-trip) — the alt-B variant measured
+    /// head-to-head against DirectPerCall's RMW-across-SPI.
+    DirectSingle,
     /// Caller calls `ledger_enqueue_trx_c`; work batched across callers (§6).
     Routed,
     /// SPIKE-A (acct-0at4.11.1): caller `INSERT`s into `ledger_inbox` in its own
@@ -194,6 +200,7 @@ impl Mode {
         match self {
             Mode::DirectPerCall => "direct-per-call",
             Mode::DirectBatched => "direct-batched",
+            Mode::DirectSingle => "direct-single",
             Mode::Routed => "routed",
             Mode::Staging => "staging",
         }

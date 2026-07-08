@@ -23,6 +23,7 @@
 //! - `bulk_write`       — UNNEST INSERT/UPSERT/DELETE helpers (§5.1 step 8)
 //! - `ledger_error_map` — LedgerError → ereport!(ERROR, ...) at the SPI boundary
 //! - `submit`           — `ledger_submit_trx_c` orchestration (§5.1 steps 1-9)
+//! - `submit_single`    — `ledger_submit_trx_single_c` single-statement commutative variant (SPIKE-B)
 //! - `drain`            — `ledger_staging_drain_c` staging-table committer (SPIKE-A)
 
 #![allow(unexpected_cfgs)]
@@ -34,6 +35,7 @@ use pgrx::prelude::*;
 pub(crate) mod drain;
 pub(crate) mod ledger_error_map;
 pub(crate) mod submit;
+pub(crate) mod submit_single;
 
 // ── _PG_init ────────────────────────────────────────────────────────
 //
