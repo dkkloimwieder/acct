@@ -165,6 +165,19 @@ Routing avoids this entirely: a pool is owned by exactly one committer at a time
 commit_group's depletions serialize *inside* one transaction with **zero deadlock-retries observed
 across the entire matrix**. Routing is the only mode that batches *safely* under contention.
 
+> **Measurement note (`acct-mvq4.25`).** The `direct-batched throughput_trx_per_sec` figures in
+> the contended scenarios above (s2, s4, s5, s7, s8, s9; and the s9 head-to-head table below) were
+> captured with the pre-fix harness, whose batched arm recorded each in-batch submission's ack
+> latency into the throughput histogram at SQL-success time — before a mid-batch failure or a
+> failed `COMMIT` rolled the whole `batch_size=50` user-tx back. At these scenarios' abort rates
+> (500–1300 aborts, up to 50 rolled-back submissions each), the reported batched throughput
+> **overstates** committed throughput. The bias is conservative w.r.t. every conclusion here: true
+> committed batched throughput is even lower, so "batched collapses under contention" only
+> strengthens, and `commits_observed` (pg_stat `xact_commit`) already corroborates the collapse.
+> Fixed in `acct-mvq4.25` (buffer per-batch latencies, flush to the histogram only on commit;
+> a rolled-back batch's submissions count as errors, not throughput). The numbers above are **not**
+> re-measured — a re-run would only push the contended batched figures further down.
+
 The complementary truth: routing does **not** universally beat `direct-per-call`. Direct-per-call
 wins on disjoint (s6) and at low-concurrency-uniform (s1, s3). On the deep moderate-overlap shapes
 (s7/s8/s9) the two are close and the ordering flips with host load. The durable routing win is

@@ -206,7 +206,13 @@ async fn caller_loop(
     while Instant::now() < deadline {
         if batched {
             // One user-tx wrapping `batch_size` submissions (§5.5). A failed
-            // submission aborts the tx; we count it and roll the batch back.
+            // submission — or a failed commit — aborts the tx, so EVERY
+            // submission in the batch rolls back. Per-call ack latencies are
+            // buffered and flushed to the histogram only after tx.commit()
+            // succeeds; a rolled-back batch counts all of its attempted
+            // submissions as errors rather than throughput, so
+            // throughput_trx_per_sec never credits durably-absent work
+            // (acct-mvq4.25).
             let mut tx = match pool.begin().await {
                 Ok(t) => t,
                 Err(_) => {
@@ -214,6 +220,7 @@ async fn caller_loop(
                     continue;
                 }
             };
+            let mut batch_latencies: Vec<u64> = Vec::with_capacity(batch_size);
             let mut aborted = false;
             for _ in 0..batch_size {
                 let lines = workload.next_lines(&mut rng, caller_id);
@@ -229,7 +236,7 @@ async fn caller_loop(
                     .execute(&mut *tx)
                     .await;
                 match res {
-                    Ok(_) => hist.record(started.elapsed().as_nanos() as u64),
+                    Ok(_) => batch_latencies.push(started.elapsed().as_nanos() as u64),
                     Err(_) => {
                         errors += 1;
                         aborted = true;
@@ -239,8 +246,18 @@ async fn caller_loop(
             }
             if aborted {
                 let _ = tx.rollback().await;
+                // The submissions that succeeded before the abort rolled back
+                // with the tx — count the whole batch, not just the failing call.
+                errors += batch_latencies.len() as u64;
             } else if tx.commit().await.is_err() {
-                errors += 1;
+                // Commit failed: every buffered submission rolled back.
+                errors += batch_latencies.len() as u64;
+            } else {
+                // Durably committed: only now do these submissions count as
+                // throughput and feed the latency histogram.
+                for latency in &batch_latencies {
+                    hist.record(*latency);
+                }
             }
         } else {
             let lines = workload.next_lines(&mut rng, caller_id);
