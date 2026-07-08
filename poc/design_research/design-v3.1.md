@@ -416,6 +416,12 @@ Both provisional_basis choices produce identical lock-hold characteristics; the 
 
 ### 3.6 Negative inventory (deferred extension)
 
+> **Forward posture (ARCH-POSTURE §16, DECIDED 2026-07-08).** The everything-provisional (alt C)
+> decision makes allow-negative the **default** production posture, not a deferred option: the hot
+> path has no synchronous qty gate, a sub-zero depletion drives the aggregate negative and is flagged
+> for recalc rather than rejected. The `InsufficientInventory` behavior below is the as-built v3.1
+> PoC behavior; §16 supersedes it going forward. (Specific-id pools, §3.4, stay strict regardless.)
+
 **PoC behavior.** Depletions that would drive a pool's aggregate qty below zero are rejected via RAISE EXCEPTION InsufficientInventory (see §3.1 depletion, §3.4 specific). Aggregate qty in the PoC is therefore always ≥ 0. Receipts and depletions are the only paths that mutate aggregate qty, so this invariant holds for every method.
 
 This is a deliberate scope cut. Real-world inventory systems often need to record events that drive on-hand qty negative — the physical good has left the warehouse before the receiving paperwork hits the ledger, or a customer-side transfer arrives before its corresponding shipment is recorded, or backflushing on a work-order completion consumes more than the on-hand record showed. ERPs handle this in different ways; the PoC's choice to reject all such cases keeps the spec simple and the measurements clean. Recording negative inventory is not on the critical path of what Path C is trying to prove (constant-time lock-hold for hot-path FIFO/LIFO).
@@ -1092,6 +1098,12 @@ If a query reads `pool_state` for a FIFO pool and finds layer_id=0 with unit_cos
 > with no predecessor-wait, so provisional unit_costs and oversell failure-sets may differ across
 > orderings (`pool_lock` serializes same-pool writes but does not order them). See below.
 > (AUDIT-PASS2.md §4.4 verified the within-group properties.)
+>
+> **Forward posture (ARCH-POSTURE §16, DECIDED 2026-07-08).** The *oversell failure-set* half of this
+> divergence is moot under the everything-provisional (alt C) decision — with no synchronous qty gate
+> there is no oversell rejection to be order-sensitive (acct-0at4.1 is superseded; §16 re-derivation).
+> The residual cross-chunk *cost*-order-sensitivity (which provisional running average a depletion
+> records) remains and is trued up by recalc regardless of order.
 
 Path B (strict routed) in some architectures uses pristine-snapshot replay to handle failures in a commit_group where one trx's plan_apply fails and excluded trxs would have left stale intermediate state visible to other trxs. Path C has no cross-trx state dependency on the hot path — each trx updates only the aggregate row and produces only its own trx_line/posting_line rows. A trx that fails plan_apply_provisional (e.g., depletion exceeds aggregate qty) is simply dropped from the working snapshot; remaining trxs proceed unchanged.
 
@@ -1238,3 +1250,83 @@ dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
   (K=1 full-layer delete) while decrementing the aggregate by only the depleted qty, leaving
   `aggregate.qty > 0` (AUDIT.md D3.2). States stay well-defined; the caller supplies qty=1 to avoid
   the mismatch.
+
+## 16. Consistency posture decision (ARCH-POSTURE — acct-0at4.11.3)
+
+> **Status: DECIDED (requirement owner dkk, 2026-07-08).** Resolves the FEEDBACK-ARCH.md problem-#2
+> incoherence and problem-#5 per-pool ceiling. Input to the architecture decision gate
+> (acct-0at4.11) alongside SPIKE-A (acct-0at4.11.1 — routed shmem stack deletable in favor of a
+> staging table) and SPIKE-B (acct-0at4.11.2 — RMW / `pool_lock` deletable for the aggregate paths).
+> The gate-verdict synthesis and the re-triage of the 10 downstream hardening children live in
+> acct-0at4.11.5; this section records only the posture decision and the two cross-references it
+> re-derives.
+
+**The incoherence being resolved.** The v3.1 PoC as built holds three positions that do not compose:
+cost is provisional (§3.5, trued up by deferred recalc §7), quantity is strict (§3.6 rejects every
+sub-zero depletion synchronously under `pool_lock`), and cross-chunk execution order is unordered
+(§14.2 — spurious drops accepted, acct-0at4.1). The strict-qty gate is the *only* reason the hot path
+reads `pool_state` under `pool_lock` at all, yet it enforces a number §14.2 admits is
+cross-chunk-nondeterministic. SPIKE-B further showed that gate is *cheap* — one commutative
+`UPDATE … WHERE qty − Δ >= 0` on PG's own row lock, no `pool_lock` table — but cheapness does not
+remove the intrinsic per-pool serial-fold ceiling (#5): any posture that retains a synchronous
+per-pool qty gate keeps the ceiling **and** keeps enforcing the nondeterministic invariant. The
+half-measure carries the costs of both coherent postures and the guarantees of neither.
+
+**Decision: everything-provisional (alternative C).** The hot path records only the physical event —
+append `trx` / `trx_line` with qty and observed cost, and optionally fire the commutative aggregate
+delta of SPIKE-B's shape — with **no synchronous read, no qty gate, and no running-average
+maintenance as a correctness dependency**. Quantity becomes a running signal: a depletion beyond
+on-hand drives the aggregate negative and is *flagged*, not rejected (the §3.6 negative-inventory
+extension becomes the default posture, not a deferred option). Costing — all of it, not merely
+FIFO-layer fidelity — becomes a single batch pass (recalc, §7) that assigns cost and posts GL. There
+is one costing plane, not a provisional plane corrected by an authoritative one. Mid-period GL is
+therefore qty-only or standard-valued (the SAP material-ledger shape: real-time perpetual quantity,
+periodic valuation); the requirement owner accepts that tradeoff. The per-pool ceiling (#5) is
+removed — the hot path is insert-only and scales with heap-insert throughput.
+
+The hybrid (scope strict mode to named pools) was considered and **not** taken. Specific-id pools
+remain structurally strict (§3.4 — K=1, no cost provisionality); that is orthogonal to this decision
+and unchanged. It is not a "strict costing plane," just a degenerate one-layer pool.
+
+**FIFO granularity (sub-question G): a configurable recalc cadence, not a fixed grain.** There is no
+strict per-depletion hot-path layer math in any configuration. "FIFO fidelity" is delivered entirely
+by recalc, and the *cadence* at which recalc runs — the accounting-period length — is a configuration
+knob. A long period is classic periodic FIFO (month-end layer consumption); shrinking the period
+approximates real-time per-depletion fidelity ("close enough for our purposes" at small periods),
+without ever adding a synchronous hot-path read. Real-time is the small-period limit of the single
+provisional plane, not a second strict plane. This couples directly to the recalc-risk
+characterization below: shorter periods run recalc more often over the same event volume, trading
+provisional-drift latency against recalc throughput load.
+
+**Re-derivation — acct-0at4.1 (routed cross-chunk silent drop).** The bug is a spurious synchronous
+`InsufficientInventory` for a caller who enqueued a receipt before its depletion when the two land in
+different concurrently-committed chunks. Under this posture there is **no synchronous qty gate**, so
+there is no synchronous failure to be spurious: the depletion is appended unconditionally and any
+transient negative aggregate is a recalc finding. The qty-drop failure mode is therefore **moot** —
+the acct-0at4.1 decision (per-pool predecessor-wait / observability channel / accept-and-document)
+collapses; no predecessor-wait is needed for quantity. The residual cross-chunk *cost*-order-
+sensitivity (which provisional running-average a depletion records) survives, but it is already
+provisional and already trued up by recalc regardless of order (§14.2/§14.3) — no new mechanism.
+Formal close / re-triage of acct-0at4.1 is deferred to the gate verdict (acct-0at4.11.5).
+
+**Re-derivation — acct-0at4.12 (deferred-recalc risk / "corrective sidecar").** The issue frames
+recalc as a corrective sidecar layered on a second costing plane, with dual bookkeeping and a
+close-time adjustment storm. Under this posture recalc is the **sole costing engine on a single
+plane**: the hot path posts no provisional cost amounts to be corrected, so the provisional-vs-
+authoritative dual bookkeeping and the adjustment-storm-against-a-first-plane both **disappear**.
+What does **not** disappear — and becomes *more* central — is the throughput inequality (FEEDBACK-ARCH
+#1): recalc does strictly more work per line than the hot path, over the same event volume,
+sequentially per pool, concurrent with appends. It is now the only path that assigns cost and posts
+GL, so its backlog gates when *any* authoritative cost/GL exists, not merely when a correction lands.
+The configurable-cadence decision above sharpens this: period length is the knob trading provisional-
+drift latency against recalc load. acct-0at4.12's characterization is therefore re-derived to (a) drop
+the dual-bookkeeping / adjustment-storm framing, (b) retain and centralize the throughput-inequality /
+quiet-backlog risk, and (c) add the cadence-vs-load tradeoff. (acct-0at4.12 also depends on the
+recalc-feed decision — acct-0at4.11.4 / alt D.)
+
+**Scope of this section.** This records the forward posture decision and the two re-derivations only.
+The as-built PoC sections (§3.5 provisional cost, §3.6 no-negative-qty, §5–§6 hot-path flavors, §14)
+continue to describe what was shipped and measured — a provisional-cost + strict-qty design — and are
+not rewritten here. Propagating the decision into those sections, writing the gate-verdict paragraph
+(SPIKE-A + SPIKE-B + posture + feed), and re-triaging the 10 downstream hardening children are the
+deliverables of acct-0at4.11.5.
