@@ -785,7 +785,12 @@ When recalc/close is added, the schema additions are likely to include: a `cost_
 
 **Strategic risk acknowledgment.** Path C's value proposition depends on a working recalc/close mechanism. If reconciliation turns out to be impractical at scale, Path C merely shifts the bottleneck from hot path to batch window. SAP CKMLCP, Oracle Cost Processor, and Dynamics Inventory Close all run at high transaction volumes in production, which is empirical evidence that the pattern is feasible — but those production validations don't substitute for measuring recalc/close on this specific schema. The decision to defer is a scope decision, not a feasibility judgment.
 
-The PoC does not pre-commit to any one of these implementation options. The choice of worker model (continuous / on-demand / periodic), progress-tracking mechanism (watermark column on pool, settled-state column on trx_line, full-recompute idempotency, txid_snapshot-based safe-watermark), and schema additions is made when recalc/close is built — informed by what the production workload demands and by what the v3.1 PoC's hot-path measurements show.
+The PoC does not pre-commit to any one of these implementation options. The choice of worker model (continuous / on-demand / periodic) and schema additions is made when recalc/close is built — informed by what the production workload demands and by what the v3.1 PoC's hot-path measurements show.
+
+> **Feed/progress mechanism FIXED (ARCH-RECALC-FEED §17, DECIDED 2026-07-08).** The progress-tracking
+> mechanism is no longer open: the recalc feed is a logical-decoding slot (commit-ordered,
+> `confirmed_flush_lsn` cursor), **not** a watermark column / settled-state column / snapshot-based
+> safe-watermark scan. That decision is locked before recalc design starts; see §17.
 
 ## 8. ledger-core (shared Rust crate)
 
@@ -1173,7 +1178,7 @@ trx_line.id is an auto-allocated identity column (declared `GENERATED ALWAYS AS 
 Concerns:
 - **id is globally monotonic, not per-pool dense.** A pool's trx_line ids will be sparse (e.g., 5, 17, 42, 109) because other pools take intervening values. Doesn't matter for ordering; only the relative order within a pool matters.
 - **BIGINT exhaustion.** Signed 64-bit; max value ~9.2 × 10^18. Not a concern.
-- **Backdated receipts under Path C.** A receipt with business-effective posted_at preceding earlier-allocated receipts in the same pool gets a HIGHER trx_line.id (because identity allocation is in INSERT order, not posted_at order). The hot path doesn't use trx_line.id for chronological ordering — it just appends. Recalc/close (deferred) decides whether to order by trx_line.id (allocation order) or by trx.posted_at (business-effective order) when reconciling.
+- **Backdated receipts under Path C.** A receipt with business-effective posted_at preceding earlier-allocated receipts in the same pool gets a HIGHER trx_line.id (because identity allocation is in INSERT order, not posted_at order). The hot path doesn't use trx_line.id for chronological ordering — it just appends. Recalc/close (deferred) decides whether to order by trx_line.id (allocation order) or by trx.posted_at (business-effective order) when reconciling. The recalc *feed* is commit-ordered (logical decoding, §17), which is distinct from either of these — §17 records that the feed fixes delivery ordering + durability but the within-pool chronological re-sort for cost correctness (this backdated-receipt concern) remains recalc's job.
 
 ### 14.6 Identity-column allocation vs commit order
 
@@ -1181,7 +1186,13 @@ PostgreSQL identity columns (and BIGSERIAL) allocate ids monotonically via the u
 
 This does not affect Path C's hot path because the hot path doesn't observe any cross-trx ordering of trx_line ids. Each trx independently reads aggregate state, updates it, writes its own trx_line.
 
-When recalc/close is built (deferred), whoever builds it must account for this — a watermark-based "advance past max visible id" scheme is broken under BIGSERIAL-without-commit-ordering. Standard fixes include settled-state columns, full-recompute idempotency, or txid_snapshot-based safe-watermark patterns. This is a recalc/close design decision.
+When recalc/close is built (deferred), whoever builds it must account for this — a watermark-based "advance past max visible id" scheme is broken under BIGSERIAL-without-commit-ordering. Standard fixes include settled-state columns, full-recompute idempotency, or txid_snapshot-based safe-watermark patterns.
+
+> **DECIDED (ARCH-RECALC-FEED §17, 2026-07-08).** This is no longer an open recalc/close design
+> decision: the feed is a logical-decoding slot, which delivers `trx_line` in commit order with a
+> durable `confirmed_flush_lsn` cursor and thereby deletes this safe-watermark problem in the
+> substrate. The settled-state-column and snapshot-safe-watermark fixes above are the rejected
+> hand-rolled alternatives (§17).
 
 ## 15. Implementation divergences (v3.1 PoC)
 
@@ -1330,3 +1341,55 @@ continue to describe what was shipped and measured — a provisional-cost + stri
 not rewritten here. Propagating the decision into those sections, writing the gate-verdict paragraph
 (SPIKE-A + SPIKE-B + posture + feed), and re-triaging the 10 downstream hardening children are the
 deliverables of acct-0at4.11.5.
+
+## 17. Recalc-feed decision (ARCH-RECALC-FEED — acct-0at4.11.4)
+
+> **Status: DECIDED 2026-07-08.** Locks the recalc/close input feed *before* any recalc design starts
+> (§7), so it is never re-litigated inside recalc. Input to the architecture decision gate
+> (acct-0at4.11); interacts with the §16 posture decision — under everything-provisional (alt C) recalc
+> is the *sole* costing engine, so the feed is load-bearing, not a corrective sidecar's input.
+> Independent of the hot-path spikes A/B (this is a recalc-side concern). Doc decision only: building
+> the slot, the consumer, and recalc remains out of scope (§7, §13).
+
+**Decision: the recalc feed is a logical-decoding replication slot** delivering `trx_line` inserts in
+**commit order** with a durable, resumable cursor (`confirmed_flush_lsn`). Recalc consumes that stream;
+it does **not** run `SELECT … FROM trx_line WHERE id > watermark`.
+
+**Why the watermark scan is rejected (§14.6).** `trx_line.id` is an identity / BIGSERIAL column
+allocated by `nextval()` in *allocation* order, which is **not** commit order: Tx1 can allocate id=10
+and commit *after* Tx2 allocates id=11. A consumer that advances a watermark to "max visible id" can
+therefore step past id=11 while id=10 is still uncommitted, then never revisit id=10 when it commits —
+a **silent gap**. That is the §14.6 breakage; it is a property of the substrate, not a query bug a
+better `WHERE` clause fixes.
+
+**Why the hand-rolled safe-watermark alternatives are dominated.** Two schemes make a scan safe: (a) a
+**snapshot-based safe-watermark** (advance only past xids below the `xmin` of the oldest running
+snapshot — `pg_snapshot` / `txid_snapshot`), and (b) a **settled-state column** on `trx_line` flipped
+by the consumer with full-recompute idempotency. Both *work*, but both reimplement in application code
+— with their own progress table, crash-recovery, and idempotency proofs — exactly what a logical slot
+provides in the substrate for free: gap-free commit-ordered delivery plus a durable cursor that
+advances only on the consumer's acknowledged flush. Logical decoding **deletes** the watermark problem;
+(a) and (b) **solve it repeatedly** and are the maintenance surface alt D exists to avoid.
+
+**What logical decoding does NOT solve — commit order ≠ business-effective order.** The slot delivers
+rows in *commit* order. Recalc for layer-tracked pools may need *business-effective* order
+(`trx.posted_at`, or a derived Cost Date) because a backdated receipt commits after — and gets a higher
+id and a later commit-LSN than — events it should precede chronologically (§14.5). Logical decoding
+gives recalc a **durable, gap-free, replayable, commit-ordered** stream (killing §14.6's safe-watermark
+problem); the **within-pool chronological re-sort for cost correctness** (§14.5) is orthogonal and
+remains recalc's job. Recorded so recalc design does not over-claim that the feed solves ordering
+end-to-end: it fixes *delivery* ordering and durability, not *costing* chronology.
+
+**Operational note — slot lag pins WAL.** An unconsumed or lagging slot retains WAL and can exhaust
+disk. Under the §16 posture (recalc = sole costing engine) a stalled recalc consumer *already* means
+"no authoritative cost is being produced," so the slot-lag alarm and the recalc-backlog alarm
+(acct-0at4.12) are the **same signal** — monitor `confirmed_flush_lsn` lag as the single backlog gauge.
+`wal_level = logical` is a prerequisite cluster setting (a WAL-volume cost this fsync-bound system
+already substantially pays).
+
+**Deferred sub-choice (recalc-design-time, not locked here): transport.** `pgoutput` + a decoding
+consumer vs a custom output plugin. The acceptance for *this* decision is the slot-vs-watermark-scan
+commitment above; the plugin/transport choice is a recalc-implementation refinement. Lean: start with
+`pgoutput` (built-in, no C plugin to maintain; the consumer filters to `trx_line` inserts and projects
+the columns recalc needs), move to a custom plugin only if consumer-side filtering/projection is
+measured to matter. Not decided here.
