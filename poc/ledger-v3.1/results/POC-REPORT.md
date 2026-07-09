@@ -92,7 +92,114 @@ not crush the direct path, precisely because the hot-path cost is depth-independ
 
 This is the load-bearing result: **Path C buys O(1) hot-path cost regardless of how many FIFO/LIFO
 layers a pool has accumulated.** The deferred recalc/close (§13) is where layer-walking cost would
-reappear — by design, off the hot path.
+reappear — by design, off the hot path. The strict-baseline linear curve that makes this contrast
+concrete — plus the raw substrate ceiling and the routed lever ablations — is the next section.
+
+---
+
+## Real baselines + lever ablations — acct-0at4.9 → **PREMISE CONFIRMED against a strict baseline**
+
+Artifact (a) shows Path C's hot path is flat in depth, but that alone is near-tautological — the
+hot path never reads layer rows (FEEDBACK #7). This section supplies the missing baselines: the
+strict alternative's *linear* curve, the raw substrate ceiling, and the two routed lever ablations.
+Together they show (a)'s flat curve is a real architectural win, not an artifact.
+
+Posture: the strict-path curve and substrate ceiling are single-threaded server-side measurements
+(per-call `clock_timestamp` deltas / bulk-insert timing) on the noisy dev workstation; absolute
+values are host-directional, but the **structural shapes** (linear vs flat, the batch curve, the
+pack delta) are load-robust. Full statistical rigor is acct-0at4.10. Scripts:
+`ledger-harness/bench/{pathA-strict-depth-curve,raw-insert-ceiling,batch-pack-ablation}.sh`. The
+advisory-lock and SetLatch-on-enqueue axes (new extension code) are split to acct-0at4.15.
+
+### A. Strict Path A depth curve — the linear baseline (ledger-v3 `ledger_submit_trx`)
+
+The strict full-recompute path (ledger-v3 Path A) hydrates a pool's ENTIRE cost-layer state per
+submission (`ledger-direct/src/hydration.rs:44`, no `LIMIT`) and the FIFO walk is O(depth·log depth)
+(`ledger-core/src/layered.rs:144,153`). Measured directly against the v3 build: FIFO pools seeded to
+a fixed depth (huge per-layer qty so 1-unit depletions never drain the front layer → depth stays
+constant across the window), timing each `ledger_submit_trx` server-side. WAC (a single cumulative
+`pool_state` row, O(1)) is the built-in control — same code path, only the method differs.
+
+| depth | FIFO p50 µs | FIFO mean µs | FIFO tput trx/s |
+|------:|-----------:|------------:|---------------:|
+| 1     | 434   | 462   | 2127 |
+| 10    | 449   | 472   | 2080 |
+| 100   | 501   | 525   | 1872 |
+| 1000  | 1010  | 1084  | 914  |
+| 10000 | 7304  | 7739  | 129  |
+| 50000 | 39219 | 39918 | 25   |
+| **WAC — any depth** | **469** | **485** | **2025** |
+
+**Verdict: linear.** FIFO per-call latency fits `≈ 460 µs + 0.79 µs × depth` (marginal cost ~constant:
+0.62 / 0.73 / 0.79 µs-per-layer across the 1k / 10k / 50k steps); throughput collapses
+inverse-linearly (2127 → 25 trx/s, an 85× drop driven purely by depth). WAC stays pinned at the
+depth-1 fixed cost (~469 µs) at every depth — with no layers to walk the strict path is O(1) too. This
+is the exact contrast artifact (a) needs: **the strict alternative pays the linear layer-walk cost
+that Path C's provisional hot path skips.** Path C's flatness is a genuine architectural win, not a
+measurement tautology. (Absolutes are not comparable to (a): Path A here is uncontended
+single-threaded compute, fsync-excluded; (a) is 16-caller client ack latency, fsync + contention
+included. The load-robust comparison is the SHAPE — linear vs flat.)
+
+### B. Raw `INSERT INTO trx_line` ceiling — substrate vs ledger
+
+Plain batched inserts into `trx_line` (poc_v3_1), no ledger logic, real row shape (PK + trx_id /
+pool_id FK + enum line_type — the same index/FK maintenance Path C pays):
+
+| regime | rows/sec | |
+|--------|---------:|--|
+| bulk (1 commit)   | 85,247 | fsync-amortized substrate bandwidth ceiling |
+| batch 1000 / tx   | 65,928 | |
+| batch 200 / tx    | 42,829 | |
+| single row / tx   | 454    | **serial** fsync floor (one fsync per commit) |
+
+**Reading:** the substrate absorbs ~85k trx_line rows/s when fsync is amortized, but Path C
+direct-single achieves ~1.5–1.9k trx/s (§(b)) — **~2 % of the substrate bandwidth**. Path C's
+throughput is gated by per-tx commit semantics + the ledger logic (hydration, plan_apply, pool_lock,
+provisional insert), NOT by raw insert bandwidth. The serial fsync floor (454 commits/s) is exceeded
+only via group commit under concurrency — which is exactly what the routed committer's batching (C)
+industrialises.
+
+### C. `batch_size_max` — commit-group amortization curve
+
+Routed mode, s2 (200 callers, Zipf(1.5), simple), `synchronous_commit=on`. The committer forms
+~⌈in-flight / batch_size_max⌉ commit groups (fsyncs) per drained wave.
+
+| batch_size_max | throughput trx/s |
+|---------------:|-----------------:|
+| 1          | 1483 |
+| 50         | 3361 |
+| 200        | 4121 |
+| 1000       | 4872 |
+| ∞ (100000) | 5176 |
+
+**Verdict: monotone, diminishing.** Throughput rises 3.5× from batch=1 (no amortization, ~1 fsync/trx)
+to ∞. Gains are steep early (1→50 = +127 %, 50→200 = +23 %); past the caller count the curve keeps
+creeping (200→1000 = +18 %, 1000→∞ = +6 %) because the shmem queue accumulates a backlog deeper than
+the instantaneous 200 in-flight, so larger groups keep amortizing. This grounds the
+⌈N/batch_size_max⌉ commit-group model empirically — with the refinement that the effective N is the
+queue backlog, not just the caller count, so saturation is softer than a hard knee at batch=callers.
+
+### D. `router_pack_disjoint` — batch size vs contention
+
+Routed mode, same s2, batch_size_max=200:
+
+| router_pack_disjoint | throughput trx/s |
+|:--------------------:|-----------------:|
+| on  | 4309 |
+| off | 2168 |
+
+**Verdict: disjoint packing wins 2×.** Packing only pool-disjoint trx into a commit group (on, the
+default) is ~2× faster than packing regardless (off) under Zipf(1.5) overlap: grouping overlapping
+trx serializes their pool locks inside the group, and that intra-group contention costs more than the
+larger batch buys. Validates the default. (The batch=200 / pack=on cell reads 4121 in C and 4309
+here — different restart cycles, ~4 % run-to-run host-load variance; the 2× and 3.5× structural
+deltas dwarf it.)
+
+**NOTE (reload semantics).** Both routed GUCs are `GucContext::Sighup`, but the committer / router
+BGWorkers do **not** adopt a value from `pg_reload_conf()` live (throughput stayed flat across an
+extreme batch=1↔∞ A/B); `ALTER SYSTEM SET` + `docker restart` is required so the BGWorker reads the
+value at init. Operationally: tuning `batch_size_max` / `router_pack_disjoint` needs a committer
+restart, not a reload.
 
 ---
 
