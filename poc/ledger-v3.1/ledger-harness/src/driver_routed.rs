@@ -49,12 +49,15 @@ pub struct RunOptions {
     /// residual throughput is the downstream drain ceiling. 1 = the production
     /// single-push path (unchanged).
     pub batch_size: usize,
-    /// Total offered rate (trx/s) to pace the caller pool at, split evenly
-    /// across callers (staggered absolute-schedule interval pacing). A caller
-    /// that falls behind (enqueue blocked on staging backpressure) sheds debt
-    /// rather than burst-catching-up, so achieved rate degrades gracefully past
-    /// saturation. None/0 = full-blast open-loop (original behavior).
+    /// Total offered rate (trx/s) to drive the caller pool at, on a
+    /// coordinated-omission-free absolute schedule (acct-0at4.8): a caller that
+    /// falls behind books its backlog into the intended-send-time latency
+    /// instead of shedding it, so both ack and committed latency reflect the
+    /// stall. Offered vs achieved (`throughput_trx_per_sec`) is the saturation
+    /// signal. None/0 = full-blast closed-loop.
     pub target_rate: Option<u64>,
+    /// Arrival process for `target_rate` (ignored closed-loop).
+    pub arrival: crate::pacing::ArrivalProcess,
     /// Hard cap on the post-callers observer + drain wait.
     pub drain_deadline: Duration,
     /// Multi-touch overlay (acct-34ce); None leaves the scenario's own setting.
@@ -134,34 +137,30 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
             "[run] routed caller-batch probe (acct-ruex): {batch_size} envelopes/push via ledger_enqueue_trx_batch_c"
         );
     }
-    // Pacing: one push submits batch_size trx, so the per-caller push interval
-    // for a total offered rate R across C callers is C*batch_size/R seconds.
-    // Starts are staggered across one interval so the pool's pushes spread
-    // evenly instead of firing in lockstep bursts.
-    let pace_interval = match opts.target_rate {
-        Some(r) if r > 0 => {
-            let iv = Duration::from_secs_f64(
-                spec.callers as f64 * batch_size as f64 / r as f64,
-            );
-            eprintln!(
-                "[run] paced open-loop: target_rate={r} trx/s ({} callers, {batch_size}/push, interval {:?}/caller)",
-                spec.callers, iv
-            );
-            Some(iv)
-        }
-        _ => None,
-    };
+    // Open-loop pacing (acct-0at4.8): one push emits batch_size trx, so the
+    // per-caller fire interval for a total offered rate R across C callers is
+    // C*batch_size/R seconds — encoded via the Pacer's per_fire=batch_size. The
+    // schedule is absolute and coordinated-omission-free (see pacing.rs).
+    let callers = spec.callers;
+    let target_rate = opts.target_rate;
+    let arrival = opts.arrival;
+    if let Some(r) = target_rate.filter(|r| *r > 0) {
+        eprintln!(
+            "[run] open-loop: target_rate={r} trx/s, arrival={}, {callers} callers, {batch_size}/push",
+            arrival.label()
+        );
+    }
     let mut handles = Vec::with_capacity(spec.callers);
     for caller_id in 0..spec.callers {
         let pool = pool.clone();
         let workload = workload.clone();
         let barrier = barrier.clone();
-        let pace = pace_interval.map(|iv| {
-            (iv, iv.mul_f64(caller_id as f64 / spec.callers as f64))
-        });
         handles.push(tokio::spawn(async move {
-            caller_loop(pool, workload, barrier, caller_id, prefix, deadline, batch_size, pace)
-                .await
+            caller_loop(
+                pool, workload, barrier, caller_id, callers, prefix, deadline, batch_size,
+                target_rate, arrival,
+            )
+            .await
         }));
     }
 
@@ -280,13 +279,16 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         started_at,
         routed_report,
     )
-    .with_multi_touch(multi_touch_report(&spec.workload));
+    .with_multi_touch(multi_touch_report(&spec.workload))
+    .with_open_loop(opts.target_rate, opts.arrival);
 
     report::write_to_path(&report, &output_path).map_err(|e| format!("write report: {e}"))?;
     let routed = report.routed.as_ref().expect("routed block populated");
     println!(
-        "{{\"scenario\":\"{}\",\"mode\":\"routed\",\"depth\":{},\"throughput_trx_per_sec\":{:.1},\
-        \"ack_p99_us\":{},\"committed_p99_us\":{},\"trx_materialized\":{},\"attempts\":{},\
+        "{{\"scenario\":\"{}\",\"mode\":\"routed\",\"depth\":{},\"offered_rate\":{},\
+        \"throughput_trx_per_sec\":{:.1},\
+        \"ack_p99_us\":{},\"committed_p99_us\":{},\"committed_p999_us\":{},\
+        \"slo_p99_us\":{},\"slo_p999_us\":{},\"trx_materialized\":{},\"attempts\":{},\
         \"enqueue_errors\":{},\"submitted_but_unseen\":{},\"observer_poll_errors\":{},\"drains\":{},\"commit_group_avg\":{:.2},\
         \"pool_lock_acq\":{},\"agg_upserts\":{},\"dropped\":{},\"poisoned\":{},\
         \"deadlock_retries\":{},\"takeovers\":{},\
@@ -297,9 +299,15 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         \"committer_samples\":{},\"output\":\"{}\"}}",
         spec.id,
         report.pool_depth.map(|d| d as i64).unwrap_or(-1),
+        opts.target_rate.map(|r| r as i64).unwrap_or(-1),
         report.throughput_trx_per_sec,
         report.ack_latency_us.p99,
         report.committed_latency_us.p99,
+        report.committed_latency_us.p999,
+        // Routed materialization latency IS the end-to-end SLO headline (uniform
+        // field across modes for the ramp runner).
+        report.committed_latency_us.p99,
+        report.committed_latency_us.p999,
         trx_count,
         report.attempts_total,
         report.errors_total,
@@ -329,15 +337,18 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn caller_loop(
     pool: PgPool,
     workload: Arc<crate::workload::Workload>,
     barrier: Arc<Barrier>,
     caller_id: usize,
+    callers: usize,
     run_prefix: i64,
     deadline: Instant,
     batch_size: usize,
-    pace: Option<(Duration, Duration)>, // (interval, initial stagger offset)
+    target_rate: Option<u64>,
+    arrival: crate::pacing::ArrivalProcess,
 ) -> (LatencyHistogram, Vec<SubmissionMark>, u64) {
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
     let mut ack_hist = LatencyHistogram::new();
@@ -349,23 +360,19 @@ async fn caller_loop(
 
     barrier.wait().await;
 
-    // Absolute-schedule pacing: fire at stagger, stagger+iv, stagger+2iv, …
-    // measured from barrier release. When a push overruns its slot (enqueue
-    // blocked on staging backpressure), the schedule resets to now — debt is
-    // shed, not burst-repaid — so past saturation the caller degrades to
-    // closed-loop and the achieved rate honestly falls below the offered rate.
-    let mut next_fire = pace.map(|(_, offset)| tokio::time::Instant::now() + offset);
+    // Coordinated-omission-free open-loop schedule (acct-0at4.8); epoch = barrier
+    // release. per_fire=batch_n because one push emits batch_n trx. None = closed
+    // loop. The intended send-time feeds BOTH ack and committed latency, so a
+    // stall inflates the tail instead of being shed.
+    let mut pacer = crate::pacing::Pacer::new(
+        target_rate, callers, caller_id, batch_n, arrival, tokio::time::Instant::now(),
+    );
 
     while Instant::now() < deadline {
-        if let (Some((interval, _)), Some(nf)) = (pace, next_fire.as_mut()) {
-            let now = tokio::time::Instant::now();
-            if *nf > now {
-                tokio::time::sleep_until(*nf).await;
-            } else {
-                *nf = now;
-            }
-            *nf += interval;
-        }
+        let intended = match pacer.as_mut() {
+            Some(p) => Some(p.wait_next(&mut rng).await),
+            None => None,
+        };
         if batch_n == 1 {
             // Production single-push path (unchanged): one trx, one
             // ledger_enqueue_trx_c, one staging-lock acquisition.
@@ -382,12 +389,16 @@ async fn caller_loop(
                 .bind(&lines_json)
                 .execute(&pool)
                 .await;
-            let ack_ns = started.elapsed().as_nanos() as u64;
+            // Latency clock = intended send-time when paced (coordinated-omission-
+            // free), else the actual issue instant. The same origin is stamped
+            // into submission_log so committed latency is CO-free too.
+            let origin = intended.unwrap_or(started);
+            let ack_ns = Instant::now().saturating_duration_since(origin).as_nanos() as u64;
 
             match res {
                 Ok(_) => {
                     ack_hist.record(ack_ns);
-                    submission_log.push((source_id, started));
+                    submission_log.push((source_id, origin));
                 }
                 Err(_) => errors += 1,
             }
@@ -418,13 +429,14 @@ async fn caller_loop(
                 .bind(&batch_json)
                 .execute(&pool)
                 .await;
-            let ack_ns = started.elapsed().as_nanos() as u64;
+            let origin = intended.unwrap_or(started);
+            let ack_ns = Instant::now().saturating_duration_since(origin).as_nanos() as u64;
 
             match res {
                 Ok(_) => {
                     ack_hist.record(ack_ns);
                     for source_id in &source_ids {
-                        submission_log.push((*source_id, started));
+                        submission_log.push((*source_id, origin));
                     }
                 }
                 Err(_) => errors += 1,

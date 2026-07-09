@@ -20,6 +20,7 @@ mod driver_routed;
 mod driver_staging;
 mod equivalence;
 mod measure;
+mod pacing;
 mod pool_universe;
 mod report;
 mod sampler;
@@ -78,6 +79,7 @@ async fn main() -> std::process::ExitCode {
             max_callers,
             batch_size,
             target_rate,
+            arrival,
             committers,
             drain_batch,
             depth,
@@ -146,6 +148,8 @@ async fn main() -> std::process::ExitCode {
                         output,
                         no_sampler,
                         max_callers,
+                        target_rate,
+                        arrival,
                         multi_touch_pct,
                         touch_dist,
                         pareto_hot_pool_pct,
@@ -164,6 +168,7 @@ async fn main() -> std::process::ExitCode {
                         max_callers,
                         batch_size,
                         target_rate,
+                        arrival,
                         drain_deadline: Duration::from_secs(30),
                         multi_touch_pct,
                         touch_dist,
@@ -181,6 +186,8 @@ async fn main() -> std::process::ExitCode {
                         output,
                         no_sampler,
                         max_callers,
+                        target_rate,
+                        arrival,
                         committers,
                         drain_batch,
                         drain_deadline: Duration::from_secs(30),

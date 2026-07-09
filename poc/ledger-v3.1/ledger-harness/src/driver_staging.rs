@@ -39,6 +39,13 @@ pub struct RunOptions {
     pub output: Option<PathBuf>,
     pub no_sampler: bool,
     pub max_callers: Option<usize>,
+    /// Open-loop offered rate (trx/s) across the caller pool (acct-0at4.8);
+    /// None = closed-loop full-blast. Caller INSERT ack latency AND observer-
+    /// timestamped committed latency are both measured from the INTENDED
+    /// send-time so a drain stall shows up as a growing tail.
+    pub target_rate: Option<u64>,
+    /// Arrival process for `target_rate` (ignored closed-loop).
+    pub arrival: crate::pacing::ArrivalProcess,
     /// Number of committer connections looping `ledger_staging_drain_c` (default
     /// 4 = routed's COMMITTER_COUNT, so the drain parallelism matches).
     pub committers: usize,
@@ -140,13 +147,23 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let deadline = driver_started + opts.duration;
     let workload = Arc::new(spec.workload.clone());
     let barrier = Arc::new(Barrier::new(spec.callers));
+    let callers = spec.callers;
+    let target_rate = opts.target_rate;
+    let arrival = opts.arrival;
+    if let Some(r) = target_rate.filter(|r| *r > 0) {
+        eprintln!(
+            "[run] open-loop: target_rate={r} trx/s, arrival={}, {callers} callers",
+            arrival.label()
+        );
+    }
     let mut handles = Vec::with_capacity(spec.callers);
     for caller_id in 0..spec.callers {
         let pool = pool.clone();
         let workload = workload.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            caller_loop(pool, workload, barrier, caller_id, prefix, deadline).await
+            caller_loop(pool, workload, barrier, caller_id, callers, prefix, deadline, target_rate, arrival)
+                .await
         }));
     }
 
@@ -249,7 +266,8 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         sampler_dump_path,
         started_at,
     )
-    .with_multi_touch(multi_touch_report(&spec.workload));
+    .with_multi_touch(multi_touch_report(&spec.workload))
+    .with_open_loop(opts.target_rate, opts.arrival);
 
     report::write_to_path(&report, &output_path).map_err(|e| format!("write report: {e}"))?;
 
@@ -257,16 +275,23 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let claimed = claimed_total.load(Ordering::Relaxed);
     let claim_group_avg = if drains > 0 { claimed as f64 / drains as f64 } else { 0.0 };
     println!(
-        "{{\"scenario\":\"{}\",\"mode\":\"staging\",\"depth\":{},\"throughput_trx_per_sec\":{:.1},\
-        \"ack_p99_us\":{},\"committed_p99_us\":{},\"trx_materialized\":{},\"attempts\":{},\
+        "{{\"scenario\":\"{}\",\"mode\":\"staging\",\"depth\":{},\"offered_rate\":{},\
+        \"throughput_trx_per_sec\":{:.1},\
+        \"ack_p99_us\":{},\"committed_p99_us\":{},\"committed_p999_us\":{},\
+        \"slo_p99_us\":{},\"slo_p999_us\":{},\"trx_materialized\":{},\"attempts\":{},\
         \"insert_errors\":{},\"submitted_but_unseen\":{},\"observer_poll_errors\":{},\
         \"committers\":{},\"drain_batch\":{},\"drains\":{},\"claimed_total\":{},\
         \"claim_group_avg\":{:.2},\"output\":\"{}\"}}",
         spec.id,
         report.pool_depth.map(|d| d as i64).unwrap_or(-1),
+        opts.target_rate.map(|r| r as i64).unwrap_or(-1),
         report.throughput_trx_per_sec,
         report.ack_latency_us.p99,
         report.committed_latency_us.p99,
+        report.committed_latency_us.p999,
+        // Staging materialization latency IS the end-to-end SLO headline.
+        report.committed_latency_us.p99,
+        report.committed_latency_us.p999,
         trx_count,
         report.attempts_total,
         report.errors_total,
@@ -282,13 +307,17 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn caller_loop(
     pool: PgPool,
     workload: Arc<crate::workload::Workload>,
     barrier: Arc<Barrier>,
     caller_id: usize,
+    callers: usize,
     run_prefix: i64,
     deadline: Instant,
+    target_rate: Option<u64>,
+    arrival: crate::pacing::ArrivalProcess,
 ) -> (LatencyHistogram, Vec<SubmissionMark>, u64) {
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
     let mut ack_hist = LatencyHistogram::new();
@@ -299,7 +328,18 @@ async fn caller_loop(
 
     barrier.wait().await;
 
+    // Coordinated-omission-free open-loop schedule (acct-0at4.8); epoch = barrier
+    // release. The intended send-time is stamped into submission_log so the
+    // observer-timestamped committed latency is CO-free, not just the ack.
+    let mut pacer = crate::pacing::Pacer::new(
+        target_rate, callers, caller_id, 1, arrival, tokio::time::Instant::now(),
+    );
+
     while Instant::now() < deadline {
+        let intended = match pacer.as_mut() {
+            Some(p) => Some(p.wait_next(&mut rng).await),
+            None => None,
+        };
         let lines = workload.next_lines(&mut rng, caller_id);
         let lines_json = build_lines_json(&lines);
         let source_id = caller_base + tick;
@@ -316,12 +356,13 @@ async fn caller_loop(
         .bind(&lines_json)
         .execute(&pool)
         .await;
-        let ack_ns = started.elapsed().as_nanos() as u64;
+        let origin = intended.unwrap_or(started);
+        let ack_ns = Instant::now().saturating_duration_since(origin).as_nanos() as u64;
 
         match res {
             Ok(_) => {
                 ack_hist.record(ack_ns);
-                submission_log.push((source_id, started));
+                submission_log.push((source_id, origin));
             }
             Err(_) => errors += 1,
         }

@@ -39,6 +39,13 @@ pub struct RunOptions {
     pub output: Option<PathBuf>,
     pub no_sampler: bool,
     pub max_callers: Option<usize>,
+    /// Open-loop offered rate (trx/s) across the caller pool (acct-0at4.8);
+    /// None = closed-loop full-blast. In the non-batched modes each caller books
+    /// per-call latency from the INTENDED send-time (coordinated-omission-free);
+    /// batched mode paces the batch cadence but keeps per-call ack latency.
+    pub target_rate: Option<u64>,
+    /// Arrival process for `target_rate` (ignored closed-loop).
+    pub arrival: crate::pacing::ArrivalProcess,
     /// Multi-touch overlay (acct-34ce); None leaves the scenario's own setting.
     pub multi_touch_pct: Option<u8>,
     pub touch_dist: Option<crate::workload::TouchDistribution>,
@@ -106,6 +113,9 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         _ => "SELECT ledger_submit_trx_c($1, $2, $3, $4::jsonb)",
     };
 
+    let callers = spec.callers;
+    let target_rate = opts.target_rate;
+    let arrival = opts.arrival;
     let mut handles = Vec::with_capacity(spec.callers);
     for caller_id in 0..spec.callers {
         let pool = pool.clone();
@@ -113,8 +123,8 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
             caller_loop(
-                pool, workload, barrier, caller_id, prefix, deadline, batched, batch_size,
-                submit_sql,
+                pool, workload, barrier, caller_id, callers, prefix, deadline, batched, batch_size,
+                submit_sql, target_rate, arrival,
             )
             .await
         }));
@@ -171,19 +181,27 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         sampler_dump_path,
         started_at,
     )
-    .with_multi_touch(multi_touch_report(&spec.workload));
+    .with_multi_touch(multi_touch_report(&spec.workload))
+    .with_open_loop(opts.target_rate, opts.arrival);
 
     report::write_to_path(&report, &output_path).map_err(|e| format!("write report: {e}"))?;
     println!(
-        "{{\"scenario\":\"{}\",\"mode\":\"{}\",\"depth\":{},\"throughput_trx_per_sec\":{:.1},\
-        \"p50_us\":{},\"p99_us\":{},\"commits\":{},\"attempts\":{},\"errors\":{},\
+        "{{\"scenario\":\"{}\",\"mode\":\"{}\",\"depth\":{},\"offered_rate\":{},\
+        \"throughput_trx_per_sec\":{:.1},\"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\
+        \"slo_p99_us\":{},\"slo_p999_us\":{},\"commits\":{},\"attempts\":{},\"errors\":{},\
         \"wal_bytes_per_commit\":{:.0},\"output\":\"{}\"}}",
         spec.id,
         mode_label,
         report.pool_depth.map(|d| d as i64).unwrap_or(-1),
+        opts.target_rate.map(|r| r as i64).unwrap_or(-1),
         report.throughput_trx_per_sec,
         report.ack_latency_us.p50,
         report.ack_latency_us.p99,
+        report.ack_latency_us.p999,
+        // Direct is synchronous: ack latency IS end-to-end, so it is the SLO
+        // headline (uniform field name across all modes for the ramp runner).
+        report.committed_latency_us.p99,
+        report.committed_latency_us.p999,
         report.commits_observed,
         report.attempts_total,
         report.errors_total,
@@ -199,11 +217,14 @@ async fn caller_loop(
     workload: Arc<crate::workload::Workload>,
     barrier: Arc<Barrier>,
     caller_id: usize,
+    callers: usize,
     run_prefix: i64,
     deadline: Instant,
     batched: bool,
     batch_size: usize,
     submit_sql: &'static str,
+    target_rate: Option<u64>,
+    arrival: crate::pacing::ArrivalProcess,
 ) -> (LatencyHistogram, u64) {
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
     let mut hist = LatencyHistogram::new();
@@ -213,7 +234,19 @@ async fn caller_loop(
 
     barrier.wait().await;
 
+    // Open-loop schedule (acct-0at4.8), epoch = barrier release. None = closed
+    // loop, in which case latency is measured from the actual issue instant.
+    let mut pacer = crate::pacing::Pacer::new(
+        target_rate, callers, caller_id, 1, arrival, tokio::time::Instant::now(),
+    );
+
     while Instant::now() < deadline {
+        // Intended send-time for this arrival (coordinated-omission-free clock);
+        // None closed-loop. In batched mode this paces the batch boundary only.
+        let intended = match pacer.as_mut() {
+            Some(p) => Some(p.wait_next(&mut rng).await),
+            None => None,
+        };
         if batched {
             // One user-tx wrapping `batch_size` submissions (§5.5). A failed
             // submission — or a failed commit — aborts the tx, so EVERY
@@ -282,8 +315,15 @@ async fn caller_loop(
                 .bind(&lines_json)
                 .execute(&pool)
                 .await;
+            // Coordinated-omission-free latency: measure from the INTENDED
+            // send-time when paced (a late fire books its full backlog), else
+            // from the actual issue instant (closed-loop has no schedule).
+            let ack_at = Instant::now();
+            let latency_ns = ack_at
+                .saturating_duration_since(intended.unwrap_or(started))
+                .as_nanos() as u64;
             match res {
-                Ok(_) => hist.record(started.elapsed().as_nanos() as u64),
+                Ok(_) => hist.record(latency_ns),
                 Err(_) => errors += 1,
             }
         }

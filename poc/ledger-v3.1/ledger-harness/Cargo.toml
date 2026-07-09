@@ -28,3 +28,6 @@ ledger-verify = { path = "../ledger-verify" }
 
 [dev-dependencies]
 tempfile     = "3"
+# test-util enables the paused-clock (`start_paused`) used by the pacing.rs
+# coordinated-omission unit test — deterministic, no wall-clock sleeps.
+tokio        = { workspace = true, features = ["test-util"] }

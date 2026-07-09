@@ -83,15 +83,24 @@ pub enum Cmd {
         /// the other modes.
         #[arg(long, default_value_t = 50)]
         batch_size: usize,
-        /// Pace the routed caller pool to this total offered rate (trx/s),
-        /// split evenly across callers with staggered absolute-schedule
-        /// interval pacing. Callers that fall behind (enqueue blocked on
-        /// staging backpressure) shed debt rather than burst-catch-up, so
-        /// achieved rate degrades gracefully past saturation; offered vs
-        /// achieved are both observable. Unset/0 = full-blast open-loop (the
-        /// original behavior). Routed mode only.
+        /// Drive an OPEN-LOOP arrival process at this total offered rate
+        /// (trx/s), split across callers on a staggered absolute schedule
+        /// (acct-0at4.8). Per-submission latency is measured from the INTENDED
+        /// send-time, so a stall shows up as a growing tail instead of being
+        /// omitted (coordinated-omission-free). The schedule is never rebased
+        /// to now: a caller that falls behind degrades to as-fast-as-possible
+        /// while its measured latency climbs — so offered vs achieved
+        /// (`throughput_trx_per_sec`) is the saturation signal. Works in all
+        /// modes (direct-*, routed, staging). Unset/0 = full-blast closed-loop
+        /// (peak-throughput measurement only).
         #[arg(long)]
         target_rate: Option<u64>,
+        /// Arrival process for `--target-rate` open-loop pacing (ignored
+        /// closed-loop). `poisson` (default) draws memoryless exponential
+        /// inter-arrivals — the realistic model the saturation methodology
+        /// assumes; `uniform` fires on a fixed interval (lower-variance A/B).
+        #[arg(long, value_enum, default_value_t = crate::pacing::ArrivalProcess::Poisson)]
+        arrival: crate::pacing::ArrivalProcess,
         /// Staging mode only (SPIKE-A): number of committer connections that loop
         /// `ledger_staging_drain_c`. Defaults to routed's COMMITTER_COUNT (4) so
         /// the drain-loop parallelism matches the shmem flavor's BGWorker pool.

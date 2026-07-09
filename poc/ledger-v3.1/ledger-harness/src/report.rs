@@ -22,6 +22,11 @@ pub struct LatencyPercentiles {
     pub p50: u64,
     pub p95: u64,
     pub p99: u64,
+    /// The tail the open-loop / coordinated-omission methodology cares about
+    /// (acct-0at4.8): a p99-only headline hides multi-second stalls that a
+    /// closed-loop generator omits entirely. Reported alongside p99 so the
+    /// throughput-at-SLO ramp can gate on either.
+    pub p999: u64,
     pub min: u64,
     pub max: u64,
     pub mean: u64,
@@ -35,6 +40,7 @@ impl LatencyPercentiles {
             p50: hist.value_at_quantile(0.50) / 1_000,
             p95: hist.value_at_quantile(0.95) / 1_000,
             p99: hist.value_at_quantile(0.99) / 1_000,
+            p999: hist.value_at_quantile(0.999) / 1_000,
             min: hist.min() / 1_000,
             max: hist.max() / 1_000,
             mean: (hist.mean() / 1_000.0) as u64,
@@ -144,6 +150,14 @@ pub struct RunReport {
     pub pool_depth: Option<usize>,
     /// Multi-touch overlay (acct-34ce); None for distinct-pool runs.
     pub multi_touch: Option<MultiTouchReport>,
+    /// Total offered arrival rate (trx/s) when driven open-loop (acct-0at4.8);
+    /// None for full-blast closed-loop runs. Paired with `throughput_trx_per_sec`
+    /// (the *achieved* rate) it is the offered-vs-achieved signal the saturation
+    /// ramp plots — the point where achieved falls below offered is saturation.
+    pub offered_rate_trx_per_sec: Option<u64>,
+    /// Arrival process driving the open-loop schedule: "poisson" | "uniform".
+    /// None for closed-loop.
+    pub arrival_process: Option<String>,
     pub duration_secs: f64,
     pub callers: usize,
     pub throughput_trx_per_sec: f64,
@@ -183,6 +197,8 @@ impl RunReport {
             mode: mode.into(),
             pool_depth,
             multi_touch: None,
+            offered_rate_trx_per_sec: None,
+            arrival_process: None,
             duration_secs,
             callers,
             throughput_trx_per_sec: if duration_secs > 0.0 {
@@ -228,6 +244,8 @@ impl RunReport {
             mode: "routed".into(),
             pool_depth,
             multi_touch: None,
+            offered_rate_trx_per_sec: None,
+            arrival_process: None,
             duration_secs,
             callers,
             throughput_trx_per_sec: if duration_secs > 0.0 {
@@ -276,6 +294,8 @@ impl RunReport {
             mode: "staging".into(),
             pool_depth,
             multi_touch: None,
+            offered_rate_trx_per_sec: None,
+            arrival_process: None,
             duration_secs,
             callers,
             throughput_trx_per_sec: if duration_secs > 0.0 {
@@ -301,6 +321,19 @@ impl RunReport {
     /// distinct-pool run.
     pub fn with_multi_touch(mut self, mt: Option<MultiTouchReport>) -> Self {
         self.multi_touch = mt;
+        self
+    }
+
+    /// Record the open-loop arrival parameters (acct-0at4.8) so the result
+    /// self-documents its offered rate and arrival process. Pass `None` offered
+    /// rate for a closed-loop (full-blast) run.
+    pub fn with_open_loop(
+        mut self,
+        offered_rate: Option<u64>,
+        arrival: crate::pacing::ArrivalProcess,
+    ) -> Self {
+        self.offered_rate_trx_per_sec = offered_rate;
+        self.arrival_process = offered_rate.map(|_| arrival.label().to_string());
         self
     }
 }
