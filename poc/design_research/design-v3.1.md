@@ -1462,3 +1462,109 @@ epic acct-0at4.11 closes; acct-0at4.1 and acct-0at4.2 close moot; the remaining 
 the surviving architecture above. The as-built §3–§6 / §14 continue to describe what the PoC shipped and
 measured; propagating the surviving architecture into a v3.2 implementation spec is downstream work, not
 part of this verdict.
+
+## 19. Deferred-recalc risk (ARCH-RECALC-RISK — acct-0at4.12)
+
+> **Status: CHARACTERIZED 2026-07-09.** The hard half of the surviving architecture (§18): the PoC
+> validated the cheap hot path and deferred recalc — the component that sinks real ERPs. Consumes the
+> acct-0at4.7 replay-oracle variance distribution (`bench/replay-oracle-results.md`) and the §16/§17
+> decisions. This section states the risk honestly and frames the mitigation space; it does **not**
+> design the recalc engine — that remains the one genuinely undesigned piece of the surviving stack.
+
+**Re-frame under alt C — what the risk is *not*.** acct-0at4.12 was filed pre-gate, framing recalc as a
+corrective sidecar layered on a second costing plane: dual bookkeeping, and a close-time *adjustment
+storm* that reverses accumulated provisional GL postings. Under the §16 everything-provisional posture
+that framing is void. The hot path posts **no provisional cost amount** — it appends the physical event
+and (optionally) fires the commutative qty aggregate; it never writes a cost leg to the GL. There is one
+costing plane, not a provisional plane trued up by an authoritative one, so there is nothing to *reverse*
+and no dual-bookkeeping drift between two GL representations of the same event. The "storm of corrections"
+disappears with the plane it was correcting. This section therefore drops that framing entirely; the risk
+that survives is structural and is *sharpened*, not softened, by the sole-engine posture.
+
+**The throughput inequality — retained and centralized.** Recalc must process **the same event volume**
+as the hot path while doing strictly *more* work per line. The hot path is a single heap `INSERT` (plus,
+at most, one commutative `UPDATE … WHERE qty − Δ >= 0` of SPIKE-B's shape); recalc, per `trx_line`, must
+walk the pool's FIFO/LIFO layer state, assign an authoritative cost, post the value leg to the GL, and
+materialize the pool's running position. That work is **sequential per pool** — a depletion's cost
+depends on the layer state left by every prior event in the same pool, an intrinsic serial fold that
+cannot be parallelized *within* a pool (only across pools). And it runs **concurrent with a hot path that
+keeps appending**, so recalc chases a moving tail rather than a fixed backlog. If the hot path needed
+batching to keep up, the reconciler — which can skip nothing — is the harder problem, not the easier one;
+its only structural advantages are latency-insensitivity and cross-pool parallelism (§16 removed the
+hot-path per-pool ceiling #5, but that ceiling **reappears inside recalc**, merely relieved of a latency
+SLA). The sole-engine posture *raises* the stakes: recalc is now the only path that assigns cost and
+posts GL, so a backlog gates whenever **any authoritative cost or GL is needed** — not merely when a
+correction lands. There is no partially-correct provisional GL to fall back on; ahead of recalc the value
+plane simply does not exist yet.
+
+**acct-0at4.7 sizes the drift — not a correction, a misstatement-and-move magnitude.** Under §16 the
+mid-period GL is qty-only or standard-valued (the SAP material-ledger shape). The acct-0at4.7 offline
+replay oracle measured how far a *provisional* per-depletion cost sits from authoritative strict
+FIFO/LIFO, per basis and per cost-volatility profile. Two honest readings of that number under alt C:
+
+- If mid-period reporting is **standard-valued**, the oracle's `standard`-basis rows *are* the gap between
+  what the mid-period books show and what recalc will assign — the size of recalc's single authoritative
+  valuation move at period end (not a reversal of a prior cost leg — the first and only one).
+- If mid-period reporting instead surfaces a **perpetual running average** (common in inventory reports
+  even under a periodic true-up), the `running_avg`-basis rows size that gap.
+
+The magnitudes (full table in `bench/replay-oracle-results.md` §2b):
+
+| basis / profile | FIFO drift (rel) | LIFO drift (rel) | note |
+|-----------------|-----------------:|-----------------:|------|
+| running_avg · low ±2%    | 0.70%  | 0.88%  | near-exact when cost is stable |
+| running_avg · med ±40%   | 14.07% | 17.47% | scales monotonically with dispersion |
+| running_avg · high ±90%  | 31.94% | 39.28% | ~⅓–⅖ of unit cost per depletion; p99 ≈ 45–54% |
+| running_avg · **trend**  | rel 18.75%, **mean Δ +57 957** | rel 24.94%, **mean Δ −121 283** | **biased, opposite by method** |
+| standard · **trend**     | **rel 61.72%** | 30.66% | fixed standard cannot track a moving front — worst basis |
+
+The load-bearing finding is the **trend row**: under a monotone cost trend the drift is *directional*, not
+mean-zero — FIFO overstates (running average sits above the cheap consumed front), LIFO understates
+(below the dear newest layer), and a fixed standard is worst of all. A biased error does **not** wash out
+across many depletions; it accumulates into a real period-level misstatement. This is the quantitative
+proof that recalc is load-bearing rather than cosmetic: the longer recalc lags, the larger and more
+one-signed the eventual valuation move, and the more misstated every mid-period report is in the interim.
+The oracle also handed acct-0at4.12 two throughput aggravators (R-1/R-2, ibid. §1): recalc must sort each
+pool by `(pool_id, posted_at, id)` — business chronology, not identity order — and a **backdated receipt
+forces re-costing of already-costed depletions in its pool**, which is precisely why recalc cannot be a
+naïve forward scan over the commit-ordered feed (§17) and why incremental streaming does not bound its
+per-event work.
+
+**The quiet-backlog failure chain and its detection signal.** The failure is silent, which is what makes
+it dangerous. Chain: the recalc consumer falls behind the append rate → its logical-slot
+`confirmed_flush_lsn` lags (pinning WAL, §17 — a disk-exhaustion risk on its own) *and* no authoritative
+cost/GL is being produced for the lagging tail → mid-period drift (sized above) persists longer and, under
+a trend, compounds directionally → period close cannot complete until recalc drains, so **close blocks**
+(the SAP CKMLCP / Inventory Close precedent: multi-hour closes, plant-wide locking) → if close is forced
+regardless, it emits the whole accumulated authoritative valuation at once — large, and one-signed under a
+trend. The detection signal is already unified by §17: because recalc is the sole costing engine, slot-lag
+*is* recalc-backlog — one gauge (`confirmed_flush_lsn` lag) is the single backlog depth. Complementary
+drift bounds: the count/value of un-costed `trx_line` rows behind the cursor, and — since alt C lets
+quantity go negative and flags rather than rejects — the conservation-invariant sweep (acct-0at4.5) over
+flagged negative aggregates, which caps how far the physical signal has run ahead of authoritative cost.
+
+**Mitigation space (framed, not designed).** Three levers, stated as the shape of the solution without
+committing to one:
+
+- **Per-pool parallel recalc.** Pools are independent, so recalc parallelizes across pools; wall-clock is
+  bounded by the slowest single pool's serial fold. Caveat: under Pareto-hot pools the #5 per-pool ceiling
+  reappears here — a handful of hot pools dominate recalc latency exactly as they dominated the hot path,
+  now without a latency SLA to violate but still setting the close-drain floor.
+- **Cadence: continuous vs at-close.** The §16 recalc-period knob. It does *not* change total work (same
+  volume regardless) — it trades **peak backlog depth and drift latency against per-run fixed-cost
+  overhead**. A short period runs recalc constantly: shallow backlog, small drift latency, steady load,
+  more fixed-cost repetition. A long period runs it rarely: deep backlog at close, a big batch move, large
+  drift latency. "Real-time FIFO" is the small-period limit, not a second strict plane.
+- **Backpressure.** When slot-lag exceeds a bound, throttle the hot path. The insert-only alt-C hot path
+  absorbs backpressure gracefully (it is just `INSERT`s), so this is a clean escape valve against unbounded
+  quiet growth — but it reintroduces a hot-path→recalc coupling that alt C otherwise severs, so it is a
+  deliberate tradeoff, not a free one.
+
+**What stays undesigned, and the corrected dependency.** The recalc **engine** — the layer-walk algorithm,
+the cross-pool scheduler, the parallelization and materialization strategy, the chronological re-sort of
+R-1 — is left undesigned here; this section characterizes the risk, it does not resolve it. The issue's
+original "design waits on posture (acct-0at4.13) and feed (acct-0at4.15)" dependency is **stale**: posture
+was decided at §16 (alt C, acct-0at4.11.3) and the feed at §17 (logical-decoding slot, acct-0at4.11.4) —
+both fixed by the gate. acct-0at4.13 is the alt-catalog (deferred alternatives E + F), not a posture
+decision, and acct-0at4.15 does not exist. The only thing genuinely pending design is the recalc engine
+itself, which has no open issue yet and is the natural head of a v3.2 recalc/close workstream.
