@@ -37,3 +37,4 @@ tokio       = { workspace = true }
 sqlx        = { workspace = true }
 rand        = { workspace = true }
 proptest    = { workspace = true }
+ledger-oracle = { path = "../ledger-oracle" }

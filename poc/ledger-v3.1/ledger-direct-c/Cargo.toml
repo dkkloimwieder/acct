@@ -32,3 +32,4 @@ sqlx        = { workspace = true }
 rand        = { workspace = true }
 proptest    = { workspace = true }
 uuid        = { workspace = true, features = ["v4"] }
+ledger-oracle = { path = "../ledger-oracle" }

@@ -26,6 +26,8 @@ use rand::SeedableRng;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+use ledger_oracle::envelope::explains_final_qty;
+
 use crate::cli::MethodMix;
 use crate::driver_common::build_lines_json;
 use crate::pool_universe;
@@ -96,9 +98,18 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
         .await
         .map_err(|e| format!("reset before routed: {e}"))?;
     setup_universe(&pool, opts.method_mix, opts.depth).await?;
+    // Seeded opening on-hand per pool — the envelope check's `start_qty`.
+    let routed_start_qty = snapshot_agg(&pool, "qty").await?;
     apply_routed(&pool, &submissions, Duration::from_secs(30)).await?;
     let routed_qty = snapshot_agg(&pool, "qty").await?;
     let routed_cost = snapshot_agg(&pool, "unit_cost").await?;
+
+    // ── Envelope-mode check on this harness run (design-v3.1 §14.2, acct-0at4.4). ──
+    // Independent of the direct-vs-routed diff: the `ledger-oracle` model computes
+    // the set of legal final on-hand qtys under drop-and-continue over the submitted
+    // multiset, and the routed observed qty must lie in it. Method-agnostic (qty is
+    // order-independent of costing), so it holds across the whole mixed universe.
+    let envelope_unexplained = envelope_check(&submissions, &routed_start_qty, &routed_qty);
 
     // ── Diff ──
     let mut qty_mismatches: Vec<(i64, i64, i64)> = Vec::new();
@@ -122,34 +133,76 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
         .filter(|p| direct_cost.get(p).copied() != routed_cost.get(p).copied())
         .count();
 
+    let ok = qty_mismatches.is_empty() && envelope_unexplained.is_empty();
     println!(
         "{{\"scenario\":\"{}\",\"pools\":{},\"submissions\":{},\"qty_mismatches\":{},\
-        \"unit_cost_divergences\":{},\"verdict\":\"{}\"}}",
+        \"unit_cost_divergences\":{},\"envelope_unexplained\":{},\"verdict\":\"{}\"}}",
         spec.id,
         all_pools.len(),
         submissions.len(),
         qty_mismatches.len(),
         cost_divergences,
-        if qty_mismatches.is_empty() { "PASS" } else { "FAIL" }
+        envelope_unexplained.len(),
+        if ok { "PASS" } else { "FAIL" }
     );
 
-    if qty_mismatches.is_empty() {
+    for (p, d, r) in qty_mismatches.iter().take(20) {
+        eprintln!("  qty mismatch pool {p}: direct qty {d} != routed qty {r}");
+    }
+    for msg in envelope_unexplained.iter().take(20) {
+        eprintln!("  envelope: {msg}");
+    }
+
+    if ok {
         eprintln!(
             "equivalence PASS: aggregate qty identical across flavors on all {} pools; \
-             {} pools show expected provisional unit_cost divergence (§11.1).",
+             {} pools show expected provisional unit_cost divergence (§11.1); \
+             routed final qty envelope-explained on every pool (§14.2).",
             all_pools.len(),
             cost_divergences
         );
         Ok(())
     } else {
-        for (p, d, r) in qty_mismatches.iter().take(20) {
-            eprintln!("  pool {p}: direct qty {d} != routed qty {r}");
-        }
         Err(format!(
-            "equivalence FAIL: {} pool(s) have mismatched aggregate qty",
-            qty_mismatches.len()
+            "equivalence FAIL: {} qty mismatch(es), {} envelope-unexplained pool(s)",
+            qty_mismatches.len(),
+            envelope_unexplained.len()
         ))
     }
+}
+
+/// Envelope check: the routed observed final on-hand qty per pool must be
+/// explainable by SOME serialization of that pool's submitted ops under
+/// drop-and-continue, starting from the seeded opening qty. Returns the list of
+/// pools whose observed qty is NOT reachable (empty = all explained). Sound: the
+/// per-op drop model over-approximates the atomic-submission reachable set, so it
+/// never rejects a legal outcome. On the deep-seeded oversell-free universe every
+/// op applies, so this reduces to confirming `observed == start + Σops` per pool.
+fn envelope_check(
+    submissions: &[Submission],
+    start_qty: &BTreeMap<i64, i64>,
+    observed_qty: &BTreeMap<i64, i64>,
+) -> Vec<String> {
+    let mut pool_ops: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for s in submissions {
+        for l in &s.lines {
+            pool_ops.entry(l.pool_id).or_default().push(l.qty);
+        }
+    }
+    let mut unexplained = Vec::new();
+    for (pool_id, ops) in &pool_ops {
+        let start = start_qty.get(pool_id).copied().unwrap_or(0);
+        let observed = observed_qty.get(pool_id).copied().unwrap_or(0);
+        let verdict = explains_final_qty(start, ops, observed);
+        if !verdict.explained() {
+            unexplained.push(format!(
+                "pool {pool_id}: routed final qty {observed} not reachable \
+                 (start {start}, {} ops)",
+                ops.len()
+            ));
+        }
+    }
+    unexplained
 }
 
 /// Deterministic submission list: one RNG per caller (seeded as the drivers do),
