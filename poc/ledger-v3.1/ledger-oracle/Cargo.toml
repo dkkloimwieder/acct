@@ -25,3 +25,12 @@ num-rational = { workspace = true }
 num-bigint = { workspace = true }
 num-traits = { workspace = true }
 chrono = { workspace = true }
+
+# Property-based differential (acct-0at4.6): drive plan_apply_provisional and the
+# ModelLedger on the same proptest-generated interleavings. Pure Rust — no pgrx,
+# no DB — so it runs fast and can afford deep case counts. Homed here (not in
+# ledger-core) because ledger-oracle already deps ledger-core; the reverse would
+# be a dependency cycle.
+[dev-dependencies]
+proptest = { workspace = true }
+rand = { workspace = true }
