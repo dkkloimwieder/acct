@@ -90,7 +90,11 @@ async fn main() -> std::process::ExitCode {
             touch_dist,
             pareto_hot_pool_pct,
             pareto_hot_traffic_pct,
+            verify,
         } => {
+            // Kept for the optional post-run conservation sweep (--verify); the
+            // driver calls below move args.dsn into their options.
+            let dsn_for_verify = args.dsn.clone();
             // Parse the multi-touch distribution overlay up front so a bad spec
             // fails before any reseed/load work (acct-34ce).
             let touch_dist = match touch_dist {
@@ -189,13 +193,23 @@ async fn main() -> std::process::ExitCode {
                 }
             };
             match result {
-                Ok(()) => std::process::ExitCode::SUCCESS,
+                Ok(()) => {
+                    if verify {
+                        // Bench-harness wiring of the conservation sweep: the
+                        // just-driven end state must satisfy every invariant.
+                        conservation_verify(&dsn_for_verify).await
+                    } else {
+                        std::process::ExitCode::SUCCESS
+                    }
+                }
                 Err(e) => {
                     eprintln!("run failed: {e}");
                     std::process::ExitCode::from(1)
                 }
             }
         }
+
+        Cmd::Verify {} => conservation_verify(&args.dsn).await,
 
         Cmd::Equivalence { scenario, submissions_per_caller, callers, method_mix, depth } => {
             match equivalence::run(equivalence::EquivalenceOptions {
@@ -224,4 +238,47 @@ async fn connect(dsn: &str, max_conns: u32) -> Result<sqlx::PgPool, sqlx::Error>
         .acquire_timeout(Duration::from_secs(10))
         .connect(dsn)
         .await
+}
+
+/// Run the conservation-invariant sweep (acct-0at4.5) against `dsn`, print the
+/// result as one JSON line (violations detailed on stderr), and map it to a
+/// process exit code: SUCCESS when clean, 1 on any violation or query error.
+/// Shared by the `verify` subcommand and `run --verify`.
+async fn conservation_verify(dsn: &str) -> std::process::ExitCode {
+    let pool = match connect(dsn, 4).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("verify connect failed: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    match ledger_verify::run_conservation_sweep(&pool).await {
+        Ok(violations) => {
+            let items: Vec<String> = violations
+                .iter()
+                .map(|v| {
+                    let detail = serde_json::to_string(&v.detail).unwrap_or_else(|_| "\"\"".into());
+                    format!("{{\"check\":\"{}\",\"detail\":{}}}", v.check, detail)
+                })
+                .collect();
+            println!(
+                "{{\"sweep\":\"conservation\",\"violations\":{},\"detail\":[{}],\"verdict\":\"{}\"}}",
+                violations.len(),
+                items.join(","),
+                if violations.is_empty() { "PASS" } else { "FAIL" }
+            );
+            for v in violations.iter().take(20) {
+                eprintln!("  [{}] {}", v.check, v.detail);
+            }
+            if violations.is_empty() {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("verify sweep query error: {e}");
+            std::process::ExitCode::from(1)
+        }
+    }
 }

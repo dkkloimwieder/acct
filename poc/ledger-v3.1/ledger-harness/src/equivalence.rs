@@ -111,6 +111,15 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
     // order-independent of costing), so it holds across the whole mixed universe.
     let envelope_unexplained = envelope_check(&submissions, &routed_start_qty, &routed_qty);
 
+    // ── Conservation sweep on the final routed state (acct-0at4.5). ──
+    // The cross-flavor diff and the envelope check both reason about qty; the
+    // sweep additionally reconciles value_sum and the posting stream against the
+    // aggregate cache, so an equivalence run doubles as a conservation
+    // post-condition on the deep-seeded routed universe.
+    let conservation = ledger_verify::run_conservation_sweep(&pool)
+        .await
+        .map_err(|e| format!("conservation sweep: {e}"))?;
+
     // ── Diff ──
     let mut qty_mismatches: Vec<(i64, i64, i64)> = Vec::new();
     let mut all_pools: Vec<i64> = direct_qty.keys().copied().collect();
@@ -133,16 +142,17 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
         .filter(|p| direct_cost.get(p).copied() != routed_cost.get(p).copied())
         .count();
 
-    let ok = qty_mismatches.is_empty() && envelope_unexplained.is_empty();
+    let ok = qty_mismatches.is_empty() && envelope_unexplained.is_empty() && conservation.is_empty();
     println!(
         "{{\"scenario\":\"{}\",\"pools\":{},\"submissions\":{},\"qty_mismatches\":{},\
-        \"unit_cost_divergences\":{},\"envelope_unexplained\":{},\"verdict\":\"{}\"}}",
+        \"unit_cost_divergences\":{},\"envelope_unexplained\":{},\"conservation_violations\":{},\"verdict\":\"{}\"}}",
         spec.id,
         all_pools.len(),
         submissions.len(),
         qty_mismatches.len(),
         cost_divergences,
         envelope_unexplained.len(),
+        conservation.len(),
         if ok { "PASS" } else { "FAIL" }
     );
 
@@ -151,6 +161,9 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
     }
     for msg in envelope_unexplained.iter().take(20) {
         eprintln!("  envelope: {msg}");
+    }
+    for v in conservation.iter().take(20) {
+        eprintln!("  conservation [{}]: {}", v.check, v.detail);
     }
 
     if ok {
@@ -164,9 +177,10 @@ pub async fn run(opts: EquivalenceOptions) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "equivalence FAIL: {} qty mismatch(es), {} envelope-unexplained pool(s)",
+            "equivalence FAIL: {} qty mismatch(es), {} envelope-unexplained pool(s), {} conservation violation(s)",
             qty_mismatches.len(),
-            envelope_unexplained.len()
+            envelope_unexplained.len(),
+            conservation.len()
         ))
     }
 }

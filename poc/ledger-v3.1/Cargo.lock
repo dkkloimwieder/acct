@@ -1222,6 +1222,7 @@ dependencies = [
  "ledger-core",
  "ledger-oracle",
  "ledger-spi-common",
+ "ledger-verify",
  "pgrx",
  "pgrx-tests",
  "proptest",
@@ -1243,6 +1244,7 @@ dependencies = [
  "humantime",
  "ledger-core",
  "ledger-oracle",
+ "ledger-verify",
  "rand 0.9.4",
  "rand_distr",
  "serde",
@@ -1272,6 +1274,7 @@ dependencies = [
  "ledger-core",
  "ledger-oracle",
  "ledger-spi-common",
+ "ledger-verify",
  "libc",
  "pgrx",
  "pgrx-tests",
@@ -1292,6 +1295,14 @@ dependencies = [
  "chrono",
  "ledger-core",
  "pgrx",
+]
+
+[[package]]
+name = "ledger-verify"
+version = "0.0.1"
+dependencies = [
+ "ledger-core",
+ "sqlx",
 ]
 
 [[package]]

@@ -1,9 +1,11 @@
 //! clap-derived CLI surface for `ledger-harness` (design-v3.1 §10, P4 acct-2ttr.8).
 //!
-//! Three subcommands:
+//! Subcommands:
 //!   seed-pools   pool universe + optional deep-pool layer seeding (§10.5)
 //!   run          drive a scenario in one of three submission modes (§10.0)
 //!   equivalence  cross-flavor §11.1 aggregate-qty diff (direct-c vs routed-c)
+//!   verify       conservation-invariant SQL sweep as a post-run post-condition
+//!                (acct-0at4.5) — also runnable inline via `run --verify`
 //!
 //! Unlike ledger-v3 (which had a `--path direct|routed`), v3.1 selects among
 //! THREE submission modes via `--mode`: direct-per-call, direct-batched, and
@@ -147,6 +149,12 @@ pub enum Cmd {
         /// fraction is set). Unset leaves the scenario's overlap untouched.
         #[arg(long)]
         pareto_hot_traffic_pct: Option<u8>,
+        /// After the bench completes, run the conservation-invariant sweep
+        /// (acct-0at4.5) over the resulting DB state and fail the run (nonzero
+        /// exit) if any invariant is violated. The bench-harness wiring of the
+        /// same sweep exposed standalone as the `verify` subcommand.
+        #[arg(long)]
+        verify: bool,
     },
     /// Drive direct-c and routed-c against an identical input sequence and diff
     /// the resulting pool_state aggregate qty (§11.1). Aggregate qty must match
@@ -170,6 +178,12 @@ pub enum Cmd {
         #[arg(long, default_value_t = 5)]
         depth: usize,
     },
+    /// Run the conservation-invariant SQL sweep (acct-0at4.5) against the DB as
+    /// a post-run / post-test post-condition and report PASS/FAIL as JSON.
+    /// Reconciles pool_state against the trx_line / posting_line stream; a
+    /// nonzero exit means a reconciliation failed. Used by CI test teardown
+    /// (scripts/run-tests.sh) and, inline, by `run --verify`.
+    Verify {},
 }
 
 /// Submission mode (§10.0). Replaces ledger-v3's `--path direct|routed`.

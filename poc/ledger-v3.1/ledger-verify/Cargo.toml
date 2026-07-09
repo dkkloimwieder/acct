@@ -1,0 +1,24 @@
+# ledger-verify — conservation-invariant SQL sweep (acct-0at4.5).
+#
+# A cheap, reusable post-run post-condition over a poc_v3_1 database: reconciles
+# pool_state against the trx_line / posting_line stream and catches whole bug
+# classes (torn aggregate writes, dropped postings, drifted book value) that no
+# single unit test targets (design-v3.1 §3.1 / §14.1 / §15; FEEDBACK-TESTING #2).
+#
+# Consumed three ways: the ledger-direct-c / ledger-routed-c acceptance binaries
+# dev-depend on it (post-test post-condition + injected-imbalance regression);
+# ledger-harness depends on it for the `verify` subcommand and the `run --verify`
+# bench post-pass. It reads the DB via sqlx and re-uses ledger-core's own
+# `banker_div` for the value_sum↔unit_cost well-formedness check — that one check
+# is a consistency assertion, not an independent oracle (the differential oracle
+# is ledger-oracle, acct-0at4.4).
+[package]
+name = "ledger-verify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+sqlx        = { workspace = true }
+ledger-core = { path = "../ledger-core" }

@@ -21,12 +21,25 @@
 #   RESTART_WAIT  seconds to sleep after restart    (default 5)
 #   PROPTEST_CASES  forwarded to property binaries  (default per-binary)
 #   BINARIES      space-separated test names; runs only those.
+#   SWEEP         1 = run the conservation-invariant sweep (acct-0at4.5) via
+#                 `ledger-harness verify` after each green binary, as a
+#                 cross-cutting CI teardown post-condition (default 0 — OPT-IN).
+#                 Off by default because several binaries seed pool_state
+#                 out-of-band (tests/common seed_aggregate) with no backing
+#                 trx_line, which the qty/value reconciliation legitimately
+#                 flags; enable only for suites that build all state through the
+#                 ledger. The always-on wiring is the dedicated
+#                 acceptance_conservation_sweep binaries, discovered like any
+#                 other test.
+#   DSN           Postgres DSN for the SWEEP verify (default poc_v3_1).
 
 set -uo pipefail
 
 CONTAINER="${CONTAINER:-acct-postgres}"
 FAIL_FAST="${FAIL_FAST:-1}"
 RESTART_WAIT="${RESTART_WAIT:-5}"
+SWEEP="${SWEEP:-0}"
+DSN="${DSN:-postgres://acct:acct_dev@localhost:5111/poc_v3_1}"
 PATH_ARG="direct"
 
 while [ $# -gt 0 ]; do
@@ -45,6 +58,19 @@ esac
 
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$WORKSPACE_DIR"
+
+# Build the harness once for the opt-in post-binary conservation sweep. A build
+# failure disables SWEEP rather than sinking the whole run.
+HARNESS=""
+if [ "$SWEEP" = "1" ]; then
+    echo "==> SWEEP=1: building ledger-harness for the post-binary conservation sweep"
+    if (cargo build -p ledger-harness --release 2>&1 | tail -2); then
+        HARNESS="$WORKSPACE_DIR/target/release/ledger-harness"
+    else
+        echo "==> ledger-harness build failed; disabling SWEEP"
+        SWEEP=0
+    fi
+fi
 
 install_crate() {
     local crate="$1" script="$2"
@@ -102,6 +128,19 @@ run_one_path() {
         if (cd "$crate_dir" && cargo test --features pg18,test_hooks --no-default-features \
                 --test "$bin" -- --ignored --test-threads=1 --nocapture); then
             greens+=("$crate/$bin")
+            # Cross-cutting conservation post-condition on whatever state the
+            # binary left (opt-in, acct-0at4.5).
+            if [ "$SWEEP" = "1" ] && [ -n "$HARNESS" ]; then
+                echo "-- conservation sweep after $crate/$bin --"
+                if ! "$HARNESS" verify --dsn "$DSN"; then
+                    echo "==> conservation sweep FAILED after $crate/$bin"
+                    reds+=("$crate/$bin::sweep")
+                    if [ "$FAIL_FAST" = "1" ]; then
+                        echo "==> FAIL_FAST=1; stopping at first red binary."
+                        return 1
+                    fi
+                fi
+            fi
         else
             reds+=("$crate/$bin")
             if [ "$FAIL_FAST" = "1" ]; then
