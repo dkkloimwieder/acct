@@ -203,6 +203,82 @@ restart, not a reload.
 
 ---
 
+## New-code ablations (advisory-lock + SetLatch-on-enqueue) — acct-0at4.15
+
+The two axes acct-0at4.9 split out because they need new extension code + a `.so` rebuild:
+**E** advisory-lock-vs-`pool_lock`-row and **F** SetLatch-on-enqueue-vs-50 ms-tick. Both are levers on
+*displaced* paths, so design-v3.1 §18's ARCH roll-up flags both for "drop" — but they differ in kind,
+and the dispositions differ.
+
+### E. advisory-lock vs `pool_lock` row — **SUBSUMED, not measured**
+
+The advisory-vs-row question only exists on `ledger_submit_trx_c`, the RMW path that takes a shared
+`FOR UPDATE` on a `pool_lock` heap row. The **chosen** direct hot path is SPIKE-B
+`ledger_submit_trx_single_c`, which folds the mutation into one `INSERT … ON CONFLICT DO UPDATE` CTE on
+the aggregate `pool_state` row and holds **no `pool_lock` row at all**. An advisory variant would
+optimize a lock the surviving architecture *deleted*. design-v3.1 §18 says so directly: the
+acct-0at4.3 row — "#7 (`pool_lock` vs advisory) … subsumed by SPIKE-B"; the acct-0at4.9 row — "Drop
+advisory-vs-row (subsumed, SPIKE-B)". Disposition: **not built, not measured; ARCH #7 is moot** (it
+asks about a lock that no longer exists on the chosen path). Recorded here per the acct-0at4.15
+acceptance criteria rather than measured against a displaced baseline.
+
+### F. SetLatch-on-enqueue vs the 50 ms router tick — **~2× committed-latency win, on the retained routed alternative**
+
+**Framing.** F is a lever on the *routed committer* — the shmem-routed path that the gate verdict
+**displaced** (chosen: direct-single + staging) but **retains as a characterized alternative**.
+design-v3.1 §18 lists "SetLatch-vs-tick" among the routed-lever ablations it recommends dropping
+(alongside `router_pack_disjoint`). It is measured here on the same basis this report already measures
+`batch_size_max` (§C) and `router_pack_disjoint` (§D) — both routed levers: to *characterize the
+retained alternative*, not to tune the chosen architecture. Nothing here bears on direct+staging.
+
+**Mechanism.** A new `ledger_routed_c.wake_on_enqueue` bool (default **off** — the pre-F behavior):
+when on, a successful `ledger_enqueue_trx_c` SetLatches the router BGWorker
+(`BackendPidGetProc(router_pid) → SetLatch(procLatch)`, mirroring queue-extension's `signal_waiter`)
+so it re-scans staging at once instead of waiting its 50 ms `wait_latch` tick. It is a pure latency
+hint: the router re-scans on every tick regardless, so the wake can never drop or double-process a
+submission, and a stale/crashed router PID resolves to a NULL PGPROC and is skipped. Functional safety
+is pinned by `acceptance_routed_wake_on_enqueue.rs` (wake-on round-trips to exactly one correct trx).
+
+**Method.** Open-loop paced (`--target-rate`, absolute-schedule arrivals, `--batch-size 1`) so
+`committed_latency` = enqueue→materialize is charged from *intended* send-time (no coordinated
+omission, acct-0at4.8). `ALTER SYSTEM SET` + `docker restart` per arm — reaches both the enqueue-side
+`wake_on_enqueue` and the router-side `batch_window_us` (§D reload caveat), and gives each arm a clean
+committer slate. all-wac (O(1) commit, so latency is pipeline/tick not cost compute), scenario s2, 64
+callers, 20 s, `synchronous_commit=on`. Noisy workstation (load ~2–3): the wake-on/off **ratio**,
+measured back-to-back, is the load-robust finding. Script: `ledger-harness/bench/wake-ablation.sh`.
+
+Committed-latency (ms), by `batch_window_us` × `wake`, at offered 50 / 200 / 800 trx/s:
+
+| window | wake | p50 (50/200/800) | p99 (50/200/800) |
+|:------:|:----:|:----------------:|:----------------:|
+| 0   | off | 64.1 / 63.4 / 62.2 | 107.5 / 106.3 / 105.8 |
+| 0   | on  | 30.3 / 26.2 / **3374** | 62.0 / 59.1 / **4136** |
+| 500 | off | 64.3 / 64.2 / 62.8 | 109.6 / 105.7 / 105.8 |
+| 500 | on  | **34.4 / 32.7 / 26.1** | 92.5 / 67.2 / 54.8 |
+
+**Verdict — a real but PARTIAL win.**
+
+- The 50 ms tick imposes a **~62–64 ms committed-p50 materialization floor** (wake=off), flat across
+  window and rate — this is the FEEDBACK #13 floor made concrete.
+- **wake-on roughly halves it to ~26–34 ms (~1.9–2.4×)** across both windows and every rate the
+  pipeline can sustain. Robust: it holds at each rate, measured back-to-back on the noisy host.
+- The residual **~26–34 ms is the router→committer tick**, not the enqueue→router tick. F wakes only
+  the **router** (from enqueue); the committer still polls its own ~50 ms latch, so half the chain is
+  untouched. Waking the committer on commit-group publish is the follow-up that would reach the
+  sub-ms floor — filed as **acct-0at4.16**.
+- **Throughput interaction.** `window=0` (no coalescing) saturates at 800 trx/s under wake-on (each
+  submission → its own commit_group → its own fsync; p50 blows to 3.4 s). `window=500`'s coalescing
+  raises the commit ceiling so 800 trx/s stays clean *and* keeps the latency win — the shipped
+  `window=500` + wake is the sweet spot (latency win, no throughput cliff).
+- p999 tail spikes (11–22 s) at the sparse (`on`/w0/r50) and saturated (`on`/*/r800) cells are
+  single-submission tails — restart warmup and fsync backlog on the noisy host; the p50/p99 halving is
+  the structural result, not the tail.
+- Reload caveat (from §D) resolves favorably for the wake knob itself: `wake_on_enqueue` is read by the
+  *enqueue backend* (a regular backend), so it flips live via `pg_reload_conf`; only the router-side
+  `batch_window_us` needs a restart.
+
+---
+
 ## (b) Direct ↔ routed crossover map — §11.4
 
 Full matrix, all three modes. `cg` = routed commit_group_size_avg; `locks` = `pool_lock`

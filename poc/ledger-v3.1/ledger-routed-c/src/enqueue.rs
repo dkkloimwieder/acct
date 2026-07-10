@@ -191,6 +191,12 @@ fn ledger_enqueue_trx_c(
     };
 
     unsafe { pg_sys::ConditionVariableCancelSleep() };
+
+    // Wake the router so it materializes this submission without waiting for its
+    // 50 ms steady tick. No-op when ledger_routed_c.wake_on_enqueue is off (the
+    // default); the slot is already published (Release CAS in push_entry_into_queue),
+    // so the wake happens-after the publish in program order.
+    crate::router::wake_router();
     request_seq as i64
 }
 
@@ -409,6 +415,11 @@ fn ledger_enqueue_trx_batch_c(trxs: pgrx::JsonB) -> i64 {
     }
     unsafe { pg_sys::ConditionVariableCancelSleep() };
 
+    // One wake for the whole batch (all published slots are already Release-CAS'd);
+    // no-op when ledger_routed_c.wake_on_enqueue is off (the default).
+    if pushed > 0 {
+        crate::router::wake_router();
+    }
     pushed as i64
 }
 

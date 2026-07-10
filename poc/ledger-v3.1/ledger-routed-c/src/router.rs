@@ -144,6 +144,37 @@ pub extern "C-unwind" fn ledger_routed_c_router_main(_arg: pg_sys::Datum) {
     }
 }
 
+/// Wake the router BGWorker immediately after an enqueue publishes a staging
+/// slot, so materialization latency is bounded by wake-signal delivery rather
+/// than the 50 ms steady-tick cadence (design-v3.1 §6.3, FEEDBACK #13). Gated by
+/// `ledger_routed_c.wake_on_enqueue`; when off (default) the router relies on its
+/// 50 ms `wait_latch` tick alone.
+///
+/// Purely a latency hint. The router re-scans staging on every tick regardless,
+/// so a missed, late, or racing wake only falls back to the tick — it can never
+/// drop or double-process a submission. `router_pid` holds the router's
+/// `MyProcPid`, Release-stored at `router_main` startup; a stale/crashed PID
+/// resolves to a NULL PGPROC and the wake is skipped (self-healing). Called from
+/// the enqueue backend with no LWLock held. Mirrors queue-extension's
+/// `signal_waiter`.
+pub(crate) fn wake_router() {
+    if !crate::wake_on_enqueue_now() {
+        return;
+    }
+    let pid = COMMITTER_QUEUE.share().router_pid.load(Acquire);
+    if pid <= 0 {
+        return;
+    }
+    // SAFETY: BackendPidGetProc does its own ProcArray locking and returns NULL
+    // for a dead/exited PID; we SetLatch only a non-NULL PGPROC's procLatch.
+    unsafe {
+        let proc_ = pg_sys::BackendPidGetProc(pid);
+        if !proc_.is_null() {
+            pg_sys::SetLatch(&mut (*proc_).procLatch);
+        }
+    }
+}
+
 // ── Per-tick pipeline ───────────────────────────────────────────────
 
 /// One scan-and-pack iteration. Returns the number of commit_groups

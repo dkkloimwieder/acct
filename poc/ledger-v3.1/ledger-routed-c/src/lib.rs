@@ -57,6 +57,7 @@ static CALLER_TX_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(30_000);
 static COMMITTER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
 static EJECT_COOLDOWN_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static ROUTER_PACK_DISJOINT: GucSetting<bool> = GucSetting::<bool>::new(true);
+static WAKE_ON_ENQUEUE: GucSetting<bool> = GucSetting::<bool>::new(false);
 // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
 static AFFINITY_SCHEME: GucSetting<i32> = GucSetting::<i32>::new(0);
 static AFFINITY_STEAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
@@ -97,6 +98,9 @@ pub(crate) fn eject_cooldown_ms_now() -> i32 {
 }
 pub(crate) fn router_pack_disjoint_now() -> bool {
     ROUTER_PACK_DISJOINT.get()
+}
+pub(crate) fn wake_on_enqueue_now() -> bool {
+    WAKE_ON_ENQUEUE.get()
 }
 // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
 pub(crate) fn affinity_scheme_now() -> i32 {
@@ -252,6 +256,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Pack disjoint pool-components into one commit_group",
         c"Production default: on. When on, the router greedily bin-packs disjoint affinity components (no shared pool_id) into a single commit_group up to batch_size_max, amortizing per-group commit/fsync on spread/Pareto workloads where same-pool coalescing alone leaves commit_groups small. Safe by construction: disjoint pools share no row lock, so one committer takes them sequentially without cross-pool FOR UPDATE contention; packing only co-locates DISJOINT pools, so each pool still takes one pool_lock + one aggregate UPSERT — no new same-pool contention. acct-p1al measured it win-or-neutral across spread (2x), deep-zipf (+170%), mixed (neutral) and single-hot-pool (inert). Off preserves one-commit_group-per-component.",
         &ROUTER_PACK_DISJOINT,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
+        c"ledger_routed_c.wake_on_enqueue",
+        c"Wake the router immediately on enqueue (vs the 50 ms steady tick)",
+        c"Default off: the router's 50 ms wait_latch tick alone governs when a staged submission is picked up (the pre-wake behavior). When on, a successful ledger_enqueue_trx_c / ledger_enqueue_trx_batch_c SetLatches the router BGWorker so it re-scans staging at once, collapsing the tick-cadence materialization floor toward wake-signal latency (design-v3.1 §6.3, FEEDBACK #13). Purely a latency hint — the router re-scans on every tick regardless, so the wake can never drop or double-process a submission, and a stale/crashed router PID simply skips the wake. Note: batch_window_us>0 still floors materialization at the coalesce window; measure the pure wake floor at batch_window_us=0. Read by the enqueue backend (a regular backend), so a Sighup change reaches it live via pg_reload_conf; the router BGWorker needs no live read of this GUC.",
+        &WAKE_ON_ENQUEUE,
         GucContext::Sighup,
         GucFlags::empty(),
     );
