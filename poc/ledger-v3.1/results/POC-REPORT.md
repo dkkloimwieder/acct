@@ -278,8 +278,8 @@ Committed-latency (ms), by `batch_window_us` × `wake`, at offered 50 / 200 / 80
   pipeline can sustain. Robust: it holds at each rate, measured back-to-back on the noisy host.
 - The residual **~26–34 ms is the router→committer tick**, not the enqueue→router tick. F wakes only
   the **router** (from enqueue); the committer still polls its own ~50 ms latch, so half the chain is
-  untouched. Waking the committer on commit-group publish is the follow-up that would reach the
-  sub-ms floor — filed as **acct-0at4.16**.
+  untouched. Waking the committer on commit-group publish closes it — done in **§F.2** below
+  (**acct-0at4.16**).
 - **Throughput interaction.** `window=0` (no coalescing) saturates at 800 trx/s under wake-on (each
   submission → its own commit_group → its own fsync; p50 blows to 3.4 s). `window=500`'s coalescing
   raises the commit ceiling so 800 trx/s stays clean *and* keeps the latency win — the shipped
@@ -290,6 +290,50 @@ Committed-latency (ms), by `batch_window_us` × `wake`, at offered 50 / 200 / 80
 - Reload caveat (from §D) resolves favorably for the wake knob itself: `wake_on_enqueue` is read by the
   *enqueue backend* (a regular backend), so it flips live via `pg_reload_conf`; only the router-side
   `batch_window_us` needs a restart.
+
+### F.2. Wake the committer on publish — closing the residual tick (`acct-0at4.16`)
+
+**Mechanism.** §F's `wake_on_enqueue` wakes only the *router* (the enqueue→router leg); the committer
+still polls its own 50 ms latch, so the *router→committer* leg stays on the tick — the residual
+~26–34 ms above. A second bool `ledger_routed_c.wake_committer_on_publish` (default **off**) closes it:
+when the router CAS-publishes a commit_group (`valid` 0→1 Release in `emit_commit_group`), it SetLatches
+every live committer (`BackendPidGetProc(pid) → SetLatch(procLatch)` over the committer identity
+registry `identity_slots[].pid`) so the group is claimed without waiting a committer tick. The router
+can't know which of the N committers will win the CAS, so it wakes **all**; losers find nothing
+claimable and re-park. Same pure-hint safety as F: committers re-scan every tick regardless, a
+missed/late/racing wake only falls back to the tick, a stale committer PID resolves to NULL and is
+skipped. Read in-process by the router (which `ProcessConfigFile`s on SIGHUP), so it is set per-arm by
+restart alongside `batch_window_us`. Functional safety pinned by `acceptance_routed_wake_committer.rs`
+(committer-wake round-trips to exactly one correct trx, exercising the wake-all-losers path).
+
+**Cumulative collapse** — committed p50 (ms), off → +enqueue-wake (F) → +committer-wake (both), same
+s2 / 64-caller / 15 s / all-wac / `synchronous_commit=on` basis as §F, back-to-back on the noisy host,
+at offered 50 / 200 trx/s:
+
+| window | off | +enqueue (F) | +committer (both) | off/both |
+|:------:|:---:|:------------:|:-----------------:|:--------:|
+| 0 (pure floor) | 62.6 / 61.5 | 30.6 / 28.0 | **10.5 / 10.2** | **6.0×** |
+| 500 (shipped)  | 63.8 / 62.4 | 36.3 / 34.0 | **19.6 / 17.7** | 3.2–3.5× |
+
+`drop = 0` in all 12 cells.
+
+**Verdict — the residual tick closes; the two wakes compose to ~6×.**
+
+- At **window=0** (pure wake floor) the committer wake takes §F's residual ~28–31 ms down to
+  **~10 ms** — the router→committer tick is gone, and committed p50 now sits within ~8× of the ack p50
+  (~1.3 ms), i.e. essentially the pipeline+fsync floor. Full chain **62 → 10 ms (6.0×)**, split roughly
+  half-and-half: the enqueue wake closes leg 1 (62→28), the committer wake closes leg 2 (28→10).
+- At **window=500** (shipped coalesce) the floor is the *window*, not a tick: the committer wake still
+  roughly halves §F's residual (34–36 → 18–20 ms), but ~18 ms is the `batch_window_us` defer, not the
+  50 ms latch — consistent with §F's note that at the shipped window a lone submission still waits the
+  coalesce gate. The sweet spot is unchanged: window=500 + both keeps the latency win without the
+  window=0 per-submission-fsync throughput cliff.
+- `drop = 0` across all cells; p999 tail spikes (8–12 s) at the sparse `enqueue`/r200 cells are
+  single-submission restart-warmup tails on the noisy host (as §F), not the structural p50/p99.
+- **Scope.** This closes the last 50 ms tick in the *routed* materialization chain — a lever on the
+  characterized-but-superseded alternative (design-v3.1 §18), **not** the chosen direct+staging path. It
+  completes §F's characterization: with both wakes, the routed committer's enqueue→materialize floor is
+  the pipeline+fsync cost, not the BGWorker tick.
 
 ---
 

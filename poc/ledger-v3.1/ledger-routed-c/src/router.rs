@@ -175,6 +175,48 @@ pub(crate) fn wake_router() {
     }
 }
 
+/// Wake the committer BGWorkers immediately after the router publishes a
+/// `CommitterQueueEntry` (the valid 0→1 Release in `emit_commit_group`), so
+/// materialization latency is bounded by wake-signal delivery rather than the
+/// committer's own 50 ms steady-tick cadence (acct-0at4.16). Gated by
+/// `ledger_routed_c.wake_committer_on_publish`; when off (default) each committer
+/// relies on its 50 ms `wait_latch` tick alone. Composes with `wake_router`
+/// (`wake_on_enqueue`): F wakes the enqueue→router leg, this wakes the
+/// router→committer leg, so both on collapses the whole enqueue→materialize
+/// chain toward the pipeline+fsync floor (design-v3.1 §18 residual).
+///
+/// Purely a latency hint — same safety as `wake_router`. Every committer
+/// re-scans the `CommitterQueue` on each tick regardless, so a missed, late, or
+/// racing wake only falls back to the tick and can never drop or double-process a
+/// group. The router cannot know which of the N committers will CAS-claim the
+/// just-published entry, so it SetLatches *every* live committer; losers find no
+/// claimable entry and return to sleep. PIDs come from the committer identity
+/// registry (`identity_slots[].pid`, stored at `claim_committer_identity`); a
+/// zero (free) or stale/crashed PID resolves to a NULL PGPROC and is skipped
+/// (self-healing). Called from the router with no LWLock held — after the
+/// `COMMITTER_QUEUE.exclusive()` guard in `emit_commit_group` has dropped.
+pub(crate) fn wake_committers() {
+    if !crate::wake_committer_on_publish_now() {
+        return;
+    }
+    let queue = COMMITTER_QUEUE.share();
+    for slot in queue.identity_slots.iter() {
+        let pid = slot.pid.load(Acquire);
+        if pid <= 0 {
+            continue;
+        }
+        // SAFETY: BackendPidGetProc does its own ProcArray locking and returns
+        // NULL for a dead/exited PID; we SetLatch only a non-NULL PGPROC's
+        // procLatch. Identical pattern to wake_router.
+        unsafe {
+            let proc_ = pg_sys::BackendPidGetProc(pid);
+            if !proc_.is_null() {
+                pg_sys::SetLatch(&mut (*proc_).procLatch);
+            }
+        }
+    }
+}
+
 // ── Per-tick pipeline ───────────────────────────────────────────────
 
 /// One scan-and-pack iteration. Returns the number of commit_groups
@@ -413,6 +455,11 @@ fn emit_commit_group(chunk: Vec<Candidate>, committer_capacity: u32) -> EmitOutc
             }
         }
     }
+
+    // The CommitterQueueEntry is published (valid==1) and the exclusive guard has
+    // dropped; nudge the committers so materialization isn't floored at their
+    // 50 ms tick (no-op when wake_committer_on_publish is off). acct-0at4.16.
+    wake_committers();
 
     record_commit_group_stats(submission_count);
     EmitOutcome::Emitted

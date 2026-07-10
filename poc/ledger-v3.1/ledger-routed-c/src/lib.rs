@@ -58,6 +58,7 @@ static COMMITTER_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
 static EJECT_COOLDOWN_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 static ROUTER_PACK_DISJOINT: GucSetting<bool> = GucSetting::<bool>::new(true);
 static WAKE_ON_ENQUEUE: GucSetting<bool> = GucSetting::<bool>::new(false);
+static WAKE_COMMITTER_ON_PUBLISH: GucSetting<bool> = GucSetting::<bool>::new(false);
 // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
 static AFFINITY_SCHEME: GucSetting<i32> = GucSetting::<i32>::new(0);
 static AFFINITY_STEAL_MS: GucSetting<i32> = GucSetting::<i32>::new(5);
@@ -101,6 +102,9 @@ pub(crate) fn router_pack_disjoint_now() -> bool {
 }
 pub(crate) fn wake_on_enqueue_now() -> bool {
     WAKE_ON_ENQUEUE.get()
+}
+pub(crate) fn wake_committer_on_publish_now() -> bool {
+    WAKE_COMMITTER_ON_PUBLISH.get()
 }
 // [acct-0usf affinity — EXPERIMENTAL/REMOVABLE]
 pub(crate) fn affinity_scheme_now() -> i32 {
@@ -264,6 +268,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Wake the router immediately on enqueue (vs the 50 ms steady tick)",
         c"Default off: the router's 50 ms wait_latch tick alone governs when a staged submission is picked up (the pre-wake behavior). When on, a successful ledger_enqueue_trx_c / ledger_enqueue_trx_batch_c SetLatches the router BGWorker so it re-scans staging at once, collapsing the tick-cadence materialization floor toward wake-signal latency (design-v3.1 §6.3, FEEDBACK #13). Purely a latency hint — the router re-scans on every tick regardless, so the wake can never drop or double-process a submission, and a stale/crashed router PID simply skips the wake. Note: batch_window_us>0 still floors materialization at the coalesce window; measure the pure wake floor at batch_window_us=0. Read by the enqueue backend (a regular backend), so a Sighup change reaches it live via pg_reload_conf; the router BGWorker needs no live read of this GUC.",
         &WAKE_ON_ENQUEUE,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_bool_guc(
+        c"ledger_routed_c.wake_committer_on_publish",
+        c"Wake the committers immediately when the router publishes a commit_group (vs their 50 ms steady tick)",
+        c"Default off: each committer's 50 ms wait_latch tick alone governs when a published CommitterQueueEntry is picked up. When on, the router SetLatches every live committer right after it CAS-publishes a commit_group (valid 0→1 Release in emit_commit_group), collapsing the router→committer leg of the materialization chain toward wake-signal latency. Composes with wake_on_enqueue (which closes the enqueue→router leg): both on collapses the whole enqueue→materialize path toward the pipeline+fsync floor (design-v3.1 §18 residual; acct-0at4.16). Purely a latency hint — every committer re-scans the CommitterQueue on each tick regardless, so a missed/late/racing wake only falls back to the tick and can never drop or double-process a group. The router does not know which of the N committers will CAS-claim the entry, so it wakes all live committers (PIDs from the committer identity registry); losers find nothing claimable and return to sleep, and a stale/crashed committer PID is skipped. Note: batch_window_us>0 still floors materialization at the coalesce window; measure the pure wake floor at batch_window_us=0. Read in-process by the router BGWorker, which ProcessConfigFile()s on SIGHUP, so a Sighup change reaches it live via pg_reload_conf.",
+        &WAKE_COMMITTER_ON_PUBLISH,
         GucContext::Sighup,
         GucFlags::empty(),
     );
