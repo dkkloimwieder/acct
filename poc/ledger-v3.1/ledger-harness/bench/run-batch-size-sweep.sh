@@ -53,10 +53,10 @@ depth_for() { case "$1" in s5|s6) echo 10 ;; s7|s8|s9) echo 1000 ;; s11|s15|s19)
 asys() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "ALTER SYSTEM SET ledger_routed_c.$1 = $2" >/dev/null; }
 reload() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT pg_reload_conf()" >/dev/null; }
 restore_defaults() {
-  asys batch_size_max 50 2>/dev/null || true
+  asys batch_size_max 200 2>/dev/null || true
   asys batch_window_us 500 2>/dev/null || true
   asys committer_count 4 2>/dev/null || true
-  asys router_pack_disjoint off 2>/dev/null || true
+  asys router_pack_disjoint on 2>/dev/null || true
   asys affinity_scheme 0 2>/dev/null || true
   asys affinity_steal_ms 5 2>/dev/null || true
   reload 2>/dev/null || true

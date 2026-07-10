@@ -36,7 +36,7 @@ reload()  { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "SELECT pg_re
 psql_v3() { docker exec "$CONTAINER" psql -U acct -d poc_v3_1 -tAc "$1" 2>/dev/null | tr -d '[:space:]'; }
 restore() {
   asys committer_count 4 2>/dev/null || true
-  asys batch_size_max 50 2>/dev/null || true
+  asys batch_size_max 200 2>/dev/null || true
   asys batch_window_us 500 2>/dev/null || true
   asys affinity_scheme 0 2>/dev/null || true
   reload 2>/dev/null || true
