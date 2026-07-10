@@ -53,6 +53,9 @@ pub struct RunOptions {
     /// scenario's overlap to Pareto. Both unset leaves the native overlap.
     pub pareto_hot_pool_pct: Option<u8>,
     pub pareto_hot_traffic_pct: Option<u8>,
+    /// Per-caller workload RNG seed (acct-0at4.10.4): each caller seeds from
+    /// `seed + caller_id`. The CLI default reproduces the historical stream.
+    pub seed: u64,
 }
 
 const POSTED_AT: &str = "2026-05-25T12:00:00+00:00";
@@ -116,6 +119,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let callers = spec.callers;
     let target_rate = opts.target_rate;
     let arrival = opts.arrival;
+    let seed = opts.seed;
     let mut handles = Vec::with_capacity(spec.callers);
     for caller_id in 0..spec.callers {
         let pool = pool.clone();
@@ -124,7 +128,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         handles.push(tokio::spawn(async move {
             caller_loop(
                 pool, workload, barrier, caller_id, callers, prefix, deadline, batched, batch_size,
-                submit_sql, target_rate, arrival,
+                submit_sql, target_rate, arrival, seed,
             )
             .await
         }));
@@ -182,7 +186,8 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         started_at,
     )
     .with_multi_touch(multi_touch_report(&spec.workload))
-    .with_open_loop(opts.target_rate, opts.arrival);
+    .with_open_loop(opts.target_rate, opts.arrival)
+    .with_seed(opts.seed);
 
     report::write_to_path(&report, &output_path).map_err(|e| format!("write report: {e}"))?;
     println!(
@@ -225,8 +230,9 @@ async fn caller_loop(
     submit_sql: &'static str,
     target_rate: Option<u64>,
     arrival: crate::pacing::ArrivalProcess,
+    seed: u64,
 ) -> (LatencyHistogram, u64) {
-    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(caller_id as u64));
     let mut hist = LatencyHistogram::new();
     let mut errors: u64 = 0;
     let caller_base: i64 = run_prefix + (caller_id as i64) * 1_000_000;

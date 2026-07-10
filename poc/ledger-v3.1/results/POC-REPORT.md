@@ -31,7 +31,7 @@ The PoC set out to validate two premises and one invariant:
 |---|---|
 | DB | `poc_v3_1` on `localhost:5111`, container `acct-postgres`, Postgres 18 (`io_uring`) |
 | Extensions | `ledger_direct_c` (`ledger_submit_trx_c`), `ledger_routed_c` (`ledger_enqueue_trx_c` + router + 4-committer pool), both preloaded |
-| 1000-caller path | pgbouncer transaction pool, host `6432` → `acct-postgres:5432`, `pool_mode=transaction`, `default_pool_size=64` (`acct-8cn2`); the §(b) crossover is confirmed stable across `default_pool_size ∈ {25,50,100,200}` — see the pool-size confound check closing §(b) (`acct-0at4.10.1`) |
+| 1000-caller path | pgbouncer transaction pool, host `6432` → `acct-postgres:5432`, `pool_mode=transaction`, `default_pool_size=64` (`acct-8cn2`); the §(b) crossover is confirmed stable across `default_pool_size ∈ {25,50,100,200}` — see the pool-size confound check closing §(b) (`acct-0at4.10.1`), and confirmed at 5-rep median±CI + Mann-Whitney rigor for s5/s7/s2/s4 in the statistics-discipline subsection (`acct-0at4.10.4`) |
 | Harness | `target/release/ledger-harness` (sqlx + tokio, multi-session) |
 | Submission modes (§10.0) | `direct-per-call` (one user-tx per submit), `direct-batched` (50 submits per user-tx), `routed` (enqueue → committer pool) |
 | Crossover scale | `SEED_COUNT=10000` pools, `30s`/run, full S1–S9 × 3 modes (S9 = WO-completion multi-touch mix, `acct-34ce`) |
@@ -430,7 +430,58 @@ Two caveats, neither of which touches the verdict:
   it drains the finite seeded aggregates (single hot pool for s5; Zipf-hot pools for s8) faster than
   direct and trips `P0006` on the drained pools; `direct` at 250–400 trx/s does not deplete as fast.
   `dropped_submissions_total` was 0 in every cell. A deeper seed removes them. Full seeded-rep
-  statistics (≥5 reps, CIs, Mann-Whitney) are `acct-0at4.10.4`.
+  statistics (≥5 reps, CIs, Mann-Whitney) are the **statistics-discipline** subsection below
+  (`acct-0at4.10.4`).
+
+### Statistics discipline — median ± CI + Mann-Whitney (`acct-0at4.10.4`)
+
+The A sweep and the §(b)/§(c) tables each reported **one** throughput number per cell. On this noisy
+daily-driver host (`project_pocv3_bench_host_is_noisy_workstation`) a lone number can't separate a
+real gap from sampling noise. This pass replaces each headline crossover cell with a **distribution**:
+5 independent reps at distinct `--seed` values, run in **shuffled** `mode×rep` order under the
+quiet-host gate, reduced to **median ± percentile-bootstrap 95% CI** with a **Mann-Whitney U** test of
+routed-vs-`direct-per-call`. Tooling (all committed): the harness `--seed` flag (per-caller RNG
+`seed+caller_id`, so reps are genuinely independent streams rather than replays of one fixed
+`0xDEADBEEF` sequence), `bench/stats.py` (hand-rolled bootstrap / MWU / rolling-CoV steady-state — no
+numpy), `bench/crossover-stats.sh` (per-scenario seed → shuffled quiet-gated reps → stats). Raw reps:
+`results/crossover-stats-merged.csv`; report: `…-merged.md`.
+
+| Scn | mode | n | median trx/s | bootstrap 95% CI | routed/direct | MWU p | CIs disjoint |
+|-----|------|--:|-------------:|-----------------:|--------------:|------:|:----------:|
+| s5 | direct-per-call | 5 | 404.3 | [156.9, 406.0] | — | — | — |
+| s5 | routed | 5 | **8962.2** | [8642.2, 9295.8] | **22.2×** | 0.0122 | yes |
+| s7 | direct-per-call | 5 | 1173.9 | [1157.9, 1192.5] | — | — | — |
+| s7 | routed | 5 | **8195.3** | [4512.0, 8587.1] | **6.98×** | 0.0122 | yes |
+| s2 | direct-per-call | 5 | 731.4 | [723.8, 739.0] | — | — | — |
+| s2 | routed | 5 | **9143.7** | [8873.2, 9405.2] | **12.5×** | 0.0122 | yes |
+| s4 | direct-per-call | 5 | 267.1 | [264.0, 273.7] | — | — | — |
+| s4 | routed | 5 | **1304.7** | [986.6, 1351.1] | **4.88×** | 0.0122 | yes |
+
+**Verdict: routed wins decisively in all four measured scenarios, with the bootstrap CIs disjoint in
+every case.** The discipline earns its keep on the outlier reps: host contention dragged individual
+`direct` reps low (s5 rep 156.9 against its four tight ~404–406 reps) and one `routed` rep low (s7
+4512 against ~8100–8600) — the **median absorbs** them (s5-direct 404.3, s7-routed 8195.3) while the
+**CI honestly widens** to surface the host noise (s5-direct `[156.9, 406.0]`). The bands never
+overlap, so each crossover is a property of the architecture, not of a lucky sample. MWU
+p = 0.0122 is identical across all four because every routed rep exceeds every direct rep (rank
+statistic U = 0); 0.0122 is the two-sided normal-approx floor at n = 5/group with the continuity
+correction, and complete rank separation is itself the strong signal at this sample size.
+
+**Steady-state rule (stated).** Per-rep throughput is the harness's **post-barrier** window mean — all
+callers rendezvous at a start barrier before the timer starts, so intra-run warmup is excluded by
+construction and each rep is one steady-state sample (the CI's sample unit is the rep). Time-series
+consumers (sustained/drift rate series) use `stats.py steady_state_window(cov_thresh=0.05)`: discard
+leading samples until the rolling coefficient-of-variation holds below 5%, deriving the warmup cut
+from the data instead of the fixed `rates[3:]` + tail-drop heuristic.
+
+**s8 not re-measured at 5-rep rigor.** The first bake was killed mid-`s8` (host wall-clock) and the
+retry's `s8` seed hit a transient while host `load1` was 9.5; independently, `s8`'s routed cells are
+**depletion-bound** at these seed depths — routed drains the Zipf-hot aggregates and trips `P0006`
+mid-run (the same documented artifact as the A sweep; `dropped = 0`), contaminating a clean
+throughput read. The partial `s8` reps that did land (direct ≈ 247–263 trx/s; routed ≈ 984, 740 err)
+are directionally consistent with the A sweep's `routed/direct ∈ [3.6, 4.4]`. A clean 5-rep `s8` is a
+mechanical re-run of `crossover-stats.sh` with a deeper `--seed-depth` on a quiet host; the crossover
+direction for `s8` is not in question (A sweep, all four pool sizes).
 
 ---
 

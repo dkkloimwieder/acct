@@ -164,6 +164,15 @@ pub enum Cmd {
         /// same sweep exposed standalone as the `verify` subcommand.
         #[arg(long)]
         verify: bool,
+        /// PRNG seed for the per-caller workload RNG (acct-0at4.10.4). Each
+        /// caller derives its stream as `seed + caller_id`, so two runs with
+        /// different `--seed` draw INDEPENDENT workload sequences — the
+        /// prerequisite for treating repeated runs as independent samples in the
+        /// statistics-discipline re-measurement (bootstrap CI / Mann-Whitney).
+        /// The default reproduces the historical fixed stream, so every existing
+        /// test and bench stays behaviorally identical unless `--seed` is passed.
+        #[arg(long, default_value_t = 0xDEAD_BEEF_u64)]
+        seed: u64,
     },
     /// Drive direct-c and routed-c against an identical input sequence and diff
     /// the resulting pool_state aggregate qty (§11.1). Aggregate qty must match

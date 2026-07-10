@@ -148,6 +148,10 @@ pub struct RunReport {
     pub mode: String,
     /// Pool depth the universe was seeded to (§10.5); None if unspecified.
     pub pool_depth: Option<usize>,
+    /// Per-caller workload RNG seed (acct-0at4.10.4) this run was driven with, so
+    /// each result JSON self-documents which sample it is in a multi-rep sweep.
+    /// Set via `with_seed`; the constructors default it to the historical stream.
+    pub seed: u64,
     /// Multi-touch overlay (acct-34ce); None for distinct-pool runs.
     pub multi_touch: Option<MultiTouchReport>,
     /// Total offered arrival rate (trx/s) when driven open-loop (acct-0at4.8);
@@ -196,6 +200,7 @@ impl RunReport {
             scenario: scenario.into(),
             mode: mode.into(),
             pool_depth,
+            seed: 0xDEAD_BEEF_u64,
             multi_touch: None,
             offered_rate_trx_per_sec: None,
             arrival_process: None,
@@ -243,6 +248,7 @@ impl RunReport {
             scenario: scenario.into(),
             mode: "routed".into(),
             pool_depth,
+            seed: 0xDEAD_BEEF_u64,
             multi_touch: None,
             offered_rate_trx_per_sec: None,
             arrival_process: None,
@@ -293,6 +299,7 @@ impl RunReport {
             scenario: scenario.into(),
             mode: "staging".into(),
             pool_depth,
+            seed: 0xDEAD_BEEF_u64,
             multi_touch: None,
             offered_rate_trx_per_sec: None,
             arrival_process: None,
@@ -334,6 +341,13 @@ impl RunReport {
     ) -> Self {
         self.offered_rate_trx_per_sec = offered_rate;
         self.arrival_process = offered_rate.map(|_| arrival.label().to_string());
+        self
+    }
+
+    /// Record the per-caller workload RNG seed (acct-0at4.10.4) so each result
+    /// JSON self-identifies its sample in a multi-rep re-measurement sweep.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
         self
     }
 }

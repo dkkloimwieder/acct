@@ -93,6 +93,7 @@ async fn main() -> std::process::ExitCode {
             pareto_hot_pool_pct,
             pareto_hot_traffic_pct,
             verify,
+            seed,
         } => {
             // Kept for the optional post-run conservation sweep (--verify); the
             // driver calls below move args.dsn into their options.
@@ -154,6 +155,7 @@ async fn main() -> std::process::ExitCode {
                         touch_dist,
                         pareto_hot_pool_pct,
                         pareto_hot_traffic_pct,
+                        seed,
                     })
                     .await
                 }
@@ -174,6 +176,7 @@ async fn main() -> std::process::ExitCode {
                         touch_dist,
                         pareto_hot_pool_pct,
                         pareto_hot_traffic_pct,
+                        seed,
                     })
                     .await
                 }
@@ -195,6 +198,7 @@ async fn main() -> std::process::ExitCode {
                         touch_dist,
                         pareto_hot_pool_pct,
                         pareto_hot_traffic_pct,
+                        seed,
                     })
                     .await
                 }

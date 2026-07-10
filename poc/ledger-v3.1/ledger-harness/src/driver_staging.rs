@@ -57,6 +57,9 @@ pub struct RunOptions {
     pub touch_dist: Option<crate::workload::TouchDistribution>,
     pub pareto_hot_pool_pct: Option<u8>,
     pub pareto_hot_traffic_pct: Option<u8>,
+    /// Per-caller workload RNG seed (acct-0at4.10.4): each caller seeds from
+    /// `seed + caller_id`. The CLI default reproduces the historical stream.
+    pub seed: u64,
 }
 
 type SubmissionMark = (i64, Instant);
@@ -150,6 +153,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     let callers = spec.callers;
     let target_rate = opts.target_rate;
     let arrival = opts.arrival;
+    let seed = opts.seed;
     if let Some(r) = target_rate.filter(|r| *r > 0) {
         eprintln!(
             "[run] open-loop: target_rate={r} trx/s, arrival={}, {callers} callers",
@@ -162,7 +166,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         let workload = workload.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            caller_loop(pool, workload, barrier, caller_id, callers, prefix, deadline, target_rate, arrival)
+            caller_loop(pool, workload, barrier, caller_id, callers, prefix, deadline, target_rate, arrival, seed)
                 .await
         }));
     }
@@ -267,7 +271,8 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         started_at,
     )
     .with_multi_touch(multi_touch_report(&spec.workload))
-    .with_open_loop(opts.target_rate, opts.arrival);
+    .with_open_loop(opts.target_rate, opts.arrival)
+    .with_seed(opts.seed);
 
     report::write_to_path(&report, &output_path).map_err(|e| format!("write report: {e}"))?;
 
@@ -318,8 +323,9 @@ async fn caller_loop(
     deadline: Instant,
     target_rate: Option<u64>,
     arrival: crate::pacing::ArrivalProcess,
+    seed: u64,
 ) -> (LatencyHistogram, Vec<SubmissionMark>, u64) {
-    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64.wrapping_add(caller_id as u64));
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(caller_id as u64));
     let mut ack_hist = LatencyHistogram::new();
     let mut submission_log: Vec<SubmissionMark> = Vec::with_capacity(4096);
     let mut errors: u64 = 0;
