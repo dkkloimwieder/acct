@@ -123,8 +123,9 @@ conflating them (option A) buys a single number at the price of a global-WAL out
 > *feed* decision (logical-decoding slot vs watermark-scan — untouched and correct); it specifies the
 > cursor-advance policy §17 left implicit and refines its single-gauge operational corollary. Recorded here in
 > the v3.2 design; a one-line forward-pointer is added to design-v3.1 §17 so the cross-reference stays
-> honest, without rewriting the frozen PoC decision record. **Flagged for review** — if the reviewer prefers
-> option A's single-gauge simplicity over WAL-safety, D8 flips and this section reverts.
+> honest, without rewriting the frozen PoC decision record. **Accepted by the requirement owner (dkk,
+> 2026-07-10).** Option A (advance-on-completion, single gauge) is the recorded fallback if this is ever
+> revisited.
 
 ## 7. Detection signals (consolidated)
 
