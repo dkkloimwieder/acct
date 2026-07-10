@@ -1585,7 +1585,10 @@ original "design waits on posture (acct-0at4.13) and feed (acct-0at4.15)" depend
 was decided at §16 (alt C, acct-0at4.11.3) and the feed at §17 (logical-decoding slot, acct-0at4.11.4) —
 both fixed by the gate. acct-0at4.13 is the alt-catalog (deferred alternatives E + F — recorded at §20),
 not a posture decision, and acct-0at4.15 does not exist. The only thing genuinely pending design is the recalc engine
-itself, which has no open issue yet and is the natural head of a v3.2 recalc/close workstream.
+itself — now the head of the v3.2 recalc/close workstream (**acct-q1oj**), whose plan is `design-v3.2.md`: it
+decomposes the engine into filable sub-issues (acct-q1oj.1 layer-walk + R-1 re-sort / .2 cross-pool scheduler +
+materialization / .3 cadence-vs-load + quiet-backlog mitigation / .4 recalc state schema + idempotent re-run / .5
+close-time semantics).
 
 ## 20. Alternatives considered — roads not taken (ARCH-ALT-CATALOG — acct-0at4.13)
 
