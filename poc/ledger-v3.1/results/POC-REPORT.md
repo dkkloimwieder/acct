@@ -193,6 +193,74 @@ the instantaneous 200 in-flight, so larger groups keep amortizing. This grounds 
 ⌈N/batch_size_max⌉ commit-group model empirically — with the refinement that the effective N is the
 queue backlog, not just the caller count, so saturation is softer than a hard knee at batch=callers.
 
+### C.1 `batch_size_max` — two-regime N=5 sweep + named limiter (acct-czz4)
+
+§C's curve is a single `s2` workload at N=1. This is the rigorous follow-up (acct-czz4): the same
+`batch_size_max` dial swept at **N=5 reps/cell, load-gated, with a per-cell wait-event histogram**,
+across the **two contention regimes** the routed committer actually meets — a single hot pool (`s5`,
+FOR-UPDATE handoff) and a wide disjoint-pool fan-out (`s19`, ~15 locks/trx). The two regimes pull the
+dial in **opposite** directions past ~200, which is what settles the default. Median trx/s (source:
+`batchdiag_s5_cc4_packoff.csv`, `batchdiag_s19_cc{4,1}_packoff.csv`; N=5 medians reproduce the
+acct-czz4.2 / .3 close notes exactly):
+
+| `batch_size_max` | `s5` hot pool (cc=4) | `s19` many-pool (cc=4) | `s19` many-pool (cc=1) |
+|---:|---:|---:|---:|
+| 50  | 2568 | 1202 | 899 |
+| 100 | 2626 | 1260 | 956 |
+| 200 | **3311** | **1292** | **970** |
+| 400 | 3389 | 878 | 337 |
+| 800 | 3811 | 549 | 254 |
+
+**Two regimes, opposite slopes past 200.**
+- **Hot pool (`s5`) — larger is better, no collapse.** Throughput rises monotonically 1.48× (50→800),
+  steepest at 100→200 (+26 %), and keeps climbing past 200 with no downturn. Latency **improves** in
+  lockstep (ack p50 497 ms → 287 ms), so there is no throughput/latency trade to balance here — bigger
+  batches are strictly better, bounded only by memory and fairness.
+- **Many-pool (`s19`) — peaks at 200, then collapses.** Both committer arms peak at
+  `batch_size_max=200` and fall off a cliff beyond it: cc=4 −32 % / −57 % at 400 / 800, cc=1
+  −65 % / −74 %. Wide caps let the router coalesce **pathological large commit groups** (cg_avg ~12 at
+  the peak → ~360 at 800 on cc=1); the oversized group serializes its many disjoint pools under one
+  committer and churns the staging ring, more than eating the fsync-amortization the larger batch was
+  meant to buy.
+
+**Named limiter per regime** (top wait event, per-cell histogram):
+- **`s5` hot pool → `Lock/tuple`** — the `FOR UPDATE`-on-`pool_lock` row-lock handoff (the same
+  `pool_lock` acquisition quantified in §(c)), ~68–72 % of committer busy time at **every** batch
+  size. `LWLock` busy-share *vanishes* as the batch grows (5.4 % → 0 %): the staging ring is not the
+  hot-pool limiter. Confirms acct-xdwk's hot-pool diagnosis (lever 1) at N=5 — the prior N=1 read was
+  under-powered, not wrong.
+- **`s19` many-pool → `LWLock/ledger_v31_staging_queue`** — the extension's shmem staging ring. At
+  cc=1 it is **100 % of named top-waits, unanimous across 25/25 reps** (`lock_of_busy = 0`), its
+  busy-share climbing ~28 % → ~61 % as the cap widens past 200. At cc=4 a second wait joins and leads,
+  **`Lock/transactionid`** (~50 %) — the cross-committer `FOR UPDATE` collision when several
+  committers hold wide, overlapping pool sets.
+
+**Regime-split reconciliation (the acct-czz4 core ask).** acct-xdwk named the hot-pool limiter
+(`FOR UPDATE` `pool_lock`, "not WAL/fsync"); acct-m4g5.1 STEP A measured a rising `lwlock_of_busy`
+(0.57 → 0.64) on **disjoint** pools but never named the LWLock. This sweep names it:
+**`LWLock/ledger_v31_staging_queue`**, a pgrx-registered extension lock — correcting the earlier
+*unverified* "disjoint-pool LWLock = WAL/fsync" guess. So both regimes want bigger batches, but for
+**different** reasons (hot: amortize the row-lock handoff; many-pool: amortize the commit/staging
+traffic), and they **diverge** past 200 — the hot path keeps climbing to 800 while the many-pool path
+collapses. There is no single monotone story; §C's `s2` N=1 curve is the *hot-leaning* slice of this
+two-regime surface.
+
+**`batch_window_us` is second-order.** The commit-group **size** cap dominates; the **time** window
+(`batch_window_us`, default 500 µs) is a second-order dial — the acct-235v window sweep
+(`batch_window_sweep.csv`, CLOSED) found it flat across the useful range once the size cap is set.
+Tune size, not window.
+
+**Recommendation — keep `batch_size_max = 200` (confirms acct-p1al).** 200 is the cross-regime sweet
+spot: it captures ~87 % of the hot-pool ceiling (3311 of 3811) **and** sits exactly on the many-pool
+peak (1292 cc=4 / 970 cc=1). The two knees are explicit and in tension — the hot-pool knee is a soft
+~200 (gains shallow but still positive past it), the many-pool knee is a **hard cliff** at 200
+(throughput more than halves by 800). 50 leaves ~30 % of hot-pool throughput on the table; 400/800
+would buy +15 % on hot pools at the cost of **−57 % to −74 %** on many-pool workloads — a badly
+asymmetric bet. The current default of 200 (set by acct-p1al) is therefore confirmed by the rigorous
+sweep; **no production change.** (Host was contended for the whole sweep — `load1` logged per rep — so
+absolute trx/s are soft, but the curve *shapes* and the named waits are load-robust structural facts;
+within-cell IQR on `s5` is 2–4 %.)
+
 ### D. `router_pack_disjoint` — batch size vs contention
 
 Routed mode, same s2, batch_size_max=200:
