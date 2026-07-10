@@ -962,6 +962,45 @@ bench-only drain-deadline ergonomics note.
 
 ---
 
+## (h) Drift-detection soak — §14 / FEEDBACK-TESTING #11 (`acct-0at4.10.3`) → **NO DRIFT PATHOLOGY**
+
+§(g) checks duration-dependent *failure counters*; it cannot see slow *trends*. Short runs never
+cross a checkpoint, burn a visible number of xids, or let the committer arena / routed metadata
+accumulate — and an arena leak was once found by **code reading, not by any test**. This artifact
+samples the cluster's drift signals over a sustained run and fits a per-minute slope to each.
+
+**Posture.** On this noisy daily-driver host a multi-hour throughput/p99 curve is host-dominated, so
+the load is driven **open-loop at a fixed arrival rate** (`--target-rate`): xid burn, WAL, and table
+growth are then ~constant per minute regardless of host noise, and the **drift slopes** — the actual
+deliverable — are load-robust. Absolute throughput/latency are recorded but explicitly not a verdict.
+
+**Method.** `bench/run-drift-soak.sh` + `bench/drift-analyze.py` (hand-rolled least-squares + ASCII
+sparklines; matplotlib is absent in-tree, so the slope table + sparklines *are* the plot). Clean
+arena baseline via container restart (arena counters are shmem), then `s2` routed receipts open-loop
+at **500 trx/s for 20 min**, sampled every **5 s** (**238 samples**). Full report + raw series:
+`results/drift-soak-<ts>.md` / `.csv`.
+
+| signal | over 20 min | slope | verdict |
+|---|---|---|---|
+| `age(datfrozenxid)` (xid burn, ARCH-2) | 55.03M → 55.68M | **+32.5k xid/min** (R²=1.00, ≈1.08 xid/trx) | linear; freeze thr (200M) in ~3.1 days, wraparound in ~44.7 days |
+| `arena_outstanding` (leak check) | 81 → 0, bounded | steady **−0.75/min** (R²≈0, flat) | **✓ no leak** — `allocs` 2.04M ≈ `frees` 2.04M, `bump_offset` pinned |
+| `pool_state` / `pool_lock` rows (bloat) | 488 → 500 then flat | steady **0/min** | **✓ stable** — plateaus after fill, no unbounded growth |
+| checkpoints | 1 timed + 0 requested | buffers +339/min (post-ckpt) | **✓ sawtooth observable** — crossed the 15-min timed checkpoint |
+| WAL insert | +710 MB | **+33.9 MB/min** (≈1.1 KB/trx) | linear, no WAL-triggered checkpoint (< `max_wal_size`) |
+| throughput (context, *not* a verdict) | — | p50 **507** / min 302 / max 541 trx/s | open-loop held at ~500 despite host load 0.47→2.85 |
+
+**Verdict: no drift pathology in 20 min of sustained routed load.** The committer arena is
+**leak-free** (outstanding bounded, allocs≡frees, bump pointer pinned — the once-suspected leak does
+not manifest), routed metadata is **bounded** (no `pool_state`/`pool_lock` growth after the initial
+fill), and the checkpoint sawtooth is captured. The **xid-burn slope is the ARCH-2 characterization
+`acct-0at4.2` consumes**: enqueue forces a real xid per submission (~1.08 xid/trx confirmed), so a
+sustained routed workload advances `datfrozenxid` age linearly — at 500 trx/s, ~3.1 days of *continuous*
+load to the freeze threshold. The forward item (tooling already supports it via `DUR`) is a
+**multi-hour quiet-host soak** to cross multiple checkpoints and actually observe an anti-wraparound
+autovacuum freeze — 20 min is far short of the 3.1-day threshold, so no freeze fired in-window.
+
+---
+
 ## Caveats & limitations
 
 - **Host load** keeps absolute throughput directional; structural ratios (lock-hold floor, collapse
