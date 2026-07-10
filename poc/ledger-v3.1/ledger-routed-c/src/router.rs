@@ -2,10 +2,12 @@
 //!
 //! ## Per-tick pipeline
 //!
-//!   1. `collect_candidates` — head-scan up to `router_window_size`
-//!      staging entries with `valid == 1` (pending); capture
-//!      (staging_idx, request_seq, pool_keys_offset/count,
-//!      enqueued_at_micros). Skips slots inside their eject cooldown.
+//!   1. `collect_candidates` — scan the occupied band `[cursor, tail)`
+//!      for up to `router_window_size` staging entries with `valid == 1`
+//!      (pending); capture (staging_idx, request_seq,
+//!      pool_keys_offset/count, enqueued_at_micros). Skips slots inside
+//!      their eject cooldown. The router-local `cursor` bounds the
+//!      share-lock hold to outstanding work rather than the whole ring.
 //!   2. `batch_window_us` gate — if the OLDEST candidate has been
 //!      pending for less than the window, defer this tick to let more
 //!      submissions accumulate. Window=0 disables the gate.
@@ -235,14 +237,13 @@ fn router_tick() -> u32 {
 
     let cooldown_ms = crate::eject_cooldown_ms_now().max(0) as u32;
     let now_ns = crate::shmem::now_ns();
+    // collect_candidates records the per-tick scan cost (slots inspected) into
+    // router_entries_scanned_total itself, bounded to the occupied band by the
+    // router-local cursor (acct-ozln).
     let candidates_meta = collect_candidates(staging_capacity, window_limit, now_ns, cooldown_ms);
     if candidates_meta.is_empty() {
         return 0;
     }
-    COMMITTER_QUEUE
-        .share()
-        .router_entries_scanned_total
-        .fetch_add(candidates_meta.len() as u64, Relaxed);
 
     // Time-coalesce gate: defer emission if the OLDEST candidate has been
     // pending for less than batch_window_us, giving more submissions a chance
@@ -612,13 +613,49 @@ struct Candidate {
     pool_keys: Vec<i64>,
 }
 
-/// Walk the staging ring from `head` and collect up to `window_limit`
-/// pending (valid==1) entries' metadata. Bounded at `staging_capacity`
-/// total slot inspections per call.
+/// Sentinel for `ROUTER_SCAN_CURSOR`: the cursor is uninitialized, so the next
+/// scan sweeps the whole ring from head=0 to re-establish the band head. Set on
+/// every router (re)start (the thread-local re-inits with the process).
+const CURSOR_UNINIT: u32 = u32::MAX;
+
+thread_local! {
+    /// Router-local scan cursor for `collect_candidates` (acct-ozln): the ring
+    /// index of the oldest still-pending staging slot observed last tick — where
+    /// the next tick's scan begins.
+    ///
+    /// Process-local to the single router BGWorker (NOT shmem): it is a pure
+    /// performance hint. A stale value only widens the scan; it can never drop,
+    /// duplicate, or reorder work, because `emit_commit_group`'s `valid` 1→2 CAS
+    /// remains the sole routing gate. `StagingQueue.head` is never advanced (it is
+    /// the committer's conceptual low-water mark and Path C never moves it), so
+    /// without this cursor the scan restarts at slot 0 every tick and inspects the
+    /// entire ring under the shared LWLock whenever occupancy is sparse — the hold
+    /// that blocks every producer's exclusive push.
+    static ROUTER_SCAN_CURSOR: std::cell::Cell<u32> = const { std::cell::Cell::new(CURSOR_UNINIT) };
+}
+
+/// Collect up to `window_limit` pending (valid==1) staging entries' metadata,
+/// scanning only the occupied band `[cursor, tail)` rather than the whole ring.
 ///
-/// Per design-v3.1 §6.3, skips entries inside their eject cooldown
-/// window: `eject_count > 0 AND now_ns - last_eject_at_ns <
-/// cooldown_ms × 1_000_000`. `cooldown_ms == 0` disables the filter.
+/// Producers push at `tail`, so every occupied slot lies in `[cursor, tail)` (mod
+/// capacity) once `cursor` tracks the oldest OCCUPIED slot, and nothing occupied
+/// lies beyond `tail`. `cursor` is advanced each call to the oldest slot that is
+/// not free (`valid != 0` — pending OR in-flight); an uninitialized cursor (fresh
+/// router process) triggers one full-ring bootstrap scan to re-establish it,
+/// matching the router's boot-time `try_recover_router_orphan` full sweep. This
+/// bounds the share-lock hold to the band length — outstanding work — instead of
+/// O(staging_capacity) under sparse occupancy (acct-ozln).
+///
+/// The band head is the oldest `valid != 0` slot, NOT the oldest `valid == 1`:
+/// an in-flight slot (`valid` 2/3) can be ejected back to pending (`valid` 3→1 /
+/// 2→1) IN PLACE — behind a cursor that had advanced past it — so advancing past
+/// anything but a free (`valid == 0`) slot would strand the ejected submission.
+/// Cooled-down pending slots are likewise `valid != 0`, so the cursor never
+/// advances past one and strands it once its cooldown lifts.
+///
+/// Per design-v3.1 §6.3, collection skips entries inside their eject cooldown
+/// window: `eject_count > 0 AND now_ns - last_eject_at_ns < cooldown_ms ×
+/// 1_000_000`. `cooldown_ms == 0` disables the filter.
 fn collect_candidates(
     staging_capacity: u32,
     window_limit: u32,
@@ -627,12 +664,50 @@ fn collect_candidates(
 ) -> Vec<CandidateMeta> {
     let mut out: Vec<CandidateMeta> = Vec::new();
     let queue = STAGING_QUEUE.share();
-    let head = queue.head.load(Relaxed);
+    let tail = queue.tail.load(Relaxed);
+
+    let cursor = ROUTER_SCAN_CURSOR.with(|c| c.get());
+    // Resolve the scan start (band head = oldest occupied slot). A live cursor
+    // already points there. An uninitialized cursor (fresh router process) is
+    // resolved by a one-time full-ring pass that finds the MIN-request_seq
+    // OCCUPIED slot (`valid != 0`): request_seq is globally monotonic, so its
+    // minimum is the true oldest even when a router restart left the band wrapped
+    // around slot 0 (anchoring on the first occupied slot from index 0 would pick
+    // the newer wrapped tail and strand the older high-index slots). This O(ring)
+    // pass runs once per router lifetime, alongside boot try_recover_router_orphan.
+    let mut bootstrap_inspected: u32 = 0;
+    let start = if cursor == CURSOR_UNINIT {
+        let mut band_head: Option<(u64, u32)> = None;
+        for i in 0..staging_capacity {
+            let slot = &queue.entries[i as usize];
+            if slot.valid.load(Relaxed) != 0 {
+                let seq = slot.request_seq;
+                if band_head.is_none_or(|(m, _)| seq < m) {
+                    band_head = Some((seq, i));
+                }
+            }
+        }
+        bootstrap_inspected = staging_capacity;
+        band_head.map(|(_, i)| i).unwrap_or(tail)
+    } else {
+        cursor
+    };
+    // `(tail - start) mod capacity` is the band length (0 = drained): the scan
+    // never inspects past the producer frontier.
+    let max_inspect = (tail + staging_capacity - start) % staging_capacity;
+
     let mut scanned: u32 = 0;
-    while scanned < staging_capacity && (out.len() as u32) < window_limit {
-        let idx = ((head + scanned) % staging_capacity) as usize;
+    let mut first_occupied: Option<u32> = None;
+    while scanned < max_inspect && (out.len() as u32) < window_limit {
+        let idx = ((start + scanned) % staging_capacity) as usize;
         let slot = &queue.entries[idx];
-        if slot.valid.load(Relaxed) == 1 {
+        let valid = slot.valid.load(Relaxed);
+        // Band head = oldest non-free slot (see fn doc): an in-flight slot can
+        // eject back to pending in place, so the cursor must not advance past it.
+        if valid != 0 && first_occupied.is_none() {
+            first_occupied = Some(idx as u32);
+        }
+        if valid == 1 {
             let observed_eject = slot.eject_count.load(Acquire);
             let observed_last_eject_ns = slot.last_eject_at_ns.load(Acquire);
             if !is_in_eject_cooldown(observed_eject, observed_last_eject_ns, now_ns, cooldown_ms) {
@@ -647,6 +722,25 @@ fn collect_candidates(
         }
         scanned += 1;
     }
+    drop(queue);
+
+    // Advance the cursor to the band head (oldest non-free slot). With the band
+    // fully drained (every inspected slot free), jump to `tail` so the next tick
+    // inspects only slots pushed after this one.
+    ROUTER_SCAN_CURSOR.with(|c| c.set(first_occupied.unwrap_or(tail)));
+
+    // Record the share-lock-hold proxy: staging slots inspected this scan
+    // (band scan + any one-time bootstrap pass). Read outside the staging guard —
+    // mirrors the existing router_tick counter writes and avoids nesting the
+    // COMMITTER_QUEUE guard inside the STAGING_QUEUE guard.
+    let inspected = bootstrap_inspected.saturating_add(scanned);
+    if inspected > 0 {
+        COMMITTER_QUEUE
+            .share()
+            .router_entries_scanned_total
+            .fetch_add(inspected as u64, Relaxed);
+    }
+
     out
 }
 

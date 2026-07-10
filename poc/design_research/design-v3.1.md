@@ -1261,6 +1261,24 @@ dead-scaffolding removal, the arena-leak fix, etc.) live in the AUDIT docs and
   (K=1 full-layer delete) while decrementing the aggregate by only the depleted qty, leaving
   `aggregate.qty > 0` (AUDIT.md D3.2). States stay well-defined; the caller supplies qty=1 to avoid
   the mismatch.
+- **Router `collect_candidates` scans a bounded band via a local cursor** (§6.3, acct-ozln): the
+  router walks the staging ring for pending (`valid == 1`) entries, but `StagingQueue.head` is never
+  advanced (it is the committer's conceptual low-water mark and Path C never moves it). A
+  head-anchored scan therefore restarts at slot 0 every tick and, whenever occupancy is sparse, walks
+  the entire ring under the shared staging LWLock — a hold that blocks every producer's exclusive push
+  (the staging-side analog of the committer claim-loop, acct-m4g5.2). The router instead keeps a
+  process-local cursor at the oldest OCCUPIED slot and scans only `[cursor, tail)`, bounding the
+  share-lock hold to outstanding work rather than `O(staging_capacity)`. The cursor is a pure
+  performance hint — the `valid` 1→2 CAS stays the sole routing gate — so a stale value (e.g. after a
+  router restart, resolved by a one-time full-ring bootstrap that anchors on the min-`request_seq`
+  occupied slot) only widens a scan; it can never drop, duplicate, or reorder work. It tracks the
+  oldest non-free slot (`valid != 0`), not the oldest pending one, because an in-flight slot can be
+  ejected back to pending (`valid` 3→1 / 2→1) in place — behind a cursor that had advanced past it.
+  The per-tick `router_entries_scanned_total` counter now records slots *inspected* (matching its
+  name and doc) rather than candidates collected. Measured on a sparse `s1` routed workload
+  (100 trx/s, ~2100 trx committed, zero drops/poison), the steady-state per-tick scan is ~13 slots
+  inspected (the band length) versus the ~16384 a head-anchored full-ring scan inspects under the
+  same sparse occupancy — a roughly three-orders-of-magnitude shorter staging share-lock hold.
 
 ## 16. Consistency posture decision (ARCH-POSTURE — acct-0at4.11.3)
 
