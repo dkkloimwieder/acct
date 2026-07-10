@@ -1111,6 +1111,44 @@ Verdict is decided **per scenario-class** (single-hot s5; deep-zipf s8/s9; Paret
 STEP 6 (`acct-0usf.6`), each citing the supporting numbers. Reproduce the thresholds:
 `python3 ledger-harness/bench/profile-aggregate.py results/committer_profile_sweep.csv`.
 
+### acct-0usf STEP 3 — precondition gate (`acct-m4g5`): affinity lever **KILLED**
+
+STEP 3 opened with an **early-kill precondition** (`acct-m4g5.1`, STEP A) run *before* building any
+affinity variant, to avoid the acct-xdwk failure mode of measuring a lever that cannot win: **does a
+second committer even help on fully-disjoint pools, with affinity OFF so the claim-loop cannot
+contaminate?** If committer parallelism buys ~2× on disjoint work, the shared claim path has headroom
+an affinity scheme could capture; if it buys ~1×, some upstream shared resource serializes first and
+affinity is dead on arrival regardless of implementation.
+
+**Measured** (`results/basic_2pool.csv`; `s2` forced to a true 50/50 split on exactly 2 hot pools via
+`--pareto-hot-pool-pct 50 --pareto-hot-traffic-pct 50`, `pool_count==2` asserted per rep; cc=1 vs
+cc=2, `affinity_scheme=0`, N=5 interleaved, load-gated on the daily-driver host):
+
+| committer_count | median trx/s | lock % of busy | LWLock % of busy |
+|---|---:|---:|---:|
+| 1 | 1052 | 0.00 | 0.57 |
+| 2 | 1328 | 0.07 | 0.64 |
+
+**B/A = 1.26×** — distributions non-overlapping (max cc=1 rep 1090 < min cc=2 rep 1287), so the ratio
+is robust, not host noise. The gate's decision band was ~2× (headroom → build STEP B–D) vs ~1× (dead
+on arrival → stop); **1.26× sits far closer to dead-on-arrival**, and the wait-event decomposition
+says why: the resource that *rises* as the second committer joins is a **shared `LWLock`**
+(0.57 → 0.64 of busy — the same staging-ring `LWLock` named in §C.1 / `acct-czz4` + `acct-ruex`),
+**not** the pool row-lock affinity targets (already **0.00** at cc=1, only 0.07 at cc=2). Affinity
+attacks a resource that is already ~zero; and funneling a pool onto a single owner would forfeit even
+the 26 % committer parallelism the shared path does deliver.
+
+**Verdict: KILL.** The committer→pool affinity lever is retired here. STEP B–D were **not pursued**:
+STEP B (`acct-m4g5.2`) would have fixed two real but **affinity-ON-only** committer claim-loop
+defects — a shared FIFO `head` cursor that strands non-owned entries behind an advancing head
+(surfacing as most of the observed steal fraction), and an O(ring) scan under the shared
+`CommitterQueue` `LWLock` — but both are inert in production (`affinity_scheme = 0`, the shipped
+default), so fixing them buys value only for a lever STEP A shows cannot win. STEP C/D
+(`acct-m4g5.3` / `.4`, the affinity-ON split test + full sweep) are moot without STEP B. This closes
+the `acct-0usf` STEP 3 evaluation: **lever 2 stays refuted** — consistent with the acct-xdwk shipped
+decision and the STEP 1 profile matrix, now backed by a measured disjoint-pool precondition rather
+than an inference. The reproducibility artifact (`bench/run-basic-2pool.sh`) is retained.
+
 ### Other observations
 
 - **`submitted_but_unseen` = 0 on every clean 2-minute cell.** Pass 1's end-of-drain tail
