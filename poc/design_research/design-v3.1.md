@@ -1652,3 +1652,60 @@ the rejection a *confirmation* of that commitment rather than a tension with it:
 
 **Recorded, rejected, parent commitment intact.** This entry documents the comparison for the v3.1 PoC
 decision; it does not reopen the parent's Postgres-native / no-TB direction, which remains in force.
+
+## 21. Review-item dispositions (FEEDBACK #6/#7/#10/#16/#17/#18/#19 — acct-0at4.3)
+
+`FEEDBACK.md` surfaced seven smaller architecture/schema items, each minor individually and rolled up
+here so none is lost. The §18 gate re-scoped the set: three items were tied to primitives the surviving
+architecture deletes (the shmem committer queue, the `pool_lock` row) and are moot; four are
+architecture-agnostic and stand on their own. Two of those four are cheap, concrete wins and are
+**implemented** as migrations `0010`/`0011`; two are structural and are **deferred** with rationale.
+
+**Implemented.**
+
+- **#17 — `trx_line (pool_id, id)` composite index → IMPLEMENTED (migration `0010`).** §14.1 has
+  recalc/close walk each pool's `trx_line` stream in `id` order (the provisional record's replay order);
+  the single-column `trx_line_pool(pool_id)` forced a per-pool sort on `id`. The gate makes this *more*
+  load-bearing, not less: recalc is now the sole costing engine (§16), so per-pool id-ordered replay is a
+  first-class access path rather than a deferred nicety. `0010` replaces the single-column index with the
+  composite; the leading `(pool_id)` prefix subsumes every lookup the old index served, so there is no
+  redundant index to carry.
+- **#19 — input CHECKs on `trx_line` → IMPLEMENTED (migration `0011`).** The schema is now the authority
+  for two invariants that `ledger-core` previously guarded application-side only: `CHECK (qty <> 0)` (§3.7
+  dispatches receipt vs depletion on the *sign* of `qty`, so a zero-qty line has no defined direction) and
+  `CHECK (unit_cost >= 0)` (an asserted receipt cost is non-negative). Zero `unit_cost` is deliberately
+  permitted, not rejected: depletion lines carry `unit_cost = 0` (the applied cost is derived from the
+  pool, not the line), and zero-cost receipts (sample / consigned goods) are legitimate. A future entry
+  point inserting `trx_line` directly can no longer bypass these.
+
+**Deferred (structural — recorded, not implemented).**
+
+- **#10 — idempotency payload-hash → DEFERRED to production.** `UNIQUE (trx_type, source_id)` is one
+  ledger event per business doc per type, and dedup is first-write-wins with no payload comparison, so a
+  retry carrying *mutated* lines is silently skipped rather than conflict-flagged. Single-doc-per-type is
+  correct for the PoC workload; adding a payload hash to the dedup key (to turn a mutated retry into a
+  flagged conflict, and to admit corrected/reopened docs and shared upstream id spaces) is a production
+  hardening, not a PoC-plane correctness gap.
+- **#16 — one-row-per-leg `posting_line` → DEFERRED.** Paired debit/credit-per-row means a
+  `posting_line_dimension` attaches to the *pair*, so the debit leg cannot be dimensioned differently from
+  the credit leg. The conventional fix (one row per leg with a signed amount, plus a trial-balance `UNION`
+  over both account columns) is a GL-model refactor touching `posting_line`, every posting path, and the
+  balance queries — out of scope for the PoC valuation plane, whose posting rows are a projection of the
+  cost ledger rather than the system of record. If a per-leg-dimension driver appears, split it into its
+  own issue rather than folding it into this roll-up ("split any that grow teeth").
+
+**Close-moot (superseded by the §18 gate verdict).**
+
+- **#6 — routed durability asymmetry / outbox framing → CLOSE-MOOT.** The point (`trx` committed ⇒ caller
+  committed, but not the reverse, so a production caller needs a durable pending-submission record +
+  reconciliation = a transactional outbox) *is* the surviving design: the staging-table outbox is the
+  caller's own transaction (SPIKE-A, §18). With the shmem committer displaced, the queue is no longer a
+  reliability primitive to reason about — the row is the durable record.
+- **#7 — `pool_lock` row `FOR UPDATE` vs `pg_advisory_xact_lock` → CLOSE-MOOT.** The item weighed a
+  WAL-dirtying row lock against an advisory lock. SPIKE-B's single-statement commutative
+  `UPDATE … WHERE qty − Δ >= 0` (§18) deletes `pool_lock` entirely — no explicit pool lock, no
+  lazy-create dance, no per-acquisition `xmax` write — so neither side of the original tradeoff survives.
+- **#18 — poison evidence lives only in shmem → CLOSE-MOOT.** The concern was that a postmaster restart
+  erases both the submissions and the evidence they were poisoned, making "operator review" vapor. The
+  staging table supersedes the shmem committer; dead-lettering is a durable row whose status *is* the
+  evidence, so the objection no longer has a target.
