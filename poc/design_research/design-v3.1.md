@@ -1565,6 +1565,90 @@ the cross-pool scheduler, the parallelization and materialization strategy, the 
 R-1 — is left undesigned here; this section characterizes the risk, it does not resolve it. The issue's
 original "design waits on posture (acct-0at4.13) and feed (acct-0at4.15)" dependency is **stale**: posture
 was decided at §16 (alt C, acct-0at4.11.3) and the feed at §17 (logical-decoding slot, acct-0at4.11.4) —
-both fixed by the gate. acct-0at4.13 is the alt-catalog (deferred alternatives E + F), not a posture
-decision, and acct-0at4.15 does not exist. The only thing genuinely pending design is the recalc engine
+both fixed by the gate. acct-0at4.13 is the alt-catalog (deferred alternatives E + F — recorded at §20),
+not a posture decision, and acct-0at4.15 does not exist. The only thing genuinely pending design is the recalc engine
 itself, which has no open issue yet and is the natural head of a v3.2 recalc/close workstream.
+
+## 20. Alternatives considered — roads not taken (ARCH-ALT-CATALOG — acct-0at4.13)
+
+> **Status: DISPOSITIONED 2026-07-10.** The decision record must state what was considered and rejected,
+> with rationale — not just what survived. FEEDBACK-ARCH offered seven alternatives (A–G). Five are
+> already dispositioned in the surviving architecture: **A** (staging-table outbox) and **B**
+> (single-statement commutative aggregate) *became* the surviving hot path via SPIKE-A / SPIKE-B (§18);
+> **C** (everything-provisional) is the adopted posture (§16); **D** (logical-decoding recalc feed) is the
+> adopted feed (§17); **G** (interrogate the FIFO requirement) is folded into the alt-C posture question
+> (§16 — periodic valuation is the small-cadence limit, not a second strict plane). This section records
+> the two that were deferred to acct-0at4.13 — **E** (app-tier partitioned consumer) and **F** (TB split)
+> — with an explicit keep/reject rationale consistent with the gate verdict (§18) and the parent repo's
+> standing commitments.
+
+### 20.1 E — application-tier partitioned consumer → **structurally enabled, not instantiated (kept as the scale-out path)**
+
+**The alternative.** Keep the single-writer-per-pool idea, but run it as an ordinary application-tier
+service rather than in-postmaster machinery: pools sharded across external worker processes (consistent
+hash or a Kafka-partition-style assignment), each worker batching its pools' events into ordinary PG
+transactions. Identical batching math to the routed committer; ordinary deployment / upgrade / debugging;
+horizontal scale-out across hosts; PG returns to being storage (FEEDBACK-ARCH #3's lifecycle critique of
+the shmem implantation is the argument for E).
+
+**Disposition.** The load-bearing half of E is already *in* the surviving architecture. The SPIKE-A pivot
+(§18) moved the transport out of postmaster shared memory and back to an ordinary durable table
+(`ledger_inbox`): the caller's enqueue is an in-tx heap `INSERT`, the committer is a plain
+`SELECT … FOR UPDATE SKIP LOCKED ORDER BY id` drain, and atomicity / observability / recovery are all
+properties of the table. PG is storage again — exactly E's endpoint. What E adds *on top* is a single
+axis: **where the committer loop runs** — in-process committer connections (the surviving choice) versus
+an external sharded worker fleet keyed by `hash(pool_id) % N`.
+
+That residual is a **deployment choice, not an architecture one.** Because the transport is a table and
+the drain is plain SQL, the identical claim-group-apply logic runs the same whether the loop lives in an
+in-process committer connection or an out-of-process worker — no schema, no wire protocol, and no
+correctness property (per-pool FIFO, atomicity, idempotency, recovery) changes across the boundary; only
+the process topology and its ops surface do. The current choice is the in-process committer pool because
+at single-tenant PoC scale it is the smaller operational footprint: one process to deploy, no
+partition-assignment / consumer-group / rebalancing machinery, and no cross-process coordination for the
+cursor (PG's own row locks already serialize `SKIP LOCKED` claimants). The measured throughput
+(POC-REPORT §(b)/(c)) does not surface a per-host committer ceiling that would force externalization at
+this scale. E earns its keep only when horizontal scale-out past one host's committer capacity becomes the
+binding constraint — and the pivot makes it **additive then, not a rewrite**: sharded workers consume the
+same `ledger_inbox` with the same drain (optionally adding a `pool_id % N` claim predicate to cut
+cross-worker lock contention), so externalizing the committer is an ops change, not a substrate change.
+**Recorded as the documented scale-out path; not instantiated now.**
+
+### 20.2 F — revisit the TigerBeetle split → **explicit comparison recorded; rejected, parent commitment intact**
+
+**The alternative.** Return to the earlier ledger design's TB split: TigerBeetle as the hot
+quantity/value plane, PG for catalog and projections. TB's native batching (8k transfers per commit, a
+single-writer core) *is* the routed committer — built by specialists over years, with the debit/credit
+invariants enforced inside the engine. Path C inside pgrx is, from one angle, a reimplementation of TB's
+write path with weaker guarantees, undertaken to avoid operating a second datastore. The charter here
+(acct-0at4.13) is to make that comparison **explicit in the record**, given the prior art is the
+project's own — not to reopen the direction.
+
+**The alt-C pivot sharpens the comparison rather than dissolving it.** Post-gate the hot path is
+insert-only — append `trx` / `trx_line`, at most one commutative `UPDATE … WHERE qty − Δ >= 0` — which
+is structurally *closer* to TB's append-only transfer log than the pre-gate RMW-under-`pool_lock` shape
+was. So the honest side-by-side is now: **(surviving)** a PG-native insert-only hot path + recalc as the
+sole costing engine, one datastore, invariants enforced by the conservation sweep (acct-0at4.5) and
+recalc; versus **(F)** a TB hot plane + PG projections, two datastores, debit/credit enforced in the TB
+engine, with TB's mature batching / single-writer core as prior art.
+
+**Disposition.** Recorded as a comparison, **rejected for this project**, consistent with — and not
+reopening — the parent repo's standing direction. The parent `acct` repo has committed hard to
+Postgres-native / **no TigerBeetle parity** (a load-bearing decision in `CLAUDE.md`; TB is a *reference
+model, not a parity target* — consolidated-doc Part VII Q1, resolved 2026-04-29). Two observations make
+the rejection a *confirmation* of that commitment rather than a tension with it:
+
+- The v3.1 PoC's central result is that the alt-C insert-only path **recovers TB's load-bearing write-path
+  property** — an append-only hot path with no synchronous per-pool fold (the #5 ceiling, removed at §18)
+  — *within a single datastore*. That is precisely the tradeoff (do not operate a second stateful system
+  in the critical path) the parent chose deliberately; the PoC is evidence the tradeoff is affordable, not
+  evidence it should be revisited.
+- The TB advantages the PG-native path does **not** replicate — engine-enforced debit/credit at write
+  time, and a single-writer core purpose-built for 8k-transfer commit groups — are real, but under the
+  surviving architecture the debit/credit invariant is a **recalc / close-time property**, not a hot-path
+  one (§16: the hot path posts no cost leg; there is one costing plane, produced by recalc). So the
+  write-time engine guarantee buys less here than it would under a synchronous-GL design, while a second
+  stateful system in the hot path would cost the full operational price at single-tenant scale.
+
+**Recorded, rejected, parent commitment intact.** This entry documents the comparison for the v3.1 PoC
+decision; it does not reopen the parent's Postgres-native / no-TB direction, which remains in force.
