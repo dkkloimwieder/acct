@@ -1405,6 +1405,14 @@ disk. Under the §16 posture (recalc = sole costing engine) a stalled recalc con
 `wal_level = logical` is a prerequisite cluster setting (a WAL-volume cost this fsync-bound system
 already substantially pays).
 
+> **Refined at recalc-design time (design-v3.2 recalc (c), acct-q1oj.3, 2026-07-10).** The *feed* decision
+> (slot, not watermark-scan) stands unchanged. The **single-gauge operational corollary** above assumed the
+> slot consumer advances the cursor on recalc *completion* — which pins all cluster WAL to the single slowest
+> pool's serial fold (the per-pool #5 ceiling reappears inside recalc). v3.2 recalc (c) ratifies advancing the
+> cursor on *ingestion into a durable dirty-set* instead, decoupling WAL retention from fold speed and
+> refining "one gauge" into **two coupled gauges** — cursor/ingestion lag (WAL / feed-consumer health) and
+> recalc backlog (per-pool `settled_through` lag). See `design-v3.2-recalc-c.md` §6.
+
 **Deferred sub-choice (recalc-design-time, not locked here): transport.** `pgoutput` + a decoding
 consumer vs a custom output plugin. The acceptance for *this* decision is the slot-vs-watermark-scan
 commitment above; the plugin/transport choice is a recalc-implementation refinement. Lean: start with
