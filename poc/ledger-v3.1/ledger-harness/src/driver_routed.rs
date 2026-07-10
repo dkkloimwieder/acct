@@ -7,6 +7,14 @@
 //! polling). Throughput = observer's seen-count / window. Committed latency =
 //! materialize_instant − enqueue_instant.
 //!
+//! End of run is drained to *completeness*, not just committer quiescence
+//! (acct-x9bg): every enqueued submission is known (submission_log), so the run
+//! waits until all of them materialize in the run's `trx` range or a
+//! duration-scaled cap elapses. Throughput therefore counts the full set of
+//! in-window submissions (numerator complete) against the caller window
+//! (denominator) — the convention is "offered work fully materialized / window",
+//! not an instantaneous steady-state drain rate.
+//!
 //! The `routed` JSON block carries committer-counter deltas
 //! (`ledger_routed_c_committer_*`): drains, trx committed, pool_lock
 //! acquisitions, aggregate upserts — these quantify the §6.7 batching win
@@ -179,7 +187,21 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
     }
     let elapsed = driver_started.elapsed();
 
-    wait_for_committer_quiet(&pool, opts.drain_deadline).await;
+    // Drain to completeness, not just committer quiescence (acct-x9bg). The perf
+    // path knows exactly how many submissions were enqueued — submission_log holds
+    // one mark per successful ledger_enqueue_trx_c, and the workload is
+    // oversell-free with globally-unique source_ids, so every enqueued trx must
+    // materialize exactly once. That known count is the authoritative end-of-run
+    // signal (mirroring equivalence.rs::apply_routed's completeness assert); a
+    // committer_drains_total-stability heuristic instead fires early if a
+    // deadlock-backoff stall freezes the counter mid-drain. The wall-clock cap
+    // scales with the run: a longer / higher-rate run builds a deeper end-of-run
+    // backlog, so it gets at least as long to drain as it took to fill, floored at
+    // the configured drain_deadline.
+    let expected_materialized = submission_log.len() as i64;
+    let drain_cap = opts.drain_deadline.max(opts.duration);
+    let drain_complete =
+        wait_for_drain_complete(&pool, run_lo, run_hi, expected_materialized, drain_cap).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     observer_stop.store(true, Ordering::Relaxed);
@@ -235,6 +257,15 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         } else {
             submitted_but_unseen += 1;
         }
+    }
+    if submitted_but_unseen > 0 {
+        eprintln!(
+            "note: {submitted_but_unseen} submission(s) still un-materialized when the \
+             {drain_cap:?} drain cap elapsed (drain_complete={drain_complete}); the committer \
+             keeps draining the cluster-lifetime staging ring after the harness stops \
+             observing, so this is an observer-window residual (dropped=0), not data loss. \
+             Reported as submitted_but_unseen; drain_complete=false flags a genuine cap hit."
+        );
     }
 
     let trx_count = seen.len() as u64;
@@ -294,7 +325,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         \"throughput_trx_per_sec\":{:.1},\
         \"ack_p99_us\":{},\"committed_p99_us\":{},\"committed_p999_us\":{},\
         \"slo_p99_us\":{},\"slo_p999_us\":{},\"trx_materialized\":{},\"attempts\":{},\
-        \"enqueue_errors\":{},\"submitted_but_unseen\":{},\"observer_poll_errors\":{},\"drains\":{},\"commit_group_avg\":{:.2},\
+        \"enqueue_errors\":{},\"submitted_but_unseen\":{},\"drain_complete\":{},\"observer_poll_errors\":{},\"drains\":{},\"commit_group_avg\":{:.2},\
         \"pool_lock_acq\":{},\"agg_upserts\":{},\"dropped\":{},\"poisoned\":{},\
         \"deadlock_retries\":{},\"takeovers\":{},\
         \"span_pool_lock_frac\":{:.3},\"span_hydrate_frac\":{:.3},\"span_apply_frac\":{:.3},\
@@ -317,6 +348,7 @@ pub async fn run(opts: RunOptions) -> Result<(), String> {
         report.attempts_total,
         report.errors_total,
         submitted_but_unseen,
+        drain_complete,
         observer_poll_errors,
         routed.drains_total,
         routed.commit_group_size_avg,
@@ -613,27 +645,42 @@ fn derive_routed_report(pre: &RoutedCounterSnapshot, post: &RoutedCounterSnapsho
     }
 }
 
-/// Wait for the committer to go quiet after callers stop: poll
-/// `committer_drains_total` at 200ms; declare drained after 3 consecutive equal
-/// reads (~600ms idle). Hard-capped by `deadline`.
-async fn wait_for_committer_quiet(pool: &PgPool, deadline: Duration) {
+/// Wait for every enqueued submission to materialize in the run's `trx` range
+/// (`source_id` ∈ [run_lo, run_hi]) — the authoritative end-of-drain signal for
+/// the perf path, mirroring the completeness assert in
+/// `equivalence.rs::apply_routed`. Polls the range count at 200ms; returns `true`
+/// the instant it reaches `expected` (fully drained), or `false` if `cap` elapses
+/// first (a residual tail, surfaced as `submitted_but_unseen`). Unlike a
+/// `committer_drains_total`-stability probe, a mid-drain committer stall
+/// (e.g. a deadlock-backoff) cannot end the wait early — the count only stops
+/// short when work genuinely hasn't materialized within the cap.
+async fn wait_for_drain_complete(
+    pool: &PgPool,
+    run_lo: i64,
+    run_hi: i64,
+    expected: i64,
+    cap: Duration,
+) -> bool {
+    if expected <= 0 {
+        return true;
+    }
     let poll = Duration::from_millis(200);
-    let cap = Instant::now() + deadline;
-    let mut last: i64 = -1;
-    let mut stable: u32 = 0;
-    while Instant::now() < cap {
-        let now: i64 = sqlx::query_scalar("SELECT ledger_routed_c_committer_drains_total()")
-            .fetch_one(pool)
-            .await
-            .unwrap_or(last);
-        if now == last {
-            stable += 1;
-            if stable >= 3 {
-                return;
-            }
-        } else {
-            stable = 0;
-            last = now;
+    let deadline = Instant::now() + cap;
+    loop {
+        let materialized: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM trx \
+              WHERE trx_type = 'po_receipt'::trx_type AND source_id BETWEEN $1 AND $2",
+        )
+        .bind(run_lo)
+        .bind(run_hi)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if materialized >= expected {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         tokio::time::sleep(poll).await;
     }

@@ -98,6 +98,9 @@ def cell_metrics(pretty, compact):
     # trx_materialized + submitted_but_unseen: compact-only (AC2-required).
     m["trx_materialized"] = c.get("trx_materialized", r.get("trx_committed_total", 0))
     m["submitted_but_unseen"] = c.get("submitted_but_unseen", 0)
+    # drain_complete (acct-x9bg): True/False on drain-to-completeness runs, None on
+    # pre-x9bg runs that used the fixed-cap quiescence heuristic.
+    m["drain_complete"] = c.get("drain_complete", None)
     m["drains"] = r.get("drains_total", c.get("drains", 0))
     m["commit_group_avg"] = r.get("commit_group_size_avg", c.get("commit_group_avg", 0.0))
     m["pool_lock_acq"] = r.get("pool_lock_acquisitions_total", c.get("pool_lock_acq", 0))
@@ -162,10 +165,20 @@ def classify(sid, short_m, long_m, short_err, long_err, short_dur, long_dur):
     if dps_s > 0 and abs(dps_l - dps_s) / dps_s > 0.50:
         findings.append(f"(d) drains/s {dps_s:.0f} → {dps_l:.0f} (>50% shift)")
 
-    # (e) submitted_but_unseen > 0 at end-of-drain.
+    # (e) end-of-drain residual. Post-acct-x9bg the run drains to completeness, so a
+    # residual means the duration-scaled cap was hit mid-drain (drain_complete=false)
+    # — a genuine "committer didn't fully drain" signal, not the old fixed-cap
+    # observer artifact. Pre-x9bg runs (drain_complete=None) keep the cosmetic label.
     for col, m in (("1m", short_m), ("10m", long_m)):
-        if m.get("submitted_but_unseen", 0) > 0:
-            findings.append(f"(e) submitted_but_unseen={m['submitted_but_unseen']} at {col} end-of-drain")
+        unseen = m.get("submitted_but_unseen", 0)
+        if unseen > 0:
+            if m.get("drain_complete") is False:
+                findings.append(
+                    f"(e) submitted_but_unseen={unseen} at {col} end-of-drain — drain cap hit "
+                    f"(drain_complete=false): committer did not fully drain within the scaled cap")
+            else:
+                findings.append(
+                    f"(e) submitted_but_unseen={unseen} at {col} end-of-drain (observer-window residual)")
 
     return findings, notes
 

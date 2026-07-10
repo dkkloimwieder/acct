@@ -796,6 +796,18 @@ behaviour. Verdict: **CLEAN** — zero `dropped`/`poisoned`/`deadlock_retries`/`
 cells, and no structural 10m-vs-1m divergence. That cleanliness verdict is robust on its own: it
 concerns failure counters, which host contention cannot manufacture.
 
+Pass 1 also surfaced `submitted_but_unseen > 0` end-of-run residuals on several long/high-throughput
+cells (s3/s8/s9/s10/s11/s12) — an **observer-window artifact, not data loss** (`dropped = 0`
+everywhere; the committer keeps draining the cluster-lifetime staging ring after the harness stops
+observing, and the residual fraction *shrank* with duration, e.g. s8 ~8 % at 1 m → ~0.3 % at 10 m).
+The routed driver's end-of-run wait was subsequently hardened (`acct-x9bg`) to drain to
+**completeness** rather than committer quiescence: it now waits until every enqueued submission
+materializes in the run's `trx` range (the count is known exactly — one mark per successful enqueue)
+or a **duration-scaled** cap (`max(drain_deadline, run_duration)`) elapses, and emits an explicit
+`drain_complete` flag. A residual therefore no longer appears on a healthy run; a nonzero
+`submitted_but_unseen` with `drain_complete=false` now means the cap was genuinely hit mid-drain — a
+real "committer didn't fully drain" signal, not the old fixed-cap read.
+
 **Pass 2 (`acct-235v`)** is a **clean, load-gated re-measurement of throughput.** Pass 1's *absolute*
 throughput numbers were contaminated by two sources identified afterward: (a) ~15 foreign PoC
 BGWorkers left in `shared_preload_libraries` by other streams' install scripts (which append and
