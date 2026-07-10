@@ -43,6 +43,20 @@ The PoC set out to validate two premises and one invariant:
 multi-touch / same-pool-twice generation — the coalesce-under-load path the S1–S8 distinct-pool
 generator never reached). Supersedes the 2026-05-27 snapshot. The three verdicts are unchanged.
 
+**Environment capture (`acct-0at4.10.2`):** the live environment is snapshotted by
+`bench/capture-env.sh` into `results/env-baseline.md` (tracked, regenerable) — LIVE `pg_settings` +
+routed committer GUCs + host/container facts + WAL-device fsync latency. Read against
+`db/postgresql.conf`, the live capture surfaces two divergences that only a live read catches
+(the base conf is overridden by `postgresql.auto.conf`): **`max_connections` = 500** live (conf says
+200), and **`shared_preload_libraries` pruned to `pg_stat_statements, pg_cron, ledger_routed_c`** —
+i.e. no foreign-stream BGWorker pools are preloaded, so these routed benches ran on a clean committer
+roster (the contamination risk in `feedback_no_preload_for_inactive_poc_streams` is not present here).
+WAL is **not** on a separate device; per FEEDBACK #10 the alternative — the WAL-volume fsync latency —
+is reported instead (`fdatasync ≈ 552 ops/sec`, captured under host load ~5, a loaded lower bound;
+regenerate on a quiet host for a clean device figure). The container is **CPU-unpinned**; pinning and
+autovacuum-off-for-short-cells are surfaced as operator knobs in `env-baseline.md` but **not** applied,
+because both mutate the shared acct-postgres container / acct-root compose that every PoC stream uses.
+
 **Per-method seeding:** the harness seeds every pool with `provisional_basis='running_avg'` and now
 also establishes `standard_cost` rows for std-method / standard-basis pools (`acct-0z5m`). All
 universes — **all-fifo** (S5–S8), **all-wac** (S1, S2), and **mixed** (S3, S4 — 50/30/20
