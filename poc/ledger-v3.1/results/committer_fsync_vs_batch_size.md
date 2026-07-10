@@ -63,3 +63,19 @@ ingress (~cg 480), liftable only with caller-batching or more concurrency. A
 production default in the 200–400 range trades a bounded latency increase for a
 ~1.5–1.7× throughput gain. Picking the exact value belongs with a latency SLO
 (Structured-testing phase), not characterization.
+
+## Cross-regime resolution (acct-czz4 / acct-jdgm)
+
+This sweep is the **single-pool, fsync-bound** regime (cc=1, one pool, all-fifo).
+Its "raise toward ~400" reading holds only here. The rigorous N=5 two-regime sweep
+(POC-REPORT §C.1) shows the many-pool regime (`s19`, ~15 locks/trx) does the
+**opposite** past `batch_size_max=200` — throughput collapses −57 % (cc=4) / −74 %
+(cc=1) at 800, because wide caps coalesce pathological large commit groups that
+churn `LWLock/ledger_v31_staging_queue`. So the fsync gain here and the many-pool
+cliff there meet at **200**, the cross-regime default (set by acct-p1al, confirmed
+by acct-czz4). §C.1 also supplies the ack-latency read this span sweep could not
+(finding 4): on the hot-pool regime latency *improves* with batch size (ack p50
+497 ms → 287 ms), so the latency-conservative worry does not bind at 200. The
+cc=1 ingress ceiling (~cg 480) and its caller-batch lift are characterized in
+acct-ruex. Net: the two levers here are settled at 200; a formal SLO-gated
+re-tune, if ever wanted, re-homes to the Structured-testing phase.
