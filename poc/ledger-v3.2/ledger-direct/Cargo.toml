@@ -29,3 +29,6 @@ sqlx        = { workspace = true }
 rand        = { workspace = true }
 proptest    = { workspace = true }
 serde_json  = { workspace = true }
+# The recalc-engine tests drive the real feed loop (submit → slot → dirty-set
+# → ledger_recalc_step) instead of simulating the dirty marks.
+ledger-feed = { path = "../ledger-feed" }

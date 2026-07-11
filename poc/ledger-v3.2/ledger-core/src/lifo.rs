@@ -1,9 +1,10 @@
-//! LIFO method — fail-loud stub (design-v3.2 §5a).
+//! LIFO method — strict layer-walk for the recalc engine, plus the hot-path
+//! guard.
 //!
-//! Same rationale as `fifo.rs`: LIFO costing is the recalc engine's job; the
-//! strict LIFO layer-walk replaces this stub when the recalc engine lands
-//! (design-v3.2-recalc-a.md). This stub keeps the strict `plan_apply`
-//! dispatcher total.
+//! Same shape as `fifo.rs`: [`strict_fold`] is the recalc engine's per-pool
+//! fold (newest layer first); the `plan_apply` dispatch entry stays a
+//! fail-loud MethodMismatch guard keeping the strict hot-path dispatcher
+//! total.
 
 use chrono::{DateTime, Utc};
 
@@ -11,6 +12,12 @@ use crate::error::LedgerError;
 use crate::method::PoolMethod;
 use crate::plan::{PlanResult, TrxLineRequest};
 use crate::snapshot::Snapshot;
+use crate::strict::{self, StrictEvent, StrictFoldOutput, StrictLayer};
+
+/// Strict LIFO fold: consume the NEWEST open layer first (recalc-a §2).
+pub fn strict_fold(opening: Vec<StrictLayer>, events: &[StrictEvent]) -> StrictFoldOutput {
+    strict::strict_fold(true, opening, events)
+}
 
 pub(crate) fn apply_lifo(
     snapshot: &Snapshot,

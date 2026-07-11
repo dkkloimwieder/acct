@@ -1085,6 +1085,7 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "ledger-core",
+ "ledger-feed",
  "ledger-spi-common",
  "pgrx",
  "pgrx-tests",

@@ -104,7 +104,38 @@ enqueued_at)`; the recost floor lives solely on `pool_settlement`), 0013 (`ledge
 slot pinning WAL. Tests: 1 acceptance + 1 property binary (floor convergence independent of batch
 boundaries / crash-redelivery interleaving).
 
-Phases 4–6 (recalc engine, close, testing) not started.
+**Phase 4 (recalc engine, acct-qm7o.4) SHIPPED**: the hard core. `ledger_core::{fifo,lifo}::strict_fold`
+(module `strict`) replaces the MethodMismatch-only stubs — the oracle-equivalent strict layer-walk
+(recalc-a §2/§7): per-depletion authoritative cost = banker-rounded weighted average of consumed layers,
+per-consumed-layer draws, final open-layer state; the uncovered (ill-defined) remainder of an
+over-depletion is costed at the depletion's own observed cost (close sweeps the residue, phase 5). The
+`plan_apply` FIFO/LIFO guards still raise MethodMismatch — the hot path never runs strict math.
+`ledger_recalc_step()` (ledger_direct) is one claim-driven worker tick (recalc-b D9): claims ONE dirty
+pool from `recalc_queue` FOR UPDATE SKIP LOCKED (per-pool exclusivity = the claim lock), replays the
+physical stream in R-1 `(pool_id, posted_at, id)` order — incremental from the persisted layer
+checkpoint at `settled_through` (D2/D4), full-opening on a recost floor (R-2; no historical checkpoints,
+D11) — and writes generation N in the same transaction (recalc-d §5 Model 1): `cost_layer_consumption` +
+`cost_settlement` per newly-costed or changed depletion, ONE `cost_adjustment` trx wrapping a
+`cost_adjustment_line` + `posting_line` per nonzero delta (routed through the depletion's own
+operation pair from `posting_account_map`, swapped to depletion direction; negative delta reverses),
+layer materialization, aggregate `value_sum` reconciliation, `pool_settlement` upsert (generation bumped
+iff written — no-op passes are free, D6). GL cost-adjustment trxs stamp `posted_at = now()` so their own
+feed delivery is a free no-op, never a floor-lowering loop; replay and the 0015 gauge view exclude
+`cost_adjustment_line`. Engine↔feed races are closed by protocol: feed applies floors BEFORE marks
+(mark evaluated after any block on a settle sees the post-settle queue); engine clears the floor
+only-if-unchanged, self-lowers the floor for unscanned mid-pass commits inside the replayed range, and
+keeps/re-stamps the queue row when work remains — invariant: floor set ⇒ queue row exists, so
+claim-by-queue is complete. Workers: N looping connections (`scripts/run-recalc.sh`, default 4 = D10);
+cadence is continuous drain (recalc-c §3). Backpressure (recalc-c §5) deliberately deferred —
+tracked as its own issue. Tests: `acceptance_recalc_engine` (10 cases: costing/linkage/GL directions,
+D6 idempotency, oracle vignette A backdate-recost via the real feed loop, loopback no-op, incremental
+tail, uncovered-at-observed, non-strict no-op, id tiebreak, rollback re-claim, concurrent workers) +
+`property_recalc_engine` (100 random interleavings of submits/ingests/steps/crash-steps over a random
+business-date grid, checked against an independent in-test layer walk: R1 oracle equivalence, R2 layer
+materialization, R3 exact value reconciliation, R4 frontier at rest, R5 idempotency, R6 derivability
+from consumption rows, R7 method isolation; bounded quiesce = livelock detection).
+
+Phases 5–6 (close, testing) not started.
 
 ## Stack
 

@@ -175,26 +175,26 @@ impl FeedConsumer {
         Ok(PeekBatch { messages, events, last_lsn })
     }
 
-    /// Durably record a delivered batch: mark every touched pool dirty, and
-    /// for pools already settled past an event, lower the recost floor
-    /// (guarded min in R-1 `(posted_at, id)` order). One transaction — the
+    /// Durably record a delivered batch: for pools already settled past an
+    /// event, lower the recost floor (guarded min in R-1 `(posted_at, id)`
+    /// order), then mark every touched pool dirty. One transaction — the
     /// commit here is what makes the subsequent cursor advance safe.
+    ///
+    /// Floors run BEFORE marks deliberately: the floor UPDATE can block on a
+    /// recalc worker's in-flight settle (both write the `pool_settlement`
+    /// row), while the mark's `ON CONFLICT DO NOTHING` never blocks — it
+    /// silently skips when the queue row exists, even one a worker holds
+    /// claimed and is about to delete. Evaluating the mark AFTER the floor
+    /// means any such block has already resolved, so the mark sees the
+    /// post-settle queue state and re-inserts the row the worker just deleted.
+    /// That ordering is what upholds the engine's claim-source invariant: a
+    /// pool with a recost floor set always has a `recalc_queue` row.
     pub async fn apply(&self, events: &[TrxLineEvent]) -> Result<(u64, u64), FeedError> {
         let pool_ids: Vec<i64> = events.iter().map(|e| e.pool_id).collect();
         let posted_ats: Vec<String> = events.iter().map(|e| e.posted_at.clone()).collect();
         let ids: Vec<i64> = events.iter().map(|e| e.trx_line_id).collect();
 
         let mut tx = self.pool.begin().await?;
-
-        let pools_marked = sqlx::query(
-            "INSERT INTO recalc_queue (pool_id) \
-             SELECT DISTINCT u.pool_id FROM UNNEST($1::bigint[]) AS u(pool_id) \
-             ON CONFLICT (pool_id) DO NOTHING",
-        )
-        .bind(&pool_ids)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
 
         // The floor only moves for events strictly behind the settlement
         // frontier, and only downward. Both guards live in the UPDATE itself
@@ -225,6 +225,16 @@ impl FeedConsumer {
         .bind(&pool_ids)
         .bind(&posted_ats)
         .bind(&ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let pools_marked = sqlx::query(
+            "INSERT INTO recalc_queue (pool_id) \
+             SELECT DISTINCT u.pool_id FROM UNNEST($1::bigint[]) AS u(pool_id) \
+             ON CONFLICT (pool_id) DO NOTHING",
+        )
+        .bind(&pool_ids)
         .execute(&mut *tx)
         .await?
         .rows_affected();

@@ -25,6 +25,14 @@
 //!   subtransaction (failures mark the row 'failed' and roll back only that
 //!   submission).
 //!
+//! - `ledger_recalc_step()` — one recalc-engine worker tick (design-v3.2 §5):
+//!   claims ONE dirty pool from `recalc_queue` FOR UPDATE SKIP LOCKED, replays
+//!   its physical stream in R-1 `(posted_at, id)` order through the
+//!   ledger-core strict FIFO/LIFO fold (incremental from the persisted layer
+//!   checkpoint; full-opening on a recost floor), and writes the
+//!   generation-keyed settlement + GL cost adjustments in the same
+//!   transaction. N looping connections = N workers (continuous cadence).
+//!
 //! The extension allocates no shared memory: every submission's work happens in
 //! the calling backend, so `_PG_init` is a no-op beyond pgrx wiring.
 //!
@@ -32,6 +40,7 @@
 //! - `cte`              — the four commutative single-statement CTEs (kept plans)
 //! - `submit`           — `ledger_submit_trx` + the shared `apply_submission`
 //! - `drain`            — `ledger_staging_drain`
+//! - `recalc`           — `ledger_recalc_step`
 //! - `ledger_error_map` — LedgerError → ereport!(ERROR, ...) at the SPI boundary
 
 #![allow(unexpected_cfgs)]
@@ -43,6 +52,7 @@ use pgrx::prelude::*;
 pub(crate) mod cte;
 pub(crate) mod drain;
 pub(crate) mod ledger_error_map;
+pub(crate) mod recalc;
 pub(crate) mod submit;
 
 #[pg_guard]

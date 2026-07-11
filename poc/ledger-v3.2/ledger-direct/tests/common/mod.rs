@@ -41,7 +41,7 @@ pub async fn reset_state(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE TABLE posting_line_dimension, posting_line, \
                        cost_settlement, cost_layer_consumption, pool_settlement, \
-                       ledger_inbox, trx_line, trx, \
+                       recalc_queue, ledger_inbox, trx_line, trx, \
                        pool_state, pool, standard_cost, posting_account_map, \
                        sku, location, account, accounting_period \
                        RESTART IDENTITY CASCADE",
@@ -222,4 +222,170 @@ pub async fn aggregate(pool: &PgPool, pool_id: i64) -> Option<(i64, i64, i64)> {
 
 pub async fn count(pool: &PgPool, sql: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await.expect("count query")
+}
+
+// ── Recalc-engine helpers (feed loop + ledger_recalc_step) ──────────────────
+
+pub const SLOT: &str = "ledger_feed";
+pub const PUBLICATION: &str = "ledger_feed";
+
+/// Timestamp grid for business-date scenarios (RFC3339, one per hour).
+pub const T09: &str = "2026-07-11T09:00:00+00:00";
+pub const T10: &str = "2026-07-11T10:00:00+00:00";
+pub const T11: &str = "2026-07-11T11:00:00+00:00";
+pub const T12: &str = "2026-07-11T12:00:00+00:00";
+pub const T13: &str = "2026-07-11T13:00:00+00:00";
+pub const T14: &str = "2026-07-11T14:00:00+00:00";
+
+/// Fresh feed cursor: drop the slot if present, recreate it, return the
+/// consumer. Call BEFORE submitting the events a test wants delivered.
+pub async fn reset_feed(pool: &PgPool) -> ledger_feed::FeedConsumer {
+    drop_feed_slot(pool).await;
+    let consumer = ledger_feed::FeedConsumer::new(pool.clone(), SLOT, PUBLICATION);
+    assert!(consumer.ensure_slot().await.expect("create feed slot"));
+    consumer
+}
+
+/// Best-effort slot cleanup so a finished binary doesn't leave a lagging slot
+/// pinning cluster WAL between test runs.
+pub async fn drop_feed_slot(pool: &PgPool) {
+    sqlx::query(
+        "SELECT pg_drop_replication_slot(slot_name) \
+         FROM pg_replication_slots WHERE slot_name = $1",
+    )
+    .bind(SLOT)
+    .execute(pool)
+    .await
+    .expect("drop feed slot");
+}
+
+/// Ingest everything currently in the slot (loop until an empty tick).
+pub async fn ingest_all(consumer: &ledger_feed::FeedConsumer) {
+    loop {
+        let report = consumer.ingest_once(10_000).await.expect("feed ingest");
+        if report.messages == 0 {
+            break;
+        }
+    }
+}
+
+/// Call ledger_submit_trx with an explicit posted_at; returns the trx id.
+pub async fn submit_at(
+    pool: &PgPool,
+    trx_type: &str,
+    source_id: i64,
+    posted_at: &str,
+    lines: Value,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT ledger_submit_trx($1, $2, $3, $4::jsonb)")
+        .bind(trx_type)
+        .bind(source_id)
+        .bind(posted_at)
+        .bind(lines)
+        .fetch_one(pool)
+        .await
+        .expect("ledger_submit_trx")
+}
+
+/// Submit a single-line po_receipt at `posted_at`; returns the trx_line id.
+pub async fn receipt_at(
+    pool: &PgPool,
+    pool_id: i64,
+    source_id: i64,
+    posted_at: &str,
+    qty: i64,
+    unit_cost: i64,
+) -> i64 {
+    let trx_id = submit_at(
+        pool,
+        "po_receipt",
+        source_id,
+        posted_at,
+        json!([line(pool_id, "po_receipt_line", qty, unit_cost)]),
+    )
+    .await;
+    sqlx::query_scalar::<_, i64>("SELECT id FROM trx_line WHERE trx_id = $1")
+        .bind(trx_id)
+        .fetch_one(pool)
+        .await
+        .expect("trx_line id of receipt")
+}
+
+/// Submit a single-line inv_adjustment depletion at `posted_at`; returns the
+/// trx_line id.
+pub async fn deplete_at(
+    pool: &PgPool,
+    pool_id: i64,
+    source_id: i64,
+    posted_at: &str,
+    qty: i64,
+) -> i64 {
+    let trx_id = submit_at(
+        pool,
+        "inv_adjustment",
+        source_id,
+        posted_at,
+        json!([line(pool_id, "inv_adjustment_line", -qty, 0)]),
+    )
+    .await;
+    sqlx::query_scalar::<_, i64>("SELECT id FROM trx_line WHERE trx_id = $1")
+        .bind(trx_id)
+        .fetch_one(pool)
+        .await
+        .expect("trx_line id of depletion")
+}
+
+/// One ledger_recalc_step() tick; returns its JSONB report.
+pub async fn recalc_step(pool: &PgPool) -> Value {
+    sqlx::query_scalar::<_, Value>("SELECT ledger_recalc_step()")
+        .fetch_one(pool)
+        .await
+        .expect("ledger_recalc_step")
+}
+
+/// Step until the queue is empty; returns the claimed-pass reports.
+pub async fn drain_recalc(pool: &PgPool) -> Vec<Value> {
+    let mut reports = Vec::new();
+    loop {
+        let r = recalc_step(pool).await;
+        if r["claimed"] == Value::Bool(false) {
+            return reports;
+        }
+        reports.push(r);
+    }
+}
+
+/// Mark a pool dirty directly (what a feed apply does), for tests that don't
+/// need the real slot delivery.
+pub async fn mark_dirty(pool: &PgPool, pool_id: i64) {
+    sqlx::query("INSERT INTO recalc_queue (pool_id) VALUES ($1) ON CONFLICT (pool_id) DO NOTHING")
+        .bind(pool_id)
+        .execute(pool)
+        .await
+        .expect("mark pool dirty");
+}
+
+/// (recalc_generation, settled_through_id, floor set?) for a pool.
+pub async fn settlement_of(pool: &PgPool, pool_id: i64) -> Option<(i64, Option<i64>, bool)> {
+    sqlx::query_as::<_, (i64, Option<i64>, bool)>(
+        "SELECT recalc_generation, settled_through_id, recost_floor_posted_at IS NOT NULL \
+           FROM pool_settlement WHERE pool_id = $1",
+    )
+    .bind(pool_id)
+    .fetch_optional(pool)
+    .await
+    .expect("read pool_settlement")
+}
+
+/// Max-generation authoritative unit cost per depletion trx_line.
+pub async fn authoritative_of(pool: &PgPool, depletion_id: i64) -> Option<i64> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT authoritative_unit_cost FROM cost_settlement \
+          WHERE depletion_trx_line_id = $1 \
+          ORDER BY recalc_generation DESC LIMIT 1",
+    )
+    .bind(depletion_id)
+    .fetch_optional(pool)
+    .await
+    .expect("read cost_settlement")
 }
