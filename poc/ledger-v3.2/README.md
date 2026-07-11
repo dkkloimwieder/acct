@@ -59,9 +59,20 @@ the golden reference; reuse the architecture-agnostic survivors acct-0at4.4 (seq
 
 ## Status
 
-**DESIGN COMPLETE** (the design-v3.2* notes; epic acct-q1oj closed 2026-07-10). **Implementation not
-started.** Residual open decisions are per-note (D5–D14, all operational — none change the correctness
-contract, which is the oracle).
+**DESIGN COMPLETE** (the design-v3.2* notes; epic acct-q1oj closed 2026-07-10). Implementation epic:
+**acct-qm7o** (six phase children mirroring the build order above).
+
+**Phase 1 (schema, acct-qm7o.1) SHIPPED**: Cargo workspace with `ledger-core` (carried over from v3.1
+minus the provisional hot-path dispatcher; FIFO/LIFO remain fail-loud stubs until the recalc engine),
+nine migrations under `db/migrations/` (alt-C base with no aggregate qty/value CHECKs and no
+`pool_lock`; `posting_account_map`; `trx_line.posted_at` denorm + `(pool_id, posted_at, id)` index;
+`cost_adjustment` enum labels + sequence; `cost_layer_consumption` / `pool_settlement` /
+`cost_settlement`), database `poc_v3_2` created and migrated. Migration-time decisions: **D5** no
+separate `(pool_id, id)` index (the R-1 composite subsumes it), **D7** distinct `cost_adjustment`
+posting_event_type. **D6** rides with the recalc engine phase. Remaining residual decisions D8–D14 are
+per-note and operational.
+
+Phases 2–6 (hot path, feed, recalc engine, close, testing) not started.
 
 ## Stack
 
