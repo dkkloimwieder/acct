@@ -5,6 +5,7 @@ members = [
     "ledger-spi-common",
     "ledger-direct",
     "ledger-feed",
+    "ledger-bench",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ thiserror   = "1"
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 sqlx        = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "chrono"] }
 rand        = "0.9"
+rand_distr  = "0.5"
 proptest    = "1"
 num-rational = { version = "0.4", default-features = false, features = ["num-bigint"] }
 num-bigint  = "0.4"

@@ -36,10 +36,15 @@ crate_of() {
     return 1
 }
 
-# Also run the pure-Rust ledger-core unit/integration tests first — fast, no DB.
+# Also run the pure-Rust unit tests first — fast, no DB.
 echo "==> ledger-core unit tests"
 if ! cargo test -p ledger-core 2>&1 | tail -3; then
     echo "==> ledger-core tests failed"
+    exit 1
+fi
+echo "==> ledger-bench unit tests"
+if ! cargo test -p ledger-bench 2>&1 | tail -3; then
+    echo "==> ledger-bench tests failed"
     exit 1
 fi
 

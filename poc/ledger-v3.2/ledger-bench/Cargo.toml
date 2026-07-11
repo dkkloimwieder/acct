@@ -1,0 +1,22 @@
+[package]
+name = "ledger-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+hdrhistogram.workspace = true
+ledger-core = { path = "../ledger-core" }
+ledger-feed = { path = "../ledger-feed" }
+rand.workspace = true
+rand_distr.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

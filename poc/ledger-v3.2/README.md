@@ -173,7 +173,30 @@ exactness `value_sum == Σ layer value` + conservation including the swept resid
 reject, C5 re-close no-op, C6 post-close life with `settle_pool` + prefix stability across the closed
 boundary, C7 method isolation).
 
-Phase 6 (testing) not started.
+**Phase 6 (testing, acct-qm7o.6) SHIPPED**: the `ledger-bench` harness — the acct-0at4 survivor oracles
+ported v3.2-native plus the two knobs the replay oracle flagged missing. `ledger-bench soak` runs the
+whole surviving architecture concurrently in one process (open-loop CO-free load on the direct + staging
+paths, the feed consumer, N recalc workers on continuous cadence, the G1/G2 gauge sampler), then
+quiesces (bounded — a floor/requeue livelock fails the run), verifies, closes the period unforced, and
+probes immutability. The workload carries the **receipt-cost-volatility knob** (`low`/`med`/`high`/`trend`
+profiles mirroring the oracle's sweep — a constant-cost seed measures nothing) and the **backdated-event
+injector** (`--backdate-pct`/`--backdate-window-secs`: business-order ≠ commit-order at a controlled rate,
+the exact R-2 breaking input). `--pause-workers`/`--pause-feed` windows demonstrate the two-gauge
+separation (G2 climbs while G1 stays flat, and vice versa); `--midrun-close-at` runs an unforced close
+inside a rolled-back transaction — a dry-run gate probe that records the per-pool lag report and G2b
+gross bound without mutating period state (advisory locks are xact-scoped, so the rollback releases
+them). `ledger-bench verify` is the conservation sweep (V1 qty, V2 value reconciliation via the
+commit-order fold − settlement deltas − swept residue, V5 structural/posting shape, V6 intent, V7 method
+isolation) plus, at quiesce, at-scale oracle equivalence (V3/V4: an independent reference walk sharing
+only `banker_div`), and emits the provisional-vs-authoritative drift distribution per method — the
+oracle's variance table measured on the live engine. `scripts/soak.sh` and `scripts/slo-sweep.sh`
+(throughput-at-SLO ramp, acct-0at4.8 methodology) are the operator entry points; results in
+[`bench/soak-results.md`](bench/soak-results.md). One invariant-formulation subtlety the soak surfaced
+(small-case property nets can't reach it): the FL exact-empty flush wipes engine aggregate value
+corrections applied before it, so the offline `fold − deltas` identity is not reconstructible for a
+flushed pool with settlements — the drift is bounded, surfaces in the close sweep's residue GL, and the
+post-close `value_sum == Σ open-layer value` check covers those pools exactly (the verify skips-and-counts
+them pre-close as `v2_skipped_flush_wiped`).
 
 ## Stack
 
