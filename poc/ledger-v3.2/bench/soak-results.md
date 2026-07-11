@@ -65,13 +65,21 @@ an offline replay, using the receipt-cost-volatility knob the oracle flagged as 
 |---|---|---:|---:|---:|---:|---:|---:|
 | fifo | med ±40% | 4 111 | −51 449 µ | 149 155 µ | 1 611 216 µ | **29.9%** | 4.4% |
 | lifo | med ±40% | 3 997 | −18 188 µ | 108 245 µ | 639 474 µ | **22.0%** | 3.8% |
+| fifo | trend 0.5×→1.5× | 2 662 | −63 853 µ | 137 188 µ | 1 006 478 µ | **36.0%** | 5.1% |
+| lifo | trend 0.5×→1.5× | 2 629 | **+94 893 µ** | 131 288 µ | 624 409 µ | **27.6%** | 5.6% |
 
 Reading: under ±40% cost volatility with 5% backdating, the provisional plane is ~22–30% wrong per
 depletion on average until recalc trues it up — same order as the offline oracle's med-profile
 findings (14–18%), amplified here by backdate-driven re-costing and negative-inventory episodes
 (uncovered depletions observed at clamp-0 cost swing the tail; p99 exceeds the base cost). The
-trend-profile run (the directionally-biased case) aborted on the §5 engine defect and is pending
-its fix.
+trend profile (monotone rising cost, 10% backdating; 60 s at 150 trx/s per path against the fixed
+engine — the same configuration that wedged on the §5 defect, now 15 965 worker passes / 18 249
+settlements with zero errors and a clean unforced close) exposes the directional asymmetry the
+symmetric profiles hide: **lifo bias flips positive** (+94 893 µ — authoritative draws come from the
+newest, most expensive layers while the observed provisional lags at the running average) while
+fifo's stays negative and grows (old cheap layers anchor the authoritative below the provisional).
+A consumer netting the two methods' provisional GL against each other would see the drift cancel;
+per-method it is systematic, which is exactly why the D8 gauges are per-pool, not global.
 
 ## 4. The adjustment storm is real: write amplification filled a disk
 
@@ -128,15 +136,20 @@ worker that claimed the pool — and a **transient single-shot** that resolved o
    worker repeats the identical replay and identical collision: a permanently wedged pool. The
    transient case is the same stale claim whose pass derived an overlapping write set directly.
 
-**Fix (tracked as a follow-up with a deterministic two-session regression test):** split
-lock-then-read in both claim paths — lock the queue row in its own statement, then read pool +
-settlement state in a second post-lock statement (fresh snapshot; every writer of
-`recalc_generation` commits under this same queue-row lock) — plus a defense-in-depth
-`GREATEST(pool_settlement.recalc_generation, EXCLUDED.recalc_generation)` monotonicity guard in
-`settle()`. No schema change, no fold change; D6 (no-op passes write nothing and do not bump) is
-preserved exactly. The regression test uses the blocking `claim_pool` path as the deterministic
-rendezvous: hold a worker pass open in one session, block `ledger_settle_pool` on the queue-row
-lock in another, commit the first, and assert the generation did not regress.
+**Fix (shipped as `acct-qm7o.8`):** split lock-then-read in both claim paths — lock the queue row
+in its own statement, then read pool + settlement state in a second post-lock statement (fresh
+snapshot; every writer of `recalc_generation` commits under this same queue-row lock) — plus a
+defense-in-depth `GREATEST(pool_settlement.recalc_generation, EXCLUDED.recalc_generation)`
+monotonicity guard in `settle()`, and a retry loop in the blocking `claim_pool` (a granted lock on
+a deleted queue row re-ensures and retries instead of erroring). No schema change, no fold change;
+D6 (no-op passes write nothing and do not bump) is preserved exactly. The deterministic
+two-session regression test (`acceptance_recalc_stale_claim.rs`) uses the blocking `claim_pool`
+path as the rendezvous — hold a worker pass open in one session, park `ledger_settle_pool` on the
+queue-row lock in another, commit the first, and assert the generation did not regress — and went
+**red on the pre-fix build on exactly the predicted mechanisms** (generation regressed to the
+stale claim's value; blocking path raised `UnknownPool` on the vanished queue row) before going
+green on the fix. The property net additionally gained an R8 generation-monotonicity invariant
+sampled after every op and drain round.
 
 The soak's fail-fast (consecutive worker-error trip) surfaced the wedge in seconds; without it the
 run would have hung to timeout with four workers spinning on the poisoned pool. Neither the 400
@@ -192,7 +205,8 @@ Structural readings:
   operator the forced-close-move number the design promised.
 - **Two real engine findings** the small-case nets couldn't reach: the adjustment-storm write
   amplification (feeds acct-qm7o.7 backpressure) and the `cost_layer_consumption_pkey`
-  generation-collision wedge (fix + regression test tracked; §5).
+  generation-collision wedge (fixed as `acct-qm7o.8` with a deterministic two-session regression
+  test; the trend soak that originally wedged now passes clean — §5, §3).
 - **Structural load shape:** direct sustains offered load 3–4× beyond the 2-committer staging
   config; batching across hot pools is a lock convoy, not a throughput win.
 

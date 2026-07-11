@@ -127,13 +127,23 @@ only-if-unchanged, self-lowers the floor for unscanned mid-pass commits inside t
 keeps/re-stamps the queue row when work remains — invariant: floor set ⇒ queue row exists, so
 claim-by-queue is complete. Workers: N looping connections (`scripts/run-recalc.sh`, default 4 = D10);
 cadence is continuous drain (recalc-c §3). Backpressure (recalc-c §5) deliberately deferred —
-tracked as its own issue. Tests: `acceptance_recalc_engine` (10 cases: costing/linkage/GL directions,
-D6 idempotency, oracle vignette A backdate-recost via the real feed loop, loopback no-op, incremental
-tail, uncovered-at-observed, non-strict no-op, id tiebreak, rollback re-claim, concurrent workers) +
-`property_recalc_engine` (100 random interleavings of submits/ingests/steps/crash-steps over a random
-business-date grid, checked against an independent in-test layer walk: R1 oracle equivalence, R2 layer
-materialization, R3 exact value reconciliation, R4 frontier at rest, R5 idempotency, R6 derivability
-from consumption rows, R7 method isolation; bounded quiesce = livelock detection).
+tracked as its own issue. The claim protocol is lock-then-read (acct-qm7o.8): the claim statement
+locks ONLY the queue row and the settlement state is read post-lock on a fresh snapshot — every
+generation writer commits under that lock, and reading through a join inside the locking statement
+surfaces EvalPlanQual-mixed rows (new queue tuple, snapshot-stale generation/floor) under concurrent
+requeue; `settle()` additionally clamps the generation write monotonic (`GREATEST`) and the blocking
+`claim_pool` re-ensures + retries when a granted lock finds the queue row deleted. Tests:
+`acceptance_recalc_engine` (10 cases: costing/linkage/GL directions, D6 idempotency, oracle vignette
+A backdate-recost via the real feed loop, loopback no-op, incremental tail, uncovered-at-observed,
+non-strict no-op, id tiebreak, rollback re-claim, concurrent workers) + `acceptance_recalc_stale_claim`
+(two deterministic multi-session interleavings pinning the claim protocol: a parked claim granted
+against a re-stamped queue row must read the sibling's committed generation — never regress it — and
+a parked claim waking to a deleted queue row must retry, not error; `pg_stat_activity` lock-wait
+polling is the rendezvous) + `property_recalc_engine` (100 random interleavings of
+submits/ingests/steps/crash-steps over a random business-date grid, checked against an independent
+in-test layer walk: R1 oracle equivalence, R2 layer materialization, R3 exact value reconciliation,
+R4 frontier at rest, R5 idempotency, R6 derivability from consumption rows, R7 method isolation,
+R8 generation monotonicity sampled after every op; bounded quiesce = livelock detection).
 
 **Phase 5 (close, acct-qm7o.5) SHIPPED**: close-time finalize (recalc-e). `ledger_close_period(period_id,
 actor, force)` is the orchestrated close — one transaction: closer mutex (advisory `(32021, period)`;

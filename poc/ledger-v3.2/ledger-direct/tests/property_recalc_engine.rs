@@ -28,6 +28,10 @@
 //!       authoritative cost from its consumption rows + uncovered remainder
 //!       at the depletion's observed cost
 //!   R7  method isolation — wac pools never gain settlement state
+//!   R8  generation monotonicity — sampled after every op, quiesce round,
+//!       and the R5 re-drain: a pool's committed recalc_generation never
+//!       decreases (committed generations key cost_layer_consumption's
+//!       primary key, so a regression wedges the next genuine re-cost)
 //!
 //! This is where the engine's plumbing (scan bounds, R-1 ordering, floor
 //! races, generation deltas, loopback filtering) has to hold under shapes no
@@ -42,6 +46,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::collections::HashMap;
 
 const TS_GRID: [&str; 6] = [T09, T10, T11, T12, T13, T14];
 const METHODS: [&str; 3] = ["fifo", "lifo", "wac"];
@@ -106,9 +111,24 @@ fn reference_walk(
     (costings, layers)
 }
 
+/// R8 — sample every pool's committed generation against its running max.
+async fn assert_gen_monotonic(pool: &PgPool, max_gen: &mut HashMap<i64, i64>) {
+    let gens: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT pool_id, recalc_generation FROM pool_settlement")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    for (pid, g) in gens {
+        let prior = max_gen.entry(pid).or_insert(0);
+        assert!(g >= *prior, "R8 generation regressed on pool {pid}: {prior} -> {g}");
+        *prior = g;
+    }
+}
+
 async fn run_case(pool: &PgPool, n_pools: usize, ops: &[Op]) {
     reset_state(pool).await;
     let consumer = reset_feed(pool).await;
+    let mut max_gen: HashMap<i64, i64> = HashMap::new();
 
     for p in 0..n_pools {
         let pid = (p + 1) as i64;
@@ -162,6 +182,7 @@ async fn run_case(pool: &PgPool, n_pools: usize, ops: &[Op]) {
                 tx.rollback().await.unwrap();
             }
         }
+        assert_gen_monotonic(pool, &mut max_gen).await;
     }
 
     // ── quiesce: ingest + drain until nothing moves. Bounded — a pool that
@@ -179,6 +200,7 @@ async fn run_case(pool: &PgPool, n_pools: usize, ops: &[Op]) {
             }
         }
         let passes = drain_recalc(pool).await;
+        assert_gen_monotonic(pool, &mut max_gen).await;
         let floors = count(
             pool,
             "SELECT count(*) FROM pool_settlement WHERE recost_floor_posted_at IS NOT NULL",
@@ -345,6 +367,7 @@ async fn run_case(pool: &PgPool, n_pools: usize, ops: &[Op]) {
         settlements_before,
         "R5 settlement history unchanged"
     );
+    assert_gen_monotonic(pool, &mut max_gen).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

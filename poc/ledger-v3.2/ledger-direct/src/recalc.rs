@@ -7,8 +7,10 @@
 //!
 //! 1. **Claim** ONE dirty pool from `recalc_queue` (`FOR UPDATE SKIP LOCKED`,
 //!    oldest mark first — recalc-b D9). The queue-row lock is the per-pool
-//!    exclusivity the serial fold requires (recalc-b §3). Non-FIFO/LIFO pools
-//!    are drained as free no-ops (the feed is method-agnostic; recalc-d D6).
+//!    exclusivity the serial fold requires (recalc-b §3); the settlement state
+//!    is read AFTER the lock lands, on a fresh snapshot (`read_claim`).
+//!    Non-FIFO/LIFO pools are drained as free no-ops (the feed is
+//!    method-agnostic; recalc-d D6).
 //! 2. **Replay** the pool's physical events in R-1 `(posted_at, id)` order
 //!    through `ledger_core::{fifo,lifo}::strict_fold`. A clean pool replays
 //!    incrementally from the persisted layer state at `settled_through` (the
@@ -264,10 +266,12 @@ pub(crate) fn run_claimed_pass(claim: &Claim) -> PassOutcome {
 /// ensures the `recalc_queue` row exists, then locks it `FOR UPDATE` without
 /// `SKIP LOCKED` — waiting out any engine worker that holds the claim. The
 /// caller's transaction then owns the pool until commit; `SKIP LOCKED`
-/// workers pass by. A queue row created here for an already-clean pool is
-/// consumed by the drain's queue decision (a free no-op pass). Re-claiming a
-/// row this transaction already locked is free, so drain loops re-read the
-/// claim state each iteration.
+/// workers pass by. A blocked lock can wake to zero rows — the prior holder
+/// deleted the row at commit — so the ensure-INSERT + lock loops until the
+/// lock lands. A queue row created here for an already-clean pool is consumed
+/// by the drain's queue decision (a free no-op pass). Re-claiming a row this
+/// transaction already locked is free, so drain loops re-read the claim state
+/// each iteration. The settlement state is read AFTER the lock (`read_claim`).
 pub(crate) fn claim_pool(pool_id: i64) -> Claim {
     Spi::connect_mut(|client| -> Result<Option<Claim>, pgrx::spi::Error> {
         let known = client
@@ -278,33 +282,24 @@ pub(crate) fn claim_pool(pool_id: i64) -> Claim {
         if !known {
             return Ok(None);
         }
-        client.update(
-            "INSERT INTO recalc_queue (pool_id) VALUES ($1) ON CONFLICT (pool_id) DO NOTHING",
-            None,
-            &[pool_id.into()],
-        )?;
-        let mut t = client.update(
-            "SELECT rq.pool_id, p.method::text, \
-                    COALESCE(ps.recalc_generation, 0), \
-                    ps.settled_through_posted_at::text, ps.settled_through_id, \
-                    ps.recost_floor_posted_at::text, ps.recost_floor_id \
-               FROM recalc_queue rq \
-               JOIN pool p ON p.id = rq.pool_id \
-               LEFT JOIN pool_settlement ps ON ps.pool_id = rq.pool_id \
-              WHERE rq.pool_id = $1 \
-                FOR UPDATE OF rq",
-            None,
-            &[pool_id.into()],
-        )?;
-        Ok(t.next().map(|row| Claim {
-            pool_id: row.get::<i64>(1).ok().flatten().expect("recalc_queue.pool_id NOT NULL"),
-            method: row.get::<String>(2).ok().flatten().expect("pool.method NOT NULL"),
-            generation: row.get::<i64>(3).ok().flatten().unwrap_or(0),
-            settled_at: row.get::<String>(4).ok().flatten(),
-            settled_id: row.get::<i64>(5).ok().flatten(),
-            floor_at: row.get::<String>(6).ok().flatten(),
-            floor_id: row.get::<i64>(7).ok().flatten(),
-        }))
+        loop {
+            client.update(
+                "INSERT INTO recalc_queue (pool_id) VALUES ($1) ON CONFLICT (pool_id) DO NOTHING",
+                None,
+                &[pool_id.into()],
+            )?;
+            let locked = client
+                .update(
+                    "SELECT pool_id FROM recalc_queue WHERE pool_id = $1 FOR UPDATE",
+                    None,
+                    &[pool_id.into()],
+                )?
+                .next()
+                .is_some();
+            if locked {
+                return Ok(Some(read_claim(client, pool_id)?));
+            }
+        }
     })
     .unwrap_or_else(|e| {
         bail(PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, format!("claim_pool: claim failed: {e}"))
@@ -345,42 +340,71 @@ pub(crate) fn drain_pool_to_head(pool_id: i64) -> DrainOutcome {
     }
 }
 
-/// Claim the oldest-marked dirty pool. The `FOR UPDATE OF rq SKIP LOCKED` row
-/// lock is the per-pool ownership for the rest of the pass; `pool` and
-/// `pool_settlement` rows stay unlocked here (the hot path locks pool rows for
-/// core-method submissions, and the feed updates floors — neither may wait on
-/// a fold).
+/// Claim the oldest-marked dirty pool. The `FOR UPDATE SKIP LOCKED` row lock
+/// is the per-pool ownership for the rest of the pass. The locking statement
+/// touches ONLY `recalc_queue`: every generation writer commits under this
+/// same queue-row lock, so `read_claim`'s post-lock read is guaranteed
+/// current, whereas a `pool_settlement` join inside the locking statement can
+/// surface an EvalPlanQual recheck row that pairs a concurrently re-stamped
+/// queue tuple with statement-snapshot settlement state — a stale generation
+/// and a stale still-set floor. `pool` and `pool_settlement` rows stay
+/// unlocked throughout (the hot path locks pool rows for core-method
+/// submissions, and the feed updates floors — neither may wait on a fold).
 fn claim_next() -> Option<Claim> {
     Spi::connect_mut(|client| -> Result<Option<Claim>, pgrx::spi::Error> {
-        let mut t = client.update(
-            "SELECT rq.pool_id, p.method::text, \
-                    COALESCE(ps.recalc_generation, 0), \
-                    ps.settled_through_posted_at::text, ps.settled_through_id, \
-                    ps.recost_floor_posted_at::text, ps.recost_floor_id \
-               FROM recalc_queue rq \
-               JOIN pool p ON p.id = rq.pool_id \
-               LEFT JOIN pool_settlement ps ON ps.pool_id = rq.pool_id \
-              ORDER BY rq.enqueued_at, rq.pool_id \
-                FOR UPDATE OF rq SKIP LOCKED \
-              LIMIT 1",
-            None,
-            &[],
-        )?;
-        Ok(match t.next() {
-            Some(row) => Some(Claim {
-                pool_id: row.get::<i64>(1)?.expect("recalc_queue.pool_id NOT NULL"),
-                method: row.get::<String>(2)?.expect("pool.method NOT NULL"),
-                generation: row.get::<i64>(3)?.unwrap_or(0),
-                settled_at: row.get::<String>(4)?,
-                settled_id: row.get::<i64>(5)?,
-                floor_at: row.get::<String>(6)?,
-                floor_id: row.get::<i64>(7)?,
-            }),
-            None => None,
-        })
+        let pool_id = {
+            let mut t = client.update(
+                "SELECT pool_id FROM recalc_queue \
+                  ORDER BY enqueued_at, pool_id \
+                    FOR UPDATE SKIP LOCKED \
+                  LIMIT 1",
+                None,
+                &[],
+            )?;
+            match t.next() {
+                Some(row) => row.get::<i64>(1)?.expect("recalc_queue.pool_id NOT NULL"),
+                None => return Ok(None),
+            }
+        };
+        Ok(Some(read_claim(client, pool_id)?))
     })
     .unwrap_or_else(|e| {
         bail(PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, format!("ledger_recalc_step: claim failed: {e}"))
+    })
+}
+
+/// Read the settlement state of an already-locked queue row. Runs as a
+/// mutable statement so it takes a fresh snapshot: the claim must observe
+/// every generation write committed before the queue-row lock was granted.
+fn read_claim(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    pool_id: i64,
+) -> Result<Claim, pgrx::spi::Error> {
+    let mut t = client.update(
+        "SELECT p.method::text, \
+                COALESCE(ps.recalc_generation, 0), \
+                ps.settled_through_posted_at::text, ps.settled_through_id, \
+                ps.recost_floor_posted_at::text, ps.recost_floor_id \
+           FROM pool p \
+           LEFT JOIN pool_settlement ps ON ps.pool_id = p.id \
+          WHERE p.id = $1",
+        None,
+        &[pool_id.into()],
+    )?;
+    let row = t.next().unwrap_or_else(|| {
+        bail(
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            format!("read_claim: queued pool {pool_id} missing from pool"),
+        )
+    });
+    Ok(Claim {
+        pool_id,
+        method: row.get::<String>(1)?.expect("pool.method NOT NULL"),
+        generation: row.get::<i64>(2)?.unwrap_or(0),
+        settled_at: row.get::<String>(3)?,
+        settled_id: row.get::<i64>(4)?,
+        floor_at: row.get::<String>(5)?,
+        floor_id: row.get::<i64>(6)?,
     })
 }
 
@@ -803,8 +827,12 @@ fn reconcile_aggregate_value(pool_id: i64, net_delta: i128) {
 /// Advance the settlement row: generation (bumped iff the pass wrote),
 /// `settled_through_*` to the new frontier, and the recost floor cleared ONLY
 /// if it still equals the claimed value — a feed batch lowering it mid-pass
-/// wins, and the surviving floor forces the next pass to re-cost. Returns
-/// whether a floor is still pending after this settle.
+/// wins, and the surviving floor forces the next pass to re-cost. The
+/// generation write is clamped monotonic (`GREATEST`): committed generations
+/// are load-bearing for `cost_layer_consumption`'s primary key, so no pass may
+/// ever lower one; a no-op pass writes its claimed generation back unchanged
+/// (`GREATEST(g, g) = g` — D6 preserved). Returns whether a floor is still
+/// pending after this settle.
 fn settle(claim: &Claim, generation: i64, frontier_at: &str, frontier_id: i64) -> bool {
     Spi::connect_mut(|client| -> Result<bool, pgrx::spi::Error> {
         let mut t = client.update(
@@ -813,7 +841,8 @@ fn settle(claim: &Claim, generation: i64, frontier_at: &str, frontier_id: i64) -
                      last_recalc_at) \
              VALUES ($1, $2, $3::timestamptz, $4, now()) \
              ON CONFLICT (pool_id) DO UPDATE SET \
-                 recalc_generation = EXCLUDED.recalc_generation, \
+                 recalc_generation = GREATEST(pool_settlement.recalc_generation, \
+                                              EXCLUDED.recalc_generation), \
                  settled_through_posted_at = EXCLUDED.settled_through_posted_at, \
                  settled_through_id = EXCLUDED.settled_through_id, \
                  recost_floor_posted_at = CASE \
