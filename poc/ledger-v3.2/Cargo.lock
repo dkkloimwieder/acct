@@ -1097,6 +1097,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-feed"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "proptest",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "ledger-spi-common"
 version = "0.0.1"
 dependencies = [

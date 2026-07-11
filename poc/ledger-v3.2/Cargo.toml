@@ -4,6 +4,7 @@ members = [
     "ledger-core",
     "ledger-spi-common",
     "ledger-direct",
+    "ledger-feed",
 ]
 
 [workspace.package]

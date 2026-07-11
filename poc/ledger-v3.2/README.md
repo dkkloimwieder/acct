@@ -84,7 +84,27 @@ migration, `FOR UPDATE SKIP LOCKED` claims, per-submission subtransaction failur
 0010 (`banker_div` in SQL) + 0011 (`ledger_inbox`). Tests: 2 acceptance + 2 property binaries
 (`scripts/run-tests.sh`), including a 100-case drain-vs-direct equivalence property.
 
-Phases 3–6 (feed, recalc engine, close, testing) not started.
+**Phase 3 (feed, acct-qm7o.3) SHIPPED**: the `ledger-feed` crate — the logical-decoding feed consumer
+(design-v3.1 §17 / design-v3.2 §6) implementing recalc-c **D8 advance-on-ingestion**. Transport:
+`pgoutput` consumed over the **SQL logical-decoding interface** (`pg_logical_slot_peek_binary_changes`
++ explicit `pg_replication_slot_advance`), not the streaming replication protocol — peek/advance
+expresses D8's advance-after-durable-ingestion exactly and stays sqlx-native; the streaming protocol
+is a latency refinement deferred until measured to matter (open question 1 stays lean). Contract:
+**at-least-once, idempotent ingestion** — peek (non-consuming) → apply batch in one transaction
+(dirty marks into `recalc_queue` + guarded-min `recost_floor` lowering on `pool_settlement`) →
+advance; a crash between apply and advance re-delivers harmlessly. The dirty-set is the
+crash-recovery boundary; the slot's `confirmed_flush_lsn` is the ONLY stream cursor (no watermark
+table). Empty batches still advance the cursor to a pre-peek anchor so unpublished WAL (other
+tables/databases) never inflates G1. Consumer is method-agnostic (every touched pool is marked;
+no-op passes are free per recalc-d D6). Migrations: 0012 (`recalc_queue` — thin `(pool_id,
+enqueued_at)`; the recost floor lives solely on `pool_settlement`), 0013 (`ledger_feed` publication,
+`publish = 'insert'`; the slot is consumer-created runtime state, not schema), 0014 (gauge views:
+`feed_lag` G1, `recalc_queue_depth` G2c, `recalc_pool_lag` G2a/G2b). Cluster prerequisites applied:
+`wal_level = logical`, plus `max_slot_wal_keep_size = 4GB` as the dev guardrail against an abandoned
+slot pinning WAL. Tests: 1 acceptance + 1 property binary (floor convergence independent of batch
+boundaries / crash-redelivery interleaving).
+
+Phases 4–6 (recalc engine, close, testing) not started.
 
 ## Stack
 
