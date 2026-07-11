@@ -57,15 +57,48 @@ use ledger_spi_common::line_type::decode_line_type;
 /// The claimed pool + its settlement state. Timestamps travel as Postgres text
 /// (`::text` round-trips exactly through `::timestamptz`); the engine never
 /// interprets them — ordering and comparison stay in SQL.
-struct Claim {
-    pool_id: i64,
-    method: String,
+pub(crate) struct Claim {
+    pub(crate) pool_id: i64,
+    pub(crate) method: String,
     generation: i64,
     settled_at: Option<String>,
     settled_id: Option<i64>,
     floor_at: Option<String>,
     floor_id: Option<i64>,
 }
+
+/// What one claimed pass did — the JSON-report fields of `ledger_recalc_step`,
+/// shared with the targeted-drain callers (close / settle_pool).
+pub(crate) struct PassOutcome {
+    pub(crate) full_replay: bool,
+    pub(crate) events: usize,
+    pub(crate) settlements: usize,
+    pub(crate) adjustments: usize,
+    pub(crate) generation: i64,
+    pub(crate) floor_pending: bool,
+    pub(crate) requeued: bool,
+}
+
+/// Accumulated stats of a synchronous drain-to-head.
+#[derive(Default)]
+pub(crate) struct DrainStats {
+    pub(crate) passes: i64,
+    pub(crate) settlements: i64,
+    pub(crate) adjustments: i64,
+    pub(crate) generation: i64,
+}
+
+/// Outcome of a targeted drain: non-strict pools have nothing to fold (their
+/// costing is the synchronous hot path), everything else drains to head.
+pub(crate) enum DrainOutcome {
+    NonStrict { method: String },
+    Drained(DrainStats),
+}
+
+/// A synchronous drain in one loop never quiesces this slowly except under a
+/// livelock (e.g. sustained concurrent appends outpacing the fold); fail loud
+/// rather than spin forever inside the caller's transaction.
+const MAX_DRAIN_PASSES: i64 = 10_000;
 
 /// One physical event from the R-1 ordered scan.
 struct Scanned {
@@ -105,6 +138,25 @@ fn ledger_recalc_step() -> pgrx::JsonB {
         }));
     }
 
+    let out = run_claimed_pass(&claim);
+    pgrx::JsonB(json!({
+        "claimed": true,
+        "pool_id": claim.pool_id,
+        "method": claim.method,
+        "full_replay": out.full_replay,
+        "events": out.events,
+        "settlements_written": out.settlements,
+        "adjustments_posted": out.adjustments,
+        "generation": out.generation,
+        "floor_pending": out.floor_pending,
+        "requeued": out.requeued,
+    }))
+}
+
+/// One serial fold + generation write for an already-claimed fifo/lifo pool.
+/// The caller holds the pool's `recalc_queue` row lock (the per-pool
+/// exclusivity) for the rest of its transaction.
+pub(crate) fn run_claimed_pass(claim: &Claim) -> PassOutcome {
     // R-2: any floor forces full-opening replay (the one live checkpoint sits
     // at settled_through, which is always ABOVE the floor — recalc-b D4).
     let full_replay = claim.floor_at.is_some() || claim.settled_at.is_none();
@@ -197,18 +249,100 @@ fn ledger_recalc_step() -> pgrx::JsonB {
     let scanned_ids: Vec<i64> = scanned.iter().map(|s| s.id).collect();
     let requeued = decide_queue(claim.pool_id, &scan_from, &frontier, &scanned_ids, floor_pending);
 
-    pgrx::JsonB(json!({
-        "claimed": true,
-        "pool_id": claim.pool_id,
-        "method": claim.method,
-        "full_replay": full_replay,
-        "events": scanned.len(),
-        "settlements_written": pending.len(),
-        "adjustments_posted": adjustments,
-        "generation": generation,
-        "floor_pending": floor_pending,
-        "requeued": requeued,
-    }))
+    PassOutcome {
+        full_replay,
+        events: scanned.len(),
+        settlements: pending.len(),
+        adjustments,
+        generation,
+        floor_pending,
+        requeued,
+    }
+}
+
+/// Targeted, BLOCKING claim of one pool (the close / settle_pool path):
+/// ensures the `recalc_queue` row exists, then locks it `FOR UPDATE` without
+/// `SKIP LOCKED` — waiting out any engine worker that holds the claim. The
+/// caller's transaction then owns the pool until commit; `SKIP LOCKED`
+/// workers pass by. A queue row created here for an already-clean pool is
+/// consumed by the drain's queue decision (a free no-op pass). Re-claiming a
+/// row this transaction already locked is free, so drain loops re-read the
+/// claim state each iteration.
+pub(crate) fn claim_pool(pool_id: i64) -> Claim {
+    Spi::connect_mut(|client| -> Result<Option<Claim>, pgrx::spi::Error> {
+        let known = client
+            .select("SELECT EXISTS (SELECT 1 FROM pool WHERE id = $1)", None, &[pool_id.into()])?
+            .first()
+            .get::<bool>(1)?
+            .unwrap_or(false);
+        if !known {
+            return Ok(None);
+        }
+        client.update(
+            "INSERT INTO recalc_queue (pool_id) VALUES ($1) ON CONFLICT (pool_id) DO NOTHING",
+            None,
+            &[pool_id.into()],
+        )?;
+        let mut t = client.update(
+            "SELECT rq.pool_id, p.method::text, \
+                    COALESCE(ps.recalc_generation, 0), \
+                    ps.settled_through_posted_at::text, ps.settled_through_id, \
+                    ps.recost_floor_posted_at::text, ps.recost_floor_id \
+               FROM recalc_queue rq \
+               JOIN pool p ON p.id = rq.pool_id \
+               LEFT JOIN pool_settlement ps ON ps.pool_id = rq.pool_id \
+              WHERE rq.pool_id = $1 \
+                FOR UPDATE OF rq",
+            None,
+            &[pool_id.into()],
+        )?;
+        Ok(t.next().map(|row| Claim {
+            pool_id: row.get::<i64>(1).ok().flatten().expect("recalc_queue.pool_id NOT NULL"),
+            method: row.get::<String>(2).ok().flatten().expect("pool.method NOT NULL"),
+            generation: row.get::<i64>(3).ok().flatten().unwrap_or(0),
+            settled_at: row.get::<String>(4).ok().flatten(),
+            settled_id: row.get::<i64>(5).ok().flatten(),
+            floor_at: row.get::<String>(6).ok().flatten(),
+            floor_id: row.get::<i64>(7).ok().flatten(),
+        }))
+    })
+    .unwrap_or_else(|e| {
+        bail(PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, format!("claim_pool: claim failed: {e}"))
+    })
+    .unwrap_or_else(|| {
+        crate::ledger_error_map::raise_ledger_error(ledger_core::LedgerError::UnknownPool(pool_id));
+        unreachable!()
+    })
+}
+
+/// Drain one pool to its stream head synchronously (recalc-e §6/§7: the
+/// `settle_pool` on-demand shape and the forced-close burst). Loops claimed
+/// passes until the queue decision reports the pool clean — no surviving
+/// floor, no tail past the frontier, no missed mid-pass commit.
+pub(crate) fn drain_pool_to_head(pool_id: i64) -> DrainOutcome {
+    let mut stats = DrainStats::default();
+    loop {
+        let claim = claim_pool(pool_id);
+        if claim.method != "fifo" && claim.method != "lifo" {
+            drop_queue_row(pool_id);
+            return DrainOutcome::NonStrict { method: claim.method };
+        }
+        stats.generation = claim.generation;
+        let out = run_claimed_pass(&claim);
+        stats.passes += 1;
+        stats.settlements += out.settlements as i64;
+        stats.adjustments += out.adjustments as i64;
+        stats.generation = out.generation;
+        if !out.requeued {
+            return DrainOutcome::Drained(stats);
+        }
+        if stats.passes >= MAX_DRAIN_PASSES {
+            bail(
+                PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                format!("drain_pool_to_head: pool {pool_id} did not quiesce after {MAX_DRAIN_PASSES} passes"),
+            );
+        }
+    }
 }
 
 /// Claim the oldest-marked dirty pool. The `FOR UPDATE OF rq SKIP LOCKED` row
@@ -250,7 +384,7 @@ fn claim_next() -> Option<Claim> {
     })
 }
 
-fn drop_queue_row(pool_id: i64) {
+pub(crate) fn drop_queue_row(pool_id: i64) {
     Spi::connect_mut(|client| -> Result<(), pgrx::spi::Error> {
         client.update("DELETE FROM recalc_queue WHERE pool_id = $1", None, &[pool_id.into()])?;
         Ok(())
@@ -524,7 +658,7 @@ fn write_generation(pool_id: i64, generation: i64, pending: &[Pending]) -> usize
 /// The pool's posting-account pairs (receipt direction per operation), from
 /// `posting_account_map` on the pool's `(sku_id, location_id)`. Fail-loud on a
 /// missing row — same posture as the hot path (§3.7).
-fn resolve_accounts(pool_id: i64) -> ledger_core::PostingAccounts {
+pub(crate) fn resolve_accounts(pool_id: i64) -> ledger_core::PostingAccounts {
     let resolved = Spi::connect(
         |client| -> Result<Option<(i64, i64, Option<ledger_core::PostingAccounts>)>, pgrx::spi::Error> {
             let mut t = client.select(

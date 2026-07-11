@@ -135,7 +135,45 @@ business-date grid, checked against an independent in-test layer walk: R1 oracle
 materialization, R3 exact value reconciliation, R4 frontier at rest, R5 idempotency, R6 derivability
 from consumption rows, R7 method isolation; bounded quiesce = livelock detection).
 
-Phases 5–6 (close, testing) not started.
+**Phase 5 (close, acct-qm7o.5) SHIPPED**: close-time finalize (recalc-e). `ledger_close_period(period_id,
+actor, force)` is the orchestrated close — one transaction: closer mutex (advisory `(32021, period)`;
+concurrent closers serialize, re-close = `already_closed` no-op; periods close in `start_date` order — an
+earlier open period fails loud, since a backdate into it could re-cost this period's depletions and wedge
+the engine against the settlement guard), the **recalc-drain gate** (period-scoped G2a over fifo/lifo pools
+with activity ≤ end-of-period: no unsettled physical event and no recost floor at/below the period end;
+gate-fail without force persists `state = 'closing'` — draining, not frozen — and returns per-pool lag +
+the G2b gross value so no forced close is silent), **drain + sweep** (force = drain synchronously, NEVER
+skip — there is no provisional cost leg to fall back on; every gate-scoped pool is claimed via its queue
+row, its aggregate row locked — every hot-path FL statement touches the aggregate first, so no event can
+commit on a swept pool mid-sweep — drained to stream head, then trued: `value_sum := Σ open-layer value`
+in one `RETURNING old` statement whose difference — banker residue, the exact-empty flush, uncovered
+depletion value — posts as a zero-qty `cost_adjustment_line` against `posting_account_map.variance_acct`),
+then **fence + re-check + stamp**: advisory `(32022, period)` exclusive waits out in-flight inserts into
+the period and blocks new ones, the gate re-runs on a fresh snapshot (stragglers can only be on unswept
+pools; one more round converges), and `closed_at`/`closed_by`/`state = 'closed'` stamps. Finalize is
+stamp-only (D13/D14): migration 0017's BEFORE INSERT triggers on `trx_line` (physical lines; the engine's
+`cost_adjustment_line` output is exempt) and `cost_settlement` reject anything landing in a closed period —
+**PeriodClosed, SQLSTATE 55000** (pgrx's SPI boundary maps non-enum SQLSTATEs to XX000, so the parent
+repo's P00xx convention cannot cross it; the `PeriodClosed:` message prefix is the stable identity). The
+trigger takes the shared side of the fence and re-reads state after acquiring it, closing every
+gate-to-stamp interleaving. Migration 0016 relaxes the `trx_line.qty <> 0` CHECK for zero-qty
+`cost_adjustment_line` rows (the sweep's pure value line). `ledger_settle_pool(pool_id)` is the on-demand
+shape (recalc-e §7): targeted blocking claim of the pool's queue row + drain to head — the three worker
+models (continuous `ledger_recalc_step` loops / on-demand / periodic close) are one engine. The close
+report carries `feed_lag_bytes` (G1): the gate reads feed-maintained floor state, so it is only as current
+as the slot — the documented premise is a running feed at close; an undelivered backdated straggler
+surfaces post-close as a loud settlement-guard reject (G2a/G2c alarm), never a silent mis-valuation.
+Tests: `acceptance_close_period` (12 cases: gate block/pass + closing-allows-backdates, idempotent
+re-close, concurrent closer serialization, forced synchronous drain with G2b in the report, all three
+sweep residue sources pinned separately with GL direction, next-period-tail drain on a passing gate,
+immutability rejects + next-period flow, guard rails, settle_pool, MissingVarianceAccount fail-loud) +
+`property_close_period` (100 random workloads over a two-day grid straddling the period boundary, closed
+amid arbitrary unsettled state: C1 completeness, C2 oracle equivalence across the close, C3 sweep
+exactness `value_sum == Σ layer value` + conservation including the swept residue, C4 random backdates all
+reject, C5 re-close no-op, C6 post-close life with `settle_pool` + prefix stability across the closed
+boundary, C7 method isolation).
+
+Phase 6 (testing) not started.
 
 ## Stack
 

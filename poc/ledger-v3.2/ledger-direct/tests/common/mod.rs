@@ -389,3 +389,71 @@ pub async fn authoritative_of(pool: &PgPool, depletion_id: i64) -> Option<i64> {
     .await
     .expect("read cost_settlement")
 }
+
+// ── Close-phase helpers (ledger_close_period / ledger_settle_pool) ──────────
+
+/// The T09–T14 grid's canonical accounting period: DATE bounds that cover the
+/// whole grid day (a period covers posted_at ∈ [start, end + 1) in DB time).
+pub const PERIOD_START: &str = "2026-07-01";
+pub const PERIOD_END: &str = "2026-07-11";
+
+/// Next-period timestamps — the day after the grid, outside PERIOD_END.
+pub const N09: &str = "2026-07-12T09:00:00+00:00";
+pub const N10: &str = "2026-07-12T10:00:00+00:00";
+
+pub async fn create_period(pool: &PgPool, id: i64, start: &str, end: &str) {
+    sqlx::query(
+        "INSERT INTO accounting_period (id, start_date, end_date, state) \
+         VALUES ($1, $2::date, $3::date, 'open')",
+    )
+    .bind(id)
+    .bind(start)
+    .bind(end)
+    .execute(pool)
+    .await
+    .expect("insert accounting_period");
+}
+
+/// Call ledger_close_period; returns its JSONB close report.
+pub async fn close_period(pool: &PgPool, id: i64, actor: &str, force: bool) -> Value {
+    sqlx::query_scalar::<_, Value>("SELECT ledger_close_period($1, $2, $3)")
+        .bind(id)
+        .bind(actor)
+        .bind(force)
+        .fetch_one(pool)
+        .await
+        .expect("ledger_close_period")
+}
+
+/// Call ledger_settle_pool; returns its JSONB report.
+pub async fn settle_pool(pool: &PgPool, pool_id: i64) -> Value {
+    sqlx::query_scalar::<_, Value>("SELECT ledger_settle_pool($1)")
+        .bind(pool_id)
+        .fetch_one(pool)
+        .await
+        .expect("ledger_settle_pool")
+}
+
+/// (state, closed_by) of an accounting period.
+pub async fn period_state(pool: &PgPool, id: i64) -> (String, Option<String>) {
+    sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT state, closed_by FROM accounting_period WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read accounting_period")
+}
+
+/// Σ open-layer value for a pool (the authoritative composition the sweep
+/// trues the aggregate to).
+pub async fn layer_value(pool: &PgPool, pool_id: i64) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(sum(value_sum), 0)::bigint FROM pool_state \
+          WHERE pool_id = $1 AND layer_id > 0",
+    )
+    .bind(pool_id)
+    .fetch_one(pool)
+    .await
+    .expect("sum layer value")
+}

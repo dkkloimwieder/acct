@@ -33,6 +33,17 @@
 //!   generation-keyed settlement + GL cost adjustments in the same
 //!   transaction. N looping connections = N workers (continuous cadence).
 //!
+//! - `ledger_close_period(period_id, actor, force)` — the orchestrated period
+//!   close (design-v3.2 §5e / recalc-e): recalc-drain gate on the period-scoped
+//!   G2a, synchronous drain (forced close drains, never skips), the
+//!   variance-into-empty-pool residue sweep that makes each pool's aggregate
+//!   `value_sum` exactly equal its authoritative open-layer value, and the
+//!   immutable finalize stamp (`state → closed`; the 0017 triggers make the
+//!   period lock a schema invariant; PeriodClosed = SQLSTATE 55000).
+//!
+//! - `ledger_settle_pool(pool_id)` — force-drain ONE pool to its stream head
+//!   synchronously (the on-demand worker shape; recalc-e §7).
+//!
 //! The extension allocates no shared memory: every submission's work happens in
 //! the calling backend, so `_PG_init` is a no-op beyond pgrx wiring.
 //!
@@ -40,7 +51,8 @@
 //! - `cte`              — the four commutative single-statement CTEs (kept plans)
 //! - `submit`           — `ledger_submit_trx` + the shared `apply_submission`
 //! - `drain`            — `ledger_staging_drain`
-//! - `recalc`           — `ledger_recalc_step`
+//! - `recalc`           — `ledger_recalc_step` + the claimed-pass machinery
+//! - `close`            — `ledger_close_period` / `ledger_settle_pool`
 //! - `ledger_error_map` — LedgerError → ereport!(ERROR, ...) at the SPI boundary
 
 #![allow(unexpected_cfgs)]
@@ -49,6 +61,7 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!();
 
+pub(crate) mod close;
 pub(crate) mod cte;
 pub(crate) mod drain;
 pub(crate) mod ledger_error_map;
