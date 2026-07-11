@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "ledger-core",
+    "ledger-spi-common",
+    "ledger-direct",
 ]
 
 [workspace.package]

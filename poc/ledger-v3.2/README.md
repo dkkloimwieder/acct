@@ -72,7 +72,19 @@ separate `(pool_id, id)` index (the R-1 composite subsumes it), **D7** distinct 
 posting_event_type. **D6** rides with the recalc engine phase. Remaining residual decisions D8–D14 are
 per-note and operational.
 
-Phases 2–6 (hot path, feed, recalc engine, close, testing) not started.
+**Phase 2 (hot path, acct-qm7o.2) SHIPPED**: the `ledger_direct` pgrx extension (crates
+`ledger-spi-common` + `ledger-direct`) with `ledger_submit_trx` — inventory-facts-only wire contract
+(§3.7/§4), per-method dispatch: WAC via the SPIKE-B commutative CTEs (strict qty gate, running average
+via PG 18 `RETURNING old`, cost leg posted), FIFO/LIFO via alt-C appends (no gate, flagged negative
+aggregates, observed cost on the line, NO cost leg), STD/specific via ledger-core (`plan_apply` under
+pool-row locks — the `pool` row is the per-pool mutex; no `pool_lock` table). Mixed-method multi-line
+submissions use a two-tier lock order (core pool-row locks before commutative tuple locks, each tier
+ascending) — deadlock-free by construction. Plus `ledger_staging_drain` (SPIKE-A): `ledger_inbox`
+migration, `FOR UPDATE SKIP LOCKED` claims, per-submission subtransaction failure isolation. Migrations
+0010 (`banker_div` in SQL) + 0011 (`ledger_inbox`). Tests: 2 acceptance + 2 property binaries
+(`scripts/run-tests.sh`), including a 100-case drain-vs-direct equivalence property.
+
+Phases 3–6 (feed, recalc engine, close, testing) not started.
 
 ## Stack
 

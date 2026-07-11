@@ -1,0 +1,18 @@
+[package]
+name = "ledger-spi-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Plain rlib: linked into each cdylib extension. NOT an extension itself
+# (no pg_module_magic!, no #[pg_extern]) — just shared runtime-Spi helpers.
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18"]
+
+[dependencies]
+pgrx        = { workspace = true }
+ledger-core = { path = "../ledger-core" }
+chrono      = { workspace = true }
