@@ -36,12 +36,15 @@ pub async fn connect_pool() -> PgPool {
         .expect("connect to poc_v3_2")
 }
 
-/// TRUNCATE all ledger + reference + staging + recalc tables RESTART IDENTITY.
+/// TRUNCATE all ledger + reference + staging + recalc tables RESTART IDENTITY,
+/// and reset the backpressure config to its migration defaults (tests lower
+/// the bounds to build cheap fixtures).
 pub async fn reset_state(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE TABLE posting_line_dimension, posting_line, \
                        cost_settlement, cost_layer_consumption, pool_settlement, \
-                       recalc_queue, ledger_inbox, trx_line, trx, \
+                       recalc_queue, recalc_backlog, recalc_backpressure, \
+                       ledger_inbox, trx_line, trx, \
                        pool_state, pool, standard_cost, posting_account_map, \
                        sku, location, account, accounting_period \
                        RESTART IDENTITY CASCADE",
@@ -49,6 +52,10 @@ pub async fn reset_state(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("reset_state TRUNCATE");
+    sqlx::query("UPDATE recalc_backpressure_config SET bound_events = DEFAULT, low_water = DEFAULT")
+        .execute(pool)
+        .await
+        .expect("reset backpressure config");
 }
 
 /// A seeded single-pool fixture with deterministic ids.
@@ -456,4 +463,37 @@ pub async fn layer_value(pool: &PgPool, pool_id: i64) -> i64 {
     .fetch_one(pool)
     .await
     .expect("sum layer value")
+}
+
+// ── Backpressure helpers (recalc-c §5, acct-qm7o.7) ─────────────────────────
+
+/// Set the backpressure bound + low-water (per-test tunables; reset_state
+/// restores the migration defaults).
+pub async fn set_backpressure_bounds(pool: &PgPool, bound: i64, low_water: i64) {
+    sqlx::query("UPDATE recalc_backpressure_config SET bound_events = $1, low_water = $2")
+        .bind(bound)
+        .bind(low_water)
+        .execute(pool)
+        .await
+        .expect("set backpressure bounds");
+}
+
+/// The pool's unsettled-event counter; None when no backlog row exists.
+pub async fn backlog_of(pool: &PgPool, pool_id: i64) -> Option<i64> {
+    sqlx::query_scalar::<_, i64>("SELECT pending_events FROM recalc_backlog WHERE pool_id = $1")
+        .bind(pool_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read recalc_backlog")
+}
+
+/// The pool's throttle entry (engage_events); None when not throttled.
+pub async fn throttled(pool: &PgPool, pool_id: i64) -> Option<i64> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT engage_events FROM recalc_backpressure WHERE pool_id = $1",
+    )
+    .bind(pool_id)
+    .fetch_optional(pool)
+    .await
+    .expect("read recalc_backpressure")
 }

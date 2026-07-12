@@ -10,6 +10,9 @@
 //! at submit time.
 //!
 //! Per-submission pipeline:
+//!   0. backpressure admission check (direct path only, recalc-c §5): a
+//!      submission touching a throttled pool is rejected with SQLSTATE 53400
+//!      before any write — one empty-index probe in the common case
 //!   1. one UNLOCKED reference-data read resolves every touched pool's method,
 //!      basis, posting accounts, and standard cost (not the contended hot
 //!      state — legitimately outside any critical section)
@@ -91,16 +94,22 @@ fn ledger_submit_trx(trx_type: &str, source_id: i64, posted_at: &str, lines: pgr
             format!("ledger_submit_trx: lines JSONB decode failed: {e}"),
         ),
     };
-    apply_submission(trx_type, source_id, posted_at, &line_jsons)
+    apply_submission(trx_type, source_id, posted_at, &line_jsons, true)
 }
 
 /// The full submission pipeline (shared by `ledger_submit_trx` and the staging
 /// drain). Raises ereport!(ERROR, ...) on any failure.
+///
+/// `enforce_backpressure` gates the recalc-c §5 admission check: true on the
+/// direct path; false from the staging drain, whose envelopes were gated by
+/// the `ledger_inbox` trigger at enqueue time — admitted work is applied, never
+/// retroactively failed.
 pub(crate) fn apply_submission(
     trx_type: &str,
     source_id: i64,
     posted_at: DateTime<Utc>,
     line_jsons: &[LineJson],
+    enforce_backpressure: bool,
 ) -> i64 {
     // Decode lines; zero-qty lines are no-ops (ledger-core's own convention).
     let mut lines: Vec<(usize, TrxLineRequest)> = Vec::with_capacity(line_jsons.len());
@@ -131,6 +140,9 @@ pub(crate) fn apply_submission(
     //    unknown pool or a missing posting_account_map row (§4).
     let touched: Vec<i64> =
         lines.iter().map(|(_, l)| l.pool_id).collect::<BTreeSet<i64>>().into_iter().collect();
+    if enforce_backpressure {
+        check_backpressure(&touched);
+    }
     let cfgs = resolve_cfgs(&touched);
     for pid in &touched {
         let cfg = match cfgs.get(pid) {
@@ -343,6 +355,50 @@ fn expect_row(res: Result<Option<i64>, pgrx::spi::Error>, what: &str, pool_id: i
             PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
             format!("ledger_submit_trx: {what} on pool {pool_id} failed: {e}"),
         ),
+    }
+}
+
+/// Admission control (recalc-c §5): reject a submission touching a
+/// backpressure-throttled pool with SQLSTATE 53400. The probe doubles as the
+/// design's cheap global "backpressure active" flag — the throttled set is
+/// empty in the common case, so the ANY-lookup is one empty-index probe; only
+/// an engaged pool makes it a consult. Zero-qty lines were dropped before
+/// `touched` was built, matching the `ledger_inbox` trigger's gate.
+fn check_backpressure(touched: &[i64]) {
+    if touched.is_empty() {
+        return;
+    }
+    let ids: Vec<i64> = touched.to_vec();
+    let hit = Spi::connect(|client| -> Result<Option<(i64, i64)>, pgrx::spi::Error> {
+        let mut t = client.select(
+            "SELECT pool_id, engage_events FROM recalc_backpressure \
+              WHERE pool_id = ANY($1::bigint[]) \
+              ORDER BY pool_id LIMIT 1",
+            None,
+            &[ids.into()],
+        )?;
+        Ok(match t.next() {
+            Some(row) => Some((
+                row.get::<i64>(1)?.expect("recalc_backpressure.pool_id NOT NULL"),
+                row.get::<i64>(2)?.expect("recalc_backpressure.engage_events NOT NULL"),
+            )),
+            None => None,
+        })
+    })
+    .unwrap_or_else(|e: pgrx::spi::Error| {
+        bail(
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            format!("ledger_submit_trx: backpressure probe failed: {e}"),
+        )
+    });
+    if let Some((pool_id, engage_events)) = hit {
+        bail(
+            PgSqlErrorCode::ERRCODE_CONFIGURATION_LIMIT_EXCEEDED,
+            format!(
+                "ledger_submit_trx: pool {pool_id} is backpressure-throttled \
+                 (unsettled backlog {engage_events} reached bound)"
+            ),
+        );
     }
 }
 

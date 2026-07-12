@@ -321,14 +321,15 @@ fn print_soak_summary(r: &soak::SoakReport) {
     println!("── soak summary ──────────────────────────────────────────────");
     if let Some(d) = &r.direct {
         println!(
-            "direct : {} acked ({:.0}/s), {} qty-gate rejects, p99 {}µs",
-            d.acked, d.achieved_rate, d.rejected_qty_gate, d.p99_us
+            "direct : {} acked ({:.0}/s), {} qty-gate rejects, {} throttled, p99 {}µs",
+            d.acked, d.achieved_rate, d.rejected_qty_gate, d.rejected_backpressure, d.p99_us
         );
     }
     if let Some(s) = &r.staging {
         println!(
-            "staging: {} enqueued ({:.0}/s), {} applied, {} failed, p99 {}µs",
-            s.acked, s.achieved_rate, s.drained_done, s.drained_failed, s.p99_us
+            "staging: {} enqueued ({:.0}/s), {} applied, {} failed, {} throttled, p99 {}µs",
+            s.acked, s.achieved_rate, s.drained_done, s.drained_failed,
+            s.rejected_backpressure, s.p99_us
         );
     }
     println!(
@@ -346,6 +347,10 @@ fn print_soak_summary(r: &soak::SoakReport) {
         r.gauges.max_g2c_dirty_pools,
         r.gauges.max_g2b_unsettled_events,
         r.gauges.max_g2b_unsettled_gross
+    );
+    println!(
+        "backpr : max {} throttled pools, max per-pool backlog {}",
+        r.gauges.max_bp_throttled_pools, r.gauges.max_bp_max_backlog
     );
     println!(
         "quiesce: {:.1}s; verify settled: {} failures; close: {}; post-close: {} failures",

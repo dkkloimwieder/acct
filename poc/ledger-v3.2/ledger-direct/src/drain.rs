@@ -21,6 +21,11 @@
 //! (pool_id, posted_at, id), and the qty aggregate delta is commutative. The
 //! observed provisional cost a racing depletion records is order-sensitive —
 //! and already provisional (design-v3.1 §16 re-derivation).
+//!
+//! Backpressure (recalc-c §5) gates ADMISSION only: the `ledger_inbox` BEFORE
+//! INSERT trigger rejects enqueues to throttled pools; this drain applies
+//! already-admitted envelopes unchecked — accepted work is never
+//! retroactively failed.
 
 use chrono::{DateTime, Utc};
 use pgrx::pg_sys::panic::CaughtError;
@@ -153,7 +158,7 @@ fn ledger_staging_drain(p_limit: i32) -> i64 {
     for c in ready {
         let sub = subtx_begin();
         let outcome: Result<i64, String> = PgTryBuilder::new(|| {
-            Ok(apply_submission(&c.trx_type, c.source_id, c.posted_at, &c.lines))
+            Ok(apply_submission(&c.trx_type, c.source_id, c.posted_at, &c.lines, false))
         })
         .catch_others(|cause| match &cause {
             CaughtError::PostgresError(report) | CaughtError::ErrorReport(report) => {

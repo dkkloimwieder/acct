@@ -27,6 +27,10 @@ pub struct GaugeSample {
     pub g2b_unsettled_events: i64,
     /// G2b — gross value of the unsettled tail (the forced-close move bound).
     pub g2b_unsettled_gross: i64,
+    /// Backpressure (recalc-c §5) — pools currently throttled.
+    pub bp_throttled_pools: i64,
+    /// Backpressure — largest per-pool unsettled-event counter.
+    pub bp_max_backlog: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -38,6 +42,8 @@ pub struct GaugeSummary {
     pub max_g2a_lagging_pools: i64,
     pub max_g2b_unsettled_events: i64,
     pub max_g2b_unsettled_gross: i64,
+    pub max_bp_throttled_pools: i64,
+    pub max_bp_max_backlog: i64,
 }
 
 pub async fn sample(pool: &PgPool, t_ms: u64) -> GaugeSample {
@@ -69,6 +75,13 @@ pub async fn sample(pool: &PgPool, t_ms: u64) -> GaugeSample {
     .fetch_one(pool)
     .await
     .unwrap_or((0, 0, 0));
+    let (throttled, max_backlog): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM recalc_backpressure), \
+                (SELECT COALESCE(max(pending_events), 0) FROM recalc_backlog)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or((0, 0));
     GaugeSample {
         t_ms,
         g1_lag_bytes: g1.map(|(l, _)| l),
@@ -78,6 +91,8 @@ pub async fn sample(pool: &PgPool, t_ms: u64) -> GaugeSample {
         g2a_lagging_pools: lagging,
         g2b_unsettled_events: events,
         g2b_unsettled_gross: gross,
+        bp_throttled_pools: throttled,
+        bp_max_backlog: max_backlog,
     }
 }
 
@@ -111,6 +126,9 @@ impl Sampler {
                     summary.max_g2b_unsettled_events.max(s.g2b_unsettled_events);
                 summary.max_g2b_unsettled_gross =
                     summary.max_g2b_unsettled_gross.max(s.g2b_unsettled_gross);
+                summary.max_bp_throttled_pools =
+                    summary.max_bp_throttled_pools.max(s.bp_throttled_pools);
+                summary.max_bp_max_backlog = summary.max_bp_max_backlog.max(s.bp_max_backlog);
                 let line = serde_json::to_string(&s).expect("serialize gauge sample");
                 let _ = writeln!(out, "{line}");
                 tokio::select! {

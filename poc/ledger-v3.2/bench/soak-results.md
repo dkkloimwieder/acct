@@ -194,6 +194,38 @@ Structural readings:
   (headline-soak direct p99: 20.8 ms with both paths + workers live). Same-pool batching is the
   useful direction (the v3.1 routed lesson), not bigger mixed batches.
 
+## 8. Backpressure engage/release under a stalled engine (acct-qm7o.7)
+
+The recalc-c §5 lever, demonstrated live against the shipped defaults (bound 200 unsettled events
+per pool, low-water 20, `recalc_backpressure_config`). Two runs, same trend/backdate shape as §3:
+
+- **Stays off (60 s, 150/s per path, workers live):** max per-pool backlog **6** vs the bound of
+  200 (33× headroom), zero pools throttled, zero 53400 rejects on either path, PASSED — and the
+  drift table reproduces §3 within noise, so the lever's steady-state presence (one empty-index
+  probe per admission) changes nothing.
+- **Engage/release (60 s, 300/s per path, workers paused 10 s → 45 s):** during the stall the
+  Pareto-hot pools accumulate ~8 events/s each; **40 pools engaged, max per-pool backlog 203** —
+  the bound plus one feed batch's overshoot, then *frozen*: admission rejects (SQLSTATE 53400)
+  stopped the growth, which is the lever doing its one job (an unthrottled hot pool would have
+  reached ~280 by resume). 1 511 direct + 1 518 staging rejects were classified, not errors.
+  Cold pools kept flowing under their bounds (per-pool granularity: 40 of 300 throttled at peak).
+  On resume the workers drained the capped tails; quiesce converged in 3.0 s, the unforced close
+  passed, and the post-close in-period probe returned 55000 (PeriodClosed) — a stuck throttle
+  would have surfaced there as 53400. PASSED, 0 worker errors.
+
+The deterministic §10 assertions (engages exactly at the bound — on either writer, releases at the
+low-water mark, hysteresis retention inside the band, admission atomicity, adjustment-loopback
+exclusion, and the late-delivery healing interleaving) live in `acceptance_recalc_backpressure` +
+`property_backpressure`; these runs are the at-scale confirmation. Reproduce: the §3 command with
+`--rate 300 --pause-workers 10:45`.
+
+Scope note: the bound is the **un-costed tail** (events above the settlement frontier — the
+ratified G2a-shape metric). A backdated/backfill flood is a different axis: those events settle
+promptly (each pass drains to head) while invalidating already-settled costs behind them, so they
+never accumulate in this counter — their cost is the §4 re-cost write amplification, bounded today
+by cadence and the close gate, not by this lever. If that axis ever needs its own throttle, §4's
+settlement-rows-per-physical-event rate is the natural input; that remains future work.
+
 ## Bottom line
 
 - **Correctness at scale: green.** With everything running concurrently — two hot paths, feed,
@@ -204,9 +236,10 @@ Structural readings:
 - **The two-gauge model works** and the close report's per-pool lag + G2b gross bound give the
   operator the forced-close-move number the design promised.
 - **Two real engine findings** the small-case nets couldn't reach: the adjustment-storm write
-  amplification (feeds acct-qm7o.7 backpressure) and the `cost_layer_consumption_pkey`
-  generation-collision wedge (fixed as `acct-qm7o.8` with a deterministic two-session regression
-  test; the trend soak that originally wedged now passes clean — §5, §3).
+  amplification (fed the acct-qm7o.7 backpressure lever — shipped, demonstrated in §8) and the
+  `cost_layer_consumption_pkey` generation-collision wedge (fixed as `acct-qm7o.8` with a
+  deterministic two-session regression test; the trend soak that originally wedged now passes
+  clean — §5, §3).
 - **Structural load shape:** direct sustains offered load 3–4× beyond the 2-committer staging
   config; batching across hot pools is a lock convoy, not a throughput win.
 

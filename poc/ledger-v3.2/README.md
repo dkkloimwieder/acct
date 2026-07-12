@@ -126,8 +126,8 @@ feed delivery is a free no-op, never a floor-lowering loop; replay and the 0015 
 only-if-unchanged, self-lowers the floor for unscanned mid-pass commits inside the replayed range, and
 keeps/re-stamps the queue row when work remains — invariant: floor set ⇒ queue row exists, so
 claim-by-queue is complete. Workers: N looping connections (`scripts/run-recalc.sh`, default 4 = D10);
-cadence is continuous drain (recalc-c §3). Backpressure (recalc-c §5) deliberately deferred —
-tracked as its own issue. The claim protocol is lock-then-read (acct-qm7o.8): the claim statement
+cadence is continuous drain (recalc-c §3). Backpressure (recalc-c §5) shipped separately
+(acct-qm7o.7, below). The claim protocol is lock-then-read (acct-qm7o.8): the claim statement
 locks ONLY the queue row and the settlement state is read post-lock on a fresh snapshot — every
 generation writer commits under that lock, and reading through a join inside the locking statement
 surfaces EvalPlanQual-mixed rows (new queue tuple, snapshot-stale generation/floor) under concurrent
@@ -207,6 +207,50 @@ corrections applied before it, so the offline `fold − deltas` identity is not 
 flushed pool with settlements — the drift is bounded, surfaces in the close sweep's residue GL, and the
 post-close `value_sum == Σ open-layer value` check covers those pools exactly (the verify skips-and-counts
 them pre-close as `v2_skipped_flush_wiped`).
+
+**Backpressure (acct-qm7o.7) SHIPPED**: the recalc-c §5 lever — the deliberate, lazily-engaged
+re-coupling that stops the physical (qty) plane running arbitrarily far ahead of authoritative cost on
+fifo/lifo pools. Bound metric: per-pool **unsettled-event count**, kept as a cheap counter
+(`recalc_backlog.pending_events`, migration 0018) — the FEED increments it at mark time for delivered
+physical fifo/lifo events (the engine's `cost_adjustment_line` loopback never counts) and **engages**
+(`recalc_backpressure` row) when the post-bump counter reaches the bound; the ENGINE resets the counter
+to the exact committed tail above the new frontier at every settle — wiping feed-lag skew, so the
+counter never drifts — applies the same bound to its own reset, and **releases** at the low-water mark.
+Bounds live in `recalc_backpressure_config` (single row, deletion-guarded; defaults 200/20 — D10
+soak-output tunables, calibrated ~3× the observed healthy global max). Throttling is
+**reject-at-admission on both paths** with SQLSTATE 53400: `ledger_submit_trx` probes the throttled
+set pre-write (the probe against the normally-empty PK is both the design's cheap global flag and the
+per-pool consult — one empty-index lookup in the common case, alt-C's read-free property preserved),
+and a BEFORE INSERT trigger gates raw `ledger_inbox` enqueues (fail-open on malformed payloads — the
+gate is admission control, not validation); `ledger_staging_drain` applies already-admitted envelopes
+unchecked (admitted work is never retroactively failed). Zero-qty lines don't count as appends;
+wac/std/specific pools never enter the lever (guarded locally at both the feed counter and the engine
+engage); a close or `settle_pool` on a throttled pool auto-releases via its settles. The feed's apply
+order is load-bearing — floors → counter bumps → marks — because the mark is what guarantees a future
+engine pass: a pass can settle events whose delivery is still in flight, and the late bump then lands
+its stale counts on top of the pass's committed reset; the trailing mark re-creates the queue row that
+pass deleted, so the guaranteed follow-up pass wipes the residue and releases any spurious engage
+(marks-first would leave a permanently throttled pool with an empty tail). Row-lock order shared by
+every writer: `pool_settlement` → `recalc_backlog` → `recalc_backpressure`, multi-pool writers
+ascending by pool id (matching the close sweep, so the two multi-pool lock accumulators cannot
+cross-lock); the engine's counter write sits at the pass tail so a feed increment blocks at most for
+the settle-to-commit window in worker shape (a close sweep holds it for the close transaction — the
+same pre-existing exposure class as its `pool_settlement` holds), and the standalone feed loop retries
+an errored tick instead of dying (deadlock-victim resilience). Gauges: the soak sampler carries
+`bp_throttled_pools` / `bp_max_backlog`, and both load paths classify 53400 as an expected reject
+(`rejected_backpressure`). Tests: `acceptance_recalc_backpressure` (7 cases: engage exactly at the
+bound + both-path rejects with atomic multi-line rejection, gate-before-write precedence on duplicate
+sources, and per-pool granularity; pre-admitted envelopes apply during throttle; settle releases at
+low-water; a two-legged parked-pass interleaving pinning the hysteresis band AND the ≤-boundary
+release with the exact-tail reset; fifo/lifo scoping + adjustment-loopback exclusion; the engine
+engaging on its own at-bound reset in the feed-lag window; and the late-delivery healing interleaving,
+red-green validated against the marks-first order) + `property_backpressure` (100 random workloads
+over random hysteresis bands checking exact feed accounting, engage completeness, engine-side
+hysteresis transitions, admission exactness with zero-residue rejects, scope, and convergence-to-open
+at rest) + R9 in `property_recalc_engine` (backpressure stays off under workloads below the bound,
+sampled after every op). Scope: the bound is the un-costed tail; backdated floods re-cost settled
+history instead of accumulating in it — that axis (soak-results §4's write amplification) stays with
+cadence + the close gate.
 
 ## Stack
 

@@ -42,7 +42,10 @@
 //!    replayed range (that one lowers the floor ourselves — its feed mark hit
 //!    our claim-locked row's DO NOTHING and its position is behind the new
 //!    frontier, so nothing else would recover it). A kept row is re-stamped to
-//!    the back of the line so a hot pool cannot starve its siblings.
+//!    the back of the line so a hot pool cannot starve its siblings. The same
+//!    freshest-snapshot tail count resets the pool's backpressure counter
+//!    (`recalc_backlog`) and applies the engage/release thresholds
+//!    (recalc-c §5) — the engine owns release at the low-water mark.
 //!
 //! Crash safety: the whole pass is the caller's transaction. An abort leaves
 //! the queue row, the floor, and generation N-1 untouched; the retry recomputes
@@ -878,6 +881,15 @@ fn settle(claim: &Claim, generation: i64, frontier_at: &str, frontier_id: i64) -
 /// feed mark our claim lock swallowed; that one also lowers the recost floor
 /// (guarded min) so the next pass replays past it. A kept row is re-stamped to
 /// the back of the line; otherwise the mark is consumed.
+///
+/// The same freshest-snapshot tail count drives the backpressure counter
+/// (recalc-c §5): every pass RESETS `recalc_backlog.pending_events` to the
+/// exact committed tail above the new frontier, wiping any feed-lag skew in
+/// the feed's mark-time increments so the counter never drifts. The reset
+/// writer then applies both thresholds to the value it just wrote — engage at
+/// the bound (a reset that lands over the bound must not cross silently) and
+/// release at the low-water mark (the engine owns release: it is the side
+/// that observes drain).
 fn decide_queue(
     pool_id: i64,
     scan_from: &Option<(String, i64)>,
@@ -935,21 +947,58 @@ fn decide_queue(
             }
         }
 
-        let tail: bool = client
+        // A count rather than an existence probe: the tail count doubles as
+        // the backpressure counter reset below. The counted rows sit above
+        // the new frontier — mid-pass arrivals — so the index-only count is
+        // bounded by the arrival rate over one pass, not the stream depth.
+        let tail_count: i64 = client
             .select(
-                "SELECT EXISTS ( \
-                    SELECT 1 FROM trx_line t \
-                     WHERE t.pool_id = $1 \
-                       AND t.line_type <> 'cost_adjustment_line' \
-                       AND ($2::timestamptz IS NULL \
-                            OR (t.posted_at, t.id) > ($2::timestamptz, $3)))",
+                "SELECT count(*) FROM trx_line t \
+                  WHERE t.pool_id = $1 \
+                    AND t.line_type <> 'cost_adjustment_line' \
+                    AND ($2::timestamptz IS NULL \
+                         OR (t.posted_at, t.id) > ($2::timestamptz, $3))",
                 None,
                 &[pool_id.into(), f_at.into(), f_id.into()],
             )?
             .first()
-            .get::<bool>(1)?
-            .unwrap_or(false);
-        if floor_pending || tail || missed {
+            .get::<i64>(1)?
+            .unwrap_or(0);
+
+        // Backpressure counter reset + threshold application (recalc-c §5).
+        // Runs at the pass tail so the counter row's lock is held only for the
+        // settle-to-commit window — a concurrent feed batch's increment blocks
+        // at most that long, never for the fold.
+        client.update(
+            "INSERT INTO recalc_backlog (pool_id, pending_events) VALUES ($1, $2) \
+             ON CONFLICT (pool_id) DO UPDATE \
+                 SET pending_events = EXCLUDED.pending_events",
+            None,
+            &[pool_id.into(), tail_count.into()],
+        )?;
+        // The method filter is a local guard: only fifo/lifo passes reach
+        // this code today, but an engaged pool the engine never settles
+        // could not be released, so the invariant must not depend on the
+        // callers' dispatch.
+        client.update(
+            "INSERT INTO recalc_backpressure (pool_id, engage_events) \
+             SELECT $1, $2::bigint FROM recalc_backpressure_config c \
+              WHERE $2::bigint >= c.bound_events \
+                AND EXISTS (SELECT 1 FROM pool p \
+                             WHERE p.id = $1 AND p.method IN ('fifo', 'lifo')) \
+             ON CONFLICT (pool_id) DO NOTHING",
+            None,
+            &[pool_id.into(), tail_count.into()],
+        )?;
+        client.update(
+            "DELETE FROM recalc_backpressure bp \
+              USING recalc_backpressure_config c \
+              WHERE bp.pool_id = $1 AND $2::bigint <= c.low_water",
+            None,
+            &[pool_id.into(), tail_count.into()],
+        )?;
+
+        if floor_pending || tail_count > 0 || missed {
             client.update(
                 "UPDATE recalc_queue SET enqueued_at = now() WHERE pool_id = $1",
                 None,

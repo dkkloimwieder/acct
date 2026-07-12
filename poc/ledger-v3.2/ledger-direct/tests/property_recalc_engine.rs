@@ -32,6 +32,10 @@
 //!       and the R5 re-drain: a pool's committed recalc_generation never
 //!       decreases (committed generations key cost_layer_consumption's
 //!       primary key, so a regression wedges the next genuine re-cost)
+//!   R9  backpressure stays off — sampled with R8: under the default bounds
+//!       (200/20) these case sizes never approach the bound, so the throttled
+//!       set must remain empty throughout (recalc-c §5 "stays off otherwise";
+//!       a counter-residue bug would surface here as a spurious engage)
 //!
 //! This is where the engine's plumbing (scan bounds, R-1 ordering, floor
 //! races, generation deltas, loopback filtering) has to hold under shapes no
@@ -112,6 +116,7 @@ fn reference_walk(
 }
 
 /// R8 — sample every pool's committed generation against its running max.
+/// R9 — piggybacked: the throttled set stays empty at these case sizes.
 async fn assert_gen_monotonic(pool: &PgPool, max_gen: &mut HashMap<i64, i64>) {
     let gens: Vec<(i64, i64)> =
         sqlx::query_as("SELECT pool_id, recalc_generation FROM pool_settlement")
@@ -123,6 +128,11 @@ async fn assert_gen_monotonic(pool: &PgPool, max_gen: &mut HashMap<i64, i64>) {
         assert!(g >= *prior, "R8 generation regressed on pool {pid}: {prior} -> {g}");
         *prior = g;
     }
+    let engaged: i64 = sqlx::query_scalar("SELECT count(*) FROM recalc_backpressure")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(engaged, 0, "R9 backpressure engaged under a workload far below the bound");
 }
 
 async fn run_case(pool: &PgPool, n_pools: usize, ops: &[Op]) {

@@ -45,13 +45,25 @@ async fn main() {
                 return;
             }
             report = consumer.ingest_once(batch) => {
-                let report = report.expect("feed ingest tick");
+                // An errored tick (deadlock-detector victim under a close
+                // sweep, transient connection loss) is retried, not fatal:
+                // the cursor did not advance, so the next peek re-delivers
+                // the batch and the idempotent apply converges.
+                let report = match report {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("feed: ingest error (retrying): {e}");
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                };
                 if report.inserts > 0 {
                     println!(
-                        "feed: {} events, {} pools marked, {} floors lowered, cursor {}",
+                        "feed: {} events, {} pools marked, {} floors lowered, {} pools throttled, cursor {}",
                         report.inserts,
                         report.pools_marked,
                         report.floors_lowered,
+                        report.pools_throttled,
                         report.advanced_to.as_deref().unwrap_or("unchanged"),
                     );
                 }

@@ -8,6 +8,8 @@
 //!
 //! Error accounting:
 //! - SQLSTATE 23000 (wac strict qty gate) — an expected reject; counted.
+//! - SQLSTATE 53400 (backpressure throttle, recalc-c §5) — an expected reject
+//!   on both paths whenever the engine lags a pool past the bound; counted.
 //! - SQLSTATE 40P01 (deadlock, documented benign under close-fence overlap) —
 //!   retried up to 3 times; retries counted.
 //! - anything else — recorded and surfaced; a run with unexplained errors
@@ -71,6 +73,7 @@ pub struct LoadOutcome {
     pub submitted: u64,
     pub acked: u64,
     pub rejected_qty_gate: u64,
+    pub rejected_backpressure: u64,
     pub deadlock_retries: u64,
     pub errors: Vec<String>,
     pub achieved_rate: f64,
@@ -92,6 +95,7 @@ struct CallerTally {
     submitted: u64,
     acked: u64,
     rejected: u64,
+    throttled: u64,
     retries: u64,
     backdated: u64,
     errors: Vec<String>,
@@ -104,6 +108,7 @@ impl CallerTally {
             submitted: 0,
             acked: 0,
             rejected: 0,
+            throttled: 0,
             retries: 0,
             backdated: 0,
             errors: Vec::new(),
@@ -228,6 +233,10 @@ pub async fn run_load(pool: &PgPool, cfg: &LoadCfg) -> LoadOutcome {
                             tally.rejected += 1;
                             break;
                         }
+                        Err(e) if sqlstate(&e) == "53400" => {
+                            tally.throttled += 1;
+                            break;
+                        }
                         Err(e) if sqlstate(&e) == "40P01" && attempts <= 3 => {
                             tally.retries += 1;
                         }
@@ -288,6 +297,7 @@ pub async fn run_load(pool: &PgPool, cfg: &LoadCfg) -> LoadOutcome {
         outcome.submitted += tally.submitted;
         outcome.acked += tally.acked;
         outcome.rejected_qty_gate += tally.rejected;
+        outcome.rejected_backpressure += tally.throttled;
         outcome.deadlock_retries += tally.retries;
         outcome.backdated_submitted += tally.backdated;
         outcome.errors.extend(tally.errors);
