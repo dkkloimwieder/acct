@@ -165,6 +165,37 @@ async fn direct_methods() {
     .expect_err("standard-basis depletion without standard_cost must raise");
     assert_eq!(sqlstate(&err), "22000", "MissingStandardCost SQLSTATE");
 
+    // Standard-basis depletion as a pool's FIRST event (missing-row upsert):
+    // the recorded cost and the value_sum decrement are the same standard —
+    // the aggregate initializes at (-qty, 0, -qty × standard).
+    let f4 = seed_pool(&pool, 4, 4, 4, "fifo", "standard").await;
+    set_standard_cost(&pool, &f4, 80).await;
+    let trx_first =
+        submit(&pool, "inv_adjustment", 23, json!([line(f4.pool_id, "inv_adjustment_line", -3, 0)]))
+            .await
+            .expect("standard-basis first-event depletion");
+    assert_eq!(
+        aggregate(&pool, f4.pool_id).await,
+        Some((-3, 0, -240)),
+        "missing-row arm decrements at the standard"
+    );
+    let observed: i64 = sqlx::query_scalar("SELECT unit_cost FROM trx_line WHERE trx_id = $1")
+        .bind(trx_first)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(observed, 80, "recorded cost equals the decrement basis");
+
+    // Negative standard costs are unrepresentable (0019 CHECK), so the
+    // depletion CTE's cost clamp can never diverge from the recorded line.
+    let err = sqlx::query(
+        "INSERT INTO standard_cost (sku_id, location_id, unit_cost) VALUES (99, 99, -1)",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("negative standard cost must be rejected");
+    assert_eq!(sqlstate(&err), "23514", "standard_cost_unit_cost_nonneg CHECK");
+
     // ── STD: main leg at standard + variance leg (ledger-core path) ────
     reset_state(&pool).await;
     let f = seed_fixture(&pool, "std", "running_avg").await;

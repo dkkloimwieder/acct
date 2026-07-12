@@ -134,12 +134,15 @@ SELECT id FROM ins_tl";
 /// book value, driving the derived average negative — a flagged, nonsensical
 /// state with no meaningful observation basis (trx_line CHECKs unit_cost >= 0;
 /// recalc assigns the authoritative cost). The clamped cost also drives the
-/// value_sum decrement, keeping value_sum == Σ signed qty×recorded-cost
-/// reconcilable to the lines.
+/// value_sum decrement — on BOTH arms, so the missing-row upsert can never
+/// move value_sum by a cost the line does not record — keeping value_sum ==
+/// Σ signed qty×recorded-cost reconcilable to the lines. (Negative standard
+/// costs are additionally unrepresentable: `standard_cost` CHECKs
+/// unit_cost >= 0.)
 const FL_DEPLETE: &str = "\
 WITH mv AS ( \
   INSERT INTO pool_state (pool_id, layer_id, qty, unit_cost, value_sum) \
-  VALUES ($1, 0, 0 - $2, 0, (($2::numeric * COALESCE($3, 0)::numeric) * -1)::bigint) \
+  VALUES ($1, 0, 0 - $2, 0, (($2::numeric * GREATEST(COALESCE($3, 0), 0)::numeric) * -1)::bigint) \
   ON CONFLICT (pool_id, layer_id) DO UPDATE \
      SET qty       = pool_state.qty - $2, \
          value_sum = CASE WHEN pool_state.qty - $2 = 0 THEN 0 \
