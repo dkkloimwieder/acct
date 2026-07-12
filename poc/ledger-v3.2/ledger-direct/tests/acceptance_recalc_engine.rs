@@ -467,3 +467,195 @@ async fn concurrent_workers_never_double_settle() {
         assert_eq!(auth, if pid % 2 == 0 { 233 } else { 167 });
     }
 }
+
+
+/// Flush-wiped correction: the FL exact-empty flush discards engine
+/// corrections folded into the aggregate before it, and the id-order
+/// (apply-order) fold with per-adjustment reconciles reconciles value_sum
+/// exactly through that wipe — the telescoped-deltas identity cannot.
+///
+/// Choreography (single fifo pool, deep-negative + backdated shape):
+/// 1. gen-1 settles the T13 deplete-29 against all three T11 receipts —
+///    authoritative 72 vs observed 279 — and folds the +6003 correction into
+///    value_sum (5913 → 11916, derived average 126 → 254);
+/// 2. a backdated T10 deplete-47 lands the aggregate qty at exactly 0: the
+///    residue flush zeroes value_sum, discarding that folded correction (its
+///    own recorded cost is the corrected average 254);
+/// 3. the backdated delivery floors the pool; the full-replay re-cost keeps
+///    auth 72 for the deplete-29 (no gen-2 row) and moves only the T13
+///    deplete-47 (254 → 253, reconcile +47).
+/// Quiesced value_sum is 6003 short of `commit-order fold − Σ (auth_final −
+/// observed) × qty` — the wiped correction, unrecoverable from the physical
+/// stream alone (verify.rs V2 skips these pools). The id-order fold over ALL
+/// lines (physical + cost_adjustment_line reconciles) reproduces it exactly.
+#[tokio::test]
+#[ignore = "needs running poc_v3_2 with ledger_direct installed"]
+async fn flush_wiped_correction_reconciles_in_apply_order() {
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let consumer = reset_feed(&pool).await;
+    let f = seed_fixture(&pool, "fifo", "running_avg").await;
+    let pid = f.pool_id;
+
+    receipt_at(&pool, pid, 1000, T11, 4, 279).await;
+    consumer.ingest_once(10_000).await.expect("ingest");
+    consumer.ingest_once(10_000).await.expect("ingest");
+    let d29 = deplete_at(&pool, pid, 1003, T13, 29).await;
+    consumer.ingest_once(10_000).await.expect("ingest");
+    receipt_at(&pool, pid, 1005, T11, 37, 39).await;
+    receipt_at(&pool, pid, 1006, T11, 35, 327).await;
+
+    // gen-1: the scan reads trx_line directly, so it sees the two receipts
+    // whose feed delivery is still pending; deplete-29 draws 4@279 + 25@39 =
+    // 2091 → banker_div(2091, 29) = 72, delta (72 − 279) × 29 = −6003.
+    let r = recalc_step(&pool).await;
+    assert_eq!(r["settlements_written"], json!(1));
+    assert_eq!(r["adjustments_posted"], json!(1));
+    assert_eq!(authoritative_of(&pool, d29).await, Some(72));
+    assert_eq!(
+        aggregate(&pool, pid).await,
+        Some((47, 254, 11916)),
+        "gen-1 correction folded: 5913 + 6003"
+    );
+
+    // Backdated exact-empty depletion: qty 47 → 0 flushes value_sum to 0,
+    // discarding the folded +6003; recorded cost is the derived average 254.
+    let d47_t10 = deplete_at(&pool, pid, 1008, T10, 47).await;
+    assert_eq!(
+        aggregate(&pool, pid).await,
+        Some((0, 254, 0)),
+        "exact-empty flush wiped the folded correction"
+    );
+
+    // Rolled-back pass: no observable effect (whole-pass transactionality).
+    {
+        let mut tx = pool.begin().await.unwrap();
+        let _: Value = sqlx::query_scalar("SELECT ledger_recalc_step()")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+    }
+
+    let d47_t13 = deplete_at(&pool, pid, 1010, T13, 47).await;
+    consumer.ingest_once(10_000).await.expect("ingest");
+    consumer.ingest_once(10_000).await.expect("ingest");
+    let d32 = deplete_at(&pool, pid, 1013, T13, 32).await;
+
+    // Quiesce: ingest + drain until nothing moves.
+    loop {
+        let mut inserts = 0usize;
+        loop {
+            let r = consumer.ingest_once(10_000).await.expect("ingest");
+            inserts += r.inserts;
+            if r.messages == 0 {
+                break;
+            }
+        }
+        let passes = drain_recalc(&pool).await;
+        let floors = count(
+            &pool,
+            "SELECT count(*) FROM pool_settlement WHERE recost_floor_posted_at IS NOT NULL",
+        )
+        .await;
+        let queued = count(&pool, "SELECT count(*) FROM recalc_queue").await;
+        if inserts == 0 && passes.is_empty() && floors == 0 && queued == 0 {
+            break;
+        }
+    }
+
+    // Settled history: the full-replay re-cost confirms 72 (no new row for
+    // d29), the uncovered depletions cost at their observed 254, and only the
+    // T13 deplete-47 moves (12@39 + 35@327 = 11913 → banker_div = 253).
+    assert_eq!(authoritative_of(&pool, d29).await, Some(72));
+    assert_eq!(authoritative_of(&pool, d47_t10).await, Some(254));
+    assert_eq!(authoritative_of(&pool, d47_t13).await, Some(253));
+    assert_eq!(authoritative_of(&pool, d32).await, Some(254));
+    assert_eq!(
+        count(
+            &pool,
+            &format!("SELECT count(*) FROM cost_settlement WHERE depletion_trx_line_id = {d29}")
+        )
+        .await,
+        1,
+        "re-cost confirms 72 without a new settlement row"
+    );
+
+    let (agg_qty, _, value_sum) = aggregate(&pool, pid).await.expect("aggregate");
+    assert_eq!((agg_qty, value_sum), (-79, -20019));
+
+    // The telescoped identity is short by exactly the wiped correction.
+    let events: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, qty, unit_cost FROM trx_line \
+          WHERE pool_id = $1 AND line_type <> 'cost_adjustment_line' \
+          ORDER BY id",
+    )
+    .bind(pid)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let mut hot_qty: i64 = 0;
+    let mut hot_value: i128 = 0;
+    for &(_, q, c) in &events {
+        hot_qty += q;
+        if q > 0 {
+            hot_value += q as i128 * c as i128;
+        } else if hot_qty == 0 {
+            hot_value = 0;
+        } else {
+            hot_value -= (-q) as i128 * c as i128;
+        }
+    }
+    let mut deltas: i128 = 0;
+    for &(id, q, observed) in &events {
+        if q < 0 {
+            let auth = authoritative_of(&pool, id).await.expect("settled");
+            deltas += (auth - observed) as i128 * (-q) as i128;
+        }
+    }
+    assert_eq!(value_sum as i128 - (hot_value - deltas), -6003, "wiped gen-1 correction");
+
+    // The apply-order fold reconciles exactly: physical lines through the FL
+    // formulas, each cost_adjustment_line through its settlement's
+    // (authoritative − prior) × qty reconcile.
+    let all_lines: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, line_type::text, qty, unit_cost FROM trx_line \
+          WHERE pool_id = $1 ORDER BY id",
+    )
+    .bind(pid)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let recons: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT tl.id, cs.authoritative_unit_cost, cs.prior_unit_cost, -tl.qty \
+           FROM trx_line tl \
+           JOIN posting_line pl ON pl.trx_line_id = tl.id \
+           JOIN cost_settlement cs ON cs.adjustment_posting_line_id = pl.id \
+          WHERE tl.pool_id = $1 AND tl.line_type = 'cost_adjustment_line'",
+    )
+    .bind(pid)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let mut fold_qty: i64 = 0;
+    let mut fold_value: i128 = 0;
+    for &(id, ref lt, q, c) in &all_lines {
+        if lt == "cost_adjustment_line" {
+            let &(_, auth, prior, dep_qty) =
+                recons.iter().find(|(rid, _, _, _)| *rid == id).expect("reconcile for adj line");
+            fold_value -= (auth - prior) as i128 * dep_qty as i128;
+            continue;
+        }
+        fold_qty += q;
+        if q > 0 {
+            fold_value += q as i128 * c as i128;
+        } else if fold_qty == 0 {
+            fold_value = 0;
+        } else {
+            fold_value -= (-q) as i128 * c as i128;
+        }
+    }
+    assert_eq!(value_sum as i128, fold_value, "apply-order fold reconciles the wipe");
+
+    drop_feed_slot(&pool).await;
+}

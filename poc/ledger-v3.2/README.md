@@ -141,9 +141,12 @@ against a re-stamped queue row must read the sibling's committed generation — 
 a parked claim waking to a deleted queue row must retry, not error; `pg_stat_activity` lock-wait
 polling is the rendezvous) + `property_recalc_engine` (100 random interleavings of
 submits/ingests/steps/crash-steps over a random business-date grid, checked against an independent
-in-test layer walk: R1 oracle equivalence, R2 layer materialization, R3 exact value reconciliation,
-R4 frontier at rest, R5 idempotency, R6 derivability from consumption rows, R7 method isolation,
-R8 generation monotonicity sampled after every op; bounded quiesce = livelock detection).
+in-test layer walk: R1 oracle equivalence, R2 layer materialization, R3 exact value reconciliation
+(an apply-order fold over physical lines + per-adjustment engine reconciles — exact even through
+exact-empty flush wipes, which sequential execution makes reconstructible from trx_line id order —
+plus a reference-anchored settlement-chain telescope so a self-consistent engine cannot satisfy the
+fold alone; acct-qm7o.9), R4 frontier at rest, R5 idempotency, R6 derivability from consumption rows, R7 method
+isolation, R8 generation monotonicity sampled after every op; bounded quiesce = livelock detection).
 
 **Phase 5 (close, acct-qm7o.5) SHIPPED**: close-time finalize (recalc-e). `ledger_close_period(period_id,
 actor, force)` is the orchestrated close — one transaction: closer mutex (advisory `(32021, period)`;

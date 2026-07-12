@@ -17,9 +17,16 @@
 //!       split the work across incremental/full/re-cost passes
 //!   R2  layer materialization — persisted `pool_state.layer_id > 0` rows
 //!       equal the reference walk's final open layers
-//!   R3  value reconciliation — aggregate value_sum == the hot path's
-//!       commit-order fold (with its exact-empty residue flush) minus the
-//!       telescoped generation deltas Σ (auth_final − observed) × qty — exact
+//!   R3  value reconciliation — aggregate value_sum == an id-order (apply-
+//!       order) replay of ALL the pool's lines: physical lines via the FL
+//!       hot-path aggregate formulas (including the exact-empty residue
+//!       flush, which discards every correction folded in before it),
+//!       `cost_adjustment_line` rows via their settlement's
+//!       (authoritative − prior) × qty reconcile — exact on every pool,
+//!       including flush-wiped shapes; PLUS the reference anchor: each
+//!       depletion's settlement chain telescopes to (ref_auth − observed) ×
+//!       qty with GL linkage iff a row moved, so a self-consistent engine
+//!       (wrong priors, unfolded corrections) cannot satisfy the fold alone
 //!   R4  bookkeeping at rest — settled_through == the pool's physical stream
 //!       head, no recost floor, empty queue
 //!   R5  idempotency — re-marking every pool dirty produces pure no-op
@@ -279,39 +286,106 @@ async fn run_case(pool: &PgPool, n_pools: usize, ops: &[Op]) {
             assert_eq!(layers, expected, "R2 layer materialization: pool {pid}");
         }
 
-        // R3 — value_sum == the hot path's commit-order (id-order) fold minus
-        // the telescoped generation deltas Σ (auth_final − observed) × qty.
-        // The hot-path fold must include the FL CTE's exact-empty branch: a
-        // depletion that zeroes the qty flushes value_sum to 0 (residue
-        // flush), so the naive Σ qty×recorded identity is off by that residue.
+        // R3 — value_sum == an id-order replay of ALL the pool's lines. Ids
+        // record apply order here: every op in this harness runs to
+        // completion before the next, so trx_line ids interleave hot-path
+        // commits and engine passes exactly as value_sum experienced them
+        // (a guarantee verify.rs V2 lacks under concurrency — it must skip
+        // flush-wiped pools; this fold reconciles them exactly). Physical
+        // lines apply the FL hot-path formulas — the exact-empty flush
+        // (post-event qty 0 ⇒ value := 0) discards every reconcile folded in
+        // before it, which the fold reproduces by construction. Each
+        // `cost_adjustment_line` applies its settlement's
+        // (authoritative − prior) × qty reconcile; per-line application sums
+        // to the engine's per-pass net (subtraction is linear). Adjustment
+        // lines never touch the aggregate qty, so they cannot fire the flush.
         if !events.is_empty() {
-            let mut by_commit = events.clone();
-            by_commit.sort_by_key(|(id, _, _)| *id);
-            let mut hot_qty: i64 = 0;
-            let mut hot_value: i128 = 0;
-            for &(_, q, c) in &by_commit {
-                hot_qty += q;
+            let all_lines: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+                "SELECT id, line_type::text, qty, unit_cost FROM trx_line \
+                  WHERE pool_id = $1 ORDER BY id",
+            )
+            .bind(pid)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            let recons: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+                "SELECT tl.id, cs.authoritative_unit_cost, cs.prior_unit_cost, -tl.qty \
+                   FROM trx_line tl \
+                   JOIN posting_line pl ON pl.trx_line_id = tl.id \
+                   JOIN cost_settlement cs ON cs.adjustment_posting_line_id = pl.id \
+                  WHERE tl.pool_id = $1 AND tl.line_type = 'cost_adjustment_line'",
+            )
+            .bind(pid)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            let recon: HashMap<i64, i128> = recons
+                .iter()
+                .map(|&(id, auth, prior, dep_qty)| {
+                    (id, (auth - prior) as i128 * dep_qty as i128)
+                })
+                .collect();
+            let adj_lines =
+                all_lines.iter().filter(|(_, lt, _, _)| lt == "cost_adjustment_line").count();
+            assert_eq!(
+                adj_lines,
+                recon.len(),
+                "R3 every adjustment line carries exactly one settlement reconcile: pool {pid}"
+            );
+            let mut fold_qty: i64 = 0;
+            let mut fold_value: i128 = 0;
+            for &(id, ref lt, q, c) in &all_lines {
+                if lt == "cost_adjustment_line" {
+                    fold_value -= recon[&id];
+                    continue;
+                }
+                fold_qty += q;
                 if q > 0 {
-                    hot_value += q as i128 * c as i128;
-                } else if hot_qty == 0 {
-                    hot_value = 0;
+                    fold_value += q as i128 * c as i128;
+                } else if fold_qty == 0 {
+                    fold_value = 0;
                 } else {
-                    hot_value -= (-q) as i128 * c as i128;
+                    fold_value -= (-q) as i128 * c as i128;
                 }
             }
-            let deltas: i128 = ref_costings
-                .iter()
-                .map(|&(dep_id, auth)| {
-                    let (_, q, observed) =
-                        *events.iter().find(|(id, _, _)| *id == dep_id).unwrap();
-                    (auth - observed) as i128 * (-q) as i128
-                })
-                .sum();
             let value_sum = aggregate(pool, pid).await.expect("aggregate exists").2;
+            assert_eq!(value_sum as i128, fold_value, "R3 value reconciliation: pool {pid}");
+        }
+
+        // R3 anchor — the settlement chain telescopes to the INDEPENDENT
+        // reference: per depletion, Σ (authoritative − prior) × qty over its
+        // rows == (ref_auth − observed) × qty, and GL linkage exists iff the
+        // row moved. The id-order fold above is self-consistent with whatever
+        // the engine recorded — an engine that mis-anchors `prior` on re-cost
+        // or records moved settlements without folding/posting would satisfy
+        // the fold alone. This anchor never reads value_sum, so it stays
+        // exact on flush-wiped pools.
+        let chains: Vec<(i64, i64, i64, bool)> = sqlx::query_as(
+            "SELECT cs.depletion_trx_line_id, cs.authoritative_unit_cost, \
+                    cs.prior_unit_cost, cs.adjustment_posting_line_id IS NOT NULL \
+               FROM cost_settlement cs \
+               JOIN trx_line tl ON tl.id = cs.depletion_trx_line_id \
+              WHERE tl.pool_id = $1",
+        )
+        .bind(pid)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let mut chain_sum: HashMap<i64, i128> = HashMap::new();
+        for &(dep, auth, prior, has_gl) in &chains {
             assert_eq!(
-                value_sum as i128,
-                hot_value - deltas,
-                "R3 value reconciliation: pool {pid}"
+                has_gl,
+                auth != prior,
+                "R3 GL linkage iff the settlement moved: pool {pid} depletion {dep}"
+            );
+            *chain_sum.entry(dep).or_default() += (auth - prior) as i128;
+        }
+        for &(dep_id, ref_auth) in &ref_costings {
+            let (_, q, observed) = *events.iter().find(|(id, _, _)| *id == dep_id).unwrap();
+            assert_eq!(
+                chain_sum.get(&dep_id).copied().unwrap_or(0) * (-q) as i128,
+                (ref_auth - observed) as i128 * (-q) as i128,
+                "R3 settlement chain telescopes to the reference: pool {pid} depletion {dep_id}"
             );
         }
 

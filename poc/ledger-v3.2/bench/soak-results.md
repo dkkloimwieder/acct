@@ -167,6 +167,16 @@ stream does not record). The drift is bounded, surfaces in the close sweep's res
 post-close `value_sum == Σ open-layer value` check covers those pools exactly. The verify
 skips-and-counts them (`v2_skipped_flush_wiped`; 8 of 300 pools in the headline run).
 
+Addendum (acct-qm7o.9): the same phenomenon reached the per-case property net at ~1-in-850 random
+cases (`property_recalc_engine` R3, then formulated as commit-order fold − telescoped deltas — a
+deterministic repro pins it in `acceptance_recalc_engine::flush_wiped_correction_reconciles_in_apply_order`).
+The property harness is sequential, so apply order IS recorded: trx_line ids interleave hot-path
+commits and engine adjustment lines exactly as `value_sum` experienced them. R3 now replays ALL
+lines in id order — physical lines through the FL formulas, each `cost_adjustment_line` through its
+settlement's `(authoritative − prior) × qty` reconcile — and stays exact through flush wipes. The
+V2 skip remains a concurrency concession (the soak's interleaving is unrecorded), not a semantic
+one.
+
 ## 7. Load / throughput-at-SLO (structural)
 
 Open-loop rungs, 12 s each, hot path only (no feed/workers), 300 pools, med profile, no
