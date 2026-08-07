@@ -188,7 +188,7 @@ The oracle is the golden reference; validation reuses it rather than inventing a
 The oracle also flagged a **test-bed gap** (§2a / §2c): the harness's constant-cost deep seed produces zero
 costing variance (a lock/throughput fixture, not a cost-divergence fixture). A recalc correctness bed needs a
 receipt-cost-volatility knob (varied costs comparable to pool value) before it can exercise the divergence
-offline — carry this into the v3.2 testing strategy (design-v3.2 §7).
+offline — carry this into the v3.2 testing strategy (design-v3.2 §8).
 
 ## 9. Interfaces to sibling children
 

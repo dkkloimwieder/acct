@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Pure-Rust cost-ledger transformation core for ledger-v3.2. plan_apply over WAC/STD/specific (strict, final-cost-on-the-hot-path); FIFO/LIFO are fail-loud stubs until the recalc engine supplies strict layer math (design-v3.2 §5a). No pgrx; no DB."
+description = "Pure-Rust cost-ledger transformation core for ledger-v3.2. plan_apply over WAC/STD/specific (strict, final-cost-on-the-hot-path); FIFO/LIFO are fail-loud stubs until the recalc engine supplies strict layer math (design-v3.2 §5). No pgrx; no DB."
 
 [lib]
 name = "ledger_core"

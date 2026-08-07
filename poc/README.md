@@ -32,8 +32,9 @@ In lineage order. "Verdict" is the tracker-recorded end state as of 2026-08-07.
 ## Specs (`design_research/`)
 
 - `convergence-decisions-2026-08-07.md` — **the decision record** (Q1–Q14, ratified).
-- `design-v3.2.md` + `design-v3.2-recalc-{a..e}.md` — the surviving line's spec skeleton +
-  five recalc design notes. Completion into a spec-of-record is `acct-476a.1`.
+- `design-v3.2.md` — the **spec-of-record** for the surviving line (§7 close semantics and §3a's
+  mechanical-guard half pending under `acct-1vur`) + `design-v3.2-recalc-{a..e}.md`, five recalc
+  design notes.
 - `design-v3.1.md` — Path C spec, including §16 posture / §17 feed / §18 gate verdict /
   §19 recalc risk / §20 alternatives. Decided inputs — do not re-litigate.
 - `design-v3.md` — the Paths A/B PoC design for `ledger-v3/`. The A/B/C revision that

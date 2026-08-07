@@ -37,7 +37,7 @@ pub(crate) mod wac;
 
 // FIFO/LIFO: the recalc engine's strict layer-walk (`strict_fold`, fed in R-1
 // order) plus fail-loud hot-path guards — the hot path never dispatches
-// FIFO/LIFO here (design-v3.2 §5a).
+// FIFO/LIFO here (design-v3.2 §5).
 pub mod fifo;
 pub mod lifo;
 

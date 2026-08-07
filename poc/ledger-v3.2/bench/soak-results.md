@@ -197,7 +197,7 @@ Structural readings:
 - **Staging saturates ≈450/s end-to-end at this committer config** (2 drainers × batch 25): past
   that, the inbox backlog grows without bound, and enqueue-ack latency collapses into the seconds
   as the backlog's drain transactions and the callers contend. Committer count/batch is the scale
-  knob (design-v3.2 §8's sharded-committer path).
+  knob (design-v3.2 §10's sharded-committer path).
 - **Drain-batch convoy (found during smoke):** a drain transaction holds every touched pool's
   aggregate tuple lock until commit; with 200-row batches over a Pareto-hot universe a concurrent
   direct submitter stalled for the whole batch chain (p99 56 s!). Batch 25 bounds the convoy

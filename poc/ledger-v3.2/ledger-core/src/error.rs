@@ -17,7 +17,7 @@ pub enum LedgerError {
 
     /// A method was dispatched to the wrong handler. Surfaces when something
     /// routes a FIFO/LIFO pool to `plan_apply` — their costing belongs to the
-    /// recalc engine (design-v3.2 §5a), not the hot-path dispatcher.
+    /// recalc engine (design-v3.2 §5), not the hot-path dispatcher.
     #[error("method mismatch: pool={pool_id} expected={expected:?} got={got:?}")]
     MethodMismatch {
         pool_id: i64,

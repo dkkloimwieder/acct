@@ -4,31 +4,59 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What the project is
 
-An ERP ledger and inventory system: SKU × location quantity tracking, per-routing-step WIP, document lifecycle (WO/SO/TO/PO), double-entry GL, multi-currency, reservations, commodity provisional pricing, period close. The design has gone through one full review cycle and has converged on a **Postgres-native v0.2** target (consolidated doc Part IV) — explicitly not a TigerBeetle drop-in or hybrid system.
+An ERP ledger and inventory system: SKU × location quantity tracking, per-routing-step WIP, document lifecycle (WO/SO/TO/PO), double-entry GL, multi-currency, reservations, commodity provisional pricing, period close. Postgres-native throughout — explicitly not a TigerBeetle drop-in or hybrid system.
 
-Four PoC research streams under `poc/` characterize architectural alternatives in parallel (separate crates, separate databases, off the production critical path). See `poc/README.md` for the catalog.
+**The repository holds two planes, and almost every question is about one of them specifically.** Know which one you are in before reading anything else:
+
+- **Costing plane — `poc/ledger-v3.2/` — the designated architecture.** SKU × location inventory valuation: hot path, recalc engine, logical-decoding feed, period close. A Rust/pgrx extension (`ledger_direct`) plus a feed consumer, on its own database `poc_v3_2`. Seven PoC generations converged here on 2026-08-07; it is merged to `main` and is where active work happens. Spec: `poc/design_research/design-v3.2.md`.
+- **Document layer — repo root (`db/`, `tests/`, `src/`) — deferred.** 70 plpgsql migrations, 29 `post_*` document wrappers, and their own plpgsql costing plane (WAC family). Frozen 2026-05-11. Whether it is ported onto v3.2 or rebuilt is convergence **Q2**, decided by the dossiers `acct-476a.2` / `acct-476a.4`. Until they report: no deletions, no premature port, and the `acct-23kd` PAUSE gate holds its issues out of `bd ready`.
+
+The two planes do not import from each other and there is no seam between them yet. Building one is gated on Q2.
+
+Seven PoC research streams lived under `poc/` between 2026-05 and 2026-07; six are retired. `poc/README.md` is the catalog with per-stream verdicts, and `poc/design_research/convergence-decisions-2026-08-07.md` is the decision record (Q1–Q14) — read it before re-litigating any stream's fate.
 
 State summary (count of files, list of shipped phases, etc.) lives in `README.md` and `db/README.md` plus the bd issue history — derive from there rather than from this file. `git log -- db/migrations/` and `bd list --status=closed` are the canonical history.
 
+> Commit hashes for commits dated **2026-05-19 or later** but cited before 2026-08-07 dangle: history was rewritten on 2026-08-07 (nine bench payload blobs stripped from all refs) and the pre-rewrite objects were gc'd. Hashes predating 2026-05-19 are unaffected. Resolve historical references via bd issue IDs, not hashes.
+
 ## Implementation stack
+
+Shared by both planes:
 
 - **Language:** Rust.
 - **Postgres driver:** `sqlx` (raw SQL, compile-time query checking against the live schema).
-- **Migrations:** `sqlx-cli` — plain `.sql` files under `db/migrations/`, run via `sqlx migrate run`.
-- **Tests:** `cargo test` — Rust integration tests using `tokio` + `sqlx`. **No pgTAP, no Python harnesses.** A small `tests/common/` module provides helpers (reset to fixture, expect SQLSTATE).
-- **Database:** Postgres 18 with `io_method=io_uring`, `pg_stat_statements`, `pg_cron`. Runs in Docker (host port `5111`, container port `5432`). Volume mounted at `/var/lib/postgresql` (PG 18+ convention). `seccomp:unconfined` on the dev container to allow io_uring syscalls; production hardening tracked as `acct-hbp`.
+- **Migrations:** `sqlx-cli` — plain `.sql` files, run via `sqlx migrate run`. **Applied migrations are immutable** (content-addressed; editing even a comment breaks `sqlx migrate run`). Corrections ship as new migrations.
+- **Tests:** `cargo test` — Rust integration tests using `tokio` + `sqlx`. **No pgTAP, no Python harnesses.**
+- **No task runners.** Shell scripts under `scripts/` are the canonical entry points, per plane.
+- **Database:** Postgres 18 with `io_method=io_uring`, `pg_stat_statements`, `pg_cron`. One Docker container (`acct-postgres`, host port `5111`), volume at `/var/lib/postgresql` (PG 18+ convention), `seccomp:unconfined` for io_uring syscalls; production hardening tracked as `acct-hbp`. **Both planes share this cluster** on separate databases — `acct` and `poc_v3_2`.
+
+Costing plane only:
+
+- **Extension substrate: `pgrx`.** `ledger_direct` is a pgrx extension — **shmem-free, no `shared_preload_libraries` entry required**. `ledger_feed` is an ordinary client of the SQL logical-decoding interface. Cluster prerequisites: `wal_level = logical`, `max_slot_wal_keep_size`.
+- **The substrate decision (convergence Q4) reopens only on named triggers:** error-identity failure at the SPI seam, PG-major-version friction, or upgrade-path cost. Absent one of those, do not reopen it. Note pgrx maps any SQLSTATE outside its enum to `XX000`, so the document layer's `P00xx` codes cannot cross the seam — v3.2 uses standard codes with stable message prefixes (`PeriodClosed:` on `55000`).
+- **A runtime-installed `.so` does not survive container recreation.** `docker restart` is safe; recreating the container means reinstalling via `poc/ledger-v3.2/scripts/install-direct.sh`.
 
 ## Commands
 
 ```bash
-./scripts/dev-up.sh        # build + start postgres, verify io_method and extensions
-./scripts/dev-down.sh      # stop (data preserved)
+# Cluster (both planes) — repo-root scripts/
+./scripts/dev-up.sh            # build + start postgres, verify io_method and extensions
+./scripts/dev-down.sh          # stop (data preserved)
 ./scripts/dev-down.sh --wipe   # stop and remove data volume
+docker restart acct-postgres   # clean slate before a full test cycle; NEVER recreate
 
-psql 'postgres://acct:acct_dev@localhost:5111/acct'
+# Document layer tests (tiered — do not run the full suite after every commit)
+./scripts/run-tests-t1.sh   ./scripts/run-tests-fast.sh   ./scripts/run-tests.sh
+
+# Costing plane (poc/ledger-v3.2/scripts/)
+./install-direct.sh   ./run-migrations.sh   ./run-tests.sh
+./run-feed.sh         ./run-recalc.sh       ./soak.sh   ./slo-sweep.sh
+
+psql 'postgres://acct:acct_dev@localhost:5111/acct'       # document layer
+psql 'postgres://acct:acct_dev@localhost:5111/poc_v3_2'   # costing plane
 ```
 
-See `db/README.md` for full dev DB details.
+See `db/README.md` for full dev DB details and `poc/ledger-v3.2/README.md` for the costing plane's phase-by-phase build record.
 
 ## Issue tracking
 
@@ -42,19 +70,40 @@ This repo uses **`bd` (beads)** for issue tracking. See `AGENTS.md` for the full
 
 ## Source of truth
 
-`ledger_design_consolidated_v0.md` is the single working reference. It is the document to read first and to update when design decisions change. Everything else is either superseded or historical.
+There is no single one — there is one per plane. **Pick by which plane the question is about** (see "What the project is"). When the user says "the spec" or "the design" without qualifying, ask or infer from what they are working on; do not default to the document layer's doc for a costing-plane question.
 
-`ARCHIVE/` holds four predecessor documents that were folded into the consolidated doc:
-- `ledger_inventory_design_spec_v0.md` — the original v0.1 design (TigerBeetle-parity Postgres ledger).
-- `phased_migration_spec_v0.md` — the original v0.1 Postgres → TigerBeetle migration roadmap (Phase 0–5).
-- `spec_review_v0.md` — critical review of v0.1.
-- `postgres_native_design_v0.md` — the redesign argument.
+| Plane | Read first | Also authoritative |
+|---|---|---|
+| Costing (`poc/ledger-v3.2/`) | `poc/design_research/design-v3.2.md` — the spec-of-record | `poc/design_research/convergence-decisions-2026-08-07.md` (Q1–Q14, ratified); the five `design-v3.2-recalc-{a..e}.md` design notes; `poc/ledger-v3.2/README.md` (phase-by-phase build record); `poc/ledger-v3.2/bench/soak-results.md` (measured behaviour) |
+| Document layer (repo root) | `ledger_design_consolidated_v0.md` | `REVIEW.md` (class-confusion audit trail + per-function walk) |
 
-Treat `ARCHIVE/` as historical record. Do not propose changes there. If a question can be answered from the consolidated doc, do not reach into the archive.
+`poc/design_research/convergence-decisions-2026-08-07.md` outranks both on any question it answers: it is the ratified record of how the streams collapsed onto v3.2. Re-litigating a decision in it is a design change requiring deliberate justification, not an incidental edit.
+
+Superseded specs live in `poc/design_research/` (`design-v3.1.md`, `design-v3.md`, `design-v2.md`, `poc-v2.1.md`, …) — decided inputs, cited but not re-opened.
+
+`ARCHIVE/` holds six historical documents: four predecessors folded into the consolidated doc — `ledger_inventory_design_spec_v0.md` (the original v0.1 TigerBeetle-parity design), `phased_migration_spec_v0.md` (the v0.1 → TB migration roadmap), `spec_review_v0.md` (critical review of v0.1), `postgres_native_design_v0.md` (the redesign argument) — plus two rescued PoC specs, `design-v2.1.md` and `design-v3-abc.md`. The two rescued PoC specs carry SUPERSEDED banners; the four predecessors are unbannered and still read "Status: Draft". Treat `ARCHIVE/` as historical record; do not propose changes there. `design-v2.1.md`'s §14 section numbering is pinned — `acct-mpjz` references it.
 
 `db/archive_migrations/` is similar: the original 104 incremental migrations are preserved verbatim for git-blame fidelity and rationale recovery, but they are **not run** (`sqlx migrate run` reads only `db/migrations/`). When you need the rationale for a function body, reach for `bd show <id>` first; the migration file in the archive is a secondary source.
 
-## Load-bearing design decisions (do not re-litigate without cause)
+## Load-bearing design decisions — costing plane (`poc/ledger-v3.2/`)
+
+The surviving architecture, per the `acct-0at4.11.5` gate verdict — verbatim: *"Machinery not justified: staging-table + single-statement + alt-C + logical-decoding-feed is the surviving architecture."* Full detail in `design-v3.2.md`; these are the commitments a task must not casually undo.
+
+- **Alt-C: the hot path records physical events, not cost, for layer-tracked methods.** FIFO/LIFO appends post **no** journal row — they record an observed provisional cost on the line and nothing else. Two hot-path shapes: single-statement direct (commutative CTE on PG's own tuple lock) and the staging-table outbox (`ledger_inbox` drained by `FOR UPDATE SKIP LOCKED` committers). No `pool_lock` table, no sorted-acquisition protocol — the shmem router/committer stack was deleted (`acct-uena`, commit `6ddbf47`); do not propose reviving it.
+- **The recalc engine is the sole costing authority for FIFO/LIFO.** It replays each pool in R-1 `(pool_id, posted_at, id)` business chronology and produces the only authoritative valuation. Backdated events forcing re-cost of already-costed depletions (R-2) is the design's central case, not an edge case.
+- **`posted_at` MUST be the true business/effective date.** R-1 correctness rests entirely on it; no constraint can enforce truthfulness, and recency is not a valid guard (backdates are admitted by design). Wall-clock defaults and constant stamps are prohibited writer patterns. The one exception is the engine's own cost-adjustment rows, deliberately stamped `now()`.
+- **Idempotency is generation-delta (Model 1).** A repeated pass over an unchanged stream writes nothing and does not bump the generation; a genuine re-cost posts exactly the inter-generation delta. Never a double-post, never a compensating pair.
+- **The feed's `confirmed_flush_lsn` IS the delivery cursor** (advance-on-ingestion): peek → apply to the durable dirty-set → advance. The dirty-set, not the slot, is the crash-recovery boundary. Delivery is at-least-once and idempotent. **No watermark table exists or may be added.** G1 (ingestion lag) and G2 (valuation staleness) are deliberately separate gauges — conflating them is the known failure mode.
+- **Close is a consistency gate plus a finalize stamp**, and **`force` means drain synchronously, never skip** — there is no provisional cost leg to fall back on. Closed-period immutability is a schema invariant (migration `0017` `BEFORE INSERT` guards), not API discipline. Period reopen is out of scope pending convergence **Q8**, which `acct-1vur` decides.
+- **Quantity is flagged, never gated (Q3b)** — with a named, unclosed gap: FIFO/LIFO implement the posture, but the strict methods (WAC/STD/specific) still gate quantity synchronously (the soak measured 84 WAC qty-gate rejects on the direct path and 87 qty-gate rejects on staging). Q3b directs that reconciliation toward removal. Do not add new quantity gates.
+- **The Q3a drift-exposure bounds are in-scope product bounds** (Q13 amendment): recalc-lag SLO on G2, close-cadence policy, sized forced-close cost. They bound *wrongness-exposure*, not throughput, and their numbers come from the gated `acct-63qs.6` baseline — not chosen up front. There is still no TPS target.
+- **The R1–R7 class-confusion rules below are document-layer rules.** They are written against plpgsql pools, `posting_lines`, and the `cost_method` dispatcher and do **not** map onto v3.2 code. Do not apply them to the costing plane; v3.2's equivalents are the property nets (R1–R9, C1–C7, V1–V7) and oracle equivalence.
+
+Open hardening epics on this plane: `acct-1vur` (**P1**, close/backdate correctness — three P1 bugs), `acct-476a` (spec-of-record + Q2 dossiers), `acct-zrju` (hot-path correctness), `acct-m0ab` (write-amplification bounds), `acct-63qs` (test/bench; its `.6` baseline is gated on `m0ab.1/.2`), `acct-gtp7` (operational readiness). Hardening order per convergence Q12: `1vur` → `m0ab`.
+
+## Load-bearing design decisions — document layer (deferred, do not re-litigate without cause)
+
+**Scope note:** everything in this section describes the frozen document layer at the repo root and its plpgsql costing plane — *not* `poc/ledger-v3.2/`. It is preserved intact because convergence Q2 defers the port-vs-rebuild decision to `acct-476a.2` / `acct-476a.4`, and these decisions are the input to that judgement. Do not apply them to costing-plane work; do not delete them either.
 
 These are decisions the consolidated doc commits to. If a task touches one of them, treat it as a design change requiring deliberate justification, not an incidental edit. References in this section cite **bd issue IDs** (durable cross-refs) rather than migration numbers; consolidated migration filenames are mentioned where structurally relevant.
 
@@ -71,7 +120,7 @@ These are decisions the consolidated doc commits to. If a task touches one of th
 - **`BIGINT` for amounts and balances; `BIGSERIAL` for account/posting_line IDs; `UUID` only for document IDs and `idempotency_key`.** Type choices are deliberate; Part IV §1.
 - **Tiered read model.** Tier 1 (base tables) → Tier 2 (trigger-maintained mat views, only when measured) → Tier 3 (logical replication for OLAP/search, only when justified). Do not propose an async projector service for MVP.
 - **Sync `post_posting_lines` for now; pivot to pseudo-sync (shape L) deferred to Phase 1+** (Part VII Q3 originally resolved 2026-04-27 as `acct-93b.3`; re-examined and re-resolved 2026-04-30 as `acct-0oy`). `post_posting_lines` is called synchronously inside the same Postgres transaction as document writes. The five outbox variants (G/J/K/L/M, perf_baseline_v0.md) characterize the alternatives; shape **L** (pseudo-sync via LISTEN/NOTIFY, `acct-yjn`) is the documented escape hatch. **L's latency-and-throughput-under-contention advantages are real and wanted** — caller p99 547 ms vs F's 8.25 s (15× better) is robust under noise; throughput median is ~1.8× F (the original "16% above shape B" claim was at the high end of L's noise distribution and didn't survive `acct-ezm`'s short-run re-measurement). The deferral is **operational, not architectural**: every Phase 0 test and every Phase 1 fixture would need rewriting around an async-listener-rendezvous call site, and realistic Phase 1 workflows (per-document postings, naturally spread across SKUs/locations) don't hit the high-contention regime where L's advantages are load-bearing. We commit to revisiting once Phase 1 produces measured contention — tracked as `acct-c4p`. The infrastructure for L (DrainConfig.notify_channel, single-listener dispatcher, drain-tx pg_notify with SQLSTATE payload) is already built and benched; pivoting later is additive, not a foundation rewrite.
-- **`standard` cost only in Phase 0** (Part VII Q4 resolved, bd `acct-93b.4`). Schema includes a `cost_method` enum and `skus.cost_method` column (default `'standard'`) so `post_posting_lines` dispatches on it; non-`standard` branches in Phase 0 raised `P0006`. WAC family lifted across `acct-qfj` / `acct-9tw` / `acct-wig` / `acct-bol` / `acct-smn` / `acct-rso` / `acct-rgb` / `acct-7eo`. FIFO / lot still raise P0006, tracked as `acct-8gg` / `acct-uze` / `acct-0kz` (all blocked-by `acct-2c1m`).
+- **`standard` cost only in Phase 0** (Part VII Q4 resolved, bd `acct-93b.4`). Schema includes a `cost_method` enum and `skus.cost_method` column (default `'standard'`) so `post_posting_lines` dispatches on it; non-`standard` branches in Phase 0 raised `P0006`. WAC family lifted across `acct-qfj` / `acct-9tw` / `acct-wig` / `acct-bol` / `acct-smn` / `acct-rso` / `acct-rgb` / `acct-7eo`. **FIFO and `lot_fifo` have since shipped too**: FIFO in `0031`–`0037` (cost-layer schema, dispatcher, recon, and the po_receipt / inventory_adjustment / rm_issue_to_wo / fg apply-event paths) and lot in `0044`–`0062` (lot schema, `lot_fifo` enum value, dispatcher, FEFO allocator, genealogy, serial). Both are registered in `cost_method_strategies` with real bodies — the surviving `P0006` raises inside them are layer-exhaustion errors, not not-implemented stubs — and carry `property_fifo_consistency.rs` / `property_fifo_wrappers.rs` / `property_lot_wrappers.rs`. `acct-2c1m` is closed (superseded by `acct-wb75`). Remaining open scope: `acct-uze` (lot/serial residual) and `acct-0kz` (catch-weight); `acct-8gg` is still open despite its work having landed.
 - **Per-event qty is persisted on `posting_lines.qty`** (`acct-75z`; forward-only). Populated at INSERT time for inventory-touching events; NULL for cash/AR/AP/FX. WAC math (`wac_perpetual` and `wac_periodic`) reads its qty divisor as `SUM(posting_lines.qty signed by debit/credit on the value pool)` — class-isolated. Pre-`acct-75z` used `stock_available.balance` which pooled raw and fg qty for the same `(sku, location)`, breaking per-class avgs when a SKU had both pools active. `_post_posting_lines_lookup_qty_account` is retained for `post_posting_lines`'s lock pre-scan only. The "single inventory class per SKU" assumption is retired.
 - **Standard cost is a separate transactional entity, not a column on `skus`** (`acct-hlr`). `skus.standard_cost` does not exist. Standard cost lives in the append-only `standard_costs` table (`sku_id`, `cost`, `effective_at` DATE, `posted_by`, ...). The single canonical lookup is `_resolve_standard_cost_at(p_sku_id, p_business_date) RETURNS BIGINT`, which raises **P0018** if no standard is in effect at `business_date`. Cost-relevant operations on standard SKUs go through this helper. Establishing or rolling the cost goes through `post_standard_cost_roll()` (INSERT into `standard_costs` + revalue raw + fg pools + audit row). WIP pools opt-in via `p_revalue_wip` (`acct-bru`). Retroactive rolls blocked (P0019); optimistic concurrency via P0017.
 - **TigerBeetle is a reference model, not a parity target** (Part VII Q1 resolved, 2026-04-29). TB informs behavioral correctness (atomicity, lock semantics, idempotency, append-only) but the implementation does not have to shape itself to TB's primitives. Postgres-native ergonomics win where they conflict.
@@ -95,7 +144,7 @@ These are decisions the consolidated doc commits to. If a task touches one of th
 - **`default_lot_size` on skus amortizes per-lot charges into per-unit standard cost** — BOM2 `acct-jg2`. Per-lot `bom_lines` charges (e.g. setup, freight) divided by parent's `default_lot_size` give per-unit contribution to `std_cum`. Lot-size variance shows up in `variance_wo_close` when actual lot ≠ default — partial-scrap with fired per_lot charges leaves the charge in pool to absorb against survivors at the amortized rate.
 - **ECOs (`engineering_change_orders`) drive revision lifecycle** — BOM2 `acct-jg2`. Workflow `draft → approved | rejected`. `post_eco_approve(eco_id, effective_at DATE, approved_by)` flips status, populates `effective_at` on tied `bom_headers`, optionally obsoletes predecessors. **P0031** on invalid state. `acct-ECO-WORKFLOW` follow-up (`acct-ir7`) covers the broader review/approval workflow.
 - **`consumption_policy` gate enforced via `wo_events` BEFORE INSERT trigger** — BOM2 `acct-jg2`. `skus.consumption_policy ∈ {forward, backflush_at_op, backflush_at_complete}` (default `forward`). Only `forward` is dispatched today; the other two raise **P0035** at WO start. Trigger pattern composes uniformly without modifying every entry-point fn. Backflush dispatcher work tracked as `acct-BACKFLUSH` (`acct-oi4`).
-- **Cost-method dispatch + close-hook orchestration are registry-driven, not switch statements** (`acct-w0lo`). `_post_posting_lines_compute_amount` does qty-NULL gate + R2 credit-first SKU resolution then looks up `cost_method_strategies(cost_method, event_kind='outbound')` for `compute_fn_name` and `EXECUTE format('SELECT %I($1, $2, $3, $4)', v_fn_name)`. Each per-strategy plpgsql function (`_compute_amount_<method>_outbound`) is a single CASE branch's logic in isolation. Adding FIFO/lot (`acct-8gg`) is INSERT into the registry + write the function — no edits to the dispatcher. `close_period` follows the same shape: iterates `close_hooks(hook_fn_name, ordering, result_key)` in order, EXECUTE-formats each as `foo_close_hook(p_period_id, p_force_provisional)`, aggregates counts under `result_key` in the JSONB return. Registered hooks at ordering 10 / 20 / 30: wac_periodic, wac_retroactive, cost_adjust_retroactive (must run last per the WAC-then-retro layering rule). 10-unit gaps allow new hooks to interleave at e.g. 15 or 25 without renumbering. **Implication for future cost-method work**: when adding a method, R1–R7 still apply per-strategy. The registry doesn't bypass any class-confusion rule — it just isolates each (method × event_kind) cell so the rules can be audited per-strategy. EXECUTE format() overhead is benign at hot-path scale (`acct-d5t8` 100-case property test 22.5s pre-refactor → 21.0s post — within noise).
+- **Cost-method dispatch + close-hook orchestration are registry-driven, not switch statements** (`acct-w0lo`). `_post_posting_lines_compute_amount` does qty-NULL gate + R2 credit-first SKU resolution then looks up `cost_method_strategies(cost_method, event_kind='outbound')` for `compute_fn_name` and `EXECUTE format('SELECT %I($1, $2, $3, $4)', v_fn_name)`. Each per-strategy plpgsql function (`_compute_amount_<method>_outbound`) is a single CASE branch's logic in isolation. Adding a method is INSERT into the registry + write the function — no edits to the dispatcher; that is exactly how FIFO (`0032`) and `lot_fifo` (`0046`) were added. `close_period` follows the same shape: iterates `close_hooks(hook_fn_name, ordering, result_key)` in order, EXECUTE-formats each as `foo_close_hook(p_period_id, p_force_provisional)`, aggregates counts under `result_key` in the JSONB return. Registered hooks at ordering 10 / 20 / 30: wac_periodic, wac_retroactive, cost_adjust_retroactive (must run last per the WAC-then-retro layering rule). 10-unit gaps allow new hooks to interleave at e.g. 15 or 25 without renumbering. **Implication for future cost-method work**: when adding a method, R1–R7 still apply per-strategy. The registry doesn't bypass any class-confusion rule — it just isolates each (method × event_kind) cell so the rules can be audited per-strategy. EXECUTE format() overhead is benign at hot-path scale (`acct-d5t8` 100-case property test 22.5s pre-refactor → 21.0s post — within noise).
 - **Class-confusion checklist (`acct-rgb` / `acct-fii` / `acct-69e` / `acct-7py` / `acct-69p` / `acct-smn` / `acct-rso` regression lock)** — `acct-du2` codified the bug-class "function presents class-/cost-method-/document-specific semantics but reads cross-class / cross-method / cross-document state." Seven rules every new function or modification touching pools/dispatch/idempotency must satisfy; each fix-needed flag from `REVIEW.md` traces back to one of these:
   - **R1** Per-class qty divisors come from per-class signed SUM on the value pool's `posting_lines.qty`, NEVER from `stock_available` (which is cross-class for raw + fg same-location). Motivated by **`acct-fii`** (post_cost_adjustment) and the sibling unfixed sites **`acct-du2.8`** (post_inventory_adjustment) and **`acct-du2.11`** (post_standard_cost_roll).
   - **R2** `cost_method` dispatch + `posting_lines_provisional` flagging resolve SKU from the CREDIT side (depletion source) of the posting. Motivated by **`acct-rgb`** (component cost dispatch) and **`acct-7py`** (multi-output co-product flagging). `_post_posting_lines_compute_amount` debit-first COALESCE is **`acct-du2.4`** drift risk.
@@ -107,7 +156,7 @@ These are decisions the consolidated doc commits to. If a task touches one of th
 
   Full audit trail and per-function 7-question walk in `REVIEW.md` at repo root.
 
-## Partition lifecycle conventions (`acct-sbr2`)
+## Partition lifecycle conventions — document layer (`acct-sbr2`)
 
 Partitioned-by-range tables (monthly granularity) follow a uniform pattern; the canonical inventory is `SELECT * FROM partitioned_tables_registry`. New partitioned tables MUST register themselves there.
 
@@ -118,7 +167,14 @@ Partitioned-by-range tables (monthly granularity) follow a uniform pattern; the 
 
 ## Open questions that gate work
 
-Part VII of the consolidated doc lists 10 gating questions. **Q1 (TB optionality), Q2 (TPS projection), Q3 (outbox), Q4 (cost method) are resolved** (see "Load-bearing design decisions" above). The remaining open ones are scope-shaping rather than framing:
+**The live gates are both convergence questions, and both are about the costing plane's future:**
+
+- **Convergence Q2 — port or rebuild the document layer.** Decided by the dossiers `acct-476a.2` (reservations under alt-C, with `acct-cz1v`'s axes folded in) and `acct-476a.4` (document-cost read model / R7 under alt-C). Until they report, the document layer stays frozen and intact. This is the question that gates everything at the repo root.
+- **Convergence Q8 — does a period-reopen primitive need to exist?** Decided by `acct-1vur`: if close-gate hardening proves the gate airtight, reopen-out is ratified; if an irreducible hole remains, reopen becomes a hardening requirement.
+
+The 14 convergence questions (`poc/design_research/convergence-decisions-2026-08-07.md`) **superseded the consolidated doc's Part VII framing questions** as the project's live agenda — Part VII asked how to shape the document layer, which is now itself deferred pending Q2. Do not treat a Part VII item as gating current work without checking it against the convergence record first.
+
+Part VII's remaining document-layer questions, retained for when Q2 resolves toward *port*. Note the numbering collides with the convergence Q-set — these are **Part VII** Q5–Q10, unrelated to convergence Q5–Q10. Part VII Q1–Q4 are resolved (see the document-layer decisions above):
 
 5. Reservation lifetime — sub-second timeouts ever needed? (Drives `pg_cron` vs `LISTEN/NOTIFY`.)
 6. Append-only enforcement model — trigger + RBAC + both?
@@ -127,9 +183,21 @@ Part VII of the consolidated doc lists 10 gating questions. **Q1 (TB optionality
 9. Tier-2 mat view scope at MVP — default none.
 10. Per-WO per-op account opt-in — default none.
 
-These don't gate further engineering work the way Q1/Q2 did. Surface them when a task forces a choice; default behaviors above otherwise.
+These don't gate further engineering work. Surface them when a task forces a choice; default behaviors above otherwise.
 
-## Testing methodology
+## Testing
+
+**One test run in flight at a time, ever.** Both planes share the `acct-postgres` cluster, and concurrent runs against the same database cause TRUNCATE collisions, row-lock deadlocks, and schema-state divergence. Background full runs (`run_in_background: true`, no timeout, one watcher); foreground is fine for a single narrowly-scoped binary. `docker restart acct-postgres` before a full cycle.
+
+### Costing plane (`poc/ledger-v3.2/`)
+
+Thirteen test binaries via `poc/ledger-v3.2/scripts/run-tests.sh` — acceptance binaries per subsystem (direct methods, staging drain, recalc engine, stale-claim interleavings, backpressure, close) plus property nets: **R1–R9** (`property_recalc_engine`), **C1–C7** (`property_close_period`), and the feed/backpressure/submit/drain nets. At scale: `ledger-bench soak` (whole architecture concurrently → quiesce → verify → close → immutability probes) and `ledger-bench verify` (**V1–V7** conservation + oracle equivalence + the drift distribution); `scripts/soak.sh` and `scripts/slo-sweep.sh` are the operator entry points.
+
+The correctness anchor is **oracle equivalence**: engine output is validated equal to an independent full-opening strict replay sharing only `banker_div`. Any new scheduler/checkpoint/cadence optimization is measured against that replay. New engine work ships with its property-net extension in the same change.
+
+Soak and bench runs need a quiet host — the bench host is the daily-driver workstation, and ambient load (a Chrome session, a foreign compile) moves absolute latencies substantially. Read structural ratios, not absolutes, and check `/proc/loadavg` first.
+
+### Document layer (Part IV §14, deferred)
 
 Part IV §14 specifies a three-layer progression. Status as of the consolidation cutover:
 
@@ -139,18 +207,18 @@ Part IV §14 specifies a three-layer progression. Status as of the consolidation
 
 SLO numbers in §14.2 are deliberately TBD — they get filled in after Structured lands, not before.
 
-### Property-test-per-entry-point convention (`acct-1cer`)
+### Property-test-per-entry-point convention — document layer (`acct-1cer`)
 
-Every entry-point function (`post_*` document wrapper) MUST ship with a sibling `tests/property_<fn>.rs` (or shared-binary `tests/property_<group>.rs` when several small functions share a workflow shape) in the same change as the function. Property tests probe random scenarios against the I1–I7 invariants in `tests/common/mod.rs::assert_invariants_hold` and pin the function-specific invariants (per-class qty divisor on cost dispatch; always-cleared routing on memos; state-machine transitions on allocate/eco; etc.). Integration tests probe specific scenarios; property tests probe random scenarios — that's where the class-confusion / R1–R7 catch-net lives. Default shape: `PROPTEST_CASES` env var (default 100), `--test-threads=1`, `mod common`, ~400–800 lines per binary, ~15–35s wall-time. There are 17 `property_*.rs` binaries covering ~25 entry-points; treat them as the regression baseline rather than re-deriving the discipline per-PR.
+Every entry-point function (`post_*` document wrapper) MUST ship with a sibling `tests/property_<fn>.rs` (or shared-binary `tests/property_<group>.rs` when several small functions share a workflow shape) in the same change as the function. Property tests probe random scenarios against the I1–I7 invariants in `tests/common/mod.rs::assert_invariants_hold` and pin the function-specific invariants (per-class qty divisor on cost dispatch; always-cleared routing on memos; state-machine transitions on allocate/eco; etc.). Integration tests probe specific scenarios; property tests probe random scenarios — that's where the class-confusion / R1–R7 catch-net lives. Default shape: `PROPTEST_CASES` env var (default 100), `--test-threads=1`, `mod common`, ~400–800 lines per binary, ~15–35s wall-time. There are 24 `property_*.rs` binaries covering ~25 entry-points; treat them as the regression baseline rather than re-deriving the discipline per-PR.
 
-## Working with the consolidated doc
+## Working with the consolidated doc (document layer)
 
-- It is large (~85 KB / ~1,750 lines). When the user references "the spec" or "the design," they mean this file unless they explicitly say otherwise.
+- It is large (~135 KB / ~2,240 lines). When the user references "the spec" or "the design" *about the document layer*, they mean this file. For costing-plane questions the equivalent is `design-v3.2.md` — see "Source of truth".
 - The structure is fixed: Part 0 (exec summary), I (v0.1 baseline), II (review), III (parity-tax root cause), IV (v0.2 design — the implementable spec), V (§△ scoreboard), VI (tradeoffs), VII (open questions), Appendices.
 - Edits should preserve cross-references. The doc has internal pointers like "Part IV §3.4" and "B2" — keep them consistent.
 - The "Open questions" list is a question list, not a decision log. Do not convert it to an owners/dates table without being asked.
 
-## Style conventions in the doc
+## Style conventions in the consolidated doc (document layer)
 
 - Severity labels in Part II: **Blocker / Major / Minor / Note** with IDs (B1–B3, M1–M7, m1–m8, N1–N5).
 - §△ markers carry forward from v0.1 for items that remain genuine open questions or future-revisit items. The Part V scoreboard tracks each by ID.

@@ -34,7 +34,7 @@
 //!   transaction. N looping connections = N workers (continuous cadence).
 //!
 //! - `ledger_close_period(period_id, actor, force)` — the orchestrated period
-//!   close (design-v3.2 §5e / recalc-e): recalc-drain gate on the period-scoped
+//!   close (design-v3.2 §7 / recalc-e): recalc-drain gate on the period-scoped
 //!   G2a, synchronous drain (forced close drains, never skips), the
 //!   variance-into-empty-pool residue sweep that makes each pool's aggregate
 //!   `value_sum` exactly equal its authoritative open-layer value, and the

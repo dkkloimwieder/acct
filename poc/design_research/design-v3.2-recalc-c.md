@@ -166,7 +166,7 @@ avoids full-opening replay) to this child.
 > speculative. Revisit when/if period reopen enters scope. Correctness is unaffected either way — full-opening
 > replay is always correct, just O(depth).
 
-## 10. Cadence-vs-load soak (hands to testing strategy, design-v3.2 §7)
+## 10. Cadence-vs-load soak (hands to testing strategy, design-v3.2 §8)
 
 Reuse the architecture-agnostic survivors: acct-0at4.8 open-loop load generator + acct-0at4.5 conservation
 sweep. Add the two things the oracle flagged missing (oracle §2a/§2c): a **receipt-cost-volatility knob**

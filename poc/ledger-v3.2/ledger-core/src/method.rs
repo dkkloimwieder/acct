@@ -3,7 +3,7 @@
 //! `plan_apply` runs strict mode for WAC/STD/specific — the methods that produce
 //! their final cost directly on the hot path (design-v3.2 §1). FIFO/LIFO hit
 //! MethodMismatch stubs: their costing is the recalc engine's job (design-v3.2
-//! §5a), so a FIFO/LIFO pool reaching this dispatcher is a misroute that fails
+//! §5), so a FIFO/LIFO pool reaching this dispatcher is a misroute that fails
 //! loud.
 
 use chrono::{DateTime, Utc};
@@ -35,7 +35,7 @@ pub enum ProvisionalBasis {
 }
 
 /// Strict dispatcher. WAC/STD/specific run real logic; FIFO/LIFO fail loud
-/// (their strict layer math belongs to the recalc engine, design-v3.2 §5a).
+/// (their strict layer math belongs to the recalc engine, design-v3.2 §5).
 ///
 /// `snapshot` is mutated in place so later lines see earlier lines' effects.
 pub fn plan_apply(

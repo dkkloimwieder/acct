@@ -1,5 +1,5 @@
 //! `ledger_close_period` / `ledger_settle_pool` — close-time finalize
-//! (design-v3.2 §5e; recalc-e).
+//! (design-v3.2 §7; recalc-e).
 //!
 //! Under alt C the mid-period GL for FIFO/LIFO pools is qty-only; recalc's
 //! authoritative valuation lands continuously and close is a consistency gate

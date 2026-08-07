@@ -1,5 +1,5 @@
 //! Acceptance tests for `ledger_close_period` / `ledger_settle_pool` — the
-//! close-time finalize (design-v3.2 §5e; recalc-e).
+//! close-time finalize (design-v3.2 §7; recalc-e).
 //!
 //! Cases pin: the period-scoped recalc-drain gate (blocks with per-pool G2a/G2b
 //! detail, passes once drained); forced close draining synchronously (never
