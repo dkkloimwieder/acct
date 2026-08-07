@@ -1,5 +1,14 @@
 # Perf baseline v2 — end-to-end Slice A+B+C mixed workload (`acct-1s6r`)
 
+> **Historical baseline (annotated 2026-08-07).** The numbers below stand as measured on
+> the 67-migration acct schema (2026-05-11). Two framings were consumed by later work:
+> the acct-c4p "inflection point" conclusion fed the `acct-8hv2` architectural review
+> (contention model + measurement methodology audit), which reframed shape-L
+> applicability (`acct-bdq6`); and the acct main tree was frozen 2026-05-11 — the
+> document layer's fate is deferred under convergence decision Q2 (deciding experiments
+> `acct-476a.2` / `acct-476a.4`). See
+> `poc/design_research/convergence-decisions-2026-08-07.md`.
+
 **Date:** 2026-05-11
 **Schema:** 67 migrations through `0067_partition_registry`
 **bd issue:** acct-1s6r

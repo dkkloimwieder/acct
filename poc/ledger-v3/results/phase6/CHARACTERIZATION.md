@@ -1,5 +1,15 @@
 # Phase 6 — Cross-path characterization
 
+> **Superseded context (2026-08-07).** Both paths measured here were later retired: the
+> routed Path B machinery by the design-v3.1 §18 gate verdict (the SPIKE-A staging table
+> matched/beat it), and strict Path A by the alt-C provisional posture — the hot-pool
+> collapse documented below (e.g. the s5 2110× cell) is Path A's motivating pathology,
+> not a durable routed advantage. Follow-ups filed off this report: `acct-t9lo` and
+> `acct-33b6` closed shipped; `acct-s7da` closed moot 2026-08-07; `acct-69c7` and
+> `acct-adte` remain open behind the ledger-v3 PAUSE gate (`acct-ytd9`) pending stream
+> disposition. Decision record:
+> `../../../design_research/convergence-decisions-2026-08-07.md`.
+
 **Inputs:** Phase 3 direct-path numbers from `results/phase3/phase3-summary.md`
 (measurement run `2026-05-21T13:27 UTC`) and Phase 5 v2 routed-path numbers
 from `results/phase5-v2/phase5-summary-v2.md` (run `2026-05-22T16:23 UTC`,

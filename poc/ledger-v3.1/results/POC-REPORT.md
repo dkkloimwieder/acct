@@ -1,7 +1,14 @@
 # design-v3.1 Path C — PoC characterization report
 
+> **Superseded context (2026-08-07).** This report characterizes both Path C flavors,
+> including the shmem routed stack — which the later SPIKE-A staging-table result and the
+> design-v3.1 §18 gate verdict (`acct-0at4.11.5`) retired. The `ledger-routed-c` crate was
+> physically deleted (`acct-uena`, commit `6ddbf47`); the measurements below remain the
+> characterization record of why. The surviving architecture is the ledger-v3.2 line. See
+> `../../design_research/convergence-decisions-2026-08-07.md`.
+
 **Stream:** `ledger-v3.1` · **Epic:** `acct-2ttr` · **Phase:** P5 (`acct-2ttr.9`)
-**Spec:** [`../design_research/design-v3.1.md`](../design_research/design-v3.1.md) §11 (success
+**Spec:** [`../../design_research/design-v3.1.md`](../../design_research/design-v3.1.md) §11 (success
 criteria) + §12 (Phase 5).
 
 This report characterizes the **provisional hot path** (Path C): FIFO/LIFO depletions record a
@@ -44,7 +51,7 @@ multi-touch / same-pool-twice generation — the coalesce-under-load path the S1
 generator never reached). Supersedes the 2026-05-27 snapshot. The three verdicts are unchanged.
 
 **Environment capture (`acct-0at4.10.2`):** the live environment is snapshotted by
-`bench/capture-env.sh` into `results/env-baseline.md` (tracked, regenerable) — LIVE `pg_settings` +
+`ledger-harness/bench/capture-env.sh` into `results/env-baseline.md` (tracked, regenerable) — LIVE `pg_settings` +
 routed committer GUCs + host/container facts + WAL-device fsync latency. Read against
 `db/postgresql.conf`, the live capture surfaces two divergences that only a live read catches
 (the base conf is overridden by `postgresql.auto.conf`): **`max_connections` = 500** live (conf says
@@ -500,7 +507,7 @@ multiplex onto `default_pool_size` server backends, an unstated pool size could 
 `direct-per-call` result and — the FEEDBACK #12 worry — make the crossover an artifact of that one
 setting. To rule that out, S5/S7/S8 were re-measured across `default_pool_size ∈ {25,50,100,200}`,
 `direct-per-call` vs `routed`, with the pgbouncer container recreated at each size and a clean
-committer slate (`docker restart`) per pool cell (`bench/pgbouncer-poolsize-sweep.sh`; seed 2000
+committer slate (`docker restart`) per pool cell (`ledger-harness/bench/pgbouncer-poolsize-sweep.sh`; seed 2000
 pools, 20 s/cell, closed-loop, `synchronous_commit=on`).
 
 | Scn | depth | pool | direct-per-call | routed | routed/direct |
@@ -554,8 +561,8 @@ real gap from sampling noise. This pass replaces each headline crossover cell wi
 quiet-host gate, reduced to **median ± percentile-bootstrap 95% CI** with a **Mann-Whitney U** test of
 routed-vs-`direct-per-call`. Tooling (all committed): the harness `--seed` flag (per-caller RNG
 `seed+caller_id`, so reps are genuinely independent streams rather than replays of one fixed
-`0xDEADBEEF` sequence), `bench/stats.py` (hand-rolled bootstrap / MWU / rolling-CoV steady-state — no
-numpy), `bench/crossover-stats.sh` (per-scenario seed → shuffled quiet-gated reps → stats). Raw reps:
+`0xDEADBEEF` sequence), `ledger-harness/bench/stats.py` (hand-rolled bootstrap / MWU / rolling-CoV steady-state — no
+numpy), `ledger-harness/bench/crossover-stats.sh` (per-scenario seed → shuffled quiet-gated reps → stats). Raw reps:
 `results/crossover-stats-merged.csv`; report: `…-merged.md`.
 
 | Scn | mode | n | median trx/s | bootstrap 95% CI | routed/direct | MWU p | CIs disjoint |
@@ -979,7 +986,7 @@ committer time into the row-lock handoff (the *only* span affinity can shrink), 
 
 **Measured: where does committer wall-time go** (full matrix, 5 reps/scenario, `committer_count=4`,
 affinity OFF, sampler ON, clean-seed + load-gated per cell on a daily-driver host; median across reps —
-`results/committer_profile_sweep.csv`, `bench/run-committer-profile-sweep.sh` + `bench/profile-aggregate.py`,
+`results/committer_profile_sweep.csv`, `ledger-harness/bench/run-committer-profile-sweep.sh` + `ledger-harness/bench/profile-aggregate.py`,
 75 rows / 0 FAILs). `busy%` is committer pool utilization (non-idle / total samples); the `of-busy`
 columns partition the **busy** time:
 
@@ -1147,7 +1154,7 @@ default), so fixing them buys value only for a lever STEP A shows cannot win. ST
 (`acct-m4g5.3` / `.4`, the affinity-ON split test + full sweep) are moot without STEP B. This closes
 the `acct-0usf` STEP 3 evaluation: **lever 2 stays refuted** — consistent with the acct-xdwk shipped
 decision and the STEP 1 profile matrix, now backed by a measured disjoint-pool precondition rather
-than an inference. The reproducibility artifact (`bench/run-basic-2pool.sh`) is retained.
+than an inference. The reproducibility artifact (`ledger-harness/bench/run-basic-2pool.sh`) is retained.
 
 ### Other observations
 
@@ -1187,7 +1194,7 @@ the load is driven **open-loop at a fixed arrival rate** (`--target-rate`): xid 
 growth are then ~constant per minute regardless of host noise, and the **drift slopes** — the actual
 deliverable — are load-robust. Absolute throughput/latency are recorded but explicitly not a verdict.
 
-**Method.** `bench/run-drift-soak.sh` + `bench/drift-analyze.py` (hand-rolled least-squares + ASCII
+**Method.** `ledger-harness/bench/run-drift-soak.sh` + `ledger-harness/bench/drift-analyze.py` (hand-rolled least-squares + ASCII
 sparklines; matplotlib is absent in-tree, so the slope table + sparklines *are* the plot). Clean
 arena baseline via container restart (arena counters are shmem), then `s2` routed receipts open-loop
 at **500 trx/s for 20 min**, sampled every **5 s** (**238 samples**). Full report + raw series:
