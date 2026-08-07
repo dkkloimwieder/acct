@@ -37,7 +37,10 @@
 //!    (an unsettled next-period tail's provisional value is not separable
 //!    from the residue without replaying the hot-path fold).
 //! 4. **Fence + re-check + stamp** (the gate-to-stamp race, closed by
-//!    protocol with 0017's trigger): take advisory `(32022, period_id)`
+//!    protocol with the admission trigger): take advisory `(32022, 0)` — the
+//!    global sentinel every physical insert holds the shared side of, which
+//!    is what interlocks a backdate into a date NO period covers (0022) —
+//!    then `(32022, period_id)`
 //!    exclusive — this waits out every in-flight insert into the period
 //!    (their triggers hold the shared side) and blocks new ones — then
 //!    re-run the gate on a fresh snapshot. Stragglers that committed before
@@ -49,13 +52,16 @@
 //!    `cost_settlement` row per in-period depletion, frozen by 0017
 //!    (PeriodClosed, SQLSTATE 55000).
 //!
-//! Deadlock posture: the common case is clean — normal appends stamp
-//! `posted_at = now()`, whose covering period is not the one being closed, so
-//! they never touch this fence. A multi-line submission backdating into the
-//! closing period while holding another pool's aggregate row can deadlock
-//! against the sweep; Postgres' detector aborts one side, immutability is
-//! never violated, and either retry converges (the submission finds the
-//! period closed and is rejected).
+//! Deadlock posture: the common case is clean. Both sides take pool aggregate
+//! rows before the fence and the sentinel before any per-period key, so the
+//! orders agree. The residual is the straggler sweep inside the re-check loop,
+//! which takes an aggregate row while already holding the fence: a submission
+//! holding that aggregate and waiting on the fence deadlocks against it.
+//! Postgres' detector aborts one side, immutability is never violated, and
+//! either retry converges (the submission finds the period closed, or the
+//! frontier raised, and is rejected). 0022's sentinel widens which submissions
+//! can enter that race — previously only ones backdating into the closing
+//! period, now any physical insert — without changing its shape or outcome.
 //!
 //! Feed currency is ENFORCED, not assumed (0020). The drain gate reads
 //! `pool_settlement` — floors and frontiers only the FEED maintains — and
@@ -106,6 +112,12 @@ use crate::submit::bail;
 /// int4.
 const MUTEX_CLASS: i32 = 32021;
 const FENCE_CLASS: i32 = 32022;
+
+/// The global stamp-fence slot (acct-1vur.3): every physical `trx_line`
+/// insert takes its shared side, so uncovered-date backdates interlock with a
+/// close that no per-period key would ever meet. No accounting_period may use
+/// id 0.
+const FENCE_SENTINEL: i32 = 0;
 
 /// The fence blocks new activity into the period, so each re-check round can
 /// only surface pools that committed before the fence — the loop converges in
@@ -235,6 +247,14 @@ fn ledger_close_period(period_id: i64, actor: &str, force: bool) -> pgrx::JsonB 
         swept.push(sweep_pool(g.pool_id, &mut adjustment_trx));
     }
 
+    // The stamp fence, in two parts. The SENTINEL (32022, 0) is taken FIRST:
+    // 0022's admission guard takes its shared side on every physical insert,
+    // so this is what interlocks the close against a backdate into a date NO
+    // period covers — the per-period key below cannot, since such an insert
+    // never touches it. Sentinel-before-period is a total lock order shared
+    // with the guard; reversing it here would deadlock against an inserter
+    // holding shared on this period.
+    advisory_lock(FENCE_CLASS, FENCE_SENTINEL);
     advisory_lock(FENCE_CLASS, key);
     let mut recheck_rounds = 0usize;
     loop {

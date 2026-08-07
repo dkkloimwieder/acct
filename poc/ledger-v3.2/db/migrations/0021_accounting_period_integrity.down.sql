@@ -1,0 +1,2 @@
+ALTER TABLE accounting_period DROP CONSTRAINT accounting_period_no_overlap;
+ALTER TABLE accounting_period DROP CONSTRAINT accounting_period_dates_ordered;
