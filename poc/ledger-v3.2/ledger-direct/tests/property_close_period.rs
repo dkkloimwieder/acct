@@ -279,7 +279,7 @@ async fn run_case(
         let in_scope = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM trx_line t \
               WHERE t.pool_id = $1 AND t.line_type <> 'cost_adjustment_line' \
-                AND t.posted_at < ($2::date + 1)::timestamptz)",
+                AND t.posted_at < (($2::date + 1)::timestamp AT TIME ZONE 'UTC'))",
         )
         .bind(pid)
         .bind(PERIOD_END)

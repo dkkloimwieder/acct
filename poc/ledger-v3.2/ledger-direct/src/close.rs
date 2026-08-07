@@ -498,7 +498,7 @@ fn in_period_event_count(end_date: &str) -> i64 {
                JOIN pool p ON p.id = t.pool_id \
               WHERE p.method IN ('fifo', 'lifo') \
                 AND t.line_type <> 'cost_adjustment_line' \
-                AND t.posted_at < ($1::date + 1)::timestamptz",
+                AND t.posted_at < (($1::date + 1)::timestamp AT TIME ZONE 'UTC')",
             None,
             &[end_date.to_string().into()],
         )?;
@@ -601,7 +601,7 @@ fn gate_pools(end_date: &str) -> Vec<GatePool> {
         let mut t = client.update(
             "SELECT p.id, lag.cnt, lag.gross, \
                     (ps.recost_floor_posted_at IS NOT NULL \
-                     AND ps.recost_floor_posted_at < ($1::date + 1)::timestamptz) \
+                     AND ps.recost_floor_posted_at < (($1::date + 1)::timestamp AT TIME ZONE 'UTC')) \
                FROM pool p \
                LEFT JOIN pool_settlement ps ON ps.pool_id = p.id \
                LEFT JOIN LATERAL ( \
@@ -610,7 +610,7 @@ fn gate_pools(end_date: &str) -> Vec<GatePool> {
                      FROM trx_line t \
                     WHERE t.pool_id = p.id \
                       AND t.line_type <> 'cost_adjustment_line' \
-                      AND t.posted_at < ($1::date + 1)::timestamptz \
+                      AND t.posted_at < (($1::date + 1)::timestamp AT TIME ZONE 'UTC') \
                       AND (ps.settled_through_posted_at IS NULL \
                            OR (t.posted_at, t.id) \
                               > (ps.settled_through_posted_at, ps.settled_through_id)) \
@@ -619,7 +619,7 @@ fn gate_pools(end_date: &str) -> Vec<GatePool> {
                 AND EXISTS (SELECT 1 FROM trx_line t2 \
                              WHERE t2.pool_id = p.id \
                                AND t2.line_type <> 'cost_adjustment_line' \
-                               AND t2.posted_at < ($1::date + 1)::timestamptz) \
+                               AND t2.posted_at < (($1::date + 1)::timestamp AT TIME ZONE 'UTC')) \
               ORDER BY p.id",
             None,
             &[end_date.to_string().into()],
