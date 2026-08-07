@@ -13,6 +13,10 @@ poc/queue-extension/target/
 poc/queue-extension/Cargo.lock
 poc/queue-extension-v21/target/
 poc/queue-extension-v21/Cargo.lock
+# Bench payload corpora are derived artifacts: bench_m8_ceiling.rs regenerates
+# them deterministically (UUIDv5, byte-stable); the tracked .meta.json sha256
+# pins the expected content.
+poc/queue-extension-v21/bench/payloads/*.jsonl
 poc/ledger-v3/target/
 poc/ledger-v3/Cargo.lock
 
