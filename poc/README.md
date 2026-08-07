@@ -56,9 +56,10 @@ convergence Q12), `acct-gtp7` (operational readiness). Hardening order per Q12:
 
 Six P0 PAUSE gates remain open, covering the retired/deferred streams: `acct-1cis`
 (batch-ledger), `acct-23kd` (acct main), `acct-hby7` (queue-extension-v21), `acct-s21z`
-(queue-extension), `acct-ui7w` (ledger-extension), `acct-ytd9` (ledger-v3). Per-stream
-disposition is a pending convergence cleanup step (not yet filed in bd). ledger-v3.1 and
-ledger-v3.2 are unpaused.
+(queue-extension), `acct-ui7w` (ledger-extension), `acct-ytd9` (ledger-v3). Each gate has
+a filed disposition child (`acct-1cis.1`, `acct-23kd.1`, `acct-hby7.1`, `acct-s21z.1`,
+`acct-ui7w.1`, `acct-ytd9.1`): write the stream's one-line disposition, decide its gated
+remnants, then close the gate. ledger-v3.1 and ledger-v3.2 are unpaused.
 
 ## Integration posture
 
