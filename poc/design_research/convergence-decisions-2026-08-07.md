@@ -147,3 +147,12 @@ push` after each work item; refresh the JSONL export at session close.
   expected content.
 - The poc-31 worktree was removed; the `worktree-poc-31` branch label survives
   (rewritten).
+- **Working-tree triage (wave-1 item 3):** the long-lived uncommitted drift was
+  discarded rather than committed, because all of it belonged to retired streams: the
+  `poc-v2.1.md` spec amendment (+173/−54) and six modified pl3b-sweep bench JSONs
+  (queue-extension-v21, retired by the gate verdict) were reverted to their committed
+  state; 33 stale phase6 equivalence logs + one stray result JSON under
+  `poc/ledger-v3/results/` (2026-05-23 runs, superseded by the v3.2 line) were deleted;
+  `.gitignore.tmp` (a leftover one-line intent to ignore `poc/ledger-v3/ledger-direct/sql/`)
+  was discarded — the ledger-v3 stream is superseded, and its generated SQL stays
+  tracked per the stream convention.
