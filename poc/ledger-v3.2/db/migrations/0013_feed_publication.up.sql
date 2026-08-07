@@ -1,0 +1,15 @@
+-- ledger_feed publication — the decode filter for the recalc feed slot
+-- (design-v3.1 §17 / design-v3.2 §6).
+--
+-- The feed consumes ONLY trx_line inserts: trx_line is the event log recalc
+-- re-costs from, and it is insert-only on the hot path (publish = 'insert';
+-- recalc's own generation bookkeeping lives in the recalc tables, not here).
+-- pgoutput + this publication is the lean transport; a custom output plugin is
+-- warranted only if consumer-side filter/projection is measured to matter
+-- (design-v3.2 open question 1).
+--
+-- The replication SLOT is deliberately NOT created here: slots are cluster
+-- runtime state (not schema), are not carried by dump/restore, and their
+-- creation is not transactional. The consumer creates its slot idempotently at
+-- startup (ledger-feed ensure_slot).
+CREATE PUBLICATION ledger_feed FOR TABLE trx_line WITH (publish = 'insert');

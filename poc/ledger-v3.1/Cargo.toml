@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "ledger-core",
+    "ledger-spi-common",
+    "ledger-direct-c",
+    "ledger-routed-c",
+    "ledger-harness",
+    "ledger-oracle",
+    "ledger-verify",
+]
+# Throwaway offline replay oracle (acct-0at4.7): a standalone bin that depends on
+# ledger-core (path) but must NOT pull the pgrx toolchain of the other members.
+# Excluded so `cargo build` inside it is self-contained.
+exclude = ["bench/replay-oracle"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.87"
+publish = false
+
+[workspace.dependencies]
+pgrx        = "=0.18.1"
+pgrx-tests  = "=0.18.1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+chrono      = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid        = { version = "1", default-features = false }
+libc        = "0.2"
+sha2        = "0.10"
+thiserror   = "1"
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+sqlx        = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "chrono"] }
+rand        = "0.9"
+proptest    = "1"
+num-rational = { version = "0.4", default-features = false, features = ["num-bigint"] }
+num-bigint  = "0.4"
+num-traits  = "0.2"
+hdrhistogram = "7"
+clap        = { version = "4", features = ["derive"] }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true   # DWARF for perf/flamegraph (acct-q6sx); larger .so, no perf change

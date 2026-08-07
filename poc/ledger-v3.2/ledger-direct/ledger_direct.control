@@ -1,0 +1,5 @@
+comment = 'ledger-v3.2 hot path: ledger_submit_trx (per-method dispatch) + ledger_staging_drain (staging-table committer). design-v3.2 §3/§4'
+default_version = '0.0.1'
+module_pathname = '$libdir/ledger_direct'
+relocatable = false
+superuser = true

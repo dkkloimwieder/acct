@@ -1,0 +1,7 @@
+span,seconds,pct_txn
+_meta,groups=1709;trx=292700;trx_per_group=171.27
+prep,3.523,4.93
+apply,63.763,89.30
+fsync,3.614,5.06
+hydrate,0.395,0.55
+pool_lock,0.111,0.16

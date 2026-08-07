@@ -1,0 +1,3 @@
+scenario,committer_count,committers_seen,callers,depth,throughput_trx_s,commit_group_avg,commits_per_s,pool_lock_per_trx,trx_materialized,errors,ack_p50_us,ack_p95_us,ack_p99_us,load1_end
+s11,4,4,200,100,1183.6423651815178,10.853877185118781,109.1,13.55,24215,3,27557,920649,1825570,1.83
+s5,4,4,1000,10,2704.965524248993,32.00229753015508,84.5,0.03,55716,0,450625,605028,661651,2.48

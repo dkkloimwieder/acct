@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "ledger-core",
+    "ledger-spi-common",
+    "ledger-direct",
+    "ledger-feed",
+    "ledger-bench",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.87"
+publish = false
+
+# Shared dependency registry for the v3.2 stream. Later phases add members that
+# consume the pgrx / sqlx / harness entries; ledger-core uses only the pure-Rust
+# subset (serde, chrono, uuid, thiserror).
+[workspace.dependencies]
+pgrx        = "=0.18.1"
+pgrx-tests  = "=0.18.1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+chrono      = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid        = { version = "1", default-features = false }
+libc        = "0.2"
+sha2        = "0.10"
+thiserror   = "1"
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+sqlx        = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "chrono"] }
+rand        = "0.9"
+rand_distr  = "0.5"
+proptest    = "1"
+num-rational = { version = "0.4", default-features = false, features = ["num-bigint"] }
+num-bigint  = "0.4"
+num-traits  = "0.2"
+hdrhistogram = "7"
+clap        = { version = "4", features = ["derive"] }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true   # DWARF for perf/flamegraph; larger binaries, no perf change

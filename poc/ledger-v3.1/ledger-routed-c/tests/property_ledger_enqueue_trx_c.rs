@@ -1,0 +1,568 @@
+//! acct-yojk.3 property test for `ledger_enqueue_trx_c` (per the acct-1cer
+//! property-test-per-entry-point convention; AUDIT.md D6.1).
+//!
+//! The direct entry point already has `property_ledger_submit_trx_c.rs`; this is
+//! its routed sibling — the higher-risk surface (shmem staging queue, router
+//! batching, multi-committer drop-and-continue). Each case picks a random
+//! aggregate method (fifo / lifo / wac / std), a small pool universe, and a
+//! random multi-caller op mix, enqueues it through the routed path, drains the
+//! committer to quiescence, then checks the §11.1 cross-flavor invariant:
+//!
+//!   E1  routed final aggregate qty (pool_state.layer_id = 0) == the model's net
+//!       signed qty per pool — i.e. exactly what the direct flavor produces. Net
+//!       qty per pool is the order-independent sum of signed line qtys, so for a
+//!       deep-seeded universe (no oversell drops) the routed batched apply MUST
+//!       land the same aggregate qty the caller-serial direct path does. A
+//!       mismatch means a submission was dropped, duplicated, or misapplied.
+//!       (Aggregate unit_cost MAY diverge across flavors — running-average
+//!       provisional cost is order-sensitive — so it is NOT asserted, per §11.1.)
+//!
+//! E1 is the workload-specific check and stays inline. The method-agnostic
+//! structural invariants — no orphan trx, posting amount == |qty|*unit_cost, no
+//! materialized layers (§3.5), no source_trx_line_id, no negative aggregate
+//! (§3.6) — come from the shared `common::assert_aggregate_method_invariants`
+//! (the I1/I2/I4/I5/I7 catch-net, acct-yojk.8), so the direct and routed property
+//! tests share one definition of "structurally sound".
+//!
+//! Coverage of the routed-specific paths the §11.1 invariant must survive:
+//!   - **drop-and-continue**: each case may inject "poison" depletions whose qty
+//!     exceeds any possible pool balance; the committer drops them and continues
+//!     with the rest of the group. The model excludes them from the expected qty,
+//!     so a poison that silently *applied* (or that aborted its whole group)
+//!     would surface as an E1 mismatch.
+//!   - **router multi-submission batching**: the interleaved multi-caller stream
+//!     puts several submissions touching shared pools in flight together, so the
+//!     router forms multi-submission commit_groups (the §6.7 collapse) rather
+//!     than degenerate one-per-group batches.
+//!
+//! Two routed paths are deliberately NOT probed here and are covered
+//! deterministically by the acceptance suite instead, because randomizing them
+//! against a 4-committer cluster would race rather than test:
+//!   - **pre-flight dedup** — `acceptance_routed_committer::
+//!     duplicate_source_caught_by_preflight_dedup`. This test uses globally
+//!     unique (trx_type, source_id) by construction; injecting duplicates under
+//!     the default `committer_count = 4` could have two workers process the two
+//!     copies' groups simultaneously, where the UNIQUE backstop (not dedup)
+//!     fires and poisons a group — a real but separately-tested edge, not a
+//!     qty-equivalence property.
+//!   - **eject** — `acceptance_routed_orphan_recovery` + the committer's
+//!     `classify_and_eject` unit tests. Eject is a transient re-batching path
+//!     (an in-progress caller XID is bounced and retried after cooldown); it
+//!     cannot change the *final* aggregate qty once the cluster has fully
+//!     drained, which is exactly the post-drain state E1 asserts.
+
+mod common;
+
+use common::*;
+use ledger_core::banker_div;
+use proptest::prelude::*;
+use proptest::test_runner::{Config, TestCaseError, TestRunner};
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use std::time::{Duration, Instant};
+
+/// Deep starting balance per pool so normal depletions never oversell — keeps net
+/// qty order-independent (the precondition for cross-flavor qty equivalence).
+const SEED_QTY: i64 = 1_000_000;
+const SEED_COST: i64 = 50;
+const STD_COST: i64 = 50;
+/// A depletion larger than any reachable balance → always dropped, in any order,
+/// by any committer. Exercises drop-and-continue without making qty order-sensitive.
+const POISON_QTY: i64 = 2_000_000;
+/// Replays per case for the determinism property. A fixed enqueue sequence,
+/// re-run from a clean DB, must land byte-identical pool_state AND trx_line
+/// content every time. This is the property that would break if the committer
+/// ever processed a pool's submissions in any order other than submission_id
+/// (e.g. pool-ascending to optimize lock acquisition): the order-independent
+/// aggregate qty would still match, but the running-average-derived provisional
+/// unit_costs on trx_line would silently change.
+const REPLAYS: usize = 3;
+
+#[derive(Clone, Debug)]
+enum Op {
+    Receipt { pool: usize, qty: i64, cost: i64 },
+    Deplete { pool: usize, qty: i64 },
+    Poison { pool: usize },
+}
+
+#[derive(Clone, Debug)]
+struct Case {
+    method: &'static str,
+    n_pools: usize,
+    callers: Vec<Vec<Op>>,
+}
+
+fn method_strategy() -> impl Strategy<Value = &'static str> {
+    prop_oneof![Just("fifo"), Just("lifo"), Just("wac"), Just("std")]
+}
+
+fn op_strategy(n_pools: usize) -> impl Strategy<Value = Op> {
+    let pool = 0..n_pools;
+    prop_oneof![
+        // Weighted so receipts/depletions dominate but poison shows up regularly.
+        4 => (pool.clone(), 1i64..=50, 1i64..=100)
+            .prop_map(|(pool, qty, cost)| Op::Receipt { pool, qty, cost }),
+        3 => (pool.clone(), 1i64..=40).prop_map(|(pool, qty)| Op::Deplete { pool, qty }),
+        1 => pool.clone().prop_map(|pool| Op::Poison { pool }),
+    ]
+}
+
+fn case_strategy() -> impl Strategy<Value = Case> {
+    (method_strategy(), 1usize..=3)
+        .prop_flat_map(|(method, n_pools)| {
+            let callers = prop::collection::vec(
+                prop::collection::vec(op_strategy(n_pools), 1..=4),
+                2..=3,
+            );
+            (Just(method), Just(n_pools), callers)
+        })
+        .prop_map(|(method, n_pools, callers)| Case { method, n_pools, callers })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn routed_aggregate_qty_equivalent_to_direct_across_random_submissions() {
+    let cases: u32 = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+
+    let pool = connect_pool().await;
+    let mut runner = TestRunner::new(Config { cases, ..Default::default() });
+
+    runner
+        .run(&case_strategy(), |case| {
+            let pool = pool.clone();
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(run_one_case(pool, case.clone()))
+            });
+            result.map_err(TestCaseError::fail)
+        })
+        .expect("routed equivalence property failed");
+}
+
+async fn run_one_case(pool: PgPool, case: Case) -> Result<(), String> {
+    reset_state(&pool).await;
+
+    // ── Seed the pool universe; every pool starts deep so depletions have
+    // headroom and the net signed qty stays order-independent. ──
+    let mut fixtures = Vec::with_capacity(case.n_pools);
+    let mut expected_qty = vec![SEED_QTY; case.n_pools];
+    for p in 0..case.n_pools {
+        let id = (p + 1) as i64;
+        let f = seed_pool(&pool, id, id, id, case.method, "running_avg").await;
+        if case.method == "std" {
+            seed_standard_cost(&pool, f.sku_id, f.loc_id, STD_COST).await;
+        }
+        seed_aggregate(&pool, f.pool_id, SEED_QTY, SEED_COST).await;
+        fixtures.push(f);
+    }
+
+    // ── Interleave callers round-robin into one enqueue stream (models several
+    // callers submitting concurrently into the staging queue) and assign each a
+    // globally unique source_id. Build the expected per-pool net qty as we go. ──
+    let max_len = case.callers.iter().map(Vec::len).max().unwrap_or(0);
+    let mut stream: Vec<(&'static str, i64, Value)> = Vec::new();
+    let mut next_source = 1i64;
+    let mut expected_trx = 0i64;
+    for tick in 0..max_len {
+        for caller in &case.callers {
+            let Some(op) = caller.get(tick) else { continue };
+            let source_id = next_source;
+            next_source += 1;
+            match *op {
+                Op::Receipt { pool: pi, qty, cost } => {
+                    let f = &fixtures[pi];
+                    expected_qty[pi] += qty;
+                    expected_trx += 1;
+                    stream.push(("po_receipt", source_id, receipt_line(f, qty, cost, case.method)));
+                }
+                Op::Deplete { pool: pi, qty } => {
+                    let f = &fixtures[pi];
+                    expected_qty[pi] -= qty;
+                    expected_trx += 1;
+                    stream.push(("transfer_shipment", source_id, depletion_line(f, qty)));
+                }
+                Op::Poison { pool: pi } => {
+                    // Dropped at commit → contributes nothing to qty or trx count.
+                    let f = &fixtures[pi];
+                    stream.push(("transfer_shipment", source_id, depletion_line(f, POISON_QTY)));
+                }
+            }
+        }
+    }
+
+    // ── Enqueue the whole stream, then drain the committer to quiescence. ──
+    for (trx_type, source_id, line) in &stream {
+        enqueue(&pool, trx_type, *source_id, vec![line.clone()])
+            .await
+            .map_err(|e| format!("enqueue source_id={source_id} ({trx_type}): {e}"))?;
+    }
+    await_quiescent(&pool, expected_trx).await?;
+
+    // ── I1/I2/I4/I5/I7 — shared structural catch-net (acct-yojk.8). Subsumes
+    // this test's E2 (no orphan trx), E3 (no layers), and E4 (no negative
+    // aggregate). ──
+    assert_aggregate_method_invariants(&pool)
+        .await
+        .map_err(|e| format!("{e} (method={})", case.method))?;
+
+    // ── E1 — routed aggregate qty == model (== what the direct flavor
+    // produces). Workload-specific (needs the per-pool expected), so inline. ──
+    for p in 0..case.n_pools {
+        let pool_id = (p + 1) as i64;
+        let got = aggregate(&pool, pool_id).await.map(|(q, _)| q).unwrap_or(0);
+        if got != expected_qty[p] {
+            return Err(format!(
+                "E1: pool {pool_id} routed qty {got} != model qty {} (method={})",
+                expected_qty[p], case.method
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// A po_receipt line. Posting accounts (including the STD PPV variance account)
+/// are resolved ledger-side from posting_account_map (§3.7), not on the line, so
+/// the wire shape no longer varies by method.
+fn receipt_line(f: &Fixture, qty: i64, cost: i64, _method: &str) -> Value {
+    json!({
+        "pool_id": f.pool_id,
+        "line_type": "po_receipt_line",
+        "qty": qty,
+        "unit_cost": cost,
+    })
+}
+
+/// Poll until the committer has materialized every non-dropped submission AND the
+/// staging queue is fully drained (no slot in any non-`empty` state), so the next
+/// case starts clean — the cluster-per-binary runner does NOT reset shmem between
+/// cases within a binary, and reset_state's TRUNCATE only touches DB tables.
+///
+/// Committed-count + staging-drained are the direct quiescence signals: they tell
+/// us every submission has been applied (or dropped) and no slot is still in
+/// flight, independent of arena reclaim timing.
+async fn await_quiescent(pool: &PgPool, expected_trx: i64) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let committed = trx_count(pool).await;
+        let inflight = staging_inflight(pool).await;
+        if committed >= expected_trx && inflight == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "drain timeout: committed {committed}/{expected_trx}, staging_inflight {inflight}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Total staging slots in any non-`empty` state (pending / routed / processing /
+/// abandoned) — i.e. work still in flight. Zero means the queue has fully drained.
+async fn staging_inflight(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(count), 0)::bigint \
+           FROM ledger_routed_c_staging_state_counts() WHERE state <> 'empty'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("staging inflight count")
+}
+
+// ── Replay-determinism (acct-j7so) ──────────────────────────────────
+//
+// E1 (above) proves the *qty* is order-independent. This proves the rest of the
+// final state is *replay*-deterministic: a fixed mixed receipt+depletion enqueue
+// sequence, drained from a clean DB N times, lands identical pool_state AND
+// trx_line content (per-line provisional unit_cost) every run. Where the qty
+// check is blind — running-average unit_cost is order-sensitive by construction
+// (§11.1; tracked for the value_sum fix as acct-0qps) — replay determinism still
+// holds, because the committer processes each commit_group in submission_id order
+// and a fixed sequence reproduces the same fold. A regression that reordered
+// processing (or let batching boundaries leak into the fold) would pass E1 and
+// fail here.
+
+/// The full provisional-cost content after a drain, in a deterministic order.
+/// Equality across replays IS the determinism assertion.
+#[derive(PartialEq, Eq, Debug)]
+struct LedgerSnapshot {
+    /// (pool_id, qty, unit_cost) for each seeded pool.
+    aggregates: Vec<(i64, i64, i64)>,
+    /// (source_id, pool_id, qty, unit_cost) for every recorded trx_line.
+    trx_lines: Vec<(i64, i64, i64, i64)>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn routed_mixed_sequence_replay_deterministic() {
+    // REPLAYS drains + a content read per case → run fewer cases than the qty
+    // test so total drain work stays in the property-test wall-time band.
+    let cases: u32 = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let replay_cases = (cases / REPLAYS as u32).max(8);
+
+    let pool = connect_pool().await;
+    let mut runner = TestRunner::new(Config { cases: replay_cases, ..Default::default() });
+
+    runner
+        .run(&case_strategy(), |case| {
+            let pool = pool.clone();
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(run_replay_case(pool, case.clone()))
+            });
+            result.map_err(TestCaseError::fail)
+        })
+        .expect("routed replay-determinism property failed");
+}
+
+async fn run_replay_case(pool: PgPool, case: Case) -> Result<(), String> {
+    // Build the enqueue sequence ONCE (fixtures are deterministic: pool_id i+1,
+    // accounts 1000/2000/3000 — matching seed_pool), then replay it.
+    let fixtures = synthetic_fixtures(case.n_pools);
+    let (stream, expected_trx) = build_stream(&case, &fixtures);
+
+    let mut snapshots: Vec<LedgerSnapshot> = Vec::with_capacity(REPLAYS);
+    for r in 0..REPLAYS {
+        let snap = run_and_capture(&pool, &case, &stream, expected_trx)
+            .await
+            .map_err(|e| format!("replay {r}: {e} (method={})", case.method))?;
+        snapshots.push(snap);
+    }
+
+    for (r, snap) in snapshots.iter().enumerate().skip(1) {
+        if *snap != snapshots[0] {
+            return Err(format!(
+                "replay {r} diverged from replay 0 (method={}, n_pools={}):\n  r0={:?}\n  r{r}={:?}",
+                case.method, case.n_pools, snapshots[0], snap
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fixtures matching what `seed_pool` produces (deterministic ids + constant
+/// accounts), so the enqueue stream can be built without a DB round-trip.
+fn synthetic_fixtures(n_pools: usize) -> Vec<Fixture> {
+    (1..=n_pools as i64)
+        .map(|id| Fixture {
+            sku_id: id,
+            loc_id: id,
+            pool_id: id,
+            inv_acct: 1000,
+            ap_acct: 2000,
+            var_acct: 3000,
+        })
+        .collect()
+}
+
+/// Interleave callers round-robin into one enqueue stream (same shape as
+/// `run_one_case`) and return it with the count of non-poison submissions
+/// (== expected trx rows; poison depletions are dropped at commit).
+fn build_stream(case: &Case, fixtures: &[Fixture]) -> (Vec<(&'static str, i64, Value)>, i64) {
+    let max_len = case.callers.iter().map(Vec::len).max().unwrap_or(0);
+    let mut stream = Vec::new();
+    let mut next_source = 1i64;
+    let mut expected_trx = 0i64;
+    for tick in 0..max_len {
+        for caller in &case.callers {
+            let Some(op) = caller.get(tick) else { continue };
+            let source_id = next_source;
+            next_source += 1;
+            match *op {
+                Op::Receipt { pool: pi, qty, cost } => {
+                    expected_trx += 1;
+                    stream.push((
+                        "po_receipt",
+                        source_id,
+                        receipt_line(&fixtures[pi], qty, cost, case.method),
+                    ));
+                }
+                Op::Deplete { pool: pi, qty } => {
+                    expected_trx += 1;
+                    stream.push((
+                        "transfer_shipment",
+                        source_id,
+                        depletion_line(&fixtures[pi], qty),
+                    ));
+                }
+                Op::Poison { pool: pi } => {
+                    stream.push((
+                        "transfer_shipment",
+                        source_id,
+                        depletion_line(&fixtures[pi], POISON_QTY),
+                    ));
+                }
+            }
+        }
+    }
+    (stream, expected_trx)
+}
+
+/// Reset + reseed + enqueue the stream + drain, then capture the full ledger
+/// content for cross-replay comparison.
+async fn run_and_capture(
+    pool: &PgPool,
+    case: &Case,
+    stream: &[(&'static str, i64, Value)],
+    expected_trx: i64,
+) -> Result<LedgerSnapshot, String> {
+    reset_state(pool).await;
+    for p in 0..case.n_pools {
+        let id = (p + 1) as i64;
+        let f = seed_pool(pool, id, id, id, case.method, "running_avg").await;
+        if case.method == "std" {
+            seed_standard_cost(pool, f.sku_id, f.loc_id, STD_COST).await;
+        }
+        seed_aggregate(pool, f.pool_id, SEED_QTY, SEED_COST).await;
+    }
+    for (trx_type, source_id, line) in stream {
+        enqueue(pool, trx_type, *source_id, vec![line.clone()])
+            .await
+            .map_err(|e| format!("enqueue source_id={source_id}: {e}"))?;
+    }
+    await_quiescent(pool, expected_trx).await?;
+
+    let mut aggregates = Vec::with_capacity(case.n_pools);
+    for p in 0..case.n_pools {
+        let pid = (p + 1) as i64;
+        let (q, u) = aggregate(pool, pid).await.unwrap_or((0, 0));
+        aggregates.push((pid, q, u));
+    }
+    let trx_lines = read_trx_line_content(pool).await;
+    Ok(LedgerSnapshot { aggregates, trx_lines })
+}
+
+/// Every trx_line's (source_id, pool_id, qty, unit_cost) in a deterministic
+/// order — the per-line provisional costs whose determinism we assert.
+async fn read_trx_line_content(pool: &PgPool) -> Vec<(i64, i64, i64, i64)> {
+    sqlx::query_as(
+        "SELECT t.source_id, tl.pool_id, tl.qty, tl.unit_cost \
+           FROM trx_line tl JOIN trx t ON t.id = tl.trx_id \
+          ORDER BY t.source_id, tl.pool_id, tl.qty, tl.unit_cost",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read trx_line content")
+}
+
+// ── Receipts-only value-weighted average (acct-0qps) ────────────────
+//
+// With value_sum storage, a receipts-only pool's final aggregate unit_cost is
+// EXACTLY banker_div(Σ qty*cost, Σ qty) — derived once from the exact accumulated
+// book value, never re-rounded incrementally off the prior average — and so it
+// is ORDER-INDEPENDENT across any interleaving of the receipts. This is the
+// property the design team's review asked for (and that the pre-value_sum
+// incremental running average could not satisfy). STD is excluded: it records
+// the standard, not the value-weighted average of actual costs. (Mixed
+// receipt+depletion sequences stay order-sensitive — covered by replay
+// determinism above, not here.)
+
+#[derive(Clone, Debug)]
+struct ReceiptCase {
+    method: &'static str,
+    n_pools: usize,
+    /// Per caller, a stream of (pool_idx, qty, cost) receipts.
+    callers: Vec<Vec<(usize, i64, i64)>>,
+}
+
+fn receipt_case_strategy() -> impl Strategy<Value = ReceiptCase> {
+    // Running-average methods only.
+    let method = prop_oneof![Just("fifo"), Just("lifo"), Just("wac")];
+    (method, 1usize..=3)
+        .prop_flat_map(|(method, n_pools)| {
+            let one = (0..n_pools, 1i64..=50, 1i64..=200);
+            let callers = prop::collection::vec(prop::collection::vec(one, 1..=5), 2..=3);
+            (Just(method), Just(n_pools), callers)
+        })
+        .prop_map(|(method, n_pools, callers)| ReceiptCase { method, n_pools, callers })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs running poc_v3_1 with ledger_routed_c (test_hooks) preloaded"]
+async fn routed_receipts_only_unit_cost_is_value_weighted() {
+    let cases: u32 = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+
+    let pool = connect_pool().await;
+    let mut runner = TestRunner::new(Config { cases, ..Default::default() });
+
+    runner
+        .run(&receipt_case_strategy(), |case| {
+            let pool = pool.clone();
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(run_receipt_case(pool, case.clone()))
+            });
+            result.map_err(TestCaseError::fail)
+        })
+        .expect("routed receipts-only value-weighted property failed");
+}
+
+async fn run_receipt_case(pool: PgPool, case: ReceiptCase) -> Result<(), String> {
+    reset_state(&pool).await;
+
+    // Seed each pool deep; the seed contributes SEED_QTY*SEED_COST to the exact
+    // expected book value. exp_value is i128 — the Σ qty*cost can exceed i64
+    // intermediate range only in pathological inputs, but i128 keeps the model
+    // honest regardless.
+    let mut fixtures = Vec::with_capacity(case.n_pools);
+    let mut exp_value: Vec<i128> = vec![(SEED_QTY as i128) * (SEED_COST as i128); case.n_pools];
+    let mut exp_qty: Vec<i64> = vec![SEED_QTY; case.n_pools];
+    for p in 0..case.n_pools {
+        let id = (p + 1) as i64;
+        let f = seed_pool(&pool, id, id, id, case.method, "running_avg").await;
+        seed_aggregate(&pool, f.pool_id, SEED_QTY, SEED_COST).await;
+        fixtures.push(f);
+    }
+
+    // Interleave callers round-robin into one enqueue stream; accumulate the
+    // exact (order-independent) expected book value + qty per pool as we go.
+    let max_len = case.callers.iter().map(Vec::len).max().unwrap_or(0);
+    let mut stream: Vec<(i64, Value)> = Vec::new();
+    let mut next_source = 1i64;
+    let mut expected_trx = 0i64;
+    for tick in 0..max_len {
+        for caller in &case.callers {
+            let Some(&(pi, qty, cost)) = caller.get(tick) else { continue };
+            exp_value[pi] += (qty as i128) * (cost as i128);
+            exp_qty[pi] += qty;
+            expected_trx += 1;
+            stream.push((next_source, receipt_line(&fixtures[pi], qty, cost, case.method)));
+            next_source += 1;
+        }
+    }
+
+    for (source_id, line) in &stream {
+        enqueue(&pool, "po_receipt", *source_id, vec![line.clone()])
+            .await
+            .map_err(|e| format!("enqueue source_id={source_id}: {e}"))?;
+    }
+    await_quiescent(&pool, expected_trx).await?;
+
+    for p in 0..case.n_pools {
+        let pool_id = (p + 1) as i64;
+        let (qty, unit_cost) = aggregate(&pool, pool_id).await.unwrap_or((0, 0));
+        let want_qty = exp_qty[p];
+        let want_uc = banker_div(exp_value[p], want_qty);
+        if qty != want_qty {
+            return Err(format!(
+                "pool {pool_id} qty {qty} != model {want_qty} (method={})",
+                case.method
+            ));
+        }
+        if unit_cost != want_uc {
+            return Err(format!(
+                "pool {pool_id} unit_cost {unit_cost} != value-weighted {want_uc} \
+                 (value_sum {}, qty {want_qty}, method={})",
+                exp_value[p], case.method
+            ));
+        }
+    }
+    Ok(())
+}

@@ -1,0 +1,5 @@
+scenario,callers,offered_rate,rep,achieved_tput,ack_p50_us,ack_p99_us,committed_p50_us,committed_p99_us,cg_avg,locks_per_trx,trx,dropped,errors,load1_end
+s10,def,850,1,850,225,640,94502,149291,29.86,13.75,17049,0,0,1.30
+s10,def,850,2,850,245,703,104202,437518,35.82,13.19,17048,0,0,1.21
+s10,def,925,1,925,275,885,970981,1971322,94.63,10.86,18547,0,0,1.27
+s10,def,925,2,925,269,606,872415,1830813,87.50,11.07,18549,0,0,1.75
