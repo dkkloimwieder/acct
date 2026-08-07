@@ -2,16 +2,13 @@
 # Cluster-per-binary test runner for ledger-v3.1 (Path C).
 #
 # Each test binary runs against a freshly-restarted acct-postgres container so
-# cross-binary shmem / GUC / BGWorker state cannot leak. (Path C direct is
-# shmem-free, so restart-between-binaries is precautionary; Path C routed's
-# shmem queues + committer BGWorkers make it load-bearing.) Within a binary,
+# cross-binary GUC / catalog state cannot leak. (Path C direct is shmem-free,
+# so restart-between-binaries is precautionary.) Within a binary,
 # --test-threads=1 + tests/common/mod.rs::reset_state keeps tests honest.
 #
 # Usage:
 #   bash poc/ledger-v3.1/scripts/run-tests.sh                 # --path direct
 #   bash poc/ledger-v3.1/scripts/run-tests.sh --path direct
-#   bash poc/ledger-v3.1/scripts/run-tests.sh --path routed
-#   bash poc/ledger-v3.1/scripts/run-tests.sh --path both
 #   FAIL_FAST=0 bash ... run-tests.sh --path direct
 #   BINARIES="acceptance_direct_methods" bash ... run-tests.sh --path direct
 #
@@ -52,8 +49,8 @@ while [ $# -gt 0 ]; do
 done
 
 case "$PATH_ARG" in
-    direct|routed|both) ;;
-    *) echo "--path must be direct | routed | both (got: $PATH_ARG)" >&2; exit 2 ;;
+    direct) ;;
+    *) echo "--path must be direct (got: $PATH_ARG)" >&2; exit 2 ;;
 esac
 
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -152,15 +149,9 @@ run_one_path() {
 }
 
 case "$PATH_ARG" in
-    direct|both)
+    direct)
         run_one_path ledger-direct-c "$WORKSPACE_DIR/ledger-direct-c" \
             "$WORKSPACE_DIR/scripts/install-direct-c.sh" || true
-        ;;
-esac
-case "$PATH_ARG" in
-    routed|both)
-        run_one_path ledger-routed-c "$WORKSPACE_DIR/ledger-routed-c" \
-            "$WORKSPACE_DIR/scripts/install-routed-c.sh" || true
         ;;
 esac
 

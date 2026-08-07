@@ -2,9 +2,8 @@
 # Create the poc_v3_1 database in the dev postgres container (design-v3.1 Path C PoC).
 #
 # Idempotent: skips CREATE DATABASE if the database already exists.
-# Does NOT load any pgrx extensions — those land with install-direct-c.sh (P2,
-# acct-2ttr.3) and install-routed-c.sh (P3, acct-2ttr.4). For now the database holds
-# only the sqlx-cli migrations.
+# Does NOT load any pgrx extensions — those land with install-direct-c.sh.
+# For now the database holds only the sqlx-cli migrations.
 #
 # Usage: bash poc/ledger-v3.1/scripts/create-poc-v3-1-db.sh
 

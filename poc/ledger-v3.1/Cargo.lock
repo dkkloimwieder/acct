@@ -1269,28 +1269,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ledger-routed-c"
-version = "0.0.1"
-dependencies = [
- "chrono",
- "ledger-core",
- "ledger-oracle",
- "ledger-spi-common",
- "ledger-verify",
- "libc",
- "pgrx",
- "pgrx-tests",
- "proptest",
- "rand 0.9.4",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "ledger-spi-common"
 version = "0.0.1"
 dependencies = [

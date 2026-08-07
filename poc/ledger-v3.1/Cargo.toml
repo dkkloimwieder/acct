@@ -4,7 +4,6 @@ members = [
     "ledger-core",
     "ledger-spi-common",
     "ledger-direct-c",
-    "ledger-routed-c",
     "ledger-harness",
     "ledger-oracle",
     "ledger-verify",

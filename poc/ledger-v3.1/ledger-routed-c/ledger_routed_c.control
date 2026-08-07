@@ -1,5 +1,0 @@
-comment = 'ledger-v3.1 Path C routed flavor: shmem staging + router/committer BGWorkers, ledger_enqueue_trx_c (design-v3.1 §6)'
-default_version = '0.0.1'
-module_pathname = '$libdir/ledger_routed_c'
-relocatable = false
-superuser = true
