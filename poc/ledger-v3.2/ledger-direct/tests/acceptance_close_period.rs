@@ -41,6 +41,9 @@ async fn try_submit_at(
 async fn gate_blocks_then_passes_after_drain() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
 
@@ -85,6 +88,9 @@ async fn gate_blocks_then_passes_after_drain() {
 async fn reclose_is_a_noop() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
     receipt_at(&pool, f.pool_id, 1, T09, 10, 100).await;
@@ -110,6 +116,9 @@ async fn reclose_is_a_noop() {
 async fn concurrent_closers_serialize() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
     receipt_at(&pool, f.pool_id, 1, T09, 10, 100).await;
@@ -138,6 +147,9 @@ async fn concurrent_closers_serialize() {
 async fn forced_close_drains_synchronously() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
     receipt_at(&pool, f.pool_id, 1, T09, 10, 100).await;
@@ -167,6 +179,9 @@ async fn forced_close_drains_synchronously() {
 async fn sweep_absorbs_banker_residue() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
     receipt_at(&pool, f.pool_id, 1, T09, 10, 100).await;
@@ -204,6 +219,9 @@ async fn sweep_absorbs_banker_residue() {
 async fn sweep_absorbs_exact_empty_flush_residue() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
 
@@ -234,6 +252,9 @@ async fn sweep_absorbs_exact_empty_flush_residue() {
 async fn sweep_absorbs_uncovered_depletion_residue() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
     receipt_at(&pool, f.pool_id, 1, T09, 5, 100).await;
@@ -268,6 +289,9 @@ async fn sweep_absorbs_uncovered_depletion_residue() {
 async fn unforced_close_drains_next_period_tail_for_the_sweep() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
     receipt_at(&pool, f.pool_id, 1, T09, 10, 100).await;
@@ -298,6 +322,9 @@ async fn unforced_close_drains_next_period_tail_for_the_sweep() {
 async fn immutability_rejects_backdate_and_new_generation() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
     receipt_at(&pool, f.pool_id, 1, T09, 10, 100).await;
@@ -338,6 +365,9 @@ async fn immutability_rejects_backdate_and_new_generation() {
 async fn close_guard_rails() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     seed_fixture(&pool, "fifo", "running_avg").await;
     create_period(&pool, 1, "2026-06-01", "2026-06-30").await;
     create_period(&pool, 2, PERIOD_START, PERIOD_END).await;
@@ -366,6 +396,9 @@ async fn close_guard_rails() {
 async fn settle_pool_drains_on_demand() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let fifo = seed_pool(&pool, 1, 1, 1, "fifo", "running_avg").await;
     let wac = seed_pool(&pool, 2, 2, 2, "wac", "running_avg").await;
 
@@ -398,6 +431,9 @@ async fn settle_pool_drains_on_demand() {
 async fn sweep_missing_variance_account_fails_loud() {
     let pool = connect_pool().await;
     reset_state(&pool).await;
+    // Feedless fixture: no slot is ever created here, so waive the
+    // close gate's feed-currency leg explicitly (0020).
+    set_feed_required(&pool, false).await;
     let f = seed_fixture(&pool, "fifo", "running_avg").await;
     sqlx::query("UPDATE posting_account_map SET variance_acct = NULL WHERE sku_id = $1")
         .bind(f.sku_id)
@@ -424,4 +460,155 @@ async fn sweep_missing_variance_account_fails_loud() {
         .await
         .unwrap();
     assert_eq!(close_period(&pool, 1, "closer", true).await["closed"], json!(true));
+}
+
+/// **acct-1vur.1** — the feed-currency gate leg (0020), pinned on the wedge
+/// shape it exists to stop.
+///
+/// An event backdated BELOW the settled frontier and committed but not yet
+/// delivered contributes to neither drain-gate signal: the lag LATERAL counts
+/// only events above the frontier, and recost floors are written solely by the
+/// feed. Before 0020 the close passed its gate, stamped an immutably wrong
+/// valuation, misbooked the straggler's whole value as sweep residue, and
+/// wedged the pool permanently once the late delivery dropped a floor below
+/// the closed boundary (every later engine pass rejected by 0017). Now the
+/// currency leg fails the close loudly — and force does not bypass it. After
+/// the feed catches up the same close runs clean, at the CORRECT valuation.
+#[tokio::test]
+#[ignore = "needs running poc_v3_2 with ledger_direct installed"]
+async fn undelivered_backdate_fails_the_gate_then_closes_clean() {
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    let consumer = reset_feed(&pool).await;
+    let f = seed_fixture(&pool, "fifo", "running_avg").await;
+    create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
+
+    // In-period activity, delivered and settled to the stream head. FIFO draws
+    // the T11 lot, so the depletion's authoritative cost is 10.
+    receipt_at(&pool, f.pool_id, 1, T11, 100, 10).await;
+    receipt_at(&pool, f.pool_id, 2, T12, 100, 20).await;
+    let d = deplete_at(&pool, f.pool_id, 3, T13, 50).await;
+    ingest_all(&consumer).await;
+    drain_recalc(&pool).await;
+    assert_eq!(authoritative_of(&pool, d).await, Some(10));
+    let (_, settled_through, floor) = settlement_of(&pool, f.pool_id).await.unwrap();
+    assert_eq!(settled_through, Some(d), "frontier at the depletion");
+    assert!(!floor, "no recost floor before the straggler");
+    let settled_value = layer_value(&pool, f.pool_id).await;
+
+    // The straggler: a cheaper lot business-dated BELOW the settled frontier,
+    // committed but deliberately NOT ingested. It re-prices the settled T13
+    // depletion (FIFO would draw it first at 5, not the T11 lot at 10).
+    let rb = receipt_at(&pool, f.pool_id, 4, T10, 100, 5).await;
+
+    // Neither drain-gate signal sees it — this is the blind spot the currency
+    // leg covers, so pin that it really is invisible to them.
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM recalc_queue").await,
+        0,
+        "no delivery ⇒ pool not marked dirty"
+    );
+    assert!(!settlement_of(&pool, f.pool_id).await.unwrap().2, "no delivery ⇒ no recost floor");
+    // The hot path DID move the aggregate; the layers are untouched. Left
+    // unenforced, the sweep would write this 500 off to variance.
+    assert_eq!(aggregate(&pool, f.pool_id).await.unwrap().2, settled_value + 500);
+    assert_eq!(layer_value(&pool, f.pool_id).await, settled_value);
+
+    // THE GATE: the close fails loud instead of stamping over the straggler.
+    let report = close_period(&pool, 1, "closer", false).await;
+    assert_eq!(report["closed"], json!(false));
+    assert_eq!(report["gate"]["passed"], json!(false));
+    assert_eq!(report["gate"]["feed"]["current"], json!(false));
+    assert!(
+        report["gate"]["feed"]["reason"].as_str().unwrap().starts_with("slot_behind_by_"),
+        "names the currency failure: {report}"
+    );
+    assert_eq!(report["gate"]["lagging"], json!([]), "the drain gate alone would have passed");
+    assert_eq!(period_state(&pool, 1).await.0, "closing");
+
+    // FORCE DOES NOT BYPASS IT: the missing input is exactly what force
+    // promises to fold in, and forcing past it misbooks the straggler's value.
+    let forced = close_period(&pool, 1, "closer", true).await;
+    assert_eq!(forced["closed"], json!(false), "force never bypasses the currency leg");
+    assert_eq!(forced["gate"]["feed"]["current"], json!(false));
+    assert_eq!(period_state(&pool, 1).await.0, "closing");
+    // Nothing was swept: no variance misbooking, aggregate untouched.
+    assert_eq!(count(&pool, "SELECT count(*) FROM posting_line").await, 1);
+    assert_eq!(aggregate(&pool, f.pool_id).await.unwrap().2, settled_value + 500);
+
+    // The feed catches up: floor drops, the engine re-costs at the TRUE cost
+    // while the period is still open, and the close then runs clean.
+    let late = consumer.ingest_once(10_000).await.expect("feed ingest");
+    assert_eq!(late.floors_lowered, 1);
+    drain_recalc(&pool).await;
+    assert_eq!(authoritative_of(&pool, d).await, Some(5), "re-costed against the backdated lot");
+    ingest_until_current(&pool, &consumer).await;
+
+    let ok = close_period(&pool, 1, "closer", false).await;
+    assert_eq!(ok["closed"], json!(true), "clean close once the feed is current: {ok}");
+    assert_eq!(ok["gate"]["passed"], json!(true));
+    assert_eq!(ok["gate"]["feed"]["current"], json!(true));
+    assert_eq!(period_state(&pool, 1).await.0, "closed");
+
+    // The straggler is a real costed layer, not variance residue, and the
+    // aggregate matches the authoritative layer value exactly.
+    let straggler_layer = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pool_state WHERE pool_id = $1 AND layer_id = $2",
+    )
+    .bind(f.pool_id)
+    .bind(rb)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(straggler_layer, 1, "the straggler became a costed layer");
+    assert_eq!(aggregate(&pool, f.pool_id).await.unwrap().2, layer_value(&pool, f.pool_id).await);
+
+    // No wedge: the engine is at rest, no floor, nothing queued.
+    assert!(!settlement_of(&pool, f.pool_id).await.unwrap().2);
+    assert_eq!(count(&pool, "SELECT count(*) FROM recalc_queue").await, 0);
+
+    drop_feed_slot(&pool).await;
+}
+
+/// A missing slot is a hard gate failure under the default strict policy: with
+/// `max_slot_wal_keep_size` permitting invalidation, an absent slot means
+/// events may have been lost entirely, which is the silent-mis-valuation case
+/// the whole leg exists to prevent. Force does not bypass it either.
+#[tokio::test]
+#[ignore = "needs running poc_v3_2 with ledger_direct installed"]
+async fn close_without_a_feed_slot_fails_loud() {
+    let pool = connect_pool().await;
+    reset_state(&pool).await;
+    // Establish the premise directly rather than inheriting it from whichever
+    // test ran last: reset_state does not touch replication slots.
+    drop_feed_slot(&pool).await;
+    let f = seed_fixture(&pool, "fifo", "running_avg").await;
+    create_period(&pool, 1, PERIOD_START, PERIOD_END).await;
+    receipt_at(&pool, f.pool_id, 1, T09, 10, 100).await;
+    deplete_at(&pool, f.pool_id, 2, T10, 4).await;
+
+    // No slot exists (reset_state left feed_required at its TRUE default).
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'ledger_feed'")
+            .await,
+        0
+    );
+    for force in [false, true] {
+        let report = close_period(&pool, 1, "closer", force).await;
+        assert_eq!(report["closed"], json!(false), "force={force}");
+        assert_eq!(report["gate"]["feed"]["reason"], json!("slot_absent"), "force={force}");
+        assert!(report["feed_lag_bytes"].is_null(), "no slot ⇒ no G1 reading");
+        assert_eq!(period_state(&pool, 1).await.0, "closing");
+    }
+
+    // The documented waiver re-opens the feedless path.
+    set_feed_required(&pool, false).await;
+    let ok = close_period(&pool, 1, "closer", true).await;
+    assert_eq!(ok["closed"], json!(true));
+    assert_eq!(ok["gate"]["feed"]["current"], json!(true));
+
+    // Leave the database strict: feed_required is persistent state, and a
+    // waiver left behind here would silently disarm the gate for every later
+    // user of poc_v3_2.
+    set_feed_required(&pool, true).await;
 }

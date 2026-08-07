@@ -56,6 +56,22 @@ pub async fn reset_state(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("reset backpressure config");
+    sqlx::query("UPDATE close_gate_config SET feed_required = DEFAULT")
+        .execute(pool)
+        .await
+        .expect("reset close gate config");
+}
+
+/// Set the close gate's feed-currency policy (0020). Every binary starts
+/// strict (`reset_state` restores the TRUE default); a test that closes
+/// without ever creating a feed slot must waive it explicitly, which is what
+/// makes the waiver visible and auditable per-test.
+pub async fn set_feed_required(pool: &PgPool, required: bool) {
+    sqlx::query("UPDATE close_gate_config SET feed_required = $1")
+        .bind(required)
+        .execute(pool)
+        .await
+        .expect("set close_gate_config.feed_required");
 }
 
 /// A seeded single-pool fixture with deterministic ids.
@@ -274,6 +290,33 @@ pub async fn ingest_all(consumer: &ledger_feed::FeedConsumer) {
             break;
         }
     }
+}
+
+/// Ingest until the slot is CURRENT, not merely until the queue drained.
+///
+/// `ingest_all` stops at the first empty tick, but that tick's cursor target
+/// is the anchor captured before its peek — any WAL written since (including
+/// the previous tick's own apply) leaves the slot marginally behind. The close
+/// gate's feed-currency leg (0020) compares against `pg_current_wal_lsn()`, so
+/// a test that must close cleanly has to reach the write pointer, not just an
+/// empty queue. Loops to a fixed point.
+pub async fn ingest_until_current(pool: &PgPool, consumer: &ledger_feed::FeedConsumer) {
+    for _ in 0..64 {
+        ingest_all(consumer).await;
+        let current = sqlx::query_scalar::<_, bool>(
+            "SELECT COALESCE(bool_or(confirmed_flush_lsn >= pg_current_wal_lsn()), false) \
+               FROM pg_replication_slots \
+              WHERE slot_name = $1 AND database = current_database()",
+        )
+        .bind(SLOT)
+        .fetch_one(pool)
+        .await
+        .expect("read slot currency");
+        if current {
+            return;
+        }
+    }
+    panic!("feed slot never reached the WAL write pointer");
 }
 
 /// Call ledger_submit_trx with an explicit posted_at; returns the trx id.

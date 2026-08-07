@@ -413,6 +413,23 @@ pub async fn run_soak(cfg: SoakCfg) -> Result<SoakReport, String> {
         .await
         .map_err(|e| format!("verify: {e}"))?;
 
+    // The close gate requires a current feed (0020) and the consumer task is
+    // stopped by now, so nothing else can advance the cursor: drain the slot
+    // to its anchor here, or the gate can never pass. Quiesce already proved
+    // the feed idle, so this is the post-verify WAL tail plus the empty-tick
+    // anchor, not real backlog.
+    let closing_consumer =
+        ledger_feed::FeedConsumer::new(pool.clone(), "ledger_feed", "ledger_feed");
+    loop {
+        let report = closing_consumer
+            .ingest_once(10_000)
+            .await
+            .map_err(|e| format!("pre-close feed catch-up: {e}"))?;
+        if report.messages == 0 {
+            break;
+        }
+    }
+
     // ── the real close (unforced — the gate must pass at quiesce) ────────
     let close_report: Value =
         sqlx::query_scalar("SELECT ledger_close_period($1, 'ledger-bench', false)")

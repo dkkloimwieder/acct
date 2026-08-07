@@ -57,16 +57,35 @@
 //! never violated, and either retry converges (the submission finds the
 //! period closed and is rejected).
 //!
-//! Feed-currency assumption (recalc-e §3 premise): the gate reads
-//! `pool_settlement` — floors and frontiers the FEED maintains. A backdated
-//! event that committed but has not yet been delivered by the slot has no
-//! recost floor, sits behind the settled frontier, and is invisible to the
-//! gate; the design premise is a continuously running feed (G1 healthy) at
-//! close time. The close report carries `feed_lag_bytes` (the G1 gauge) so no
-//! caller closes blind to a lagging slot. If the straggler's floor lands
-//! after the close, the engine's re-cost attempt fails loud against the 0017
-//! settlement guard and the pool alarms on G2a/G2c — mis-valuation is never
-//! silent, and resolving it is the out-of-scope reopen workflow (D14).
+//! Feed currency is ENFORCED, not assumed (0020). The drain gate reads
+//! `pool_settlement` — floors and frontiers only the FEED maintains — and
+//! measures lag as events strictly above the settled frontier. An event
+//! backdated BELOW that frontier, committed but not yet delivered by the slot,
+//! contributes to neither signal: it would pass a blind gate, be stamped at an
+//! immutably wrong valuation, have its whole value misbooked to variance by
+//! the residue sweep (the aggregate carries it, the layers do not), and then
+//! wedge the pool permanently once the late delivery dropped a recost floor
+//! below the closed boundary and 0017's settlement guard began rejecting every
+//! engine pass. So the gate now carries a **feed-currency leg**: with
+//! `close_gate_config.feed_required` (default TRUE), a present,
+//! non-invalidated `ledger_feed` slot whose `confirmed_flush_lsn` has reached
+//! the WAL position captured at gate entry — under recalc-c D8 that cursor is
+//! the delivered-and-applied position, so reaching it means every event
+//! committed before this close is in the dirty set. A second check under the
+//! `(32022)` fence catches anything that lands in the period mid-close.
+//! `feed_lag_bytes` (G1) stays in the report as the diagnostic.
+//!
+//! Force does NOT bypass this leg — the sole non-bypassable arm. Force means
+//! "pay the remaining fold synchronously"; that is coherent only when the fold
+//! has all its inputs, and on a lagging slot a forced close does not close
+//! early, it corrupts the variance account. A currency failure returns the
+//! standard gate-fail report (`closing`, `gate.passed = false`) with a `feed`
+//! arm naming the cause, forced or not; the caller lets the feed catch up and
+//! re-invokes, exactly like the drain gate.
+//!
+//! `active` is not consulted: the feed consumes over the SQL peek/advance
+//! interface, which holds the slot only during each tick, so a healthy feed
+//! reads `active = false` between ticks. Currency subsumes liveness.
 //!
 //! `ledger_settle_pool(pool_id)` is the on-demand SAP shape (recalc-e §7):
 //! force-drain ONE pool to its stream head synchronously — the same
@@ -140,12 +159,55 @@ fn ledger_close_period(period_id: i64, actor: &str, force: bool) -> pgrx::JsonB 
     }
     reject_out_of_order(period_id);
 
+    // ORDER IS LOAD-BEARING: the event baseline is read BEFORE the WAL
+    // position, never after. Every event visible to this count committed
+    // before `gate_lsn` is read, so `confirmed_flush_lsn >= gate_lsn` proves
+    // the whole counted set was delivered and applied. Reading the LSN first
+    // would leave a window — an event committing between the two reads sits
+    // ABOVE the LSN the currency leg proves (so it may be undelivered) yet is
+    // already INSIDE the fence baseline (so the recount cannot see it) —
+    // which reopens the exact stamp-wrong-then-wedge path this gate closes.
+    // Events that commit after the count but before the LSN are simply absent
+    // from the baseline and trip the fence recount: a retryable abort, never
+    // a silent admit.
+    let events_at_gate = in_period_event_count(&period.end);
+    let gate_lsn = current_wal_lsn();
+
     let gate = gate_pools(&period.end);
     let lagging: Vec<Value> = gate.iter().filter(|g| g.lagging()).map(gate_json).collect();
-    let gate_passed = lagging.is_empty();
     let g2b_total: i64 =
         gate.iter().filter(|g| g.lagging()).map(|g| g.unsettled_gross).sum();
     let feed_lag = feed_lag_bytes();
+
+    // The feed-currency leg (0020). Force does not bypass it: an undelivered
+    // straggler is a missing INPUT to the fold force promises to pay, so
+    // forcing past it mis-values the period and misbooks the straggler's value
+    // as sweep residue. A failure takes the same mark-closing path as a drain
+    // gate failure — the caller lets the feed catch up and re-invokes.
+    let feed_state = feed_currency(&gate_lsn);
+    let gate_passed = lagging.is_empty() && feed_state.is_none();
+
+    if let Some(reason) = &feed_state {
+        mark_closing(period_id);
+        return pgrx::JsonB(json!({
+            "period_id": period_id,
+            "closed": false,
+            "state": "closing",
+            // Nothing was forced — the close did not happen. `force_requested`
+            // records what the caller asked for, so a forced attempt that the
+            // non-bypassable currency leg refused is legible in the report.
+            "forced": false,
+            "force_requested": force,
+            "feed_lag_bytes": feed_lag,
+            "gate": {
+                "passed": false,
+                "pools_in_scope": gate.len(),
+                "lagging": lagging,
+                "unsettled_gross_total": g2b_total,
+                "feed": {"current": false, "reason": reason},
+            },
+        }));
+    }
 
     if !gate_passed && !force {
         mark_closing(period_id);
@@ -160,6 +222,7 @@ fn ledger_close_period(period_id: i64, actor: &str, force: bool) -> pgrx::JsonB 
                 "pools_in_scope": gate.len(),
                 "lagging": lagging,
                 "unsettled_gross_total": g2b_total,
+                "feed": {"current": true, "reason": Value::Null},
             },
         }));
     }
@@ -202,6 +265,26 @@ fn ledger_close_period(period_id: i64, actor: &str, force: bool) -> pgrx::JsonB 
         }
     }
 
+    // Still under the fence: no in-period physical event may have appeared
+    // since the gate. The fence has waited out in-flight inserts and blocks
+    // new ones, so this reading is final. A change means a backdate landed
+    // during our drain/sweep — undelivered by construction, since the currency
+    // leg passed at gate entry — which is the straggler class this gate
+    // exists to stop. Fail loud and roll the whole close back rather than
+    // stamp over it; the caller retries once the feed has delivered it.
+    let events_at_fence = in_period_event_count(&period.end);
+    if events_at_fence != events_at_gate {
+        bail(
+            PgSqlErrorCode::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            format!(
+                "ledger_close_period: {} physical event(s) landed in period {period_id} \
+                 during the close (gate saw {events_at_gate}, fence sees {events_at_fence}); \
+                 they are not yet delivered by the feed — retry once the slot is current",
+                events_at_fence - events_at_gate
+            ),
+        );
+    }
+
     let closed_at = stamp_closed(period_id, actor);
 
     let residues: Vec<Value> = swept
@@ -229,6 +312,7 @@ fn ledger_close_period(period_id: i64, actor: &str, force: bool) -> pgrx::JsonB 
             "pools_in_scope": gate.len(),
             "lagging": lagging,
             "unsettled_gross_total": g2b_total,
+            "feed": {"current": true, "reason": Value::Null},
         },
         "drained": {
             "pools": swept.len(),
@@ -277,6 +361,134 @@ fn feed_lag_bytes() -> Option<i64> {
     })
     .unwrap_or_else(|e| {
         bail(PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, format!("ledger_close_period: feed gauge failed: {e}"))
+    })
+}
+
+/// The WAL position every already-committed event sits at or below.
+///
+/// This MUST be the same pointer the feed anchors to (`pg_current_wal_lsn()`,
+/// consumer.rs `ingest_once`), not `pg_current_wal_insert_lsn()`. The insert
+/// pointer runs ahead of the write pointer by any WAL still in buffers, and
+/// the feed's empty-tick anchor can never reach it — demanding it makes the
+/// currency leg permanently unsatisfiable (measured: a slot freshly caught up
+/// still reads tens of bytes "behind").
+///
+/// Soundness rests on `synchronous_commit = on` (the configured default):
+/// a commit record is flushed before the committing backend returns, so the
+/// write pointer is at or past every committed event. Under
+/// `synchronous_commit = off` the write pointer could trail a committed
+/// event; that configuration would need the feed's anchor moved in step.
+fn current_wal_lsn() -> String {
+    Spi::connect_mut(|client| -> Result<Option<String>, pgrx::spi::Error> {
+        let mut t = client.update("SELECT pg_current_wal_lsn()::text", None, &[])?;
+        Ok(t.next().and_then(|row| row.get::<String>(1).ok().flatten()))
+    })
+    .unwrap_or_else(|e| {
+        bail(PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, format!("ledger_close_period: wal lsn read failed: {e}"))
+    })
+    .unwrap_or_else(|| {
+        bail(
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            "ledger_close_period: pg_current_wal_lsn() returned NULL".to_string(),
+        )
+    })
+}
+
+/// The feed-currency leg (0020). `None` means current — or waived by
+/// `close_gate_config.feed_required = FALSE`; `Some(reason)` names the failure
+/// for the gate report.
+///
+/// Checked, in order: the slot exists, it has not been invalidated (dropping
+/// WAL it never delivered is exactly the silent-loss case
+/// `max_slot_wal_keep_size` permits), and its `confirmed_flush_lsn` — the D8
+/// delivered-and-applied cursor — has reached `gate_lsn`.
+///
+/// The slot is matched by name AND `database = current_database()` AND
+/// `slot_type = 'logical'`: replication slot names are cluster-global, so a
+/// same-named slot belonging to another database on this shared cluster would
+/// otherwise satisfy the gate while this database's feed was dead.
+///
+/// Two known gaps are deliberately out of scope here and tracked separately:
+/// a slot DROPPED and re-created past an undelivered gap reads current
+/// (`ensure_slot` recreate path — acct-1vur.2 slot-loss detection/reseed), and
+/// a backdate into a timestamp range no `accounting_period` covers evades the
+/// 0017 fence entirely (acct-1vur.3 period-coverage side door).
+fn feed_currency(gate_lsn: &str) -> Option<String> {
+    Spi::connect_mut(|client| -> Result<Option<String>, pgrx::spi::Error> {
+        let required = client
+            .update("SELECT feed_required FROM close_gate_config", None, &[])?
+            .next()
+            .and_then(|row| row.get::<bool>(1).ok().flatten())
+            .unwrap_or(true);
+        if !required {
+            return Ok(None);
+        }
+        let mut t = client.update(
+            "SELECT s.wal_status, s.invalidation_reason, \
+                    s.confirmed_flush_lsn IS NULL, \
+                    COALESCE(s.confirmed_flush_lsn >= $1::pg_lsn, false), \
+                    COALESCE(pg_wal_lsn_diff($1::pg_lsn, s.confirmed_flush_lsn), 0)::bigint \
+               FROM pg_replication_slots s \
+              WHERE s.slot_name = 'ledger_feed' \
+                AND s.slot_type = 'logical' \
+                AND s.database = current_database()",
+            None,
+            &[gate_lsn.to_string().into()],
+        )?;
+        let Some(row) = t.next() else {
+            return Ok(Some("slot_absent".to_string()));
+        };
+        let wal_status = row.get::<String>(1)?.unwrap_or_default();
+        let invalidation = row.get::<String>(2)?;
+        let no_cursor = row.get::<bool>(3)?.unwrap_or(true);
+        let current = row.get::<bool>(4)?.unwrap_or(false);
+        let behind = row.get::<i64>(5)?.unwrap_or(0);
+        if let Some(reason) = invalidation {
+            return Ok(Some(format!("slot_invalidated: {reason}")));
+        }
+        if wal_status == "lost" {
+            return Ok(Some("slot_invalidated: wal_status=lost".to_string()));
+        }
+        if no_cursor {
+            // A slot that has never confirmed anything is not "0 bytes behind".
+            return Ok(Some("slot_no_cursor".to_string()));
+        }
+        if !current {
+            return Ok(Some(format!("slot_behind_by_{behind}_bytes")));
+        }
+        Ok(None)
+    })
+    .unwrap_or_else(|e| {
+        bail(
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            format!("ledger_close_period: feed currency check failed: {e}"),
+        )
+    })
+}
+
+/// Count of physical (non-`cost_adjustment_line`) events inside the period on
+/// gate-scoped (fifo/lifo) pools. Compared across the fence to detect a
+/// mid-close arrival. Scoped to fifo/lifo deliberately: only those pools carry
+/// settlement state a straggler can wedge, so wac/std/specific activity must
+/// not abort an otherwise-good close.
+fn in_period_event_count(end_date: &str) -> i64 {
+    Spi::connect_mut(|client| -> Result<i64, pgrx::spi::Error> {
+        let mut t = client.update(
+            "SELECT count(*)::bigint FROM trx_line t \
+               JOIN pool p ON p.id = t.pool_id \
+              WHERE p.method IN ('fifo', 'lifo') \
+                AND t.line_type <> 'cost_adjustment_line' \
+                AND t.posted_at < ($1::date + 1)::timestamptz",
+            None,
+            &[end_date.to_string().into()],
+        )?;
+        Ok(t.next().and_then(|row| row.get::<i64>(1).ok().flatten()).unwrap_or(0))
+    })
+    .unwrap_or_else(|e| {
+        bail(
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            format!("ledger_close_period: in-period event count failed: {e}"),
+        )
     })
 }
 

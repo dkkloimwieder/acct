@@ -234,15 +234,28 @@ async fn run_case(
     // current (the documented close premise, G1 healthy): the gate reads the
     // floor/frontier state only the feed maintains, so a backdated event
     // whose delivery is still in the slot would be invisible to it. ────────
-    ingest_all(&consumer).await;
+    ingest_until_current(pool, &consumer).await;
     let unforced = close_period(pool, 1, "prop", false).await;
     if unforced["closed"] == json!(false) {
         assert_eq!(unforced["state"], json!("closing"), "gate-fail persists closing");
+        // A blocked gate always names its cause: either per-pool drain lag, or
+        // the feed-currency leg (0020) reporting why the slot is not current.
+        let drain_lag =
+            unforced["gate"]["lagging"].as_array().is_some_and(|l| !l.is_empty());
+        let feed_stale = unforced["gate"]["feed"]["current"] == json!(false);
         assert!(
-            unforced["gate"]["lagging"].as_array().is_some_and(|l| !l.is_empty()),
-            "a blocked gate names its laggards: {unforced}"
+            drain_lag || feed_stale,
+            "a blocked gate names its laggards or its feed: {unforced}"
+        );
+        assert!(
+            !feed_stale || unforced["gate"]["feed"]["reason"].is_string(),
+            "a stale-feed gate states a reason: {unforced}"
         );
     }
+    // The unforced attempt may itself have written WAL (the `closing` stamp),
+    // which leaves the slot behind the next gate's captured LSN — the feed
+    // must be current for every close, not just the first (0020).
+    ingest_until_current(pool, &consumer).await;
     let report = close_period(pool, 1, "prop", true).await;
     assert_eq!(report["closed"], json!(true), "forced close closes: {report}");
 
