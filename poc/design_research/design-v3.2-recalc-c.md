@@ -160,11 +160,12 @@ avoids full-opening replay) to this child.
 > **D11 resolved: no historical checkpoints in v3.2 scope — one live checkpoint (b's default).** A backdated
 > event *before* `settled_through` triggers full-opening replay (a's O(depth) correctness baseline), priced by
 > G2 and exercised by the soak (§10). Rationale: retaining historical checkpoints keyed to prior accounting
-> boundaries only pays off for **backdating into an already-closed period**, which requires a period-reopen
-> workflow that is **out of scope (§13, no period-close-reopen mechanics in v3.2)**. So within v3.2's scope the
-> historical-checkpoint benefit is unreachable; adding the storage + invalidation machinery now would be
-> speculative. Revisit when/if period reopen enters scope. Correctness is unaffected either way — full-opening
-> replay is always correct, just O(depth).
+> boundaries only pays off for **backdating into an already-closed period**. Admission refuses that outright
+> (the monotonic closed frontier, design-v3.2 §7.2), and the one path that reaches it — the reopen workflow
+> (`acct-1vur.9`, in scope since convergence Q8) — is a rare, audited, operator-initiated act rather than a
+> steady-state shape. So the historical-checkpoint benefit stays unreachable in the steady state; adding the
+> storage + invalidation machinery would be speculative. Revisit only if reopen-driven deep replay shows up on
+> the G2 gauges. Correctness is unaffected either way — full-opening replay is always correct, just O(depth).
 
 ## 10. Cadence-vs-load soak (hands to testing strategy, design-v3.2 §8)
 

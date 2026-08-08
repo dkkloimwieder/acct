@@ -1,26 +1,26 @@
 # design-v3.2: cost-ledger spec-of-record — the surviving architecture
 
-> **Status: spec-of-record.** This describes the v3.2 costing plane **as built**, merged to `main` at
-> the convergence merge `8378a7d` (tree state `4a48512`). It is the authoritative description of the
-> costing plane; the code is the implementation of this document, not the other way round.
+> **Status: spec-of-record.** This describes the v3.2 costing plane **as built** on `main` through
+> migration `0029` (see §2 for the migration high-water mark) and the `acct-1vur` hardening lane. It is
+> the authoritative description of the costing plane; the code is the implementation of this document,
+> not the other way round. Authoring work item: `acct-476a.1`.
 >
-> **Two sections are still being written** and are marked in place: **§7 (close semantics)** and the
-> mechanical-guard half of **§3a (posted_at)**. Both are the subject of active hardening under
-> `acct-1vur`, which is rewriting the close gate's feed premise; publishing their detail before that
-> verdict would document semantics that are changing. Everything else here is settled.
+> **Residual open work on the surfaces described here:** the `acct-1vur` lane is 7/9 closed —
+> `acct-1vur.9` (the reopen workflow, §7.3) and `acct-1vur.7` (the period-creation frontier check,
+> §7.2) remain open. Both are named at their sites.
 >
 > Decided inputs are consolidated **by reference** from design-v3.1 §16 (posture) / §17 (feed) / §18
 > (gate verdict) / §19 (recalc risk) / §20 (alternatives) / §3.7 (wire contract), and from
-> [`convergence-decisions-2026-08-07.md`](convergence-decisions-2026-08-07.md) (Q1–Q14). Neither is
-> re-litigated here.
+> [`convergence-decisions-2026-08-07.md`](convergence-decisions-2026-08-07.md) (Q1–Q14, including the
+> Q2 and Q8 resolutions). Neither is re-litigated here.
 
-**Labels used below.** **T2** — the pending tranche named in the status block (§7 and §3a's guard
-half); a `[T2]` marker means "decided, not yet written here". **SPIKE-A / SPIKE-B** — the two
-hot-path spikes design-v3.1 §18 measured at the gate: the staging-table outbox and the
-single-statement direct write, both of which survived. **D1, D3, D5, D7, D8-B, D11, D13, D14** —
-design-decision IDs from the five [`design-v3.2-recalc-{a..e}.md`](.) notes, which are part of this
-spec's reference set; each is cited where it was resolved. **R-1 / R-2** — the two recalc
-correctness requirements: business-chronological re-sort, and re-costing forced by backdated events.
+**Labels used below.** **SPIKE-A / SPIKE-B** — the two hot-path spikes design-v3.1 §18 measured at
+the gate: the staging-table outbox and the single-statement direct write, both of which survived.
+**D1, D3, D5, D7, D8-B, D10–D14** — design-decision IDs from the five
+[`design-v3.2-recalc-{a..e}.md`](.) notes, which are part of this spec's reference set; each is
+labelled at the site where it was resolved. **R-1 / R-2** — the two recalc correctness requirements: business-chronological
+re-sort, and re-costing forced by backdated events. **G1 / G2** — the feed-ingestion and
+valuation-staleness gauge families (§6).
 
 
 
@@ -37,8 +37,11 @@ plane the unification target and Q11 merged the line to `main`. v3.2 is therefor
 starting architecture** for the costing plane, not a PoC path under evaluation.
 
 **What it is not.** It is not yet wired into the `acct` document layer, which retains its own plpgsql
-costing plane. Whether that layer is ported onto v3.2 or rebuilt is convergence **Q2**, decided by
-the dossiers `acct-476a.2` / `acct-476a.4`. Until they report, the two planes coexist without a seam.
+costing plane. Whether that layer is ported onto v3.2 or rebuilt was convergence **Q2**, resolved
+2026-08-07 by the dossiers `acct-476a.2` / `acct-476a.4`: **asset, not rebuild** — the document layer
+is a port target, not a teardown. The seam itself is unbuilt: the two planes still coexist without
+one, and the port/integration program is gated behind `acct-23kd`, with `acct-476a.3` (currency/seam
+contract) and `acct-476a.5` (close-hook mapping) as its remaining spec inputs.
 
 **Posture (Q13).** Correctness first; no fixed TPS target; baseline before complexity. One amendment
 carries real weight for this document: the **Q3a drift-exposure bounds are in-scope product bounds**,
@@ -56,7 +59,10 @@ dominated at the gate — by SPIKE-A, SPIKE-B, and the §16 alt-C endpoint respe
 
 ## 2. Schema
 
-Twenty migrations under `poc/ledger-v3.2/db/migrations/`, all applied to database `poc_v3_2`.
+Twenty-eight migrations under `poc/ledger-v3.2/db/migrations/`, all applied to database `poc_v3_2`.
+The sequence skips `0025`: it was reserved for the documentation-only migration that eventually landed
+as `0029`, and because `sqlx` refuses a version below the highest applied one the gap is permanent and
+harmless.
 Migrations are content-addressed by `sqlx` and therefore **immutable once applied**: corrections ship
 as new migrations, never as edits.
 
@@ -81,13 +87,23 @@ as new migrations, never as edits.
 | `0017` | Period guards | `BEFORE INSERT` triggers on `trx_line` and `cost_settlement`. See §7 |
 | `0018` | Backpressure | `recalc_backpressure_config` (single row, deletion-guarded, defaults 200/20), `recalc_backlog` (per-pool counter), `recalc_backpressure` (throttled set), `ledger_inbox` admission trigger |
 | `0019` | Cost floor | `standard_cost.unit_cost >= 0` — a stored negative standard would be silently observed as 0 by the hot path's cost clamp, so it is rejected at the source |
-| `0020` | Close gate config | `close_gate_config` — single row, `feed_required` default `TRUE`. Turns the close gate's feed-currency premise into an enforced leg. See §7 |
+| `0020` | Close gate config | `close_gate_config` — single row, deletion-guarded, `feed_required` default `TRUE`. Turns the close gate's feed-currency premise into an enforced leg (§7) |
+| `0021` | Period integrity | `accounting_period` gains `CHECK (start_date <= end_date)` and `EXCLUDE USING gist (daterange(start_date, end_date, '[]') WITH &&)` — no `btree_gist` needed. Overlap is forbidden; **gaps are deliberately legal** |
+| `0022` | Backdate floor | Reframes admission from coverage to a **monotonic closed frontier**: `max(end_date) FILTER (state = 'closed')`. Adds the `(32022, 0)` sentinel fence both guards and the closer take. See §7 |
+| `0023` | Append-only | `BEFORE UPDATE OR DELETE` guards (SQLSTATE `55006`, `AppendOnly:` prefix) on `trx_line`, `posting_line`, `cost_settlement`, `cost_layer_consumption`, plus the `accounting_period` transition guard. `pool_settlement` / `pool_state` stay exempt |
+| `0024` | Timezone pin | Every period-boundary cast becomes `(date_col::timestamp AT TIME ZONE 'UTC')`, so period membership no longer depends on the session's `TimeZone` |
+| `0026` | Slot health | `feed_slot_health` — an **always-one-row** gauge, so slot absence is a value rather than an empty set. See §6 |
+| `0027` | `posted_at` contract | Pins the columns against a future `DEFAULT now()`, validates the staging path, and states the contract in `COMMENT ON`. See §3a |
+| `0028` | Reseed + escalation | `ledger_feed_reseed()`, the `recalc_escalation` table + `recalc_escalations` view, and the halt surfaced on both registered gauges. See §6 and §7 |
+| `0029` | Variance-account comment | `COMMENT ON COLUMN posting_account_map.variance_acct` — corrects `0006`'s immutable header claim that only STD pools need it. See §4.1 |
 
 Two schema properties are load-bearing rather than incidental:
 
 - **`pool_state` carries no non-negativity constraints on `qty` or `value_sum`.** Quantity is a
   flagged running signal (§9, Q3b): a FIFO/LIFO depletion beyond on-hand drives the aggregate
-  negative and is flagged, not rejected. `value_sum` is the net posted book value, and the running
+  negative and is **not rejected**. The rejection half of that posture is implemented; the *flag
+  surface* — a view, recon check, or alert that selects on the negative — is not yet built, and is
+  tracked as `acct-gtp7.3`. `value_sum` is the net posted book value, and the running
   average is *derived* as `banker_div(value_sum, qty)` — never re-rounded incrementally.
 - **`trx.UNIQUE (trx_type, source_id)` is the ledger idempotency key.** Re-submitting a pair raises a
   constraint violation rather than duplicating. Engine-generated adjustment transactions satisfy it
@@ -111,7 +127,7 @@ row *is* the status: durable, observable, cleanly re-claimed after a committer c
 
 | Method | Quantity | Cost | Journal |
 |---|---|---|---|
-| FIFO / LIFO | No gate; aggregate may go negative, flagged | Observed provisional cost recorded on the line (running average, or standard basis) | **None** — recalc posts the only cost legs (alt C) |
+| FIFO / LIFO | No gate; aggregate may go negative (the flag surface is pending — §9) | Observed provisional cost recorded on the line (running average, or standard basis) | **None** as built — recalc posts the only cost legs (alt C). A provisional cost leg at observed cost is **decided, pending implementation**: see §5.4 |
 | WAC | Strict gate in the depletion's `WHERE (qty − Δ >= 0)` | Final, at the pre-update running average (PG 18 `RETURNING old`) | Cost leg posts |
 | STD / specific | Strict gate via `ledger_core::plan_apply` under pool-row locks | Final | Cost leg posts |
 
@@ -183,12 +199,42 @@ stamped `posted_at = now()` deliberately — never a business date — so that t
 cannot lower a recost floor and loop the pool. These rows are excluded from replay, from the gauges,
 and from the period guard.
 
-> **[T2 — pending `acct-1vur.6`]** The *mechanical guard set* that backs this contract — staging-write
-> validation, optional sanity bounds against the open-period window, and the audit of in-tree writers
-> for constant or wall-clock stamping — is being specified under `acct-1vur.6` and will be recorded
-> here. The contract text above is complete and binding as written; what is pending is the enforcement
-> surface, not the rule. (Recorded as decided and shipped: **D1**, the denormalized column and its
-> index — migration `0007`.)
+**The mechanical guards** (`0027`). Truthfulness is unenforceable, but three things around it are, and
+the migration is mostly a *lock* rather than an addition:
+
+- **`NOT NULL`** on `trx.posted_at`, `trx_line.posted_at`, `posting_line.posted_at` and
+  `ledger_inbox.posted_at`. Already held, per column, since `0003` (`trx`), `0004` (`posting_line`),
+  `0007` (`trx_line`, with the D1 denormalization) and `0011` (`ledger_inbox`); audited, unchanged.
+  `0027`'s own header attributes these to `0001`/`0011`, which is wrong — `0001` creates only enums —
+  and, being applied, it is immutable; this section is the authority, as §4.1 is for `0006`.
+- **No column default — the load-bearing one.** None of those columns carries a default, so a writer
+  that omits `posted_at` gets a `NOT NULL` violation instead of silently inheriting `now()`. A
+  `DEFAULT now()` added later would convert every such bug into precisely the constant-stamp failure
+  mode above, invisibly. `0027` pins this, and a test asserts no `posted_at` column is nullable *or*
+  defaulted.
+- **Staging-path validation.** `ledger_inbox` is the one route by which a producer writes the ledger
+  without passing through `ledger_submit_trx`, so it gets a `BEFORE INSERT` guard of its own.
+- **`COMMENT ON`** both columns, so the contract is legible at the schema rather than only here.
+
+**A future-side bound is declined, deliberately.** The past side is already bounded (§7's closed-period
+guards and the monotonic frontier). Business events legitimately carry future effective dates — a
+scheduled receipt, a dated transfer — so a horizon would fail closed on legitimate documents while
+doing nothing about the actual risk, which is a *wrong* date rather than a far one. Tests pin that
+far-past and far-future both admit.
+
+That decline was conditional on closing the one hazard future-dating does create, which was real: the
+feed's floor-lowering statement did not exclude the engine's own `cost_adjustment_line` output. Those
+rows stamp `now()`, which normally sorts above every frontier — but a pool whose head event is
+future-dated has a frontier *above* `now()`, so the engine's own adjustment delivers below it, lowers
+a recost floor, and triggers a re-fold that emits another adjustment: a self-sustaining loop. Fixed at
+the root by filtering `line_type` there.
+
+**Writer audit: clean.** `ledger_submit_trx` takes `posted_at` from the caller with no fallback. Engine
+and close-sweep adjustment lines stamp `now()` by design and are excluded from replay. The bench
+workload stamps a varying time per operation plus its deliberate backdate injector, so it exercises
+business-order ≠ commit-order rather than collapsing it. One real finding was fixed: the bench universe
+seeded `accounting_period` bounds from a session-dependent `current_date`, now pinned to
+`(now() AT TIME ZONE 'UTC')::date`. (**D1**, the denormalized column and its index, shipped in `0007`.)
 
 ## 4. SPI surface
 
@@ -247,8 +293,9 @@ close to surface the misconfiguration: populate `variance_acct` for every pool a
 
 > Migration `0006`'s header comment states the opposite ("pools that are never STD never need it"), as
 > does the `ledger_core::snapshot` doc comment. Both predate the close sweep. `0006` is applied and
-> therefore immutable, so the correction ships as a separate `COMMENT ON COLUMN` migration. **This
-> section is the authoritative statement of the rule.**
+> therefore immutable, so the correction ships as `0029`, a `COMMENT ON COLUMN` on the column itself
+> where `\d+` and any schema browser will surface it. **This section is the authoritative statement of
+> the rule.**
 
 ## 5. Recalc engine
 
@@ -265,9 +312,20 @@ authoritative cost is needed — not merely when a correction lands.
    free no-ops — the feed is method-agnostic, and the engine decides per pool what a pass means.
 2. **Replay** the pool's physical events in R-1 `(posted_at, id)` order through
    `ledger_core::{fifo,lifo}::strict_fold`. A clean pool replays **incrementally** from the persisted
-   layer state at `settled_through` (the live checkpoint — O(new events), the steady state); a pool
-   with a recost floor set, or with no frontier yet, replays **from opening** (the oracle-equivalent
-   correctness baseline). `cost_adjustment_line` rows are engine output and are never replay input.
+   layer state at `settled_through` (the live checkpoint — **D11** — O(new events), the steady state);
+   a pool with a recost floor set, or with no frontier yet, replays **from opening** (the
+   oracle-equivalent correctness baseline). `cost_adjustment_line` rows are engine output and are
+   never replay input.
+   > **D11 — one live checkpoint, no historical retention.** The persisted layers at `settled_through`
+   > are the only checkpoint; a pool with a floor replays from opening, O(depth). Historical
+   > checkpoints keyed to prior period boundaries would only pay off for a backdate into an already-
+   > closed period. Admission refuses that outright (§7.2's monotonic frontier), and after Q8 the one
+   > path that reaches it — reopen (`acct-1vur.9`) — is a rare, audited, operator-initiated act, not a
+   > steady-state shape. So the benefit stays unreachable in the steady state and the storage +
+   > invalidation machinery is not warranted; revisit only if reopen-driven deep replay shows up on the
+   > G2 gauges. Correctness is unaffected either way — full-opening replay is always correct, just
+   > O(depth).
+
 3. **Write generation N** in the same transaction: a `cost_settlement` + `cost_layer_consumption` row
    set per depletion newly costed or whose authoritative cost changed, and one `cost_adjustment` trx
    wrapping a `cost_adjustment_line` + `posting_line` per nonzero delta `(authoritative − prior) × qty`,
@@ -316,7 +374,9 @@ Ownership splits at the events that move the metric: the **feed** increments the
 physical FIFO/LIFO events and engages at the bound; the **engine** resets the counter to the exact
 committed tail above the new frontier at every settle — wiping feed-lag skew so it never drifts —
 applies the same bound to its own reset, and releases at the low-water mark. Bounds live in
-`recalc_backpressure_config` (defaults 200 / 20, calibrated ≈3× the observed healthy global maximum).
+`recalc_backpressure_config` (defaults 200 / 20). Those bounds keep the lever off with wide headroom
+in a healthy system — the soak's healthy profile peaks at **6** unsettled events per pool against a
+bound of 200 — while still engaging within tens of seconds under a stalled engine (soak §8).
 
 The feed's apply order is load-bearing — **floors → counter bumps → marks** — because the mark is what
 guarantees a future engine pass. A pass can settle events whose delivery is still in flight; the late
@@ -331,6 +391,24 @@ Row-lock order, shared by every writer (feed apply, engine pass, close sweep):
 events settle promptly while invalidating already-settled costs behind them, so they never accumulate
 in this counter. Their cost is re-cost write amplification, bounded today by cadence and the close
 gate.
+
+### 5.4 The FIFO/LIFO provisional cost leg — decided, pending implementation
+
+As built, a FIFO/LIFO hot-path append posts **no** journal row (§3): the aggregate moves, the observed
+cost lands on the line, and recalc posts the only cost legs. That leaves mid-period GL for
+layer-tracked SKUs qty-only, which the document-cost dossier found too thin a substrate for the
+document layer to port against — a consumer reading COGS between closes gets nothing rather than an
+approximation it can label.
+
+**The decision, ratified with convergence Q2:** the FIFO/LIFO hot path **gains a provisional cost leg
+at observed cost**, in the `wac_periodic` idiom — the leg posts at the running observed number, is
+marked provisional, and recalc's generation-delta trues it to authoritative exactly as it does today.
+Nothing about §5.2 idempotency or the R-1/R-2 replay changes; the leg is an additional write on the
+append path, not a new costing plane.
+
+Implementation and its measurement — the write-amplification cost of one more journal row per FIFO/LIFO
+append is the open question — ride **`acct-zrju.7`**. Until that ships, the §3 table's `None` is the
+as-built truth and this section is the recorded decision, not a description of behaviour.
 
 ### 5a. The mid-period valuation read contract
 
@@ -400,42 +478,225 @@ quiet.
 **Single-consumer posture.** A logical slot has one cursor, so exactly one consumer process owns it.
 Concurrency lives in the recalc workers draining the dirty-set.
 
-## 7. Close  *[T2 — being written under `acct-1vur`]*
+### 6.1 Slot loss is an operational state, not a theoretical one
 
-> This section is deliberately not yet written in full. `ledger_close_period(period_id, actor, force)`
-> ships and is exercised by 14 acceptance cases plus a 100-workload property net (C1–C7), but the
-> remaining `acct-1vur` children are still changing the surrounding admission surface, and a hardening
-> verdict under that epic also decides convergence **Q8** (whether a period-reopen primitive is needed
-> at all). Publishing the detailed semantics before those land would document a moving target.
->
-> What is already decided and will be recorded here: close is a **consistency gate plus a finalize
-> stamp**, not an adjustment storm; **force means drain synchronously, never skip** (there is no
-> provisional cost leg to fall back on); periods close in `start_date` order; finalize is **stamp-only**,
-> with migration `0017`'s `BEFORE INSERT` guards on `trx_line` and `cost_settlement` making closed-period
-> immutability a schema invariant rather than API discipline; and `PeriodClosed` is **SQLSTATE 55000**
-> with the `PeriodClosed:` message prefix as its stable identity, because pgrx maps non-enum SQLSTATEs
-> to `XX000`.
->
-> **Feed currency is enforced, not assumed** (migration `0020`): the gate requires a present,
-> non-invalidated `ledger_feed` slot whose `confirmed_flush_lsn` has reached the WAL position captured
-> at gate entry, so every event committed before the close has been delivered. `close_gate_config.feed_required`
-> (default `TRUE`) is a stored policy rather than a call argument — the waiver should be a visible,
-> auditable property of the database, not a flag a caller passes by habit. **Force does not bypass this
-> leg**; it is the gate's only non-bypassable arm, because "pay the remaining fold synchronously" is
-> coherent only when the fold has all its inputs.
->
-> The period boundary convention is stable and used identically by the guards, the gate, and the sweep:
-> a period covers `posted_at ∈ [start_date, end_date + 1)`.
+`max_slot_wal_keep_size` deliberately permits the cluster to invalidate the slot rather than let an
+abandoned consumer pin WAL without bound. That is the right trade, and it makes slot loss real: the
+consumer's `ensure_slot` would otherwise recreate the slot at the *current* WAL position, silently
+skipping every event decodable in the gap. Those events never lower a floor and never mark their pool
+dirty, so they are never re-folded — the one failure mode the loud-alarm posture cannot catch, because
+the alarm only fires if the event is eventually delivered.
+
+- **Detection (`0026`).** `feed_slot_health` is an **always-one-row** view, so slot absence is a
+  *value* rather than an empty result set. It exposes `wal_status` and
+  `invalidation_reason`, reduced to a single `unhealthy` boolean, and matches the slot by name **and
+  database and slot type**, since slot names are cluster-global on a shared cluster. `active` is
+  deliberately excluded: the peek/advance interface holds the slot only during a tick, so a healthy
+  feed reads `active = false` between ticks. The slot name is fixed rather than environment-
+  configurable: a renamed slot would evade both this gauge and the close gate's currency leg.
+- **Terminal failure.** `FeedError::SlotLost` exits the consumer loudly instead of retrying a peek
+  that cannot succeed.
+- **Recovery (`0028`).** `ledger_feed_reseed()` rebuilds the dirty set from durable state, and is
+  called on demand and by the consumer whenever a slot is created over a database that already holds
+  events — a slot that was lost, or one that never ran while events accumulated, which is the same
+  hole. Its scope is **every FIFO/LIFO pool with physical activity**, a deliberate superset of "pools
+  whose tail extends past the frontier": a backdate below the frontier does not extend the tail, and a
+  lost slot is exactly the situation in which we cannot know what went missing. Pools whose history is
+  not contradicted simply re-derive the same numbers and write nothing. Ordering matches the feed's
+  own apply — **floors before marks**, as separate statements — because the mark is what guarantees a
+  future pass.
+- **A floor marks "must re-fold"; it does not bound the replay.** Say this plainly, because the
+  obvious reading is wrong: the engine reads `recost_floor_posted_at` as a **boolean**
+  (`full_replay = floor_at.is_some()`), then replays the pool's whole stream from opening. The floor's
+  *value* never bounds the replay or the write set. No choice of floor can therefore protect a closed
+  period; that protection comes from the settlement guard plus the escalation contract in §7.3.
+
+**Ordering and prerequisites.** Start the feed **before** load: a logical slot only decodes WAL
+written after it exists, so events committed before its first run are never *delivered*. Starting late
+is recoverable but not free — the consumer detects a slot created over a database that already holds
+events and reseeds every FIFO/LIFO pool for a full opening re-fold (Recovery, above). `run-feed.sh`
+documents both. The cluster settings the design depends
+on — `wal_level = logical`, `max_slot_wal_keep_size`, and a UTC cluster timezone — each fail *open*
+(the system keeps running and quietly stops being correct) and a container rebuild silently drops them,
+so `scripts/check-cluster-prereqs.sh` verifies them, with an apply mode.
+
+**The residual gap is accepted, not closed.** A slot dropped and re-created past an undelivered gap
+reads perfectly current: a fresh cursor satisfies the §7 feed-currency leg, so the close gate cannot
+distinguish it from a healthy feed. Recovery is what surfaces the resulting divergence, and the reopen
+workflow is what repairs it — recorded as an **escalation path** (§7), not an unfinished defect.
+
+## 7. Close
+
+`ledger_close_period(period_id, actor, force)` is **one transaction**. Under alt C the mid-period GL
+for FIFO/LIFO pools is qty-only and the engine's authoritative valuation lands continuously, so close
+is a **consistency gate plus a finalize stamp** — not an adjustment storm.
+
+The period boundary convention is used identically by the admission guards, the gate, and the sweep: a
+period covers `posted_at ∈ [start_date, end_date + 1)`, with the bounds pinned to UTC (`0024`).
+
+### 7.1 The four phases
+
+**1. Closer mutex.** Advisory `(32021, period_id)` exclusive serializes concurrent closers. Re-closing
+a closed period returns an `already_closed` no-op report — close is idempotent. **Periods close in
+`start_date` order**: an earlier still-open period fails loud, because closing out of order would let a
+backdate into that earlier period re-cost this one's depletions and wedge the engine against the
+settlement guard.
+
+**2. The gate.** Three arms, all reported:
+
+- **Drain (G2a, period-scoped).** Over FIFO/LIFO pools with physical activity at or before the period
+  end: no unsettled physical event ≤ end-of-period, and no recost floor ≤ end-of-period.
+- **Feed currency (`0020`).** A present, non-invalidated `ledger_feed` slot **for this database** —
+  matched on name, database, and slot type, since slot names are cluster-global — whose
+  `confirmed_flush_lsn` has reached a WAL position captured at gate entry. Under D8-B that cursor is
+  the delivered-and-applied position, so reaching it means every event committed before this close is
+  in the dirty set. `close_gate_config.feed_required` (default `TRUE`) governs; `FALSE` waives the leg
+  for feedless fixtures. It is a **stored policy rather than a call argument** deliberately: the waiver
+  should be a visible, auditable property of the database, not a flag a caller passes by habit.
+  **Force does not bypass this arm** — a forced close still returns the gate-fail report and marks the
+  period `closing`.
+- **Halt.** Any pool carrying an unresolved escalation (§7.3) fails the gate by name. **Force does not
+  bypass this arm either**; the fold force promises to pay is exactly the one that is blocked.
+
+So **two of the three arms are force-proof**, and only the drain arm yields. `0020`'s header calls the
+feed leg "the only non-bypassable arm" — true when written, before the halt arm existed; that
+migration is applied and therefore immutable, so this section is the authority, as §4.1 is for `0006`.
+
+A gate failure without `force` marks the period `closing` — *draining, not frozen*: appends continue,
+and the caller re-invokes — and returns the per-pool lag plus the G2b gross-value magnitude, so no
+forced close is ever silent about the size of the move it would emit.
+
+**3. Drain and sweep.** **Force never skips the fold** — it pays the remainder synchronously, because
+there is no provisional cost leg to fall back on. It waives only the drain arm's refusal; the
+feed-currency and halt arms stand regardless. Each gate-scoped pool is
+claimed by its queue row (waiting out workers), its aggregate row locked — every hot-path FIFO/LIFO
+statement touches the aggregate first, so no physical event can commit on a swept pool until this
+transaction resolves — drained to stream head, then trued: `value_sum := Σ open-layer value` in one
+statement whose `RETURNING old` yields the residue. That residue — banker-rounding remainder, the
+hot-path exact-empty flush, uncovered-depletion value — posts as a single zero-qty
+`cost_adjustment_line` + `posting_line` against `variance_acct` (NULL ⇒ `MissingVarianceAccount`, fail
+loud; §4.1). The sweep drains to head even when the period-scoped gate passed, because the residue is
+only defined at full settlement.
+
+**4. Fence, re-check, stamp.** Take advisory `(32022, 0)` — the **global sentinel** every physical
+insert holds the shared side of — then `(32022, period_id)` exclusive. Sentinel first, always: that
+ordering is a total order, and taking it second would deadlock an inserter holding shared
+`(32022, P)` against a closer holding the sentinel. Then re-run the gate on a fresh snapshot.
+Stragglers that committed before the fence can only be on unswept pools, so one more drain+sweep round
+converges; nothing new can land while the fence is held. Then stamp `closed_at` / `closed_by` /
+`state → closed` and commit.
+
+Finalize is **stamp-only**: the finalized valuation *is* the max-generation `cost_settlement` row per
+in-period depletion. Nothing is rewritten at close.
+
+### 7.2 Admission: what closed actually forbids
+
+Closed-period immutability is a **schema invariant, not API discipline** (**D13**) — four mechanisms:
+three declarative `BEFORE` trigger sets (`0017`/`0022` on INSERT, `0023` on UPDATE/DELETE) plus two
+table constraints (`0021`), rather than checks in the entry points:
+
+- **Coverage (`0017`).** No physical `trx_line`, and no `cost_settlement` for a depletion, may land
+  inside a closed period. `cost_adjustment_line` rows are exempt: they are the engine's own output,
+  stamped `now()`, excluded from replay and gauges, and their valuation invariant is keyed by the
+  *depletion's* `posted_at`, which the settlement guard covers.
+- **The monotonic frontier (`0022`).** Coverage has holes — dates before the first period, and gaps
+  between periods, which `0021` deliberately permits. So admission is reframed: once any period is
+  closed, **nothing physical may land at or before `max(end_date) FILTER (state = 'closed')`**,
+  covered or not. `closing` does not raise the frontier. The frontier is what makes gaps safe, which
+  is why abutment is not required.
+- **Structural integrity (`0021`).** Inverted bounds would make a period cover nothing — silently
+  disabling its guards — and overlapping periods would let one date be simultaneously frozen and
+  appendable. Both are constraints (a `CHECK` and a GiST `EXCLUDE`), because there is no
+  period-creation function to put a check in. **One hole remains open:** nothing checks period
+  *creation* against the closed frontier, so a period created wholly below it wedges every later close
+  via the `start_date`-order rule — an availability wedge, recoverable by deleting the offending open
+  period (`0023` permits open-period deletes). Tracked as `acct-1vur.7`.
+- **Append-only (`0023`).** `UPDATE`/`DELETE` are rejected on `trx_line`, `posting_line`,
+  `cost_settlement`, `cost_layer_consumption` (`AppendOnly:`, SQLSTATE `55006`), and
+  `accounting_period` transitions are confined to exactly `open → closing`, `open → closed`,
+  `closing → closed`. Closed rows reject every update — including audit touch-ups — and deletion,
+  because the frontier is monotonic *only* under the close API: `closed → open` lowers it wholesale,
+  and extending a closed `end_date` swallows unsettled events above it. A consequence kept
+  deliberately: open periods' dates are immutable too, since moving `end_date` under an open period
+  silently changes what a pending close will sweep. `pool_settlement` and `pool_state` stay exempt —
+  they are derived state the engine must rewrite.
+
+`PeriodClosed` is **SQLSTATE 55000** with the `PeriodClosed:` message prefix as its stable identity;
+pgrx maps non-enum SQLSTATEs to `XX000`, so the parent repo's `P00xx` convention cannot cross the SPI
+seam.
+
+**The fence's accepted cost.** The sentinel briefly serializes *all* physical inserts against the
+closer's fence window, not only inserts into the closing period — the price of interlocking dates no
+period covers. It also widens which submissions can enter the pre-existing straggler-sweep deadlock
+race (an inserter holding a pool aggregate then waiting on the fence). The shape and outcome are
+unchanged: Postgres' detector aborts one side, immutability is never violated, and either retry
+converges.
+
+### 7.3 When a close is discovered to have been wrong: the escalation contract
+
+Everything above assumes the close saw every event. §6.1 describes the one case where it may not have:
+a slot dropped and re-created past an undelivered gap reads current, so the feed-currency leg passes.
+Recovery then re-folds the pool from opening and can discover that a **closed period was valued over
+events that were never delivered**.
+
+**The decision (convergence Q8, "Q8 RESOLVED"): correctness over liveness — the guard keeps failing
+loud.** Two alternatives were explicitly declined: filtering the generation write set so closed periods
+are final by construction (which silently keeps a known-wrong valuation), and gating the close on a
+"reseed pending" flag (which narrows the window without closing it). A closed-period divergence is an
+**operator-escalation event**, never a silently-accepted wrong number.
+
+What that means concretely:
+
+- **Detection precedes the write**, so nothing lands half-applied. The pass records the escalation,
+  writes no generation, and the pool stops being claimed. Detection mirrors **both** arms of the
+  settlement guard — coverage *and* the monotonic frontier — because a detector narrower than the
+  guard merely converts a named escalation into a raw SQLSTATE.
+- **The state is durable and legible.** `recalc_escalation` names the pool, the closed period (NULL
+  when the divergence is against the frontier in an uncovered range), an exemplar depletion, both
+  costs, whether the depletion had ever been authoritatively costed, and the pool's whole exposure
+  (diverging depletion count and total value divergence). The `recalc_escalations` view renders an
+  operator message with the remedy in it. A partial unique index keeps **one open escalation per
+  pool** while allowing a pool to escalate again after a repair — keying on `pool_id` alone would make
+  the surface one-shot for all time, which is the silent state this mechanism exists to abolish.
+- **The gauges refuse to read green.** The halted pool **keeps** its `recalc_queue` row — deleting it
+  would break the "floor set ⇒ queue row" invariant and, worse, make the dirty-set depth and per-pool
+  staleness gauges read *engine at rest* for a permanently un-costed pool. `claim_next` skips halted
+  pools instead, which is what actually stops the spin, and both registered gauges carry the halt
+  explicitly (`halted_pools`, `halted_by_closed_period`).
+- **`ledger_settle_pool` refuses.** It would otherwise answer `settled: true` for a pool that did
+  nothing — the likeliest operator reaction to a stuck pool. The refusal lives in `claim_pool`, the
+  choke point that `settle_pool` and the close sweep share.
+- **The halt survives restarts.** A restarted worker re-reads the escalation rather than rediscovering
+  the divergence and spinning.
+- **A divergence found by the close's own drain aborts the close**, atomically, with the pool,
+  exemplar, and remedy in the error text. Because the close is one transaction the escalation row rolls
+  back with it — so the facts travel in the error, and the next worker tick records them durably.
+
+**The exit is reopen.** D14 is therefore **in scope**, not deferred: a controlled, audited
+`closed → open` transition through the `0023` transition guard, with re-admission semantics and
+`start_date`-order cascade rules, tracked as `acct-1vur.9`. Until it ships, an escalated pool is
+halted by design: its valuation is known to disagree with a frozen period, and no further costing
+happens on it.
+
+### 7.4 D12 as-built: forced-close cost
+
+A forced close drains **every gate-scoped pool synchronously and without bound** inside the close
+transaction. That is the honest as-built shape, and it is the coherent one — force means paying the
+fold, and a partial payment is not a fold. Its **sizing** (a bounded-burst variant, or a policy for
+how large a move an operator should accept in one close) is deliberately unresolved and gated on the
+`acct-63qs.6` baseline, per the Q3a bounds in §9. The close report's per-pool lag and G2b gross value
+exist so the operator sees that number *before* forcing.
 
 ## 8. Testing estate
 
-Thirteen test binaries, all against `poc_v3_2`. **One test run in flight at a time** — they share the
+Eighteen test binaries, all against `poc_v3_2`. **One test run in flight at a time** — they share the
 database.
 
 | Layer | Coverage |
 |---|---|
-| Acceptance (`ledger-direct`) | `acceptance_direct_methods`, `acceptance_staging_drain`, `acceptance_recalc_engine` (11 cases), `acceptance_recalc_stale_claim` (two deterministic multi-session interleavings), `acceptance_recalc_backpressure` (7 cases), `acceptance_close_period` (14 cases) |
-| Acceptance (`ledger-feed`) | `acceptance_feed_ingest` |
+| Acceptance — core (`ledger-direct`) | `acceptance_direct_methods`, `acceptance_staging_drain`, `acceptance_recalc_engine` (11 cases), `acceptance_recalc_stale_claim` (two deterministic multi-session interleavings), `acceptance_recalc_backpressure` (7 cases), `acceptance_close_period` (14 cases) |
+| Acceptance — hardening (`ledger-direct`) | `acceptance_period_admission` (8 cases: overlap/inversion rejected, gaps allowed, both uncovered-date holes closed, the frontier tracking the greatest closed `end_date`, and a two-session interleaving pinning the sentinel interlock), `acceptance_append_only` (6), `acceptance_timezone_independence`, `acceptance_posted_at_contract` (5), `acceptance_slot_recovery` |
+| Acceptance (`ledger-feed`) | `acceptance_feed_ingest` (10 cases) |
 | Property | `property_ledger_submit_trx`, `property_ledger_staging_drain` (100-case drain-vs-direct equivalence), `property_recalc_engine` (**R1–R9**), `property_close_period` (**C1–C7**), `property_backpressure`, `property_feed_ingest` |
 | At scale | `ledger-bench soak` (whole architecture concurrently, then quiesce → verify → close → immutability probes), `ledger-bench verify` (**V1–V7** conservation + at-quiesce oracle equivalence + the drift distribution), `scripts/soak.sh`, `scripts/slo-sweep.sh` |
 
@@ -470,20 +731,29 @@ amendment: how stale or provisional a mid-period cost may get is a **product** b
 spec, and §5a is the interface rule it constrains. The numbers are filled from the gated `acct-63qs.6`
 baseline, not chosen up front. No TPS target exists or is wanted.
 
-**Q3b — quantity is flagged, never gated.** The ledger flags negative inventory; it does not reject on
-quantity. Gating is a document/seam concern, not a ledger concern.
+**Q3b — quantity is flagged, never gated.** The ledger does not reject on quantity; a negative
+on-hand is recorded and surfaced rather than refused. Gating is a document/seam concern, not a ledger
+concern.
 
-> **Known deviation, stated plainly.** The posture binds *the ledger*, and the layer-tracked methods
-> implement it: FIFO/LIFO appends take no gate and drive the aggregate negative with a flag. The
-> **strict methods still gate quantity synchronously** — WAC in the depletion statement's `WHERE`,
-> STD/specific in `plan_apply` — and the soak measured this in production shape: **84 WAC qty-gate
-> rejects on the direct path and 87 qty-gate rejects on staging** in the headline run. The implementation is
-> therefore not yet at the designed posture, and convergence Q3b directs the WAC qty-gate
-> reconciliation **toward removal**. That follow-through has no issue carrying it yet and needs one.
-> This is a named gap, not a second posture: nothing in this document should be read as endorsing a
-> quantity gate as the ledger's steady state. Note the two
-> axes are independent — a method can be *final-costed* on the hot path (Q3a) without *gating quantity*
-> (Q3b); the strict methods currently do both, and only the second is at issue.
+> **Two named gaps, stated plainly — the posture is ratified, its implementation is partial.**
+>
+> **(a) The flag surface does not exist yet.** The *rejection* half is implemented: FIFO/LIFO appends
+> take no gate and drive the aggregate negative. The *flagging* half is not — nothing in the tree
+> selects on `qty < 0` to raise a view, recon check, or alert, and the conservation verifier passes a
+> uniformly-negative pool. So "flagged" describes the ratified posture, not current behaviour: today
+> the negative is *recorded* and readable, not *surfaced*. Building that surface is `acct-gtp7.3`.
+>
+> **(b) The strict methods still gate.** WAC gates in the depletion statement's `WHERE`, STD and
+> specific in `plan_apply`, and the soak measured this in production shape: **84 WAC qty-gate rejects
+> on the direct path and 87 qty-gate rejects on staging** in the headline run. Convergence Q3b directs
+> that reconciliation **toward removal**; the follow-through is folded into `acct-gtp7.3` alongside the
+> flag surface, which is the coherent pairing — you want somewhere for the negative to show up before
+> you stop refusing it.
+>
+> Neither gap is a second posture: nothing here should be read as endorsing a quantity gate as the
+> ledger's steady state. Note the two axes are independent — a method can be *final-costed* on the hot
+> path (Q3a) without *gating quantity* (Q3b); the strict methods currently do both, and only the
+> second is at issue.
 
 **Q4 — substrate.** Harden on the built pgrx artifact. `ledger_direct` is **shmem-free** and requires
 no `shared_preload_libraries` entry; `ledger_feed` is an ordinary client of the logical-decoding SQL
@@ -508,7 +778,9 @@ carrying it here would re-import the parity tax the whole line exists to avoid.
   no-TB-parity direction stands.
 - **Multi-currency** (Q7 fixes the seam instead), effective-dated standard costs, multi-tenant
   isolation, webhook delivery.
-- **Period reopen** — out of scope pending the convergence **Q8** verdict, which `acct-1vur` decides.
+- **Period reopen is no longer out of scope.** Convergence **Q8** resolved it *into* scope: the
+  escalation contract (§7.3) makes reopen the only exit from a halted pool, so D14 is required work,
+  tracked as `acct-1vur.9`. It is unbuilt, not excluded.
 - **Retention/pruning** of drained `ledger_inbox` rows and of superseded settlement generations —
   operational follow-ups (`acct-m0ab`).
 
@@ -522,8 +794,8 @@ recorded here with its source.
 | # | Question | Resolution | Where it lives |
 |---|---|---|---|
 | 1 | Recalc transport | `pgoutput` over the **SQL** logical-decoding interface (peek + explicit advance); streaming protocol deferred as a latency refinement | §6; `ledger-feed/src/consumer.rs`; migration `0013` |
-| 2 | Worker model | **Continuous** default; all three shapes coexist as one engine — continuous `ledger_recalc_step` loops, on-demand `ledger_settle_pool`, periodic close | §5.1, §7; `scripts/run-recalc.sh` (default 4 workers) |
-| 3 | Cadence + backpressure bound | Continuous drain; bounds **200 / 20** in `recalc_backpressure_config`, calibrated ≈3× the observed healthy global maximum | §5.3; migration `0018`; soak §8 |
+| 2 | Worker model | **Continuous** default; all three shapes coexist as one engine — continuous `ledger_recalc_step` loops, on-demand `ledger_settle_pool`, periodic close. Worker count is **D10**: default 4 | §5.1, §7; `scripts/run-recalc.sh` |
+| 3 | Cadence + backpressure bound | Continuous drain; bounds **200 / 20** in `recalc_backpressure_config` — off with wide headroom in a healthy system (peak 6 unsettled per pool), engaging within tens of seconds under a stalled engine | §5.3; migration `0018`; soak §8 |
 | 4 | Materialization granularity | **Full layer-row materialization** at `pool_state.layer_id > 0` — the checkpoint that makes the steady-state pass O(new events) | §5.1 step 4; migration `0003` |
 | 5 | Cross-pool scheduler | **Claim-driven** `SKIP LOCKED`, oldest-mark-first, with re-stamp-to-back anti-starvation | §5.1 steps 1 and 6; migration `0012` |
 | 6 | Idempotency contract | **Generation-delta (Model 1)**: zero-delta passes write nothing and do not bump; a genuine re-cost posts exactly the inter-generation delta | §5.2; migration `0009`; `property_recalc_engine` R5 |

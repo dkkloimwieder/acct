@@ -20,9 +20,10 @@
 //!    (appends continue — closing means draining, not frozen) and returns the
 //!    per-pool lag + the G2b gross-value magnitude so no forced close is
 //!    silent (recalc-e §6); the caller re-invokes.
-//! 3. **Drain + sweep** (recalc-e §5/§6). Force never bypasses the gate —
-//!    there is no provisional cost leg to fall back on, so force means the
-//!    close pays the remaining fold synchronously. Every gate-scoped pool is
+//! 3. **Drain + sweep** (recalc-e §5/§6). Force never SKIPS the fold — there is
+//!    no provisional cost leg to fall back on, so force means the close pays
+//!    the remainder synchronously. It waives only the drain arm's refusal; the
+//!    feed-currency and halt arms stand regardless. Every gate-scoped pool is
 //!    swept: claim its queue row (per-pool exclusivity, waiting out workers),
 //!    lock its aggregate row (every hot-path FL statement updates the
 //!    aggregate first, so no physical event can commit on a swept pool until
@@ -81,13 +82,19 @@
 //! `(32022)` fence catches anything that lands in the period mid-close.
 //! `feed_lag_bytes` (G1) stays in the report as the diagnostic.
 //!
-//! Force does NOT bypass this leg — the sole non-bypassable arm. Force means
+//! Force does NOT bypass this leg. Two of the three gate arms are force-proof —
+//! this feed-currency leg and the halt arm (an unresolved `recalc_escalation` on
+//! a gate-scoped pool); only the drain arm yields to force, and yielding there
+//! means paying the fold synchronously rather than skipping it. Force means
 //! "pay the remaining fold synchronously"; that is coherent only when the fold
 //! has all its inputs, and on a lagging slot a forced close does not close
 //! early, it corrupts the variance account. A currency failure returns the
 //! standard gate-fail report (`closing`, `gate.passed = false`) with a `feed`
 //! arm naming the cause, forced or not; the caller lets the feed catch up and
-//! re-invokes, exactly like the drain gate.
+//! re-invokes, exactly like the drain gate. (0020's header calls this leg the
+//! only non-bypassable arm — true when written, before the halt arm existed;
+//! that migration is applied and immutable, so design-v3.2 §7.1 is the
+//! authority.)
 //!
 //! `active` is not consulted: the feed consumes over the SQL peek/advance
 //! interface, which holds the slot only during each tick, so a healthy feed
