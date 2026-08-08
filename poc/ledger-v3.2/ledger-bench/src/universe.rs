@@ -103,7 +103,8 @@ pub async fn seed(pool: &PgPool, n_pools: i64, period_back_days: i64) -> Result<
     .await?;
     sqlx::query(
         "INSERT INTO accounting_period (id, start_date, end_date, state) \
-         VALUES ($1, current_date - $2::int, current_date, 'open') \
+         VALUES ($1, ((now() AT TIME ZONE 'UTC')::date - $2::int), \
+                 (now() AT TIME ZONE 'UTC')::date, 'open') \
          ON CONFLICT DO NOTHING",
     )
     .bind(PERIOD_ID)

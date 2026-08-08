@@ -291,11 +291,25 @@ impl FeedConsumer {
         // (single-statement read-modify-write under the row lock), and the
         // per-pool minimum over the batch means within-batch delivery order is
         // irrelevant.
+        //
+        // `cost_adjustment_line` rows are excluded, matching the backpressure
+        // bump below. They are the engine's OWN output and are never replay
+        // input (the scan excludes them), so they can never justify lowering a
+        // floor. The usual argument — they are stamped posted_at = now() and
+        // so sort above every frontier — does not hold in general: posted_at
+        // is caller-supplied business time with no future bound, so a pool
+        // whose head event is future-dated has a frontier ABOVE now(), and its
+        // own adjustment line would then deliver below that frontier, lower a
+        // floor, and trigger a re-fold that emits another adjustment line —
+        // a self-sustaining loop. Filtering by line_type removes the premise
+        // rather than restricting what business dates callers may use
+        // (acct-1vur.6).
         let floors_lowered = sqlx::query(
             "WITH ev AS ( \
                  SELECT e.pool_id, e.posted_at::timestamptz AS posted_at, e.id \
-                 FROM UNNEST($1::bigint[], $2::text[], $3::bigint[]) \
-                      AS e(pool_id, posted_at, id) \
+                 FROM UNNEST($1::bigint[], $2::text[], $3::bigint[], $4::text[]) \
+                      AS e(pool_id, posted_at, id, line_type) \
+                 WHERE e.line_type <> 'cost_adjustment_line' \
              ), mins AS ( \
                  SELECT DISTINCT ON (pool_id) pool_id, posted_at, id \
                  FROM ev ORDER BY pool_id, posted_at, id \
@@ -315,6 +329,7 @@ impl FeedConsumer {
         .bind(&pool_ids)
         .bind(&posted_ats)
         .bind(&ids)
+        .bind(&line_types)
         .execute(&mut *tx)
         .await?
         .rows_affected();
