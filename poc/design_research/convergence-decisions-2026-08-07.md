@@ -156,3 +156,34 @@ push` after each work item; refresh the JSONL export at session close.
   `.gitignore.tmp` (a leftover one-line intent to ignore `poc/ledger-v3/ledger-direct/sql/`)
   was discarded — the ledger-v3 stream is superseded, and its generated SQL stays
   tracked per the stream convention.
+
+---
+
+## Q2 RESOLVED (same day, wave 2): asset, not rebuild
+
+Ratified by dkk 2026-08-07 after both deciding dossiers reported (drafted, adversarially
+fact-checked, and finalized the same day — commits `e82d479` → `18761a5`):
+
+- **`acct-476a.2` (reservations):** no rebuild forced. Shape = **S3 with the pinned path
+  split out** — quantity gating stays at the document/seam (`inventory_reservations` +
+  `reserve_inventory` port as an asset with their hard-in-effect semantics; the v3.2
+  ledger gains no reservation concept and no per-pool serial-fold ceiling). Lot-specific
+  pins are cost-layer selectors and become a **seam→costing-plane input contract**
+  specified alongside `acct-476a.3` — new seam work, not a rebuild trigger.
+- **`acct-476a.4` (document-cost):** asset. The `document_cost` view (max-generation
+  `cost_settlement`, method-aware) carries `provisional → settled (revisable) → final`;
+  R7 restates from simultaneity to convergence; invoices float until close then pin;
+  close never rewrites document lines. The FIFO/LIFO hot path gains a provisional cost
+  leg at observed cost (**decided**, `wac_periodic`-style; implementation + measurement
+  = `acct-zrju.7`). Migration surface ≈ five pool-derived columns + a re-resolved return
+  path + R7 property tests restated to convergence form. The real cost is behavioural:
+  mid-period COGS for layer-tracked SKUs is decision-support (~22–30% band, directional
+  bias) until settlement.
+
+**Consequences:** `acct-23kd`'s reopen trigger (both dossiers reported + verdict
+recorded) is **met** — the gate stays closed until a port/integration plan exists as its
+own planned program; lifting the gate is that program's first act, not a side effect of
+this ratification. The acct document layer is confirmed as a **port target, not a
+teardown**: its 70 migrations / 29 wrappers port against the v3.2 costing plane behind
+the Q7 functional-currency seam, with `acct-476a.3` (seam contract) and `acct-476a.5`
+(close-hook mapping) as the remaining spec inputs.
