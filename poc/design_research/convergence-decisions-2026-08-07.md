@@ -187,3 +187,25 @@ this ratification. The acct document layer is confirmed as a **port target, not 
 teardown**: its 70 migrations / 29 wrappers port against the v3.2 costing plane behind
 the Q7 functional-currency seam, with `acct-476a.3` (seam contract) and `acct-476a.5`
 (close-hook mapping) as the remaining spec inputs.
+
+---
+
+## Q8 RESOLVED (wave 2): reopen comes into scope — correctness over liveness
+
+Ratified by dkk at the close of the `acct-1vur` hardening lane. The lane's final finding
+(`acct-1vur.2`): after feed-slot loss, recovery can discover a closed period that was
+valued over never-delivered events — the recalc engine full-replays from pool origin
+(the recost floor is boolean-read; its value never bounds the write set), and a
+re-created slot passes the feed-currency gate with a fresh cursor. The decision: **the
+guard keeps failing loud — option (B)**. Closed-period divergence discovered by recovery
+is an operator-escalation event, never a silently-accepted wrong valuation (options (A)
+close-final-by-construction and (C) reseed-pending gate refusal were explicitly
+declined). Consequences:
+
+- **The reopen primitive (D14) is required work**: filed as `acct-1vur.9` (P1) — a
+  controlled, audited `closed → open` transition through the 0023 transition guard,
+  with re-admission semantics and start_date-order cascade rules.
+- The parent-tree reopen epic `acct-7h4` (Phase 2 Epic K) is **un-mooted** — it remains
+  behind `acct-23kd` as port-program material.
+- The slot-recreate currency-gate gap is **accepted as an escalation path** (surfaced by
+  recovery, repaired by reopen), recorded at its `close.rs` comment site.
