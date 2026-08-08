@@ -82,6 +82,10 @@ pub(crate) struct PassOutcome {
     pub(crate) generation: i64,
     pub(crate) floor_pending: bool,
     pub(crate) requeued: bool,
+    /// Set when this pass found its re-fold contradicting a closed period and
+    /// halted the pool instead of writing (acct-1vur.2b). Carries the closed
+    /// period id so the report names it.
+    pub(crate) escalated: Option<Escalation>,
 }
 
 /// Accumulated stats of a synchronous drain-to-head.
@@ -91,6 +95,10 @@ pub(crate) struct DrainStats {
     pub(crate) settlements: i64,
     pub(crate) adjustments: i64,
     pub(crate) generation: i64,
+    /// Set when a pass in this drain halted the pool. Without this the drain
+    /// is indistinguishable from a clean one and callers report success on a
+    /// pool that did nothing (acct-1vur.2b).
+    pub(crate) escalated: Option<Escalation>,
 }
 
 /// Outcome of a targeted drain: non-strict pools have nothing to fold (their
@@ -154,6 +162,14 @@ fn ledger_recalc_step() -> pgrx::JsonB {
         "adjustments_posted": out.adjustments,
         "generation": out.generation,
         "floor_pending": out.floor_pending,
+        "escalated": out.escalated.as_ref().map(|e| json!({
+            "pool_id": e.pool_id,
+            "closed_period_id": e.closed_period_id,
+            "depletion_trx_line_id": e.depletion_trx_line_id,
+            "diverging_depletions": e.diverging_depletions,
+            "reason": "recalc halted: re-fold contradicts frozen history",
+            "remedy": "reopen the closed period (acct-1vur.9); see recalc_escalations",
+        })),
         "requeued": out.requeued,
     }))
 }
@@ -212,6 +228,27 @@ pub(crate) fn run_claimed_pass(claim: &Claim) -> PassOutcome {
         }
     }
 
+    // (B) Correctness wins: a re-fold that contradicts a CLOSED period is a
+    // real divergence, not something to absorb. Detect it BEFORE writing, so
+    // nothing lands half-applied and the state is legible instead of an
+    // anonymous 55000 retry loop. The 0024 guard stays the backstop for any
+    // path that reaches the INSERT anyway.
+    if let Some(esc) = detect_closed_period_divergence(claim.pool_id, &pending) {
+        record_escalation(&esc);
+        return PassOutcome {
+            full_replay,
+            events: scanned.len(),
+            settlements: 0,
+            adjustments: 0,
+            generation: claim.generation,
+            // What the settlement row actually holds — not a hopeful constant.
+            floor_pending: claim.floor_at.is_some(),
+            // The queue row is kept, so the pool remains dirty.
+            requeued: true,
+            escalated: Some(esc),
+        };
+    }
+
     let wrote = !pending.is_empty();
     let generation = claim.generation + i64::from(wrote);
     let mut adjustments = 0usize;
@@ -262,7 +299,194 @@ pub(crate) fn run_claimed_pass(claim: &Claim) -> PassOutcome {
         generation,
         floor_pending,
         requeued,
+        escalated: None,
     }
+}
+
+
+/// One pool's re-fold contradicting a frozen period (acct-1vur.2b).
+pub(crate) struct Escalation {
+    pub(crate) pool_id: i64,
+    /// NULL when the divergence is against the closed FRONTIER in a date
+    /// range no period covers (0021 permits gaps).
+    pub(crate) closed_period_id: Option<i64>,
+    pub(crate) depletion_trx_line_id: i64,
+    pub(crate) had_settlement: bool,
+    pub(crate) frozen_unit_cost: i64,
+    pub(crate) recomputed_unit_cost: i64,
+    pub(crate) qty: i64,
+    pub(crate) diverging_depletions: i64,
+    pub(crate) total_value_divergence: i128,
+}
+
+/// Does any pending settlement target a depletion that 0024's guard would
+/// reject — i.e. one inside a CLOSED period, or at/below the monotonic closed
+/// frontier in a range no period covers?
+///
+/// This MIRRORS both arms of `period_guard_cost_settlement`. A detector
+/// narrower than the guard is worse than none: the guard still rejects, but
+/// with a raw SQLSTATE instead of a named, durable escalation.
+///
+/// The exemplar reported is the earliest GENUINELY divergent depletion in R-1
+/// order — a first-time costing at exactly its observed cost is in `pending`
+/// (is_new) but diverges from nothing, and naming it would render an
+/// escalation whose two costs are equal. The aggregates alongside describe
+/// the pool's whole exposure rather than that one line's.
+fn detect_closed_period_divergence(pool_id: i64, pending: &[Pending]) -> Option<Escalation> {
+    if pending.is_empty() {
+        return None;
+    }
+    let ids: Vec<i64> = pending.iter().map(|p| p.costing.depletion_trx_line_id).collect();
+    let frozen = Spi::connect_mut(|client| -> Result<Vec<(i64, Option<i64>)>, pgrx::spi::Error> {
+        let mut t = client.update(
+            "WITH frontier AS ( \
+                 SELECT max((end_date + 1)::timestamp AT TIME ZONE 'UTC') AS at \
+                   FROM accounting_period WHERE state = 'closed' \
+             ) \
+             SELECT t.id, \
+                    (SELECT ap.id FROM accounting_period ap \
+                      WHERE ap.state = 'closed' \
+                        AND t.posted_at >= (ap.start_date::timestamp AT TIME ZONE 'UTC') \
+                        AND t.posted_at <  ((ap.end_date + 1)::timestamp AT TIME ZONE 'UTC') \
+                      LIMIT 1) \
+               FROM trx_line t, frontier f \
+              WHERE t.id = ANY($1) \
+                AND (f.at IS NOT NULL AND t.posted_at < f.at) \
+              ORDER BY t.posted_at, t.id",
+            None,
+            &[ids.clone().into()],
+        )?;
+        let mut out = Vec::new();
+        while let Some(row) = t.next() {
+            out.push((row.get::<i64>(1)?.unwrap_or(0), row.get::<i64>(2)?));
+        }
+        Ok(out)
+    })
+    .unwrap_or_else(|e| {
+        bail(
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            format!("ledger_recalc_step: closed-period divergence check failed: {e}"),
+        )
+    });
+    if frozen.is_empty() {
+        return None;
+    }
+
+    let affected: Vec<(&Pending, Option<i64>)> = frozen
+        .iter()
+        .filter_map(|(id, period)| {
+            pending
+                .iter()
+                .find(|p| p.costing.depletion_trx_line_id == *id)
+                .map(|p| (p, *period))
+        })
+        .collect();
+    let diverging_depletions = affected.iter().filter(|(p, _)| p.delta != 0).count() as i64;
+    let total_value_divergence: i128 = affected.iter().map(|(p, _)| p.delta).sum();
+
+    // Earliest genuinely-divergent line; fall back to the earliest affected
+    // one when every delta is zero (a first costing inside frozen history is
+    // still a divergence from "never costed").
+    let (p, period) = affected
+        .iter()
+        .find(|(p, _)| p.delta != 0)
+        .copied()
+        .unwrap_or(affected[0]);
+
+    Some(Escalation {
+        pool_id,
+        closed_period_id: period,
+        depletion_trx_line_id: p.costing.depletion_trx_line_id,
+        had_settlement: p.delta != 0 || p.prior_unit_cost != p.costing.observed_unit_cost,
+        frozen_unit_cost: p.prior_unit_cost,
+        recomputed_unit_cost: p.costing.authoritative_unit_cost,
+        qty: p.costing.qty,
+        diverging_depletions,
+        total_value_divergence,
+    })
+}
+
+/// Record the escalation durably.
+///
+/// The queue row is KEPT and the recost floor LEFT SET: the pool genuinely
+/// still needs re-folding, the registered gauges read it as dirty rather than
+/// going quiet, and the documented "floor set ⇒ queue row exists" invariant
+/// holds. `claim_next` is what stops the spin, by skipping halted pools.
+///
+/// Idempotent against the one-open-escalation partial unique index, and NOT
+/// blocked by an earlier RESOLVED escalation on the same pool — a pool may
+/// diverge again after a reopen, and that must record rather than halt
+/// silently.
+fn record_escalation(e: &Escalation) {
+    Spi::connect_mut(|client| -> Result<(), pgrx::spi::Error> {
+        client.update(
+            "INSERT INTO recalc_escalation \
+                 (pool_id, closed_period_id, depletion_trx_line_id, had_settlement, \
+                  frozen_unit_cost, recomputed_unit_cost, qty, \
+                  diverging_depletions, total_value_divergence) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (pool_id) WHERE resolved_at IS NULL DO NOTHING",
+            None,
+            &[
+                e.pool_id.into(),
+                e.closed_period_id.into(),
+                e.depletion_trx_line_id.into(),
+                e.had_settlement.into(),
+                e.frozen_unit_cost.into(),
+                e.recomputed_unit_cost.into(),
+                e.qty.into(),
+                e.diverging_depletions.into(),
+                i64::try_from(e.total_value_divergence).unwrap_or(i64::MAX).into(),
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap_or_else(|e| {
+        bail(
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            format!("ledger_recalc_step: recording escalation failed: {e}"),
+        )
+    })
+}
+
+/// The closed period a pool is halted against, if it is halted at all.
+/// `Some(None)` means halted against the frontier in an uncovered range.
+pub(crate) fn halted_period(pool_id: i64) -> Option<Option<i64>> {
+    Spi::connect_mut(|client| -> Result<Option<Option<i64>>, pgrx::spi::Error> {
+        let mut t = client.update(
+            "SELECT closed_period_id FROM recalc_escalation \
+              WHERE pool_id = $1 AND resolved_at IS NULL LIMIT 1",
+            None,
+            &[pool_id.into()],
+        )?;
+        Ok(t.next().map(|row| row.get::<i64>(1).ok().flatten()))
+    })
+    .unwrap_or_else(|e| {
+        bail(PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, format!("halted check failed: {e}"))
+    })
+}
+
+/// Pools halted by an unresolved escalation, for the close gate's report.
+pub(crate) fn escalated_pools() -> Vec<(i64, Option<i64>)> {
+    Spi::connect_mut(|client| -> Result<Vec<(i64, Option<i64>)>, pgrx::spi::Error> {
+        let mut t = client.update(
+            "SELECT pool_id, closed_period_id FROM recalc_escalation \
+              WHERE resolved_at IS NULL ORDER BY pool_id",
+            None,
+            &[],
+        )?;
+        let mut out = Vec::new();
+        while let Some(row) = t.next() {
+            out.push((row.get::<i64>(1)?.unwrap_or(0), row.get::<i64>(2)?));
+        }
+        Ok(out)
+    })
+    .unwrap_or_else(|e| {
+        bail(
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            format!("escalated pool read failed: {e}"),
+        )
+    })
 }
 
 /// Targeted, BLOCKING claim of one pool (the close / settle_pool path):
@@ -276,6 +500,24 @@ pub(crate) fn run_claimed_pass(claim: &Claim) -> PassOutcome {
 /// transaction already locked is free, so drain loops re-read the claim state
 /// each iteration. The settlement state is read AFTER the lock (`read_claim`).
 pub(crate) fn claim_pool(pool_id: i64) -> Claim {
+    // A halted pool cannot be drained: its fold is known to contradict frozen
+    // history, so the targeted claim refuses it by name rather than replaying
+    // and rediscovering the same divergence (acct-1vur.2b). This is the choke
+    // point both `ledger_settle_pool` and the close sweep go through.
+    if let Some(period) = halted_period(pool_id) {
+        bail(
+            PgSqlErrorCode::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            format!(
+                "RecalcHalted: pool {pool_id} is halted — its re-fold contradicts {}. \
+                 Costing cannot proceed; repair requires reopening the period \
+                 (acct-1vur.9). See recalc_escalations.",
+                match period {
+                    Some(p) => format!("closed period {p}"),
+                    None => "frozen history below the closed-period frontier".to_string(),
+                }
+            ),
+        );
+    }
     Spi::connect_mut(|client| -> Result<Option<Claim>, pgrx::spi::Error> {
         let known = client
             .select("SELECT EXISTS (SELECT 1 FROM pool WHERE id = $1)", None, &[pool_id.into()])?
@@ -331,6 +573,13 @@ pub(crate) fn drain_pool_to_head(pool_id: i64) -> DrainOutcome {
         stats.settlements += out.settlements as i64;
         stats.adjustments += out.adjustments as i64;
         stats.generation = out.generation;
+        // A halted pool keeps its queue row (so the gauges stay honest), so
+        // the requeued check below would loop it to the pass cap. Stop here
+        // and hand the escalation back — the caller must not report success.
+        if out.escalated.is_some() {
+            stats.escalated = out.escalated;
+            return DrainOutcome::Drained(stats);
+        }
         if !out.requeued {
             return DrainOutcome::Drained(stats);
         }
@@ -357,8 +606,15 @@ fn claim_next() -> Option<Claim> {
     Spi::connect_mut(|client| -> Result<Option<Claim>, pgrx::spi::Error> {
         let pool_id = {
             let mut t = client.update(
-                "SELECT pool_id FROM recalc_queue \
-                  ORDER BY enqueued_at, pool_id \
+                // Pools halted by an unresolved escalation are not claimed:
+                // their fold is known to contradict a frozen period, so a pass
+                // could only rediscover that and spin (acct-1vur.2b). The
+                // reopen workflow clears the escalation.
+                "SELECT q.pool_id FROM recalc_queue q \
+                  WHERE NOT EXISTS (SELECT 1 FROM recalc_escalation e \
+                                     WHERE e.pool_id = q.pool_id \
+                                       AND e.resolved_at IS NULL) \
+                  ORDER BY q.enqueued_at, q.pool_id \
                     FOR UPDATE SKIP LOCKED \
                   LIMIT 1",
                 None,

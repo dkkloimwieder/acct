@@ -104,7 +104,9 @@ use pgrx::prelude::*;
 use serde_json::{json, Value};
 
 use crate::ledger_error_map;
-use crate::recalc::{claim_pool, drain_pool_to_head, resolve_accounts, DrainOutcome, DrainStats};
+use crate::recalc::{
+    claim_pool, drain_pool_to_head, escalated_pools, resolve_accounts, DrainOutcome, DrainStats,
+};
 use crate::submit::bail;
 
 /// Advisory keyspace (database-local, int4 pair for pg_locks legibility):
@@ -196,8 +198,46 @@ fn ledger_close_period(period_id: i64, actor: &str, force: bool) -> pgrx::JsonB 
     // forcing past it mis-values the period and misbooks the straggler's value
     // as sweep residue. A failure takes the same mark-closing path as a drain
     // gate failure — the caller lets the feed catch up and re-invokes.
+    // Pools halted by an unresolved escalation (acct-1vur.2b) cannot be
+    // drained, so a close that would sweep one must fail loud and NAME it —
+    // otherwise the operator sees only an un-drainable pool and no reason.
+    // Force does not bypass this: the fold force promises to pay is exactly
+    // the one that is blocked.
+    let halted: Vec<Value> = escalated_pools()
+        .into_iter()
+        .filter(|(pool_id, _)| gate.iter().any(|g| g.pool_id == *pool_id))
+        .map(|(pool_id, period_id)| {
+            json!({
+                "pool_id": pool_id,
+                "closed_period_id": period_id,
+                "reason": "recalc halted: re-fold contradicts a closed period",
+                "remedy": "reopen the closed period (acct-1vur.9); see recalc_escalations",
+            })
+        })
+        .collect();
+
     let feed_state = feed_currency(&gate_lsn);
-    let gate_passed = lagging.is_empty() && feed_state.is_none();
+    let gate_passed = lagging.is_empty() && feed_state.is_none() && halted.is_empty();
+
+    if !halted.is_empty() {
+        mark_closing(period_id);
+        return pgrx::JsonB(json!({
+            "period_id": period_id,
+            "closed": false,
+            "state": "closing",
+            "forced": false,
+            "force_requested": force,
+            "feed_lag_bytes": feed_lag,
+            "gate": {
+                "passed": false,
+                "pools_in_scope": gate.len(),
+                "lagging": lagging,
+                "unsettled_gross_total": g2b_total,
+                "feed": {"current": feed_state.is_none(), "reason": feed_state},
+                "halted": halted,
+            },
+        }));
+    }
 
     if let Some(reason) = &feed_state {
         mark_closing(period_id);
@@ -217,6 +257,7 @@ fn ledger_close_period(period_id: i64, actor: &str, force: bool) -> pgrx::JsonB 
                 "lagging": lagging,
                 "unsettled_gross_total": g2b_total,
                 "feed": {"current": false, "reason": reason},
+                "halted": [],
             },
         }));
     }
@@ -235,6 +276,7 @@ fn ledger_close_period(period_id: i64, actor: &str, force: bool) -> pgrx::JsonB 
                 "lagging": lagging,
                 "unsettled_gross_total": g2b_total,
                 "feed": {"current": true, "reason": Value::Null},
+                "halted": [],
             },
         }));
     }
@@ -333,6 +375,7 @@ fn ledger_close_period(period_id: i64, actor: &str, force: bool) -> pgrx::JsonB 
             "lagging": lagging,
             "unsettled_gross_total": g2b_total,
             "feed": {"current": true, "reason": Value::Null},
+            "halted": [],
         },
         "drained": {
             "pools": swept.len(),
@@ -359,14 +402,30 @@ fn ledger_settle_pool(pool_id: i64) -> pgrx::JsonB {
             "method": method,
             "skipped": "non_strict_method",
         })),
-        DrainOutcome::Drained(s) => pgrx::JsonB(json!({
-            "pool_id": pool_id,
-            "settled": true,
-            "passes": s.passes,
-            "settlements_written": s.settlements,
-            "adjustments_posted": s.adjustments,
-            "generation": s.generation,
-        })),
+        DrainOutcome::Drained(s) => match &s.escalated {
+            // Halting is not settling. The on-demand shape is the most likely
+            // operator reaction to a stuck pool, so it must not answer "true".
+            Some(e) => pgrx::JsonB(json!({
+                "pool_id": pool_id,
+                "settled": false,
+                "halted": {
+                    "closed_period_id": e.closed_period_id,
+                    "depletion_trx_line_id": e.depletion_trx_line_id,
+                    "diverging_depletions": e.diverging_depletions,
+                    "reason": "recalc halted: re-fold contradicts frozen history",
+                    "remedy": "reopen the closed period (acct-1vur.9); see recalc_escalations",
+                },
+                "passes": s.passes,
+            })),
+            None => pgrx::JsonB(json!({
+                "pool_id": pool_id,
+                "settled": true,
+                "passes": s.passes,
+                "settlements_written": s.settlements,
+                "adjustments_posted": s.adjustments,
+                "generation": s.generation,
+            })),
+        },
     }
 }
 
@@ -428,11 +487,15 @@ fn current_wal_lsn() -> String {
 /// same-named slot belonging to another database on this shared cluster would
 /// otherwise satisfy the gate while this database's feed was dead.
 ///
-/// Two known gaps are deliberately out of scope here and tracked separately:
-/// a slot DROPPED and re-created past an undelivered gap reads current
-/// (`ensure_slot` recreate path — acct-1vur.2 slot-loss detection/reseed), and
-/// a backdate into a timestamp range no `accounting_period` covers evades the
-/// 0017 fence entirely (acct-1vur.3 period-coverage side door).
+/// One gap is ACCEPTED rather than closed here, by decision: a slot DROPPED
+/// and re-created past an undelivered gap reads current, so this leg passes
+/// and a close can complete over events that were never delivered. Gating on
+/// a "reseed pending" flag was considered and declined. The posture instead is
+/// that recovery SURFACES the damage and reopen REPAIRS it —
+/// `ledger_feed_reseed()` re-folds every strict pool, a pool whose re-fold
+/// contradicts a frozen period halts into `recalc_escalation` (named in this
+/// gate's `halted` arm), and the exit is the reopen workflow (acct-1vur.9).
+/// The period-coverage side door is closed separately by acct-1vur.3.
 fn feed_currency(gate_lsn: &str) -> Option<String> {
     Spi::connect_mut(|client| -> Result<Option<String>, pgrx::spi::Error> {
         let required = client
@@ -706,6 +769,30 @@ fn sweep_pool(pool_id: i64, adjustment_trx: &mut Option<i64>) -> SweepResult {
         DrainOutcome::Drained(s) => s,
         DrainOutcome::NonStrict { .. } => unreachable!("method checked above"),
     };
+    // A divergence discovered by the close's OWN drain: the gate-time halted
+    // check could not have seen it. Abort by name rather than sweeping a pool
+    // whose fold is contradicted (which would absorb the divergence into
+    // variance) or spinning the re-check loop to its cap and dying anonymous.
+    // The close is one transaction, so the escalation row rolls back with it —
+    // the error carries the same facts, and a worker tick records it durably.
+    if let Some(e) = &drain.escalated {
+        bail(
+            PgSqlErrorCode::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            format!(
+                "RecalcHalted: close aborted — pool {pool_id} re-folds against frozen \
+                 history ({}), diverging depletions {}, exemplar trx_line {}. Costing on \
+                 this pool cannot proceed; repair requires reopening the period \
+                 (acct-1vur.9). Run ledger_recalc_step() to record it in \
+                 recalc_escalations.",
+                match e.closed_period_id {
+                    Some(p) => format!("closed period {p}"),
+                    None => "below the closed-period frontier".to_string(),
+                },
+                e.diverging_depletions,
+                e.depletion_trx_line_id,
+            ),
+        );
+    }
     if !has_aggregate {
         // No aggregate row means no hot-path activity ever reached the pool;
         // nothing to true up.

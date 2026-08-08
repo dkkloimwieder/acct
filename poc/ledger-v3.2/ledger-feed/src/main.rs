@@ -33,29 +33,18 @@ async fn main() {
         .expect("connect to feed database");
 
     let consumer = FeedConsumer::new(pool, SLOT_NAME, PUBLICATION_NAME);
-    if consumer.ensure_slot().await.expect("ensure replication slot") {
-        // A slot created over a database that already holds events is a slot
-        // that was LOST: its cursor starts at the current WAL position, so
-        // everything decodable in the gap is skipped and those pools will
-        // never be re-folded. Recovery is acct-1vur.2b; until it lands this
-        // is at least loud instead of silent.
-        let has_history: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM trx_line WHERE line_type <> 'cost_adjustment_line')",
-        )
-        .fetch_one(consumer.pool())
-        .await
-        .expect("check for pre-existing history");
-        if has_history {
-            eprintln!(
-                "feed: WARNING — created slot {} over a database that already holds events. \
-                 Events committed before now were never delivered and their pools will not be \
-                 re-folded. Recovery is not yet implemented (acct-1vur.2b).",
-                consumer.slot()
-            );
-        } else {
-            println!("feed: created slot {}", consumer.slot());
-        }
+    match consumer.ensure_slot_with_recovery().await.expect("ensure replication slot") {
+        (true, Some(pools)) => eprintln!(
+            "feed: WARNING — created slot {} over a database that already holds events. \
+             Events committed before now were never delivered; reseeded {pools} pool(s) for a \
+             full re-fold. Any pool whose re-fold contradicts a CLOSED period halts — check \
+             SELECT * FROM recalc_escalations.",
+            consumer.slot()
+        ),
+        (true, None) => println!("feed: created slot {}", consumer.slot()),
+        (false, _) => {}
     }
+
     println!("feed: consuming slot {} (batch {batch}, idle poll {poll_ms}ms)", consumer.slot());
 
     loop {

@@ -125,8 +125,7 @@ impl FeedConsumer {
     /// event decodable before this moment is skipped. That is harmless on a
     /// virgin database and silently destructive on one that already holds
     /// data — which is exactly what a lost slot looks like. Callers that care
-    /// callers must therefore treat a `true` return over a non-empty database
-    /// as a slot-loss event needing recovery (acct-1vur.2b).
+    /// callers should therefore use [`FeedConsumer::ensure_slot_with_recovery`].
     pub async fn ensure_slot(&self) -> Result<bool, FeedError> {
         let created: Option<String> = sqlx::query_scalar(
             "SELECT (pg_create_logical_replication_slot($1, 'pgoutput')).lsn::text \
@@ -136,6 +135,41 @@ impl FeedConsumer {
         .fetch_optional(&self.pool)
         .await?;
         Ok(created.is_some())
+    }
+
+    /// `ensure_slot`, plus the recovery a re-created slot implies.
+    ///
+    /// A slot created over a database that already holds physical events is a
+    /// slot that was LOST (invalidated past `max_slot_wal_keep_size`, or
+    /// dropped) — or one that never ran while events accumulated, the
+    /// first-startup bootstrap. Both leave the same hole: events no feed tick
+    /// will ever deliver, hence pools no engine pass will ever re-fold.
+    /// `ledger_feed_reseed()` rebuilds the dirty set so the next pass
+    /// full-replays them.
+    ///
+    /// Under the decided posture (acct-1vur.2b) that re-fold may find a
+    /// CLOSED period was valued over the missing events. It then halts the
+    /// pool into `recalc_escalation` rather than absorbing or skipping the
+    /// divergence; the exit is the reopen workflow (acct-1vur.9). Recovery
+    /// surfaces damage — it does not promise to repair it.
+    ///
+    /// Returns `(created, pools_reseeded)`.
+    pub async fn ensure_slot_with_recovery(&self) -> Result<(bool, Option<i64>), FeedError> {
+        let created = self.ensure_slot().await?;
+        if !created {
+            return Ok((false, None));
+        }
+        let has_history: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM trx_line WHERE line_type <> 'cost_adjustment_line')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !has_history {
+            return Ok((true, None));
+        }
+        let pools: i64 =
+            sqlx::query_scalar("SELECT ledger_feed_reseed()").fetch_one(&self.pool).await?;
+        Ok((true, Some(pools)))
     }
 
     /// Fail loud when the slot is absent or the cluster has invalidated it.
