@@ -1,12 +1,15 @@
 # Backport design note: reservations under alt-C's no-gate posture
 
-> **Status: draft for decision (`acct-476a.2`).** This note extends the spec-of-record
+> **Status: decided (`acct-476a.2`, 2026-08-07).** This note extends the spec-of-record
 > [`design-v3.2.md`](design-v3.2.md); it does not amend it. It states the posture conflict between the
 > `acct` document layer's reservation enforcement and v3.2's ratified no-gate posture, sets out the
-> candidate shapes, and walks each against the axes the requirement owner actually raised. **It does
-> not pick a shape**: §5.2 is an unordered trade-off matrix, per `acct-cz1v`'s own process constraint
-> ("sketch 2-3 alternative shapes — *not* a single recommended shape — and walk each one against the
-> existing flows").
+> candidate shapes, and walks each against the axes the requirement owner actually raised.
+>
+> **§7 records the outcome: S3 (seam-side gate), with pinned reservations split out as a separate seam
+> contract.** §1–§6 are the analysis that produced it and are preserved as written — §5.2's trade-off
+> matrix stays unordered, per `acct-cz1v`'s process constraint ("sketch 2-3 alternative shapes — *not*
+> a single recommended shape — and walk each one against the existing flows"), because the matrix is
+> the record of what was weighed, not an argument for the answer.
 >
 > Per convergence Q6 this dossier and its sibling
 > [`design-v3.2-backport-document-cost.md`](design-v3.2-backport-document-cost.md) (`acct-476a.4`) run
@@ -245,6 +248,11 @@ So the axis is real, but the defect is sharper than "it's just a label": a statu
 decomposition. S2 and S3 *can* carry today's enum — but doing so ports the release-on-allocate
 behaviour unexamined, which is a decision, not a deferral.
 
+> **Decided (D-R3).** Today's schema carries across unchanged and the decomposition axes are deferred.
+> The release-on-allocate behaviour is **recorded, not fixed**: the owner chose record-not-fix
+> explicitly, so it ports as-is and its correction is port-time work. It is documented here precisely
+> so the port does not carry it unexamined — which was the objection to deferring it.
+
 ### 4.2 Soft versus hard
 
 `acct-cz1v` defines these precisely: soft = displaceable intent, expirable; hard = commitment,
@@ -259,6 +267,11 @@ not a commitment). S3 is coherent under **either** answer: it defers the distinc
 where it must still be answered but does not gate the shape choice.
 
 So this axis discriminates S1 from S2; it does not block choosing S3.
+
+> **Decided (D-R1): resolved by construction.** S3 was chosen, so soft-versus-hard is not answered
+> here — it defers to the seam, and the parent's existing semantics carry over with it. The parent's
+> promise-time gate is *hard* in effect (`reserve_inventory` refuses), and that behaviour is preserved
+> unchanged; making the soft/hard split first-class remains available as future seam work.
 
 ### 4.3 Detailed versus generic
 
@@ -285,6 +298,13 @@ reservation row therefore **selects which cost layer is consumed**. Under S1 tha
 plane that owns layers; under S2 and S3 it sits in the document layer while v3.2 assigns FIFO/LIFO
 layers in the engine — a conflict each must resolve explicitly.
 
+> **Decided (D-R2a): pinned reservations split out.** S3 was chosen for quantity, and the conflict
+> this paragraph names is resolved by not pretending the pin is a quantity concern. A lot pin becomes
+> an **input the seam passes to the costing plane** — a separate seam contract, specified alongside
+> `acct-476a.3`'s seam work. Generic reservations port behind the seam untouched; the pinned path is
+> new contract work, not a port. Unit-level pinning (`unit_ids`) is unaffected for now, being
+> write-only today.
+
 ### 4.4 Shipped-as-cost-relevant
 
 The owner's point is that `active → shipped` is not a label change: *"you are decreasing inventory
@@ -302,6 +322,15 @@ backdated event behind it forces a new generation under R-2, and it may carry `r
 `final` only once its `posted_at` falls in a closed period. So a reservation model that treats
 "shipped" as the moment cost is known imports an assumption v3.2 does not honour. Whatever `shipped`
 means, **it cannot mean "cost is final"**.
+
+> **Decided (D-R4): shared vocabulary adopted.** `shipped` is a quantity/lifecycle fact, never a cost
+> assertion; the three states `provisional` → `settled` (revisable) → `final` are the shared vocabulary
+> across both dossiers. One update from the sibling's decision round sharpens this: `acct-476a.4` §5.4
+> resolved as option (c) — the FIFO/LIFO hot path will post a **provisional cost leg at the observed
+> cost** (`acct-zrju.7`). A shipped line therefore has a journalled base amount from the moment it
+> ships, rather than no cost leg at all, and later recalc posts variance against it. That does not make
+> `shipped` mean final — the base is `provisional` by construction — but it does mean the seam has a
+> real journalled figure to reconcile against instead of a gap.
 
 ### 4.5 WO-versus-SO allocation target
 
@@ -324,6 +353,11 @@ rather than a cleanup of something already mixed.
 **Shape interaction.** Largely orthogonal to §3: all three shapes would carry the same discriminator
 question. It bears on §4.2 though, because WO material commitments and SO promises are the most likely
 place a genuine soft/hard split would first be needed.
+
+> **Decided (D-R5): forward-looking only.** Not in scope for the port. `inventory_reservations` stays
+> structurally SO-only (`so_id UUID NOT NULL`), because there is no existing WO allocation to
+> decompose — the axis is recorded here as a schema question for whenever WO material commitments are
+> wanted as reservation rows.
 
 ## 5. Trade-offs and decisions
 
@@ -356,7 +390,13 @@ S1 is the only coherent home for *lot pinning as a cost-layer selector*. A singl
 not be the right unit of decision — generic and pinned reservations may want different answers. This
 is derived from the pin's role in `_lot_walk_layers` (§4.3), not proposed as a fourth shape.
 
+> **This observation is what the decision took up.** §7 records S3 for quantity with the pinned path
+> split out as separate seam work — the two axes answered separately rather than forced into one shape.
+
 ### 5.3 Decisions required
+
+> **All resolved 2026-08-07 — see §7 for the outcomes.** The questions are preserved as posed, so the
+> decisions in §7 can be read against what was actually asked.
 
 - **D-R1 (soft/hard, §4.2).** Are hard reservations required — commitments the system must be unable
   to violate — or is every reservation displaceable intent? **Blocking for S1 and S2 only**; S3 defers
@@ -414,3 +454,36 @@ without, and — per §16's own reasoning — takes back the per-pool serial-fol
 to the *surviving architecture*, not to the document layer, and it is a materially different Q2
 conversation than S2 or S3 produce. The asset-versus-rebuild judgment should not be finalized before
 D-R1, D-R2, and D-R2a are answered.
+
+### 6.1 Q2 verdict for this axis — decided
+
+**No rebuild forced.** S3 was chosen, so the branch above that would have changed v3.2 is not taken:
+the ledger acquires no reservation concept, no admission-time consult, and no per-pool serial-fold
+ceiling. `inventory_reservations` and `reserve_inventory` port behind the seam as the asset they are,
+carrying their existing hard-in-effect semantics.
+
+The one piece of genuinely new work — expressing a lot pin to the costing plane — is **seam contract
+work, not a rebuild trigger**. It does not invalidate the parent's reservation model; it defines how a
+document-layer pin is communicated to a plane that assigns layers itself. Reservations therefore
+report **asset, not rebuild**, for the Q2 judgment.
+
+## 7. Decisions (2026-08-07)
+
+Recorded in the decision round on this dossier. `acct-476a.2`'s question — where the promise-time
+quantity read goes under alt C — is answered; the axes it folded in from `acct-cz1v` are answered or
+explicitly deferred with their reasons.
+
+| ID | Decision |
+|---|---|
+| **D-R2 / D-R2a** | **S3, split pinned/generic.** Quantity gating stays at the document/seam. `reserve_inventory` carries over with its hard semantics; the ledger is unchanged. Pinned (lot-specific) reservations are a **separate seam contract** — the pin becomes an input the seam passes to the costing plane, specified alongside `acct-476a.3` |
+| **D-R1** | **Resolved by construction.** Under S3, soft-versus-hard defers to the seam; parent semantics carry over unchanged |
+| **D-R3** | **Carry today's schema.** Decomposition axes deferred. The release-on-allocate behaviour (§4.1) is **recorded as-is, fix deferred to port time** — record-not-fix was chosen explicitly |
+| **D-R4** | **Shared vocabulary adopted.** `shipped` ≠ cost-final; `provisional` → `settled` (revisable) → `final`. `acct-476a.4` §5.4 resolved as option (c), so a shipped line now carries a journalled provisional cost leg at observed cost (`acct-zrju.7`) for the seam to reconcile against |
+| **D-R5** | **Forward-looking only.** Reservations stay structurally SO-only; the WO-vs-SO discriminator is recorded, not scoped |
+| **D-R6** | **Home is `acct-9ij`.** The P0006-vs-flag enumeration lives there; a note has been appended to that issue |
+| Q2 (§6.1) | **No rebuild forced** — asset, behind the seam; the pin contract is new seam work |
+
+**What is now open work rather than open question:** the pinned-reservation seam contract (with
+`acct-476a.3`), the provisional cost leg (`acct-zrju.7`), the negative-quantity flag surface
+(`acct-gtp7.3`, §5.1), and the port-time correction of release-on-allocate. None of these blocks the
+Q2 judgment.

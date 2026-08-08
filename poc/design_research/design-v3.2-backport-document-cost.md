@@ -15,6 +15,11 @@
 >
 > **Shared lifecycle vocabulary**, used identically here and in `acct-476a.2`'s note:
 > **`provisional` → `settled` (still revisable) → `final`**. `settled` is never a synonym for done.
+> The alignment is bilateral: the reservations dossier's **D-R4** adopts *shipped ≠ cost-final*, so
+> neither note uses `settled` where it means `final`.
+>
+> **The five open questions in §5 were decided on 2026-08-07** — see §7 for the decision record. §5
+> retains the arguments; §7 states what was chosen.
 
 ## 1. The conflict, precisely
 
@@ -251,8 +256,9 @@ Five details are load-bearing:
   ordering makes an anomaly visible as `provisional`-in-a-closed-period rather than laundering it into
   a `final` NULL.
 - **The period join carries its own timezone pin.** This is a **new** DATE→timestamptz boundary cast
-  site, outside the seven that `acct-1vur.5` enumerated, so it must be pinned explicitly with
-  `AT TIME ZONE 'UTC'` in the form strategy A lands in the guard bodies — it inherits nothing. As a
+  site, outside the seven that `acct-1vur.5` enumerated, so it must be pinned explicitly — it inherits
+  nothing. The sketch above uses `(date_col::timestamp AT TIME ZONE 'UTC')`, matching the form that
+  migration `0024_timezone_pinned_boundaries` landed in the guard bodies. As a
   public read interface evaluated in *arbitrary consumer sessions*, it is the most timezone-exposed
   cast site in the plane, not the least: a client that sends its own `TimeZone` (JDBC does by default)
   overrides even a cluster-level `timezone='UTC'` pin. The bracket convention itself —
@@ -370,35 +376,39 @@ independent layer walk, (b) the telescoping GL identity of §3.2 holds, and (c) 
 status `final` ever changes afterwards**. Property (c) is the one that would have caught a two-state
 flag.
 
-## 5. Open questions
+## 5. The questions, and the arguments
 
-**5.1 Does an invoice pin a generation, or float? → user decision, with parent precedent.**
+All five were decided on 2026-08-07. This section keeps the arguments that produced the decisions;
+**§7 is the decision record** and is the section to read for what was chosen.
+
+**5.1 Does an invoice pin a generation, or float? → DECIDED: float, pin at close.**
 Pinning at invoice time re-creates the drift R7 exists to prevent. Floating means an invoice's COGS is
-not stable until close. *Recommendation: float, and pin at close* — **strengthened by §1.2**: this is
-already what the parent does for `wac_periodic` and `wac_retroactive`, where a shipped line's cost
-floats until the close hook posts variance. The decision is therefore not novel, it is whether to
-extend an existing convention to three more methods. It remains a user decision because an accounting
-or contractual requirement to state COGS at invoice time would outrank it and force 5.2(c).
+not stable until close. What settled it is §1.2: floating is already what the parent does for
+`wac_periodic` and `wac_retroactive`, where a shipped line's cost floats until the close hook posts
+variance — so the decision extends an existing convention to three more methods rather than
+introducing a new one. The consideration that could have gone the other way was an accounting or
+contractual requirement to state COGS at invoice time, which would have outranked it and forced
+5.2(c); no such requirement was asserted.
 
-**5.2 What does a FIFO/LIFO document line show at write time? → user decision.**
+**5.2 What does a FIFO/LIFO document line show at write time? → DECIDED: (a), the observed cost,
+labelled provisional.**
 (a) the observed cost, explicitly labelled provisional; (b) nothing until settled — honest, and cheap
 for the one nullable column but a schema change for the `NOT NULL` ones; (c) synchronously drain that
 pool at document time, which is what the parent does today and which buys back premise 1 at the cost of
-alt-C's hot-path posture for that call site. *Recommendation: (a)*, which is also the parent's
+alt-C's hot-path posture for that call site. **(a) was chosen**, which is also the parent's
 `wac_periodic` behaviour. Note one structural difference worth preserving: the parent needs
 `posting_lines_provisional` as a **materialized worklist** so its close hook can find what to true up,
 whereas v3.2 already has that worklist as the recalc queue plus settlement generations. A port should
 not carry the side table across — it would be a second home for a fact the costing plane already owns.
 
-**5.3 Should close write the final cost back onto the document line? → user decision.**
+**5.3 Should close write the final cost back onto the document line? → DECIDED: no.**
 It would restore R7 literally post-close and give reporting a stable local join. Against: it adds a
 write-amplification term to close (already the `soak-results.md` §4 storm axis, `acct-m0ab`), and it
-duplicates a fact the view serves. *Recommendation: no, default to the view* — **and the parent agrees
-with this by precedent**: its close hooks post variance and stamp `posting_lines_provisional`; they do
-not rewrite `so_shipment_lines.unit_cost`.
+duplicates a fact the view serves. **The view remains the authoritative read surface** — and the
+parent agrees by precedent: its close hooks post variance and stamp `posting_lines_provisional`; they
+do not rewrite `so_shipment_lines.unit_cost`.
 
-**5.4 Should a base COGS leg be posted for FIFO/LIFO? → open; this is the item that can turn the
-verdict.**
+**5.4 Should a base COGS leg be posted for FIFO/LIFO? → DECIDED: yes — option (c).**
 Today generation 1 posts `(authoritative − observed) × qty` with `prior = observed` — exactly right
 when the observed cost was journalled, and leaving the journal incomplete when it was not (§1.5). The
 parent's convention is a complete journal at document time plus a later variance, so a document layer
@@ -418,9 +428,10 @@ almost certainly requires the base leg to exist somewhere. Three shapes:
   which is a posture rather than a performance property, and it would need measuring before anyone
   claims it is free.
 
-*No recommendation.* (c) is the closest fit to the parent's convention and the cheapest to reason
-about; (b) is the most self-contained; (a) is the least invasive to v3.2. The choice belongs with the
-currency and posting-plane questions in `acct-476a.3`.
+**(c) was adopted** — the closest fit to the parent's convention and the cheapest to reason about,
+since it leaves the recalc delta model untouched. Implementation is `acct-zrju.7`; the measurement of
+the hot-path cost rides that issue rather than gating it, and design-v3.2's posture line updates when
+it ships.
 
 **5.5 Resolved here: the flush-wipe divergence.** Not a document-plane concern (§3.3).
 
@@ -450,19 +461,46 @@ What coexistence costs:
   label it. This is a change to what the business sees, not merely to how the schema is shaped.
 - **The return path (§3.3) and every affected wrapper's R7 property test** change shape — the tests
   from simultaneity assertions to convergence assertions.
-- **§5.4 is unresolved**, and it is not a detail: if the document layer requires a complete COGS
-  journal and neither the seam nor the engine nor the hot path will produce the base leg, no read model
-  repairs a missing journal.
+- **The costing plane owes a base COGS leg.** §5.4 resolved this rather than leaving it hanging: the
+  FIFO/LIFO hot path gains a provisional cost leg (`acct-zrju.7`). Until that ships, the as-built
+  engine still has the no-base-leg shape of §1.5, and the journal for a FIFO/LIFO depletion carries
+  only the recalc deltas.
 
-**Verdict for this axis: asset, not rebuild — conditional on §5.4 resolving toward one of its three
-shapes. If none will be adopted, this axis reports rebuild.** Nothing else here argues for discarding
-the document layer: what the rest argues for is a bounded migration of a small set of columns plus an
-explicit change to the mid-period COGS contract. The document layer's semantics — its state machines,
-its document lifecycle, its posting conventions — are untouched by anything in this note, and its
-existing provisional-cost machinery is evidence that the conventions can absorb the change.
+**Verdict for this axis: asset, not rebuild.** With §5.4 decided, the verdict carries no open
+condition. Nothing here argues for discarding the document layer: what it argues for is a bounded
+migration of a small set of columns (§4.2), a re-resolved return path (§3.3), R7 property tests
+restated from simultaneity to convergence (§4.3), and an explicit change to the mid-period COGS
+contract. The document layer's semantics — its state machines, its document lifecycle, its posting
+conventions — are untouched by anything in this note, and its existing provisional-cost machinery
+(§1.2) is evidence that the conventions can absorb the change.
 
-That verdict is scoped to the document-cost axis, and its own open condition routes to `acct-476a.3`
-(currency and posting-plane questions), not to `acct-476a.2`. What `acct-476a.2` conditions is the
-**aggregate Q2 call**: reservations are the sharper conflict, being a *synchronous gate* where alt-C
-deliberately removed synchronous gating, and this note's method-scoping does not transfer there. Q2
-should not be called until both dossiers report.
+The view and status contract specified in §3 stands as written and does not wait on `acct-zrju.7`:
+the base leg changes what the *journal* contains, not what the authoritative cost *is* or how a
+document reads it. What it does change is §3.2's tie-out, which becomes a plain per-generation
+reconciliation once the base is journalled — the telescoping identity is a statement about the
+current shape, not a permanent one.
+
+That verdict is scoped to the document-cost axis. What `acct-476a.2` conditions is the **aggregate Q2
+call**: reservations are the sharper conflict, being a *synchronous gate* where alt-C deliberately
+removed synchronous gating, and this note's method-scoping does not transfer there. Q2 should not be
+called until both dossiers report.
+
+## 7. Decisions (2026-08-07)
+
+| # | Question | Decision |
+|---|---|---|
+| 5.1 | Invoice COGS: pin a generation, or float? | **Float until close, then pin.** Extends the parent's `posting_lines_provisional` convention to the layer-tracked methods rather than introducing a new one |
+| 5.2 | What a FIFO/LIFO document line shows at write time | **The observed cost, labelled provisional.** The three-state status travels with the number wherever it is displayed |
+| 5.3 | Does close write the final cost back onto document lines? | **No.** `document_cost` is the authoritative read surface; close posts variance and stamps, exactly as the parent's close hooks do — no document-line rewrite, no second home for the fact |
+| 5.4 | Does anything post a base COGS leg for FIFO/LIFO? | **Yes — option (c).** The hot path gains a provisional cost leg at the observed cost, `wac_periodic`-style. Filed as `acct-zrju.7`; measurement of the hot-path cost rides the implementation |
+| 5.5 | The flush-wipe divergence | Resolved in-note: not a document-plane concern (§3.3) |
+
+The four substantive decisions are mutually reinforcing rather than independent: 5.4 makes the journal
+complete at document time, which is what lets 5.1's float-then-pin sit on top of a real posting rather
+than an absence; 5.2 supplies the label that makes floating honest to a reader; and 5.3 keeps the
+correction flowing through variance postings, which is the only reason the labelled snapshot in 5.2
+stays true after it is written.
+
+**Consequences already recorded above:** §5.4's adoption removes the §6 verdict's condition; the
+§3.2 tie-out is scoped as a statement about the pre-`zrju.7` shape; the §3 view and status contract
+are unaffected either way.
