@@ -5,12 +5,14 @@
 //! one cursor). Configuration via environment:
 //!
 //!   FEED_DSN          postgres DSN            (default: dev poc_v3_2)
-//!   FEED_SLOT         replication slot name   (default: ledger_feed)
-//!   FEED_PUBLICATION  publication name        (default: ledger_feed)
 //!   FEED_BATCH        peek message budget     (default: 10000)
 //!   FEED_POLL_MS      idle sleep between polls (default: 250)
+//!
+//! The slot and publication names are NOT configurable: the close gate and
+//! the health gauge match the slot by the literal `ledger_feed`, so a renamed
+//! slot would silently evade both (acct-1vur.2).
 
-use ledger_feed::FeedConsumer;
+use ledger_feed::{FeedConsumer, PUBLICATION_NAME, SLOT_NAME};
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 
@@ -21,8 +23,6 @@ fn env_or(key: &str, default: &str) -> String {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let dsn = env_or("FEED_DSN", "postgres://acct:acct_dev@localhost:5111/poc_v3_2");
-    let slot = env_or("FEED_SLOT", "ledger_feed");
-    let publication = env_or("FEED_PUBLICATION", "ledger_feed");
     let batch: i32 = env_or("FEED_BATCH", "10000").parse().expect("FEED_BATCH must be an int");
     let poll_ms: u64 = env_or("FEED_POLL_MS", "250").parse().expect("FEED_POLL_MS must be an int");
 
@@ -32,9 +32,29 @@ async fn main() {
         .await
         .expect("connect to feed database");
 
-    let consumer = FeedConsumer::new(pool, slot, publication);
+    let consumer = FeedConsumer::new(pool, SLOT_NAME, PUBLICATION_NAME);
     if consumer.ensure_slot().await.expect("ensure replication slot") {
-        println!("feed: created slot {}", consumer.slot());
+        // A slot created over a database that already holds events is a slot
+        // that was LOST: its cursor starts at the current WAL position, so
+        // everything decodable in the gap is skipped and those pools will
+        // never be re-folded. Recovery is acct-1vur.2b; until it lands this
+        // is at least loud instead of silent.
+        let has_history: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM trx_line WHERE line_type <> 'cost_adjustment_line')",
+        )
+        .fetch_one(consumer.pool())
+        .await
+        .expect("check for pre-existing history");
+        if has_history {
+            eprintln!(
+                "feed: WARNING — created slot {} over a database that already holds events. \
+                 Events committed before now were never delivered and their pools will not be \
+                 re-folded. Recovery is not yet implemented (acct-1vur.2b).",
+                consumer.slot()
+            );
+        } else {
+            println!("feed: created slot {}", consumer.slot());
+        }
     }
     println!("feed: consuming slot {} (batch {batch}, idle poll {poll_ms}ms)", consumer.slot());
 
@@ -51,6 +71,14 @@ async fn main() {
                 // the batch and the idempotent apply converges.
                 let report = match report {
                     Ok(r) => r,
+                    // An unusable slot is terminal: WAL it never delivered has
+                    // been discarded, so no amount of retrying recovers those
+                    // events. Spinning here would look like a running feed
+                    // while the dirty set silently stopped growing.
+                    Err(e @ ledger_feed::FeedError::SlotLost { .. }) => {
+                        eprintln!("feed: FATAL — {e}");
+                        std::process::exit(1);
+                    }
                     Err(e) => {
                         eprintln!("feed: ingest error (retrying): {e}");
                         tokio::time::sleep(Duration::from_millis(250)).await;

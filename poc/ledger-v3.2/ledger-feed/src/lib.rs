@@ -10,4 +10,12 @@
 pub mod consumer;
 pub mod pgoutput;
 
+/// The canonical slot and publication names. Fixed literals, not
+/// configuration: `ledger_close_period`'s feed-currency gate and the
+/// `feed_slot_health` gauge both match the slot by this exact name, so a
+/// renamed slot would silently evade both while the feed appeared to work
+/// (acct-1vur.2). One name is the only coherent posture.
+pub const SLOT_NAME: &str = "ledger_feed";
+pub const PUBLICATION_NAME: &str = "ledger_feed";
+
 pub use consumer::{FeedConsumer, FeedError, IngestReport, PeekBatch, TrxLineEvent};

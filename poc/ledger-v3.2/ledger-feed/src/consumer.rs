@@ -51,6 +51,13 @@ pub enum FeedError {
     Parse(#[from] pgoutput::ParseError),
     #[error("feed protocol error: {0}")]
     Protocol(String),
+    /// The slot is gone or the cluster invalidated it (`wal_status = 'lost'`,
+    /// which `max_slot_wal_keep_size` deliberately permits). WAL the slot
+    /// never delivered has been discarded, so retrying the peek can only spin.
+    #[error("feed slot '{slot}' is unusable ({reason}); retrying cannot recover events \
+             whose WAL was discarded — re-create the slot and re-fold the affected pools \
+             (recovery routine: acct-1vur.2b)")]
+    SlotLost { slot: String, reason: String },
 }
 
 /// One `trx_line` insert delivered by the slot, projected to the columns the
@@ -106,9 +113,20 @@ impl FeedConsumer {
         &self.slot
     }
 
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Create the slot if it does not exist. Returns true when this call
     /// created it. Slots are cluster runtime state, not schema — this is the
     /// consumer's startup responsibility, not a migration's.
+    ///
+    /// Creating a slot puts its cursor at the CURRENT WAL position, so every
+    /// event decodable before this moment is skipped. That is harmless on a
+    /// virgin database and silently destructive on one that already holds
+    /// data — which is exactly what a lost slot looks like. Callers that care
+    /// callers must therefore treat a `true` return over a non-empty database
+    /// as a slot-loss event needing recovery (acct-1vur.2b).
     pub async fn ensure_slot(&self) -> Result<bool, FeedError> {
         let created: Option<String> = sqlx::query_scalar(
             "SELECT (pg_create_logical_replication_slot($1, 'pgoutput')).lsn::text \
@@ -120,9 +138,42 @@ impl FeedConsumer {
         Ok(created.is_some())
     }
 
+    /// Fail loud when the slot is absent or the cluster has invalidated it.
+    /// Checked at the top of every tick: an invalidated slot returns an error
+    /// from `peek` forever, and a bare retry loop would spin on it while the
+    /// dirty set silently stopped growing.
+    pub async fn check_slot_usable(&self) -> Result<(), FeedError> {
+        let row: Option<(bool, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT present, wal_status, invalidation_reason FROM feed_slot_health",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((present, wal_status, invalidation)) = row else {
+            return Ok(());
+        };
+        if !present {
+            return Err(FeedError::SlotLost {
+                slot: self.slot.clone(),
+                reason: "slot absent".to_string(),
+            });
+        }
+        if let Some(reason) = invalidation {
+            return Err(FeedError::SlotLost { slot: self.slot.clone(), reason });
+        }
+        if wal_status.as_deref() == Some("lost") {
+            return Err(FeedError::SlotLost {
+                slot: self.slot.clone(),
+                reason: "wal_status=lost".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// One feed tick: peek → apply → advance. Returns what happened so the
     /// caller's loop can pace itself (messages == 0 → queue empty, sleep).
     pub async fn ingest_once(&self, limit: i32) -> Result<IngestReport, FeedError> {
+        self.check_slot_usable().await?;
+
         // Anchor BEFORE the peek: everything decodable before this point is
         // covered by the peek below, so on an empty batch the cursor can move
         // here without skipping anything. Keeps G1 honest (and WAL released)
